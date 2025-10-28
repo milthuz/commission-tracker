@@ -100,18 +100,27 @@ app.get('/api/auth/callback', async (req, res) => {
     console.log('Client ID:', ZOHO_CONFIG.client_id ? 'SET' : 'MISSING');
     console.log('Client Secret:', ZOHO_CONFIG.client_secret ? 'SET' : 'MISSING');
     console.log('Redirect URI:', ZOHO_CONFIG.redirect_uri);
+    console.log('Accounts URL:', accountsUrl);
 
-    // Exchange code for tokens
+    // Exchange code for tokens - using form-urlencoded format
     const tokenResponse = await axios.post(
       `${accountsUrl}/oauth/v2/token`,
-      {
+      new URLSearchParams({
         grant_type: 'authorization_code',
         client_id: ZOHO_CONFIG.client_id,
         client_secret: ZOHO_CONFIG.client_secret,
         redirect_uri: ZOHO_CONFIG.redirect_uri,
         code,
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
       }
     );
+
+    console.log('Token exchange successful!');
+    console.log('Response:', tokenResponse.data);
 
     const {
       access_token,
