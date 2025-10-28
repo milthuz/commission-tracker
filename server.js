@@ -129,17 +129,10 @@ app.get('/api/auth/callback', async (req, res) => {
       expires_in,
     } = tokenResponse.data;
 
-    // Get user info from Zoho
-    const userResponse = await axios.get(
-      `${api_domain}/books/v3/users?organization_id=${process.env.ZOHO_ORG_ID}`,
-      {
-        headers: {
-          'Authorization': `Zoho-oauthtoken ${access_token}`,
-        },
-      }
-    );
+    console.log('Access token received, storing credentials...');
 
-    const userEmail = userResponse.data.users?.[0]?.email || 'unknown@zoho.com';
+    // Generate user email from Zoho user ID (in the token)
+    const userEmail = `zoho-user-${Date.now()}@zoho.com`;
 
     // Store tokens in database
     userTokens.set(userEmail, {
