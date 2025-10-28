@@ -292,6 +292,10 @@ app.get('/api/commissions', authenticateToken, async (req, res) => {
     res.json({ commissions });
   } catch (error) {
     console.error('Commission API error:', error.message);
+    console.error('Zoho API response status:', error.response?.status);
+    console.error('Zoho API response data:', JSON.stringify(error.response?.data, null, 2));
+    console.error('API Domain:', tokenData?.api_domain);
+    console.error('Organization ID:', process.env.ZOHO_ORG_ID);
     res.status(500).json({ 
       error: 'Failed to fetch commissions',
       details: error.message 
