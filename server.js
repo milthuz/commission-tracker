@@ -76,7 +76,7 @@ app.get('/api/auth/zoho', (req, res) => {
     `&redirect_uri=${ZOHO_CONFIG.redirect_uri}` +
     `&state=${state}` +
     `&access_type=offline` +
-    `&prompt=consent`;
+    `&prompt=login`;
 
   // Store state for verification
   res.json({ authUrl, state });
