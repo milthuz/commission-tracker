@@ -161,12 +161,14 @@ app.get('/api/auth/callback', async (req, res) => {
     res.redirect(redirectUrl);
   } catch (error) {
     console.error('OAuth callback error:', error.message);
-    if (error.response) {
-      console.error('Zoho API Response:', error.response.status, error.response.data);
-    }
+    console.error('Error status:', error.response?.status);
+    console.error('Error headers:', error.response?.headers);
+    console.error('Full error response:', JSON.stringify(error.response?.data, null, 2));
+    
     res.status(500).json({ 
       error: 'Token exchange failed',
       details: error.message,
+      status: error.response?.status,
       zohoError: error.response?.data
     });
   }
