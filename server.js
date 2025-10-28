@@ -150,10 +150,11 @@ app.get('/api/auth/callback', async (req, res) => {
       expires_in,
     } = tokenResponse.data;
 
-    // Create a unique user ID from the token (Zoho includes user info in token)
-    // For now, use timestamp-based ID, but this will be unique per login
-    const userEmail = `zoho-rep-${Date.now()}@cluster.local`;
-    console.log('User email:', userEmail);
+    // Use the access token to create a unique, consistent user ID
+    // This ensures each Zoho account gets a unique identifier
+    const crypto = require('crypto');
+    const userEmail = crypto.createHash('md5').update(access_token).digest('hex');
+    console.log('User ID:', userEmail);
 
     // Store tokens in database
     await pool.query(
