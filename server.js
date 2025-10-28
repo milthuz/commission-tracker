@@ -270,8 +270,8 @@ app.get('/api/commissions', authenticateToken, async (req, res) => {
         params: {
           organization_id: process.env.ZOHO_ORG_ID,
           status: 'paid',
-          'filter_by': 'InvoiceDate.after',
-          'filter_value': start,
+          // Correct Zoho filter format
+          sort_column: 'invoice_date',
         },
         headers: {
           'Authorization': `Zoho-oauthtoken ${accessToken}`,
