@@ -150,8 +150,22 @@ app.get('/api/auth/callback', async (req, res) => {
       expires_in,
     } = tokenResponse.data;
 
-    // Generate user email from token
-    const userEmail = `zoho-user-${Date.now()}@zoho.com`;
+    // Get user info from Zoho to get their actual email
+    console.log('Fetching user info from Zoho...');
+    const userResponse = await axios.get(
+      `${api_domain}/books/v3/users`,
+      {
+        params: {
+          organization_id: process.env.ZOHO_ORG_ID,
+        },
+        headers: {
+          'Authorization': `Zoho-oauthtoken ${access_token}`,
+        },
+      }
+    );
+
+    const userEmail = userResponse.data.users?.[0]?.email || `zoho-user-${Date.now()}@zoho.com`;
+    console.log('User email:', userEmail);
 
     // Store tokens in database
     await pool.query(
@@ -322,39 +336,35 @@ function calculateCommissions(invoices, user, startDate, endDate) {
       return;
     }
 
-    // Calculate commission
-    let totalCommission = 0;
-    const lineItems = invoice.line_items || [];
+    // Get total invoice amount
+    const invoiceTotal = parseFloat(invoice.total || 0);
+    
+    // Calculate 10% commission on total invoice amount
+    const commission = invoiceTotal * 0.10;
 
-    lineItems.forEach((item) => {
-      const itemName = item.item_name || '';
-      const unitPrice = parseFloat(item.item_price || 0);
-      const quantity = parseFloat(item.quantity || 1);
-      const itemTotal = unitPrice * quantity;
-
-      // 10% commission on all items
-      totalCommission += itemTotal * 0.1;
-    });
+    console.log(`Invoice: ${invoice.invoice_number}, Rep: ${salesRep}, Total: ${invoiceTotal}, Commission: ${commission}`);
 
     // Aggregate by sales rep
     if (commissionsMap.has(salesRep)) {
       const existing = commissionsMap.get(salesRep);
+      const newTotal = existing.commission + commission;
       commissionsMap.set(salesRep, {
         repName: salesRep,
         invoices: existing.invoices + 1,
-        commission: existing.commission + totalCommission,
-        avgPerInvoice: (existing.commission + totalCommission) / (existing.invoices + 1),
+        commission: newTotal,
+        avgPerInvoice: newTotal / (existing.invoices + 1),
       });
     } else {
       commissionsMap.set(salesRep, {
         repName: salesRep,
         invoices: 1,
-        commission: totalCommission,
-        avgPerInvoice: totalCommission,
+        commission: commission,
+        avgPerInvoice: commission,
       });
     }
   });
 
+  console.log('Final commissions:', Array.from(commissionsMap.values()));
   return Array.from(commissionsMap.values());
 }
 
