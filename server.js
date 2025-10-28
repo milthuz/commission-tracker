@@ -150,21 +150,9 @@ app.get('/api/auth/callback', async (req, res) => {
       expires_in,
     } = tokenResponse.data;
 
-    // Get user info from Zoho to get their actual email
-    console.log('Fetching user info from Zoho...');
-    const userResponse = await axios.get(
-      `${api_domain}/books/v3/users`,
-      {
-        params: {
-          organization_id: process.env.ZOHO_ORG_ID,
-        },
-        headers: {
-          'Authorization': `Zoho-oauthtoken ${access_token}`,
-        },
-      }
-    );
-
-    const userEmail = userResponse.data.users?.[0]?.email || `zoho-user-${Date.now()}@zoho.com`;
+    // Create a unique user ID from the token (Zoho includes user info in token)
+    // For now, use timestamp-based ID, but this will be unique per login
+    const userEmail = `zoho-rep-${Date.now()}@cluster.local`;
     console.log('User email:', userEmail);
 
     // Store tokens in database
