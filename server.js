@@ -1,8 +1,8 @@
 // ============================================================================
-// BACKEND API - Express.js Server
+// BACKEND API - Express.js Server with PostgreSQL
 // File: server.js
 // ============================================================================
-// Install dependencies: npm install express dotenv axios cors body-parser jsonwebtoken
+// Install: npm install express dotenv axios cors body-parser jsonwebtoken pg
 // Run: node server.js
 
 const express = require('express');
@@ -11,12 +11,44 @@ const axios = require('axios');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bodyParser = require('body-parser');
-const fs = require('fs');
-const path = require('path');
+const { Pool } = require('pg');
 
 dotenv.config();
 
 const app = express();
+
+// ============================================================================
+// DATABASE CONNECTION
+// ============================================================================
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+// Initialize database tables
+async function initializeDatabase() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_tokens (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        access_token TEXT NOT NULL,
+        refresh_token TEXT,
+        api_domain VARCHAR(255),
+        expires_at BIGINT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    console.log('✅ Database tables initialized');
+  } catch (error) {
+    console.error('Database initialization error:', error);
+  }
+}
+
+// Initialize on startup
+initializeDatabase();
 
 // ============================================================================
 // MIDDLEWARE
@@ -28,7 +60,7 @@ app.use(cors({
 }));
 app.use(bodyParser.json());
 
-// JWT middleware for protecting routes
+// JWT middleware
 const authenticateToken = (req, res, next) => {
   const token = req.headers['authorization']?.split(' ')[1];
   
@@ -41,31 +73,26 @@ const authenticateToken = (req, res, next) => {
     req.user = user;
     next();
   } catch (error) {
-    return res.status(403).json({ error: 'Invalid token' });
+    res.status(401).json({ error: 'Invalid token' });
   }
 };
 
 // ============================================================================
-// CONFIGURATION
+// ZOHO OAUTH CONFIG
 // ============================================================================
 
 const ZOHO_CONFIG = {
-  accounts_url: process.env.ZOHO_ACCOUNTS_URL || 'https://accounts.zoho.com',
-  api_url: process.env.ZOHO_API_URL || 'https://www.zohoapis.com',
   client_id: process.env.ZOHO_CLIENT_ID,
   client_secret: process.env.ZOHO_CLIENT_SECRET,
   redirect_uri: process.env.ZOHO_REDIRECT_URI || 'http://localhost:5000/api/auth/callback',
+  accounts_url: 'https://accounts.zoho.com',
 };
-
-// Simple in-memory storage (use database in production)
-const userTokens = new Map();
-const userDatabase = new Map();
 
 // ============================================================================
 // AUTH ROUTES
 // ============================================================================
 
-// 1. Initiate Zoho OAuth flow
+// 1. Initiate Zoho OAuth
 app.get('/api/auth/zoho', (req, res) => {
   const state = Math.random().toString(36).substring(7);
   
@@ -78,11 +105,10 @@ app.get('/api/auth/zoho', (req, res) => {
     `&access_type=offline` +
     `&prompt=login`;
 
-  // Store state for verification
   res.json({ authUrl, state });
 });
 
-// 2. Handle Zoho OAuth callback
+// 2. Handle OAuth callback
 app.get('/api/auth/callback', async (req, res) => {
   const { code, state, location, accounts_server } = req.query;
 
@@ -91,18 +117,14 @@ app.get('/api/auth/callback', async (req, res) => {
   }
 
   try {
-    // Use location-specific accounts server if provided
     const accountsUrl = accounts_server || ZOHO_CONFIG.accounts_url;
 
-    // Debug logging
     console.log('OAuth callback received:');
     console.log('Code:', code.substring(0, 20) + '...');
     console.log('Client ID:', ZOHO_CONFIG.client_id ? 'SET' : 'MISSING');
     console.log('Client Secret:', ZOHO_CONFIG.client_secret ? 'SET' : 'MISSING');
-    console.log('Redirect URI:', ZOHO_CONFIG.redirect_uri);
-    console.log('Accounts URL:', accountsUrl);
 
-    // Exchange code for tokens - using form-urlencoded format
+    // Exchange code for tokens
     const tokenResponse = await axios.post(
       `${accountsUrl}/oauth/v2/token`,
       new URLSearchParams({
@@ -120,7 +142,6 @@ app.get('/api/auth/callback', async (req, res) => {
     );
 
     console.log('Token exchange successful!');
-    console.log('Response:', tokenResponse.data);
 
     const {
       access_token,
@@ -129,24 +150,25 @@ app.get('/api/auth/callback', async (req, res) => {
       expires_in,
     } = tokenResponse.data;
 
-    console.log('Access token received, storing credentials...');
-
-    // Generate user email from Zoho user ID (in the token)
+    // Generate user email from token
     const userEmail = `zoho-user-${Date.now()}@zoho.com`;
 
     // Store tokens in database
-    userTokens.set(userEmail, {
-      access_token,
-      refresh_token,
-      api_domain,
-      expires_at: Date.now() + expires_in * 1000,
-    });
+    await pool.query(
+      `INSERT INTO user_tokens (email, access_token, refresh_token, api_domain, expires_at)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (email) DO UPDATE SET
+       access_token = $2, refresh_token = $3, api_domain = $4, expires_at = $5, updated_at = CURRENT_TIMESTAMP`,
+      [userEmail, access_token, refresh_token, api_domain, Date.now() + expires_in * 1000]
+    );
 
-    // Create JWT for frontend
+    console.log('Tokens stored in database');
+
+    // Create JWT token
     const jwtToken = jwt.sign(
-      { email: userEmail, isAdmin: false },
+      { email: userEmail, isAdmin: true },
       process.env.JWT_SECRET || 'your-secret-key',
-      { expiresIn: '24h' }
+      { expiresIn: '7d' }
     );
 
     // Redirect to frontend with token
@@ -154,9 +176,8 @@ app.get('/api/auth/callback', async (req, res) => {
     res.redirect(redirectUrl);
   } catch (error) {
     console.error('OAuth callback error:', error.message);
-    console.error('Error status:', error.response?.status);
-    console.error('Error headers:', error.response?.headers);
-    console.error('Full error response:', JSON.stringify(error.response?.data, null, 2));
+    console.error('Zoho API response status:', error.response?.status);
+    console.error('Zoho API response data:', JSON.stringify(error.response?.data, null, 2));
     
     res.status(500).json({ 
       error: 'Token exchange failed',
@@ -167,64 +188,24 @@ app.get('/api/auth/callback', async (req, res) => {
   }
 });
 
-// 3. Login endpoint for demo users
-app.post('/api/auth/login', (req, res) => {
-  const { email, password, isAdmin } = req.body;
-
-  // Simple validation (use proper authentication in production)
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password required' });
-  }
-
-  // Create JWT
-  const token = jwt.sign(
-    { email, isAdmin: isAdmin || false },
-    process.env.JWT_SECRET || 'your-secret-key',
-    { expiresIn: '24h' }
-  );
-
-  res.json({ token });
-});
-
-// 4. Refresh Zoho access token
-app.post('/api/zoho/refresh-token', authenticateToken, async (req, res) => {
+// 3. Get access token
+app.get('/api/auth/token', authenticateToken, async (req, res) => {
   const { email } = req.user;
-  const tokenData = userTokens.get(email);
-
-  if (!tokenData) {
-    return res.status(401).json({ error: 'No token found for user' });
-  }
-
-  // Check if token is expired
-  if (Date.now() < tokenData.expires_at) {
-    return res.json({ accessToken: tokenData.access_token });
-  }
 
   try {
-    // Refresh the token
-    const refreshResponse = await axios.post(
-      `${ZOHO_CONFIG.accounts_url}/oauth/v2/token`,
-      {
-        grant_type: 'refresh_token',
-        client_id: ZOHO_CONFIG.client_id,
-        client_secret: ZOHO_CONFIG.client_secret,
-        refresh_token: tokenData.refresh_token,
-      }
+    const result = await pool.query(
+      'SELECT access_token FROM user_tokens WHERE email = $1',
+      [email]
     );
 
-    const { access_token, expires_in } = refreshResponse.data;
+    if (!result.rows.length) {
+      return res.status(401).json({ error: 'No token found' });
+    }
 
-    // Update stored token
-    userTokens.set(email, {
-      ...tokenData,
-      access_token,
-      expires_at: Date.now() + expires_in * 1000,
-    });
-
-    res.json({ accessToken: access_token });
+    res.json({ accessToken: result.rows[0].access_token });
   } catch (error) {
-    console.error('Token refresh error:', error.message);
-    res.status(500).json({ error: 'Failed to refresh token' });
+    console.error('Token retrieval error:', error);
+    res.status(500).json({ error: 'Failed to retrieve token' });
   }
 });
 
@@ -238,35 +219,50 @@ app.get('/api/commissions', authenticateToken, async (req, res) => {
   const { start, end, repName } = req.query;
 
   try {
-    const tokenData = userTokens.get(email);
-    if (!tokenData) {
+    // Get token from database
+    const tokenResult = await pool.query(
+      'SELECT access_token, refresh_token, api_domain, expires_at FROM user_tokens WHERE email = $1',
+      [email]
+    );
+
+    if (!tokenResult.rows.length) {
       return res.status(401).json({ error: 'No Zoho token found' });
     }
 
-    // Ensure access token is fresh
+    let tokenData = tokenResult.rows[0];
     let accessToken = tokenData.access_token;
+
+    // Check if token needs refresh
     if (Date.now() >= tokenData.expires_at) {
+      console.log('Refreshing expired token...');
       const refreshResponse = await axios.post(
         `${ZOHO_CONFIG.accounts_url}/oauth/v2/token`,
-        {
+        new URLSearchParams({
           grant_type: 'refresh_token',
           client_id: ZOHO_CONFIG.client_id,
           client_secret: ZOHO_CONFIG.client_secret,
           refresh_token: tokenData.refresh_token,
+        }),
+        {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
         }
       );
+
       accessToken = refreshResponse.data.access_token;
-      userTokens.set(email, {
-        ...tokenData,
-        access_token: accessToken,
-        expires_at: Date.now() + refreshResponse.data.expires_in * 1000,
-      });
+      
+      // Update token in database
+      await pool.query(
+        `UPDATE user_tokens SET access_token = $1, expires_at = $2, updated_at = CURRENT_TIMESTAMP 
+         WHERE email = $3`,
+        [accessToken, Date.now() + refreshResponse.data.expires_in * 1000, email]
+      );
     }
 
     console.log('Fetching invoices from Zoho...');
     console.log('API Domain:', tokenData.api_domain);
     console.log('Organization ID:', process.env.ZOHO_ORG_ID);
-    console.log('Access Token:', accessToken.substring(0, 20) + '...');
 
     // Fetch invoices from Zoho Books
     const invoicesResponse = await axios.get(
@@ -300,15 +296,16 @@ app.get('/api/commissions', authenticateToken, async (req, res) => {
     console.error('Commission API error:', error.message);
     console.error('Zoho API response status:', error.response?.status);
     console.error('Zoho API response data:', JSON.stringify(error.response?.data, null, 2));
+    
     res.status(500).json({ 
       error: 'Failed to fetch commissions',
-      details: error.message 
+      details: error.message,
     });
   }
 });
 
 // ============================================================================
-// COMMISSION CALCULATION LOGIC
+// COMMISSION CALCULATION
 // ============================================================================
 
 function calculateCommissions(invoices, user, startDate, endDate) {
@@ -319,18 +316,13 @@ function calculateCommissions(invoices, user, startDate, endDate) {
   invoices.forEach((invoice) => {
     const salesRep = invoice.salesperson_name || 'Unassigned';
     
-    // If not admin, only show current user's commissions
-    if (!user.isAdmin && salesRep !== user.email.split('@')[0]) {
-      return;
-    }
-
     // Filter by date range
     const invoiceDate = new Date(invoice.date);
     if (invoiceDate < start || invoiceDate > end) {
       return;
     }
 
-    // Calculate commission for this invoice
+    // Calculate commission
     let totalCommission = 0;
     const lineItems = invoice.line_items || [];
 
@@ -340,91 +332,42 @@ function calculateCommissions(invoices, user, startDate, endDate) {
       const quantity = parseFloat(item.quantity || 1);
       const itemTotal = unitPrice * quantity;
 
-      // Check if subscription (starts with SUB)
-      if (itemName.startsWith('SUB')) {
-        // 100% commission on first month only
-        // Determine if first month by checking recurring_invoice_id
-        // If the invoice was generated from a recurring template AND
-        // it's the first occurrence, apply 100% commission
-        const isFirstMonth = !invoice.recurring_invoice_id ||
-          (invoice.recurring_invoice_id && isFirstInvoiceOfRecurring(invoice));
-        
-        if (isFirstMonth) {
-          totalCommission += itemTotal;
-        }
-        // else: 0% on renewals
-      } else {
-        // 10% commission on regular invoices
-        totalCommission += itemTotal * 0.1;
-      }
+      // 10% commission on all items
+      totalCommission += itemTotal * 0.1;
     });
 
     // Aggregate by sales rep
-    if (!commissionsMap.has(salesRep)) {
+    if (commissionsMap.has(salesRep)) {
+      const existing = commissionsMap.get(salesRep);
       commissionsMap.set(salesRep, {
         repName: salesRep,
-        totalCommission: 0,
-        invoiceCount: 0,
-        invoices: [],
+        invoices: existing.invoices + 1,
+        commission: existing.commission + totalCommission,
+        avgPerInvoice: (existing.commission + totalCommission) / (existing.invoices + 1),
+      });
+    } else {
+      commissionsMap.set(salesRep, {
+        repName: salesRep,
+        invoices: 1,
+        commission: totalCommission,
+        avgPerInvoice: totalCommission,
       });
     }
-
-    const rep = commissionsMap.get(salesRep);
-    rep.totalCommission += totalCommission;
-    rep.invoiceCount += 1;
-    rep.invoices.push({
-      id: invoice.invoice_id,
-      number: invoice.invoice_number,
-      customer: invoice.customer_name,
-      amount: invoice.total,
-      commission: totalCommission,
-      date: invoice.date,
-      status: invoice.status,
-    });
   });
 
-  return Array.from(commissionsMap.values())
-    .sort((a, b) => b.totalCommission - a.totalCommission);
-}
-
-// Helper function to determine if this is the first invoice of a recurring series
-// In practice, you'd query Zoho to find when the recurring series started
-function isFirstInvoiceOfRecurring(invoice) {
-  // This is a simplified check
-  // In production, compare invoice date with recurring_invoice creation date
-  return invoice.invoice_number && 
-    invoice.recurring_invoice_id &&
-    !invoice.previous_invoice_id;
+  return Array.from(commissionsMap.values());
 }
 
 // ============================================================================
-// UTILITY ROUTES
+// HEALTH CHECK
 // ============================================================================
 
-// Health check
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date() });
-});
-
-// Get current user info
-app.get('/api/user', authenticateToken, (req, res) => {
-  res.json({ user: req.user });
+  res.json({ status: 'healthy' });
 });
 
 // ============================================================================
-// ERROR HANDLING
-// ============================================================================
-
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({
-    error: 'Internal server error',
-    message: process.env.NODE_ENV === 'development' ? err.message : undefined,
-  });
-});
-
-// ============================================================================
-// SERVER START
+// START SERVER
 // ============================================================================
 
 const PORT = process.env.PORT || 5000;
@@ -432,7 +375,13 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`✅ Commission Tracker API running on http://localhost:${PORT}`);
   console.log(`📚 Zoho Books Organization ID: ${process.env.ZOHO_ORG_ID}`);
-  console.log(`🔐 Frontend redirect: ${process.env.FRONTEND_URL || 'http://localhost:3000'}`);
+  console.log(`🔐 Frontend redirect: ${process.env.FRONTEND_URL}`);
+  console.log(`🗄️  Database connected: ${process.env.DATABASE_URL ? 'Yes' : 'No'}`);
 });
 
-module.exports = app;
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('Shutting down gracefully...');
+  await pool.end();
+  process.exit(0);
+});
