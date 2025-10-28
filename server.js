@@ -268,14 +268,13 @@ app.get('/api/commissions', authenticateToken, async (req, res) => {
     console.log('Organization ID:', process.env.ZOHO_ORG_ID);
     console.log('Access Token:', accessToken.substring(0, 20) + '...');
 
-    // Fetch paid invoices from Zoho Books
+    // Fetch invoices from Zoho Books
     const invoicesResponse = await axios.get(
       `${tokenData.api_domain}/books/v3/invoices`,
       {
         params: {
           organization_id: process.env.ZOHO_ORG_ID,
           status: 'paid',
-          sort_column: 'invoice_date',
         },
         headers: {
           'Authorization': `Zoho-oauthtoken ${accessToken}`,
@@ -301,8 +300,6 @@ app.get('/api/commissions', authenticateToken, async (req, res) => {
     console.error('Commission API error:', error.message);
     console.error('Zoho API response status:', error.response?.status);
     console.error('Zoho API response data:', JSON.stringify(error.response?.data, null, 2));
-    console.error('API Domain:', tokenData?.api_domain);
-    console.error('Organization ID:', process.env.ZOHO_ORG_ID);
     res.status(500).json({ 
       error: 'Failed to fetch commissions',
       details: error.message 
