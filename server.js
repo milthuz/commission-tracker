@@ -156,16 +156,20 @@ app.get('/api/auth/callback', async (req, res) => {
     const userEmail = crypto.createHash('md5').update(access_token).digest('hex');
     console.log('User ID:', userEmail);
 
-    // Store tokens in database
-    await pool.query(
-      `INSERT INTO user_tokens (email, access_token, refresh_token, api_domain, expires_at)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (email) DO UPDATE SET
-       access_token = $2, refresh_token = $3, api_domain = $4, expires_at = $5, updated_at = CURRENT_TIMESTAMP`,
-      [userEmail, access_token, refresh_token, api_domain, Date.now() + expires_in * 1000]
-    );
-
-    console.log('Tokens stored in database');
+    // Store tokens in database with error handling
+    try {
+      await pool.query(
+        `INSERT INTO user_tokens (email, access_token, refresh_token, api_domain, expires_at)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (email) DO UPDATE SET
+         access_token = $2, refresh_token = $3, api_domain = $4, expires_at = $5, updated_at = CURRENT_TIMESTAMP`,
+        [userEmail, access_token, refresh_token, api_domain, Date.now() + expires_in * 1000]
+      );
+      console.log('✅ Tokens stored in database for:', userEmail);
+    } catch (dbError) {
+      console.error('❌ Database error:', dbError.message);
+      return res.status(500).json({ error: 'Failed to store tokens in database' });
+    }
 
     // Create JWT token
     const jwtToken = jwt.sign(
@@ -174,8 +178,11 @@ app.get('/api/auth/callback', async (req, res) => {
       { expiresIn: '7d' }
     );
 
+    console.log('✅ JWT token created');
+
     // Redirect to frontend with token
     const redirectUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}?token=${jwtToken}`;
+    console.log('🔄 Redirecting to:', redirectUrl);
     res.redirect(redirectUrl);
   } catch (error) {
     console.error('OAuth callback error:', error.message);
