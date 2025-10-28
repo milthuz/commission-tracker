@@ -263,6 +263,11 @@ app.get('/api/commissions', authenticateToken, async (req, res) => {
       });
     }
 
+    console.log('Fetching invoices from Zoho...');
+    console.log('API Domain:', tokenData.api_domain);
+    console.log('Organization ID:', process.env.ZOHO_ORG_ID);
+    console.log('Access Token:', accessToken.substring(0, 20) + '...');
+
     // Fetch paid invoices from Zoho Books
     const invoicesResponse = await axios.get(
       `${tokenData.api_domain}/books/v3/invoices`,
@@ -270,7 +275,6 @@ app.get('/api/commissions', authenticateToken, async (req, res) => {
         params: {
           organization_id: process.env.ZOHO_ORG_ID,
           status: 'paid',
-          // Correct Zoho filter format
           sort_column: 'invoice_date',
         },
         headers: {
@@ -278,6 +282,9 @@ app.get('/api/commissions', authenticateToken, async (req, res) => {
         },
       }
     );
+
+    console.log('Invoices fetched successfully!');
+    console.log('Number of invoices:', invoicesResponse.data.invoices?.length || 0);
 
     const invoices = invoicesResponse.data.invoices || [];
 
