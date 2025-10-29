@@ -320,8 +320,15 @@ app.get('/api/commissions', authenticateToken, async (req, res) => {
 
 function calculateCommissions(invoices, user, startDate, endDate) {
   const commissionsMap = new Map();
+  
+  // Parse dates and set time appropriately
   const start = new Date(startDate);
+  start.setHours(0, 0, 0, 0); // Start of day
+  
   const end = new Date(endDate);
+  end.setHours(23, 59, 59, 999); // End of day
+
+  console.log(`Filtering invoices from ${start.toISOString()} to ${end.toISOString()}`);
 
   invoices.forEach((invoice) => {
     const salesRep = invoice.salesperson_name || 'Unassigned';
@@ -329,6 +336,7 @@ function calculateCommissions(invoices, user, startDate, endDate) {
     // Filter by date range
     const invoiceDate = new Date(invoice.date);
     if (invoiceDate < start || invoiceDate > end) {
+      console.log(`Skipping invoice ${invoice.invoice_number} - date ${invoiceDate.toISOString()} outside range`);
       return;
     }
 
