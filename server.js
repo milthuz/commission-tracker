@@ -223,6 +223,194 @@ app.get('/api/auth/token', authenticateToken, async (req, res) => {
 // COMMISSION API ROUTES
 // ============================================================================
 
+// ============================================================================
+// AUTO-SYNC INVOICES (runs every 4 hours)
+// ============================================================================
+
+async function autoSyncInvoices() {
+  try {
+    console.log('🔄 [AUTO-SYNC] Starting automatic invoice sync...');
+    
+    // Get the first admin user to use for syncing
+    const adminResult = await pool.query(
+      'SELECT email, access_token, api_domain FROM user_tokens WHERE is_admin = true LIMIT 1'
+    );
+
+    if (!adminResult.rows[0]) {
+      console.log('⚠️ [AUTO-SYNC] No admin user found for sync');
+      return;
+    }
+
+    const admin = adminResult.rows[0];
+    console.log(`🔐 [AUTO-SYNC] Using admin: ${admin.email}`);
+
+    // Fetch PAID invoices from Zoho
+    const paidResponse = await axios.get(
+      `${admin.api_domain}/books/v3/invoices`,
+      {
+        params: {
+          organization_id: process.env.ZOHO_ORG_ID,
+          status: 'paid',
+          limit: 200,
+        },
+        headers: {
+          'Authorization': `Zoho-oauthtoken ${admin.access_token}`,
+        },
+      }
+    );
+
+    // Fetch OVERDUE invoices from Zoho
+    const overdueResponse = await axios.get(
+      `${admin.api_domain}/books/v3/invoices`,
+      {
+        params: {
+          organization_id: process.env.ZOHO_ORG_ID,
+          status: 'overdue',
+          limit: 200,
+        },
+        headers: {
+          'Authorization': `Zoho-oauthtoken ${admin.access_token}`,
+        },
+      }
+    );
+
+    const paidInvoices = (paidResponse.data.invoices || []).map(inv => ({ ...inv, status: 'paid' }));
+    const overdueInvoices = (overdueResponse.data.invoices || []).map(inv => ({ ...inv, status: 'overdue' }));
+    const allInvoices = [...paidInvoices, ...overdueInvoices];
+
+    console.log(`📥 [AUTO-SYNC] Fetched ${paidInvoices.length} paid + ${overdueInvoices.length} overdue invoices`);
+
+    // Insert/Update invoices in database
+    let syncedCount = 0;
+    for (const inv of allInvoices) {
+      const salesperson = inv.salesperson_name || 'Unassigned';
+      const total = parseFloat(inv.total) || 0;
+      const commission = (total * 0.1); // 10% commission
+      const invDate = new Date(inv.date || new Date());
+
+      await pool.query(
+        `INSERT INTO invoices 
+         (invoice_number, salesperson_name, total, status, date, commission, organization_id) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (invoice_number) DO UPDATE SET
+         status = $4, total = $3, commission = $6, updated_at = CURRENT_TIMESTAMP`,
+        [inv.invoice_number, salesperson, total, inv.status, invDate, commission, process.env.ZOHO_ORG_ID]
+      );
+      syncedCount++;
+    }
+
+    console.log(`✅ [AUTO-SYNC] Successfully synced ${syncedCount} invoices at ${new Date().toISOString()}`);
+  } catch (error) {
+    console.error(`❌ [AUTO-SYNC] Sync failed: ${error.message}`);
+  }
+}
+
+// Schedule auto-sync to run every 4 hours (14400000 ms)
+const AUTO_SYNC_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours
+
+let syncInterval;
+
+function startAutoSync() {
+  console.log('⏰ [AUTO-SYNC] Starting automatic sync scheduler (every 4 hours)');
+  
+  // Run sync immediately on startup
+  autoSyncInvoices();
+  
+  // Then run every 4 hours
+  syncInterval = setInterval(autoSyncInvoices, AUTO_SYNC_INTERVAL);
+}
+
+function stopAutoSync() {
+  if (syncInterval) {
+    clearInterval(syncInterval);
+    console.log('⏹️ [AUTO-SYNC] Stopped automatic sync scheduler');
+  }
+}
+
+// ============================================================================
+// SYNC INVOICES FROM ZOHO TO DATABASE
+// ============================================================================
+
+app.post('/api/sync/invoices', authenticateToken, async (req, res) => {
+  try {
+    console.log('🔄 Starting invoice sync from Zoho...');
+    const { email, isAdmin } = req.user;
+
+    if (!isAdmin) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    // Get latest access token
+    const tokenResult = await pool.query(
+      'SELECT access_token, api_domain FROM user_tokens WHERE email = $1',
+      [email]
+    );
+
+    if (!tokenResult.rows[0]) {
+      return res.status(401).json({ error: 'No valid token' });
+    }
+
+    const tokenData = tokenResult.rows[0];
+
+    // Fetch PAID invoices from Zoho
+    const paidResponse = await axios.get(
+      `${tokenData.api_domain}/books/v3/invoices`,
+      {
+        params: {
+          organization_id: process.env.ZOHO_ORG_ID,
+          status: 'paid',
+        },
+        headers: {
+          'Authorization': `Zoho-oauthtoken ${tokenData.access_token}`,
+        },
+      }
+    );
+
+    // Fetch OVERDUE invoices from Zoho
+    const overdueResponse = await axios.get(
+      `${tokenData.api_domain}/books/v3/invoices`,
+      {
+        params: {
+          organization_id: process.env.ZOHO_ORG_ID,
+          status: 'overdue',
+        },
+        headers: {
+          'Authorization': `Zoho-oauthtoken ${tokenData.access_token}`,
+        },
+      }
+    );
+
+    const paidInvoices = (paidResponse.data.invoices || []).map(inv => ({ ...inv, status: 'paid' }));
+    const overdueInvoices = (overdueResponse.data.invoices || []).map(inv => ({ ...inv, status: 'overdue' }));
+    const allInvoices = [...paidInvoices, ...overdueInvoices];
+
+    console.log(`📥 Fetched ${paidInvoices.length} paid and ${overdueInvoices.length} overdue invoices`);
+
+    // Insert invoices into database
+    for (const inv of allInvoices) {
+      const salesperson = inv.salesperson_name || 'Unassigned';
+      const total = parseFloat(inv.total) || 0;
+      const commission = (total * 0.1); // 10% commission
+      const invDate = new Date(inv.date || new Date());
+
+      await pool.query(
+        `INSERT INTO invoices 
+         (invoice_number, salesperson_name, total, status, date, commission, organization_id) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (invoice_number) DO UPDATE SET
+         status = $4, total = $3, commission = $6, updated_at = CURRENT_TIMESTAMP`,
+        [inv.invoice_number, salesperson, total, inv.status, invDate, commission, process.env.ZOHO_ORG_ID]
+      );
+    }
+
+    console.log(`✅ Synced ${allInvoices.length} invoices to database`);
+    res.json({ synced: allInvoices.length, paid: paidInvoices.length, overdue: overdueInvoices.length });
+  } catch (error) {
+    console.error('❌ Sync error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Get commission data
 app.get('/api/commissions', authenticateToken, async (req, res) => {
   const { email, isAdmin } = req.user;
@@ -270,38 +458,69 @@ app.get('/api/commissions', authenticateToken, async (req, res) => {
       );
     }
 
-    console.log('Fetching invoices from Zoho...');
-    console.log('API Domain:', tokenData.api_domain);
-    console.log('Organization ID:', process.env.ZOHO_ORG_ID);
+    console.log('📊 Fetching commissions from database...');
+    console.log('📅 Date range:', start, 'to', end);
 
-    // Fetch invoices from Zoho Books
-    const invoicesResponse = await axios.get(
-      `${tokenData.api_domain}/books/v3/invoices`,
-      {
-        params: {
-          organization_id: process.env.ZOHO_ORG_ID,
-          status: 'paid',
-        },
-        headers: {
-          'Authorization': `Zoho-oauthtoken ${accessToken}`,
-        },
-      }
-    );
+    // Query database for PAID invoices only
+    let query = `
+      SELECT 
+        salesperson_name,
+        COUNT(*) as invoices,
+        SUM(commission) as total_commission
+      FROM invoices
+      WHERE organization_id = $1
+      AND status = 'paid'
+      AND date BETWEEN $2 AND $3
+    `;
+    
+    const params = [process.env.ZOHO_ORG_ID, new Date(start), new Date(end)];
+    let paramIndex = 4;
 
-    console.log('Invoices fetched successfully!');
-    console.log('Number of invoices:', invoicesResponse.data.invoices?.length || 0);
+    // If not admin, only show their data
+    if (!isAdmin) {
+      query += ` AND salesperson_name = $${paramIndex}`;
+      params.push(repName || email);
+      paramIndex++;
+    }
 
-    const invoices = invoicesResponse.data.invoices || [];
+    query += ` GROUP BY salesperson_name ORDER BY total_commission DESC`;
 
-    // Calculate commissions
-    const commissions = calculateCommissions(
-      invoices,
-      { email, isAdmin, repName },
-      start,
-      end
-    );
+    const commResult = await pool.query(query, params);
 
-    res.json({ commissions });
+    // Format commissions response
+    const commissions = commResult.rows.map(row => ({
+      repName: row.salesperson_name,
+      invoices: parseInt(row.invoices),
+      commission: parseFloat(row.total_commission) || 0,
+      avgPerInvoice: (parseFloat(row.total_commission) / parseInt(row.invoices)) || 0
+    }));
+
+    console.log(`✅ Found ${commissions.length} reps with paid invoices`);
+
+    // Get all invoices (for invoices tab)
+    let invQuery = `
+      SELECT * FROM invoices 
+      WHERE organization_id = $1
+      AND date BETWEEN $2 AND $3
+    `;
+    
+    const invParams = [process.env.ZOHO_ORG_ID, new Date(start), new Date(end)];
+    let invParamIndex = 4;
+    
+    if (!isAdmin) {
+      invQuery += ` AND salesperson_name = $${invParamIndex}`;
+      invParams.push(repName || email);
+    }
+    
+    invQuery += ` ORDER BY date DESC`;
+
+    const invResult = await pool.query(invQuery, invParams);
+
+    console.log(`✅ Returning ${invResult.rows.length} invoices`);
+    res.json({ 
+      commissions,
+      invoices: invResult.rows 
+    });
   } catch (error) {
     console.error('Commission API error:', error.message);
     console.error('Zoho API response status:', error.response?.status);
@@ -320,8 +539,15 @@ app.get('/api/commissions', authenticateToken, async (req, res) => {
 
 function calculateCommissions(invoices, user, startDate, endDate) {
   const commissionsMap = new Map();
+  
+  // Parse dates and set time appropriately
   const start = new Date(startDate);
+  start.setHours(0, 0, 0, 0); // Start of day
+  
   const end = new Date(endDate);
+  end.setHours(23, 59, 59, 999); // End of day
+
+  console.log(`Filtering invoices from ${start.toISOString()} to ${end.toISOString()}`);
 
   invoices.forEach((invoice) => {
     const salesRep = invoice.salesperson_name || 'Unassigned';
@@ -329,6 +555,7 @@ function calculateCommissions(invoices, user, startDate, endDate) {
     // Filter by date range
     const invoiceDate = new Date(invoice.date);
     if (invoiceDate < start || invoiceDate > end) {
+      console.log(`Skipping invoice ${invoice.invoice_number} - date ${invoiceDate.toISOString()} outside range`);
       return;
     }
 
@@ -383,11 +610,15 @@ app.listen(PORT, () => {
   console.log(`📚 Zoho Books Organization ID: ${process.env.ZOHO_ORG_ID}`);
   console.log(`🔐 Frontend redirect: ${process.env.FRONTEND_URL}`);
   console.log(`🗄️  Database connected: ${process.env.DATABASE_URL ? 'Yes' : 'No'}`);
+  
+  // Start automatic invoice sync
+  startAutoSync();
 });
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('Shutting down gracefully...');
+  stopAutoSync();
   await pool.end();
   process.exit(0);
 });
