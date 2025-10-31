@@ -148,7 +148,6 @@ class ZohoService {
         {
           params: {
             organization_id: process.env.ZOHO_ORG_ID,
-            limit: 200,
           },
           headers: {
             'Authorization': `Zoho-oauthtoken ${accessToken}`,
@@ -171,8 +170,8 @@ class ZohoService {
       return salespersons;
     } catch (error) {
       console.error(`⚠️ [ZOHO] Could not fetch salespersons:`, error.message);
-      if (error.response?.status === 404) {
-        console.error(`⚠️ [ZOHO] Endpoint /salespersons returned 404 - may not be available in your Zoho Books plan`);
+      if (error.response?.data) {
+        console.error(`⚠️ [ZOHO] Response data:`, error.response.data);
       }
       return [];
     }
