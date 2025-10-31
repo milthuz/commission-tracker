@@ -245,9 +245,11 @@ async function autoSyncInvoices() {
     console.log(`🔐 [AUTO-SYNC] Using admin: ${admin.email}`);
 
     // Check if token is expired and refresh if needed
-    const expiresAt = admin.expires_at ? new Date(admin.expires_at) : null;
+    const expiresAtMs = admin.expires_at ? parseInt(admin.expires_at) : null;
+    const expiresAt = expiresAtMs ? new Date(expiresAtMs) : null;
+    
     if (expiresAt && expiresAt < new Date()) {
-      console.log('🔄 [AUTO-SYNC] Token expired, refreshing...');
+      console.log(`🔄 [AUTO-SYNC] Token expired at ${expiresAt.toISOString()}, refreshing...`);
       
       try {
         const refreshResponse = await axios.post(
