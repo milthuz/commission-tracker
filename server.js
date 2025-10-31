@@ -177,7 +177,15 @@ app.get('/api/commissions', authenticateToken, async (req, res) => {
 
     query += ` GROUP BY salesperson_name ORDER BY total_commission DESC`;
 
+    console.log(`🔍 Query:`, query);
+    console.log(`🔍 Params:`, params);
+    
     const commResult = await pool.query(query, params);
+
+    console.log(`✅ Found ${commResult.rows.length} reps with paid invoices`);
+    commResult.rows.forEach(row => {
+      console.log(`  - ${row.salesperson_name}: ${row.invoices} invoices, $${row.total_commission} commission`);
+    });
 
     const commissions = commResult.rows.map(row => ({
       repName: row.salesperson_name,
