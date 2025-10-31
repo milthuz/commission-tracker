@@ -142,8 +142,9 @@ class ZohoService {
     try {
       console.log(`📋 [ZOHO] Fetching all salespersons...`);
       
+      // Use the correct endpoint from Zoho documentation
       const response = await axios.get(
-        `${apiDomain}/books/v3/salespersons`,
+        `https://books.zoho.com/api/v3/salespersons`,
         {
           params: {
             organization_id: process.env.ZOHO_ORG_ID,
@@ -178,7 +179,7 @@ class ZohoService {
   }
 
   /**
-   * Get salesperson name by ID (from contacts endpoint)
+   * Get salesperson name by ID (from API)
    */
   async getSalespersonName(salespersonId, apiDomain, accessToken) {
     if (!salespersonId) {
@@ -191,9 +192,9 @@ class ZohoService {
     }
 
     try {
-      // Try to get from contacts endpoint
+      // Use correct endpoint from Zoho documentation
       const response = await axios.get(
-        `${apiDomain}/books/v3/contacts/${salespersonId}`,
+        `https://books.zoho.com/api/v3/salespersons/${salespersonId}`,
         {
           params: {
             organization_id: process.env.ZOHO_ORG_ID,
@@ -205,12 +206,12 @@ class ZohoService {
         }
       );
 
-      const contact = response.data.contact;
-      const name = contact.contact_name || contact.company_name || contact.salesperson_name || 'Unknown';
+      const salesperson = response.data.salesperson;
+      const name = salesperson.salesperson_name || 'Unknown';
       
       // Cache it
       this.salespersonCache.set(salespersonId, name);
-      console.log(`  ✓ Fetched contact ${salespersonId} = ${name}`);
+      console.log(`  ✓ Fetched salesperson ${salespersonId} = ${name}`);
       
       return name;
     } catch (error) {
@@ -263,14 +264,23 @@ class ZohoService {
       console.log(`📊 [ZOHO] Invoices WITHOUT salesperson_id: ${withoutSalesId}`);
 
       // Fetch salesperson details for invoices that have IDs
-      console.log(`📋 [ZOHO] Fetching salesperson details...`);
+      console.log(`📋 [ZOHO] Enriching invoice data with salesperson info...`);
       for (let inv of allInvoices) {
+        // Priority: salesperson_id > created_by > no_salesrep
         if (inv.salesperson_id && inv.salesperson_id.trim()) {
+          // Try to fetch name from API (will likely fail with 401, but try cache first)
           const name = await this.getSalespersonName(inv.salesperson_id, tokenData.api_domain, tokenData.access_token);
           if (name) {
             inv.salesperson_name = name;
+          } else {
+            // Use ID as fallback if we can't fetch the name
+            inv.salesperson_name = `Sales Rep ${inv.salesperson_id}`;
           }
+        } else if (inv.created_by && inv.created_by.trim()) {
+          // Use created_by as fallback
+          inv.salesperson_name = inv.created_by;
         }
+        // else: will be flagged as no_salesrep in server.js
       }
 
       if (allInvoices.length > 0) {
