@@ -244,12 +244,9 @@ async function autoSyncInvoices() {
     let admin = adminResult.rows[0];
     console.log(`🔐 [AUTO-SYNC] Using admin: ${admin.email}`);
 
-    // Check if token is expired and refresh if needed
-    const expiresAtMs = admin.expires_at ? parseInt(admin.expires_at) : null;
-    const expiresAt = expiresAtMs ? new Date(expiresAtMs) : null;
-    
-    if (expiresAt && expiresAt < new Date()) {
-      console.log(`🔄 [AUTO-SYNC] Token expired at ${expiresAt.toISOString()}, refreshing...`);
+    // Always refresh token to ensure it's valid
+    if (admin.refresh_token) {
+      console.log('🔄 [AUTO-SYNC] Refreshing token...');
       
       try {
         const refreshResponse = await axios.post(
@@ -268,24 +265,25 @@ async function autoSyncInvoices() {
         );
 
         const newAccessToken = refreshResponse.data.access_token;
-        const newExpiresAt = Date.now() + refreshResponse.data.expires_in * 1000;
+        const newExpiresIn = parseInt(refreshResponse.data.expires_in) || 3600;
+        const newExpiresAt = Date.now() + (newExpiresIn * 1000);
+
+        console.log(`✅ [AUTO-SYNC] Token refreshed (expires in ${newExpiresIn}s)`);
 
         // Update token in database
         await pool.query(
           `UPDATE user_tokens SET access_token = $1, expires_at = $2, updated_at = CURRENT_TIMESTAMP 
            WHERE email = $3`,
-          [newAccessToken, new Date(newExpiresAt), admin.email]
+          [newAccessToken, newExpiresAt, admin.email]
         );
 
         admin.access_token = newAccessToken;
-        console.log('✅ [AUTO-SYNC] Token refreshed successfully');
       } catch (error) {
         console.error('❌ [AUTO-SYNC] Token refresh failed:', error.message);
+        console.error('Response data:', error.response?.data);
         return;
       }
     }
-
-    console.log(`🔑 [AUTO-SYNC] Using token (expires: ${expiresAt ? expiresAt.toISOString() : 'unknown'})`);
 
     // Fetch PAID invoices from Zoho
     const paidResponse = await axios.get(
