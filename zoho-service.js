@@ -241,6 +241,20 @@ class ZohoService {
 
       console.log(`📥 [ZOHO] Total invoices to sync: ${allInvoices.length}`);
 
+      // Debug: Log all fields that might have salesperson info
+      if (allInvoices.length > 0) {
+        const inv = allInvoices[0];
+        console.log(`\n🔍 [ZOHO] Checking all fields in first invoice for salesperson info:`);
+        for (const [key, value] of Object.entries(inv)) {
+          if (key.toLowerCase().includes('sales') || key.toLowerCase().includes('person') || 
+              key.toLowerCase().includes('rep') || key.toLowerCase().includes('employee') ||
+              key.toLowerCase().includes('user') || key.toLowerCase().includes('created')) {
+            console.log(`  ${key}: ${JSON.stringify(value)}`);
+          }
+        }
+        console.log('');
+      }
+
       // Count invoices with salesperson_id
       const withSalesId = allInvoices.filter(inv => inv.salesperson_id && inv.salesperson_id.trim()).length;
       const withoutSalesId = allInvoices.length - withSalesId;
