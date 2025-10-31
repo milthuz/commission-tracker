@@ -142,9 +142,9 @@ class ZohoService {
     try {
       console.log(`📋 [ZOHO] Fetching all salespersons...`);
       
-      // Use the correct endpoint from Zoho documentation
+      // Use zohoapis domain as per Zoho error message
       const response = await axios.get(
-        `https://books.zoho.com/api/v3/salespersons`,
+        `https://www.zohoapis.com/books/v3/salespersons`,
         {
           params: {
             organization_id: process.env.ZOHO_ORG_ID,
@@ -191,9 +191,9 @@ class ZohoService {
     }
 
     try {
-      // Use correct endpoint from Zoho documentation
+      // Use zohoapis domain
       const response = await axios.get(
-        `https://books.zoho.com/api/v3/salespersons/${salespersonId}`,
+        `https://www.zohoapis.com/books/v3/salespersons/${salespersonId}`,
         {
           params: {
             organization_id: process.env.ZOHO_ORG_ID,
@@ -214,7 +214,7 @@ class ZohoService {
       
       return name;
     } catch (error) {
-      console.error(`  ⚠️ Could not fetch contact ${salespersonId}:`, error.message);
+      console.error(`  ⚠️ Could not fetch salesperson ${salespersonId}:`, error.message);
       return null;
     }
   }
