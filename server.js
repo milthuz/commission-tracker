@@ -49,6 +49,12 @@ app.use((req, res, next) => {
   next();
 });
 
+// Request logging
+app.use((req, res, next) => {
+  console.log(`📨 [${new Date().toISOString()}] ${req.method} ${req.path}`);
+  next();
+});
+
 // ============================================================================
 // AUTHENTICATION MIDDLEWARE
 // ============================================================================
