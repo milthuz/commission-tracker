@@ -286,6 +286,7 @@ async function autoSyncInvoices() {
     }
 
     // Fetch PAID invoices from Zoho
+    console.log(`🔗 [AUTO-SYNC] Fetching paid invoices from: ${admin.api_domain}/books/v3/invoices`);
     const paidResponse = await axios.get(
       `${admin.api_domain}/books/v3/invoices`,
       {
@@ -300,7 +301,11 @@ async function autoSyncInvoices() {
       }
     );
 
+    console.log(`✅ [AUTO-SYNC] Paid response status: ${paidResponse.status}`);
+    console.log(`📊 [AUTO-SYNC] Paid invoices count: ${paidResponse.data.invoices?.length || 0}`);
+
     // Fetch OVERDUE invoices from Zoho
+    console.log(`🔗 [AUTO-SYNC] Fetching overdue invoices...`);
     const overdueResponse = await axios.get(
       `${admin.api_domain}/books/v3/invoices`,
       {
@@ -315,9 +320,16 @@ async function autoSyncInvoices() {
       }
     );
 
+    console.log(`✅ [AUTO-SYNC] Overdue response status: ${overdueResponse.status}`);
+    console.log(`📊 [AUTO-SYNC] Overdue invoices count: ${overdueResponse.data.invoices?.length || 0}`);
+
     const paidInvoices = (paidResponse.data.invoices || []).map(inv => ({ ...inv, status: 'paid' }));
     const overdueInvoices = (overdueResponse.data.invoices || []).map(inv => ({ ...inv, status: 'overdue' }));
     const allInvoices = [...paidInvoices, ...overdueInvoices];
+
+    if (allInvoices.length > 0) {
+      console.log(`📥 [AUTO-SYNC] Sample invoice:`, JSON.stringify(allInvoices[0], null, 2));
+    }
 
     console.log(`📥 [AUTO-SYNC] Fetched ${paidInvoices.length} paid + ${overdueInvoices.length} overdue invoices`);
 
