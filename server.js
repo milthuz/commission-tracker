@@ -333,12 +333,13 @@ async function autoSyncInvoices() {
 
     console.log(`📥 [AUTO-SYNC] Fetched ${paidInvoices.length} paid + ${overdueInvoices.length} overdue invoices`);
 
-    // Insert/Update invoices in database
+    // Insert/Update invoices in database (both paid and overdue)
     let syncedCount = 0;
     for (const inv of allInvoices) {
       const salesperson = inv.salesperson_name || 'Unassigned';
       const total = parseFloat(inv.total) || 0;
-      const commission = (total * 0.1); // 10% commission
+      // Commission only for PAID invoices
+      const commission = inv.status === 'paid' ? (total * 0.1) : 0;
       const invDate = new Date(inv.date || new Date());
 
       await pool.query(
@@ -353,6 +354,7 @@ async function autoSyncInvoices() {
     }
 
     console.log(`✅ [AUTO-SYNC] Successfully synced ${syncedCount} invoices at ${new Date().toISOString()}`);
+    console.log(`💰 [AUTO-SYNC] Commission calculated ONLY on paid invoices`);
   } catch (error) {
     console.error(`❌ [AUTO-SYNC] Sync failed: ${error.message}`);
   }
