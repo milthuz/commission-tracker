@@ -178,45 +178,10 @@ class ZohoService {
   }
 
   /**
-   * Get salesperson name by ID (from API)
+   * Get salesperson name by ID - DISABLED (use created_by instead)
    */
   async getSalespersonName(salespersonId, apiDomain, accessToken) {
-    if (!salespersonId) {
-      return null;
-    }
-
-    // Check cache first
-    if (this.salespersonCache.has(salespersonId)) {
-      return this.salespersonCache.get(salespersonId);
-    }
-
-    try {
-      // Use zohoapis domain
-      const response = await axios.get(
-        `https://www.zohoapis.com/books/v3/salespersons/${salespersonId}`,
-        {
-          params: {
-            organization_id: process.env.ZOHO_ORG_ID,
-          },
-          headers: {
-            'Authorization': `Zoho-oauthtoken ${accessToken}`,
-          },
-          timeout: 10000,
-        }
-      );
-
-      const salesperson = response.data.salesperson;
-      const name = salesperson.salesperson_name || 'Unknown';
-      
-      // Cache it
-      this.salespersonCache.set(salespersonId, name);
-      console.log(`  ✓ Fetched salesperson ${salespersonId} = ${name}`);
-      
-      return name;
-    } catch (error) {
-      console.error(`  ⚠️ Could not fetch salesperson ${salespersonId}:`, error.message);
-      return null;
-    }
+    return null; // Disabled - using created_by fallback instead
   }
 
   /**
@@ -241,17 +206,10 @@ class ZohoService {
 
       console.log(`📥 [ZOHO] Total invoices to sync: ${allInvoices.length}`);
 
-      // Debug: Log all fields that might have salesperson info
+      // Debug: Log COMPLETE first invoice
       if (allInvoices.length > 0) {
-        const inv = allInvoices[0];
-        console.log(`\n🔍 [ZOHO] Checking all fields in first invoice for salesperson info:`);
-        for (const [key, value] of Object.entries(inv)) {
-          if (key.toLowerCase().includes('sales') || key.toLowerCase().includes('person') || 
-              key.toLowerCase().includes('rep') || key.toLowerCase().includes('employee') ||
-              key.toLowerCase().includes('user') || key.toLowerCase().includes('created')) {
-            console.log(`  ${key}: ${JSON.stringify(value)}`);
-          }
-        }
+        console.log(`\n📄 [ZOHO] COMPLETE first invoice object:`);
+        console.log(JSON.stringify(allInvoices[0], null, 2));
         console.log('');
       }
 
@@ -262,22 +220,18 @@ class ZohoService {
       console.log(`📊 [ZOHO] Invoices WITH salesperson_id: ${withSalesId}`);
       console.log(`📊 [ZOHO] Invoices WITHOUT salesperson_id: ${withoutSalesId}`);
 
-      // Fetch salesperson details for invoices that have IDs
+      // Enrich invoice data - use salesperson_id or created_by
       console.log(`📋 [ZOHO] Enriching invoice data with salesperson info...`);
       for (let inv of allInvoices) {
         // Priority: salesperson_id > created_by > no_salesrep
         if (inv.salesperson_id && inv.salesperson_id.trim()) {
-          // Try to fetch name from API (will likely fail with 401, but try cache first)
-          const name = await this.getSalespersonName(inv.salesperson_id, tokenData.api_domain, tokenData.access_token);
-          if (name) {
-            inv.salesperson_name = name;
-          } else {
-            // Use ID as fallback if we can't fetch the name
-            inv.salesperson_name = `Sales Rep ${inv.salesperson_id}`;
-          }
+          // Just use the ID for now - we can map names later
+          inv.salesperson_name = `Sales Rep ${inv.salesperson_id}`;
+          console.log(`  ✓ Invoice ${inv.invoice_number} -> Sales Rep ${inv.salesperson_id}`);
         } else if (inv.created_by && inv.created_by.trim()) {
           // Use created_by as fallback
           inv.salesperson_name = inv.created_by;
+          console.log(`  ✓ Invoice ${inv.invoice_number} -> ${inv.created_by}`);
         }
         // else: will be flagged as no_salesrep in server.js
       }
