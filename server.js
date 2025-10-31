@@ -245,7 +245,8 @@ async function autoSyncInvoices() {
     console.log(`🔐 [AUTO-SYNC] Using admin: ${admin.email}`);
 
     // Check if token is expired and refresh if needed
-    if (admin.expires_at && new Date(admin.expires_at) < new Date()) {
+    const expiresAt = admin.expires_at ? new Date(admin.expires_at) : null;
+    if (expiresAt && expiresAt < new Date()) {
       console.log('🔄 [AUTO-SYNC] Token expired, refreshing...');
       
       try {
@@ -282,7 +283,7 @@ async function autoSyncInvoices() {
       }
     }
 
-    console.log(`🔑 [AUTO-SYNC] Using token (expires: ${new Date(admin.expires_at).toISOString()})`);
+    console.log(`🔑 [AUTO-SYNC] Using token (expires: ${expiresAt ? expiresAt.toISOString() : 'unknown'})`);
 
     // Fetch PAID invoices from Zoho
     const paidResponse = await axios.get(
