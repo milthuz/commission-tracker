@@ -4,6 +4,7 @@ class ZohoService {
   constructor(pool) {
     this.pool = pool;
     this.tokenCache = new Map();
+    this.salespersonCache = new Map(); // Cache salesperson lookups
   }
 
   /**
@@ -135,12 +136,96 @@ class ZohoService {
   }
 
   /**
+   * Fetch all salespeople and cache them
+   */
+  async fetchAllSalespeople(email, apiDomain, accessToken) {
+    try {
+      console.log(`📋 [ZOHO] Fetching all salespeople...`);
+      
+      const response = await axios.get(
+        `${apiDomain}/books/v3/salespeople`,
+        {
+          params: {
+            organization_id: process.env.ZOHO_ORG_ID,
+            limit: 200,
+          },
+          headers: {
+            'Authorization': `Zoho-oauthtoken ${accessToken}`,
+          },
+          timeout: 15000,
+        }
+      );
+
+      const salespeople = response.data.salespeople || [];
+      console.log(`✅ [ZOHO] Fetched ${salespeople.length} salespeople`);
+
+      // Cache all salespeople by ID
+      for (const sp of salespeople) {
+        const name = sp.salesperson_name || sp.name || 'Unknown';
+        this.salespersonCache.set(sp.salesperson_id, name);
+        console.log(`  ✓ ${sp.salesperson_id} = ${name}`);
+      }
+
+      return salespeople;
+    } catch (error) {
+      console.error(`⚠️ [ZOHO] Could not fetch salespeople list:`, error.message);
+      return [];
+    }
+  }
+
+  /**
+   * Get salesperson name by ID (with caching)
+   */
+  async getSalespersonName(email, salespersonId, apiDomain, accessToken) {
+    if (!salespersonId) {
+      return null;
+    }
+
+    // Check cache first
+    if (this.salespersonCache.has(salespersonId)) {
+      return this.salespersonCache.get(salespersonId);
+    }
+
+    try {
+      const response = await axios.get(
+        `${apiDomain}/books/v3/salespeople/${salespersonId}`,
+        {
+          params: {
+            organization_id: process.env.ZOHO_ORG_ID,
+          },
+          headers: {
+            'Authorization': `Zoho-oauthtoken ${accessToken}`,
+          },
+          timeout: 10000,
+        }
+      );
+
+      const salesperson = response.data.salesperson;
+      const name = salesperson.salesperson_name || salesperson.name || 'Unknown';
+      
+      // Cache it
+      this.salespersonCache.set(salespersonId, name);
+      console.log(`✅ [ZOHO] Cached salesperson: ${salespersonId} = ${name}`);
+      
+      return name;
+    } catch (error) {
+      console.error(`⚠️ [ZOHO] Could not fetch salesperson ${salespersonId}:`, error.message);
+      return null;
+    }
+  }
+
+  /**
    * Sync all invoices (paid + overdue)
    */
   async syncAllInvoices(email) {
     try {
       console.log(`🔄 [ZOHO] Starting invoice sync for ${email}`);
 
+      const tokenData = await this.getValidToken(email);
+      
+      // Fetch all salespeople first and cache them
+      await this.fetchAllSalespeople(email, tokenData.api_domain, tokenData.access_token);
+      
       const paidInvoices = await this.fetchInvoices(email, 'paid');
       const overdueInvoices = await this.fetchInvoices(email, 'overdue');
 
@@ -151,8 +236,25 @@ class ZohoService {
 
       console.log(`📥 [ZOHO] Total invoices to sync: ${allInvoices.length}`);
 
+      // Lookup salesperson names from cache
+      for (let inv of allInvoices) {
+        if (inv.salesperson_id) {
+          const name = this.salespersonCache.get(inv.salesperson_id);
+          if (name) {
+            inv.salesperson_name = name;
+            console.log(`  ✓ Invoice ${inv.invoice_number}: ${name}`);
+          }
+        }
+      }
+
       if (allInvoices.length > 0) {
-        console.log(`📄 [ZOHO] Sample invoice:`, JSON.stringify(allInvoices[0], null, 2));
+        console.log(`📄 [ZOHO] Sample invoice:`, JSON.stringify({
+          invoice_number: allInvoices[0].invoice_number,
+          salesperson_id: allInvoices[0].salesperson_id,
+          salesperson_name: allInvoices[0].salesperson_name,
+          total: allInvoices[0].total,
+          status: allInvoices[0].status,
+        }, null, 2));
       }
 
       return allInvoices;

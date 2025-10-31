@@ -239,10 +239,16 @@ async function autoSyncInvoices() {
 
     // Insert into database
     let syncedCount = 0;
+    let noSalesrepCount = 0;
+    
     for (const inv of allInvoices) {
-      const salesperson = inv.salesperson_name || 'Unassigned';
+      // If no salesperson assigned, flag with special status
+      const salesperson = (inv.salesperson_name && inv.salesperson_name.trim()) 
+        ? inv.salesperson_name 
+        : 'no_salesrep';
+      
       const total = parseFloat(inv.total) || 0;
-      const commission = inv.status === 'paid' ? (total * 0.1) : 0;
+      const commission = (inv.status === 'paid' && salesperson !== 'no_salesrep') ? (total * 0.1) : 0;
       const invDate = new Date(inv.date || new Date());
 
       await pool.query(
@@ -250,14 +256,21 @@ async function autoSyncInvoices() {
          (invoice_number, salesperson_name, total, status, date, commission, organization_id) 
          VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (invoice_number) DO UPDATE SET
-         status = $4, total = $3, commission = $6, updated_at = CURRENT_TIMESTAMP`,
+         status = $4, total = $3, salesperson_name = $2, commission = $6, updated_at = CURRENT_TIMESTAMP`,
         [inv.invoice_number, salesperson, total, inv.status, invDate, commission, ZOHO_CONFIG.organizationId]
       );
+      
+      if (salesperson === 'no_salesrep') {
+        noSalesrepCount++;
+      }
       syncedCount++;
     }
 
     console.log(`✅ [AUTO-SYNC] Successfully synced ${syncedCount} invoices`);
-    console.log(`💰 [AUTO-SYNC] Commission calculated ONLY on paid invoices`);
+    console.log(`💰 [AUTO-SYNC] Commission calculated ONLY on paid invoices with salesreps`);
+    if (noSalesrepCount > 0) {
+      console.log(`⚠️ [AUTO-SYNC] ${noSalesrepCount} invoices flagged as "no_salesrep" (no salesperson assigned)`);
+    }
   } catch (error) {
     console.error(`❌ [AUTO-SYNC] Sync failed:`, error.message);
   }
