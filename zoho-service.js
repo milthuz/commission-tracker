@@ -178,9 +178,9 @@ class ZohoService {
   }
 
   /**
-   * Get salesperson name by ID (with caching)
+   * Get salesperson name by ID (fetch from API if not in cache)
    */
-  async getSalespersonName(email, salespersonId, apiDomain, accessToken) {
+  async getSalespersonName(salespersonId, apiDomain, accessToken) {
     if (!salespersonId) {
       return null;
     }
@@ -192,7 +192,7 @@ class ZohoService {
 
     try {
       const response = await axios.get(
-        `${apiDomain}/books/v3/salespeople/${salespersonId}`,
+        `${apiDomain}/books/v3/salespersons/${salespersonId}`,
         {
           params: {
             organization_id: process.env.ZOHO_ORG_ID,
@@ -209,11 +209,11 @@ class ZohoService {
       
       // Cache it
       this.salespersonCache.set(salespersonId, name);
-      console.log(`✅ [ZOHO] Cached salesperson: ${salespersonId} = ${name}`);
+      console.log(`  ✓ Fetched salesperson ${salespersonId} = ${name}`);
       
       return name;
     } catch (error) {
-      console.error(`⚠️ [ZOHO] Could not fetch salesperson ${salespersonId}:`, error.message);
+      console.error(`  ⚠️ Could not fetch salesperson ${salespersonId}:`, error.message);
       return null;
     }
   }
@@ -247,13 +247,13 @@ class ZohoService {
       console.log(`📊 [ZOHO] Invoices WITH salesperson_id: ${withSalesId}`);
       console.log(`📊 [ZOHO] Invoices WITHOUT salesperson_id: ${withoutSalesId}`);
 
-      // Lookup salesperson names from cache
+      // Fetch salesperson details for invoices that have IDs
+      console.log(`📋 [ZOHO] Fetching salesperson details...`);
       for (let inv of allInvoices) {
-        if (inv.salesperson_id) {
-          const name = this.salespersonCache.get(inv.salesperson_id);
+        if (inv.salesperson_id && inv.salesperson_id.trim()) {
+          const name = await this.getSalespersonName(inv.salesperson_id, tokenData.api_domain, tokenData.access_token);
           if (name) {
             inv.salesperson_name = name;
-            console.log(`  ✓ Invoice ${inv.invoice_number}: ${name}`);
           }
         }
       }
