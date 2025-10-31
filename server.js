@@ -328,7 +328,13 @@ async function autoSyncInvoices() {
     const allInvoices = [...paidInvoices, ...overdueInvoices];
 
     if (allInvoices.length > 0) {
-      console.log(`📥 [AUTO-SYNC] Sample invoice:`, JSON.stringify(allInvoices[0], null, 2));
+      console.log(`📥 [AUTO-SYNC] Sample paid invoice:`, JSON.stringify(paidInvoices[0], null, 2));
+      if (overdueInvoices.length > 0) {
+        console.log(`📥 [AUTO-SYNC] Sample overdue invoice:`, JSON.stringify(overdueInvoices[0], null, 2));
+      }
+    } else {
+      console.log(`⚠️ [AUTO-SYNC] No invoices returned. Full paid response:`, JSON.stringify(paidResponse.data, null, 2));
+      console.log(`⚠️ [AUTO-SYNC] Full overdue response:`, JSON.stringify(overdueResponse.data, null, 2));
     }
 
     console.log(`📥 [AUTO-SYNC] Fetched ${paidInvoices.length} paid + ${overdueInvoices.length} overdue invoices`);
@@ -380,6 +386,67 @@ function stopAutoSync() {
     clearInterval(syncInterval);
     console.log('⏹️ [AUTO-SYNC] Stopped automatic sync scheduler');
   }
+}
+
+// ============================================================================
+// TOKEN HELPER - Refresh token if expired
+// ============================================================================
+
+async function ensureValidToken(email) {
+  const tokenResult = await pool.query(
+    'SELECT access_token, refresh_token, api_domain, expires_at FROM user_tokens WHERE email = $1',
+    [email]
+  );
+
+  if (!tokenResult.rows.length) {
+    throw new Error('No token found');
+  }
+
+  let tokenData = tokenResult.rows[0];
+  const expiresAtMs = tokenData.expires_at ? parseInt(tokenData.expires_at) : null;
+  const expiresAt = expiresAtMs ? new Date(expiresAtMs) : null;
+
+  // If token is expired or expires in less than 5 minutes, refresh it
+  if (expiresAt && expiresAt < new Date(Date.now() + 5 * 60 * 1000)) {
+    if (!tokenData.refresh_token) {
+      console.log(`⚠️ Token expired for ${email} but no refresh_token available`);
+      return tokenData;
+    }
+
+    console.log(`🔄 Refreshing token for ${email}`);
+    try {
+      const refreshResponse = await axios.post(
+        'https://accounts.zoho.com/oauth/v2/token',
+        new URLSearchParams({
+          grant_type: 'refresh_token',
+          client_id: process.env.ZOHO_CLIENT_ID,
+          client_secret: process.env.ZOHO_CLIENT_SECRET,
+          refresh_token: tokenData.refresh_token,
+        }),
+        {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+        }
+      );
+
+      const newAccessToken = refreshResponse.data.access_token;
+      const newExpiresIn = parseInt(refreshResponse.data.expires_in) || 3600;
+      const newExpiresAt = Date.now() + (newExpiresIn * 1000);
+
+      await pool.query(
+        `UPDATE user_tokens SET access_token = $1, expires_at = $2, updated_at = CURRENT_TIMESTAMP WHERE email = $3`,
+        [newAccessToken, newExpiresAt, email]
+      );
+
+      tokenData.access_token = newAccessToken;
+      console.log(`✅ Token refreshed for ${email}`);
+    } catch (error) {
+      console.error(`❌ Token refresh failed for ${email}:`, error.message);
+    }
+  }
+
+  return tokenData;
 }
 
 // ============================================================================
