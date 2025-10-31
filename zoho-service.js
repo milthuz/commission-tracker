@@ -140,10 +140,10 @@ class ZohoService {
    */
   async fetchAllSalespeople(email, apiDomain, accessToken) {
     try {
-      console.log(`📋 [ZOHO] Fetching all salespeople...`);
+      console.log(`📋 [ZOHO] Fetching all salespersons...`);
       
       const response = await axios.get(
-        `${apiDomain}/books/v3/salespeople`,
+        `${apiDomain}/books/v3/salespersons`,
         {
           params: {
             organization_id: process.env.ZOHO_ORG_ID,
@@ -156,19 +156,23 @@ class ZohoService {
         }
       );
 
-      const salespeople = response.data.salespeople || [];
-      console.log(`✅ [ZOHO] Fetched ${salespeople.length} salespeople`);
+      const salespersons = response.data.salespersons || [];
+      console.log(`✅ [ZOHO] Fetched ${salespersons.length} salespersons`);
 
-      // Cache all salespeople by ID
-      for (const sp of salespeople) {
-        const name = sp.salesperson_name || sp.name || 'Unknown';
-        this.salespersonCache.set(sp.salesperson_id, name);
-        console.log(`  ✓ ${sp.salesperson_id} = ${name}`);
+      // Cache all salespersons by ID
+      for (const sp of salespersons) {
+        const id = sp.salesperson_id;
+        const name = sp.salesperson_name || 'Unknown';
+        this.salespersonCache.set(id, name);
+        console.log(`  ✓ ${id} = ${name}`);
       }
 
-      return salespeople;
+      return salespersons;
     } catch (error) {
-      console.error(`⚠️ [ZOHO] Could not fetch salespeople list:`, error.message);
+      console.error(`⚠️ [ZOHO] Could not fetch salespersons:`, error.message);
+      if (error.response?.status === 404) {
+        console.error(`⚠️ [ZOHO] Endpoint /salespersons returned 404 - may not be available in your Zoho Books plan`);
+      }
       return [];
     }
   }
