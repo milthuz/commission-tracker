@@ -178,7 +178,7 @@ class ZohoService {
   }
 
   /**
-   * Get salesperson name by ID (fetch from API if not in cache)
+   * Get salesperson name by ID (from contacts endpoint)
    */
   async getSalespersonName(salespersonId, apiDomain, accessToken) {
     if (!salespersonId) {
@@ -191,8 +191,9 @@ class ZohoService {
     }
 
     try {
+      // Try to get from contacts endpoint
       const response = await axios.get(
-        `${apiDomain}/books/v3/salespersons/${salespersonId}`,
+        `${apiDomain}/books/v3/contacts/${salespersonId}`,
         {
           params: {
             organization_id: process.env.ZOHO_ORG_ID,
@@ -204,16 +205,16 @@ class ZohoService {
         }
       );
 
-      const salesperson = response.data.salesperson;
-      const name = salesperson.salesperson_name || salesperson.name || 'Unknown';
+      const contact = response.data.contact;
+      const name = contact.contact_name || contact.company_name || contact.salesperson_name || 'Unknown';
       
       // Cache it
       this.salespersonCache.set(salespersonId, name);
-      console.log(`  ✓ Fetched salesperson ${salespersonId} = ${name}`);
+      console.log(`  ✓ Fetched contact ${salespersonId} = ${name}`);
       
       return name;
     } catch (error) {
-      console.error(`  ⚠️ Could not fetch salesperson ${salespersonId}:`, error.message);
+      console.error(`  ⚠️ Could not fetch contact ${salespersonId}:`, error.message);
       return null;
     }
   }
