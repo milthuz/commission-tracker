@@ -240,6 +240,13 @@ class ZohoService {
 
       console.log(`📥 [ZOHO] Total invoices to sync: ${allInvoices.length}`);
 
+      // Count invoices with salesperson_id
+      const withSalesId = allInvoices.filter(inv => inv.salesperson_id && inv.salesperson_id.trim()).length;
+      const withoutSalesId = allInvoices.length - withSalesId;
+      
+      console.log(`📊 [ZOHO] Invoices WITH salesperson_id: ${withSalesId}`);
+      console.log(`📊 [ZOHO] Invoices WITHOUT salesperson_id: ${withoutSalesId}`);
+
       // Lookup salesperson names from cache
       for (let inv of allInvoices) {
         if (inv.salesperson_id) {
