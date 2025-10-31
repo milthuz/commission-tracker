@@ -39,7 +39,7 @@ app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', frontendUrl);
   res.header('Access-Control-Allow-Credentials', 'true');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Cache-Control, Pragma');
   res.header('Access-Control-Max-Age', '3600');
 
   if (req.method === 'OPTIONS') {
