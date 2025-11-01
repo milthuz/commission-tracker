@@ -598,6 +598,13 @@ app.get('/api/commissions', authenticateToken, async (req, res) => {
     console.log('📊 Fetching commissions from database...');
     console.log('📅 Date range:', start, 'to', end);
 
+    // Parse dates properly - add end of day to end date
+    const startDate = new Date(start);
+    const endDate = new Date(end);
+    endDate.setHours(23, 59, 59, 999); // Set to end of day
+
+    console.log('📅 Parsed dates:', startDate, 'to', endDate);
+
     // Query database for PAID invoices only
     let query = `
       SELECT 
@@ -607,10 +614,11 @@ app.get('/api/commissions', authenticateToken, async (req, res) => {
       FROM invoices
       WHERE organization_id = $1
       AND status = 'paid'
-      AND date BETWEEN $2 AND $3
+      AND date >= $2
+      AND date <= $3
     `;
     
-    const params = [process.env.ZOHO_ORG_ID, new Date(start), new Date(end)];
+    const params = [process.env.ZOHO_ORG_ID, startDate, endDate];
     let paramIndex = 4;
 
     // If not admin, only show their data
@@ -727,6 +735,75 @@ function calculateCommissions(invoices, user, startDate, endDate) {
   console.log('Final commissions:', Array.from(commissionsMap.values()));
   return Array.from(commissionsMap.values());
 }
+
+// ============================================================================
+// INVOICES API ENDPOINT
+// ============================================================================
+
+app.get('/api/invoices', authenticateToken, async (req, res) => {
+  const { email, isAdmin } = req.user;
+  const { start, end, salesperson } = req.query;
+
+  try {
+    // Parse dates properly - add end of day to end date
+    const startDate = new Date(start);
+    const endDate = new Date(end);
+    endDate.setHours(23, 59, 59, 999); // Set to end of day
+
+    console.log('📄 Fetching invoices from database...');
+    console.log('📅 Date range:', startDate, 'to', endDate);
+
+    // Query database for all invoices
+    let query = `
+      SELECT 
+        invoice_number,
+        salesperson_name,
+        date,
+        total,
+        commission,
+        status,
+        organization_id
+      FROM invoices
+      WHERE organization_id = $1
+      AND date >= $2
+      AND date <= $3
+      AND status = 'paid'
+    `;
+    
+    const params = [process.env.ZOHO_ORG_ID, startDate, endDate];
+    let paramIndex = 4;
+
+    // If salesperson filter provided
+    if (salesperson) {
+      query += ` AND salesperson_name = $${paramIndex}`;
+      params.push(salesperson);
+      paramIndex++;
+    }
+
+    query += ` ORDER BY date DESC`;
+
+    const result = await pool.query(query, params);
+
+    const invoices = result.rows.map(row => ({
+      invoice_number: row.invoice_number,
+      salesperson_name: row.salesperson_name || 'Unassigned',
+      date: row.date,
+      total: row.total,
+      commission: row.commission,
+      status: row.status,
+    }));
+
+    console.log(`✅ Found ${invoices.length} invoices`);
+
+    res.json({ 
+      invoices,
+      dateRange: { start: startDate, end: endDate }
+    });
+  } catch (error) {
+    console.error('❌ Error fetching invoices:', error);
+    res.status(500).json({ error: 'Failed to fetch invoices', details: error.message });
+  }
+});
 
 // ============================================================================
 // HEALTH CHECK
