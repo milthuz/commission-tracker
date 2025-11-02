@@ -196,7 +196,7 @@ app.get('/api/auth/callback', async (req, res) => {
     console.log('✅ JWT token created');
 
     // Redirect to frontend with token
-    const redirectUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}?token=${jwtToken}`;
+    const redirectUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/auth/zoho/callback?token=${jwtToken}`;
     console.log('🔄 Redirecting to:', redirectUrl);
     res.redirect(redirectUrl);
   } catch (error) {
@@ -232,6 +232,19 @@ app.get('/api/auth/token', authenticateToken, async (req, res) => {
     console.error('Token retrieval error:', error);
     res.status(500).json({ error: 'Failed to retrieve token' });
   }
+});
+
+// 4. Verify JWT token
+app.get('/api/auth/verify', authenticateToken, (req, res) => {
+  // If authenticateToken middleware passes, token is valid
+  res.json({ 
+    valid: true, 
+    user: {
+      email: req.user.email,
+      name: req.user.email,
+      zoho_id: req.user.email
+    }
+  });
 });
 
 // ============================================================================
