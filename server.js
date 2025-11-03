@@ -167,25 +167,37 @@ app.get('/api/auth/callback', async (req, res) => {
 
     // Fetch actual user information from Zoho
     console.log('📋 Fetching user information from Zoho...');
-    const userInfoResponse = await axios.get(
-      `${accountsUrl}/oauth/user/info`,
-      {
-        headers: {
-          'Authorization': `Zoho-oauthtoken ${access_token}`,
-        },
-      }
-    );
+    let userEmail, userName, userPhoto, zohoUserId;
+    
+    try {
+      const userInfoResponse = await axios.get(
+        `${accountsUrl}/oauth/user/info`,
+        {
+          headers: {
+            'Authorization': `Zoho-oauthtoken ${access_token}`,
+          },
+        }
+      );
 
-    const userInfo = userInfoResponse.data;
-    console.log('✅ User info retrieved:', {
-      email: userInfo.Email,
-      firstName: userInfo.First_Name,
-      lastName: userInfo.Last_Name,
-    });
-
-    const userEmail = userInfo.Email;
-    const userName = `${userInfo.First_Name || ''} ${userInfo.Last_Name || ''}`.trim() || userEmail;
-    const userPhoto = userInfo.profile_photo_url || null;
+      const userInfo = userInfoResponse.data;
+      userEmail = userInfo.Email;
+      userName = `${userInfo.First_Name || ''} ${userInfo.Last_Name || ''}`.trim() || userEmail;
+      userPhoto = userInfo.profile_photo_url || null;
+      zohoUserId = userInfo.ZUID;
+      
+      console.log('✅ User info retrieved:', {
+        email: userEmail,
+        name: userName,
+      });
+    } catch (userInfoError) {
+      console.error('⚠️ Failed to fetch Zoho user info, using fallback:', userInfoError.message);
+      // Fallback to MD5 hash if Zoho user API fails
+      const crypto = require('crypto');
+      userEmail = crypto.createHash('md5').update(access_token).digest('hex');
+      userName = 'Zoho User';
+      userPhoto = null;
+      zohoUserId = userEmail;
+    }
 
     console.log('User Email:', userEmail);
     console.log('User Name:', userName);
@@ -211,7 +223,7 @@ app.get('/api/auth/callback', async (req, res) => {
         email: userEmail, 
         name: userName,
         photo: userPhoto,
-        zoho_id: userInfo.ZUID,
+        zoho_id: zohoUserId,
         isAdmin: true 
       },
       process.env.JWT_SECRET || 'your-secret-key',
