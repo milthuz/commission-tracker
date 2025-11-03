@@ -189,6 +189,7 @@ app.get('/api/auth/callback', async (req, res) => {
         email: userEmail,
         name: userName,
       });
+      console.log('📸 Full user info from Zoho:', JSON.stringify(userInfo, null, 2));
     } catch (userInfoError) {
       console.error('⚠️ Failed to fetch Zoho user info, using fallback:', userInfoError.message);
       // Fallback to MD5 hash if Zoho user API fails
