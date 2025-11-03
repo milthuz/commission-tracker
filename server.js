@@ -112,7 +112,7 @@ app.get('/api/auth/zoho', (req, res) => {
   const state = Math.random().toString(36).substring(7);
   
   const authUrl = `${ZOHO_CONFIG.accounts_url}/oauth/v2/auth?` +
-    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE,profile` +
+    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE,profile,email` +
     `&client_id=${ZOHO_CONFIG.client_id}` +
     `&response_type=code` +
     `&redirect_uri=${ZOHO_CONFIG.redirect_uri}` +
@@ -180,10 +180,10 @@ app.get('/api/auth/callback', async (req, res) => {
       );
 
       const userInfo = userInfoResponse.data;
-      userEmail = userInfo.Email || userInfo.email;
-      userName = `${userInfo.First_Name || userInfo.first_name || ''} ${userInfo.Last_Name || userInfo.last_name || ''}`.trim() || userInfo.Display_Name || userInfo.display_name || userEmail;
-      userPhoto = userInfo.photo || userInfo.picture || null;
-      zohoUserId = userInfo.ZUID || userInfo.zuid;
+      userEmail = userInfo.email || userInfo.Email;
+      userName = `${userInfo.first_name || userInfo.First_Name || ''} ${userInfo.last_name || userInfo.Last_Name || ''}`.trim() || userInfo.name || userInfo.Display_Name || userEmail;
+      userPhoto = userInfo.picture || userInfo.photo || null;
+      zohoUserId = userInfo.sub || userInfo.ZUID;
       
       console.log('✅ User info retrieved:', {
         email: userEmail,
