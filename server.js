@@ -165,11 +165,30 @@ app.get('/api/auth/callback', async (req, res) => {
       expires_in,
     } = tokenResponse.data;
 
-    // Use the access token to create a unique, consistent user ID
-    // This ensures each Zoho account gets a unique identifier
-    const crypto = require('crypto');
-    const userEmail = crypto.createHash('md5').update(access_token).digest('hex');
-    console.log('User ID:', userEmail);
+    // Fetch actual user information from Zoho
+    console.log('📋 Fetching user information from Zoho...');
+    const userInfoResponse = await axios.get(
+      `${accountsUrl}/oauth/user/info`,
+      {
+        headers: {
+          'Authorization': `Zoho-oauthtoken ${access_token}`,
+        },
+      }
+    );
+
+    const userInfo = userInfoResponse.data;
+    console.log('✅ User info retrieved:', {
+      email: userInfo.Email,
+      firstName: userInfo.First_Name,
+      lastName: userInfo.Last_Name,
+    });
+
+    const userEmail = userInfo.Email;
+    const userName = `${userInfo.First_Name || ''} ${userInfo.Last_Name || ''}`.trim() || userEmail;
+    const userPhoto = userInfo.profile_photo_url || null;
+
+    console.log('User Email:', userEmail);
+    console.log('User Name:', userName);
 
     // Store tokens in database with error handling
     try {
@@ -188,7 +207,13 @@ app.get('/api/auth/callback', async (req, res) => {
 
     // Create JWT token
     const jwtToken = jwt.sign(
-      { email: userEmail, isAdmin: true },
+      { 
+        email: userEmail, 
+        name: userName,
+        photo: userPhoto,
+        zoho_id: userInfo.ZUID,
+        isAdmin: true 
+      },
       process.env.JWT_SECRET || 'your-secret-key',
       { expiresIn: '7d' }
     );
@@ -241,8 +266,9 @@ app.get('/api/auth/verify', authenticateToken, (req, res) => {
     valid: true, 
     user: {
       email: req.user.email,
-      name: req.user.email,
-      zoho_id: req.user.email
+      name: req.user.name || req.user.email,
+      photo: req.user.photo || null,
+      zoho_id: req.user.zoho_id || req.user.email
     }
   });
 });
