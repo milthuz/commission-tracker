@@ -112,7 +112,7 @@ app.get('/api/auth/zoho', (req, res) => {
   const state = Math.random().toString(36).substring(7);
   
   const authUrl = `${ZOHO_CONFIG.accounts_url}/oauth/v2/auth?` +
-    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE,AaaServer.profile.READ` +
+    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE,profile` +
     `&client_id=${ZOHO_CONFIG.client_id}` +
     `&response_type=code` +
     `&redirect_uri=${ZOHO_CONFIG.redirect_uri}` +
@@ -171,7 +171,7 @@ app.get('/api/auth/callback', async (req, res) => {
     
     try {
       const userInfoResponse = await axios.get(
-        `${accountsUrl}/oauth/user/info`,
+        `${accountsUrl}/oauth/v2/userinfo`,
         {
           headers: {
             'Authorization': `Zoho-oauthtoken ${access_token}`,
@@ -180,10 +180,10 @@ app.get('/api/auth/callback', async (req, res) => {
       );
 
       const userInfo = userInfoResponse.data;
-      userEmail = userInfo.Email;
-      userName = `${userInfo.First_Name || ''} ${userInfo.Last_Name || ''}`.trim() || userEmail;
-      userPhoto = userInfo.profile_photo_url || null;
-      zohoUserId = userInfo.ZUID;
+      userEmail = userInfo.Email || userInfo.email;
+      userName = `${userInfo.First_Name || userInfo.first_name || ''} ${userInfo.Last_Name || userInfo.last_name || ''}`.trim() || userInfo.Display_Name || userInfo.display_name || userEmail;
+      userPhoto = userInfo.photo || userInfo.picture || null;
+      zohoUserId = userInfo.ZUID || userInfo.zuid;
       
       console.log('✅ User info retrieved:', {
         email: userEmail,
