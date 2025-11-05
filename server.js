@@ -15,6 +15,9 @@ const { Pool } = require('pg');
 
 dotenv.config();
 
+// Import invoice routes
+const invoiceRoutes = require('./routes/invoiceRoutes');
+
 const app = express();
 
 // ============================================================================
@@ -104,6 +107,12 @@ const ZOHO_CONFIG = {
 };
 
 // ============================================================================
+// INVOICE ROUTES
+// ============================================================================
+
+app.use('/api/invoices', invoiceRoutes);
+
+// ============================================================================
 // AUTH ROUTES
 // ============================================================================
 
@@ -112,7 +121,7 @@ app.get('/api/auth/zoho', (req, res) => {
   const state = Math.random().toString(36).substring(7);
   
   const authUrl = `${ZOHO_CONFIG.accounts_url}/oauth/v2/auth?` +
-    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE,profile,email` +
+    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE` +
     `&client_id=${ZOHO_CONFIG.client_id}` +
     `&response_type=code` +
     `&redirect_uri=${ZOHO_CONFIG.redirect_uri}` +
@@ -167,38 +176,25 @@ app.get('/api/auth/callback', async (req, res) => {
 
     // Fetch actual user information from Zoho
     console.log('📋 Fetching user information from Zoho...');
-    let userEmail, userName, userPhoto, zohoUserId;
-    
-    try {
-      const userInfoResponse = await axios.get(
-        `${accountsUrl}/oauth/v2/userinfo`,
-        {
-          headers: {
-            'Authorization': `Zoho-oauthtoken ${access_token}`,
-          },
-        }
-      );
+    const userInfoResponse = await axios.get(
+      `${accountsUrl}/oauth/user/info`,
+      {
+        headers: {
+          'Authorization': `Zoho-oauthtoken ${access_token}`,
+        },
+      }
+    );
 
-      const userInfo = userInfoResponse.data;
-      userEmail = userInfo.email || userInfo.Email;
-      userName = `${userInfo.first_name || userInfo.First_Name || ''} ${userInfo.last_name || userInfo.Last_Name || ''}`.trim() || userInfo.name || userInfo.Display_Name || userEmail;
-      userPhoto = userInfo.picture || userInfo.photo || null;
-      zohoUserId = userInfo.sub || userInfo.ZUID;
-      
-      console.log('✅ User info retrieved:', {
-        email: userEmail,
-        name: userName,
-      });
-      console.log('📸 Full user info from Zoho:', JSON.stringify(userInfo, null, 2));
-    } catch (userInfoError) {
-      console.error('⚠️ Failed to fetch Zoho user info, using fallback:', userInfoError.message);
-      // Fallback to MD5 hash if Zoho user API fails
-      const crypto = require('crypto');
-      userEmail = crypto.createHash('md5').update(access_token).digest('hex');
-      userName = 'Zoho User';
-      userPhoto = null;
-      zohoUserId = userEmail;
-    }
+    const userInfo = userInfoResponse.data;
+    console.log('✅ User info retrieved:', {
+      email: userInfo.Email,
+      firstName: userInfo.First_Name,
+      lastName: userInfo.Last_Name,
+    });
+
+    const userEmail = userInfo.Email;
+    const userName = `${userInfo.First_Name || ''} ${userInfo.Last_Name || ''}`.trim() || userEmail;
+    const userPhoto = userInfo.profile_photo_url || null;
 
     console.log('User Email:', userEmail);
     console.log('User Name:', userName);
@@ -224,7 +220,7 @@ app.get('/api/auth/callback', async (req, res) => {
         email: userEmail, 
         name: userName,
         photo: userPhoto,
-        zoho_id: zohoUserId,
+        zoho_id: userInfo.ZUID,
         isAdmin: true 
       },
       process.env.JWT_SECRET || 'your-secret-key',
@@ -878,13 +874,13 @@ app.listen(PORT, () => {
   console.log(`🗄️  Database connected: ${process.env.DATABASE_URL ? 'Yes' : 'No'}`);
   
   // Start automatic invoice sync
-  startAutoSync();
+  // startAutoSync();  // Commented out - function not defined yet
 });
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('Shutting down gracefully...');
-  stopAutoSync();
+  // stopAutoSync();  // Commented out - function not defined yet
   await pool.end();
   process.exit(0);
 });
