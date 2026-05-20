@@ -2057,13 +2057,13 @@ app.get('/api/debug/photo', authenticateToken, async (req, res) => {
   try {
     // Get stored token
     const tokenResult = await pool.query(
-      'SELECT access_token, api_domain, LENGTH(photo) as photo_length FROM user_tokens WHERE email = $1',
+      'SELECT access_token, api_domain, LENGTH(photo) as photo_length, photo FROM user_tokens WHERE email = $1',
       [req.user.email]
     );
     const row = tokenResult.rows[0] || {};
     const accessToken = row.access_token;
 
-    // Fetch fresh user info from Zoho
+    // Fetch fresh user info from Zoho Accounts
     let zohoUserInfo = null;
     try {
       const uRes = await axios.get('https://accounts.zoho.com/oauth/user/info', {
@@ -2074,34 +2074,83 @@ app.get('/api/debug/photo', authenticateToken, async (req, res) => {
       zohoUserInfo = { error: e.message, status: e.response?.status };
     }
 
-    // Test each photo endpoint
-    const endpoints = [
-      `https://accounts.zoho.com/api/v1/user/${zohoUserInfo?.ZUID}/photo`,
+    const apiDomain = row.api_domain || 'https://www.zohoapis.com';
+    const ZUID = zohoUserInfo?.ZUID;
+
+    // --- IMAGE endpoints (try as binary) ---
+    const imageEndpoints = [
+      `https://accounts.zoho.com/api/v1/user/${ZUID}/photo`,
       `https://accounts.zoho.com/api/v1/user/self/photo`,
-      `https://accounts.zoho.ca/api/v1/user/${zohoUserInfo?.ZUID}/photo`,
-      `https://accounts.zoho.ca/api/v1/user/self/photo`,
+      `https://contacts.zoho.com/api/v1/user/${ZUID}/photo`,
       zohoUserInfo?.profile_photo_url,
     ].filter(Boolean);
 
-    const results = [];
-    for (const url of endpoints) {
+    const imageResults = [];
+    for (const url of imageEndpoints) {
       try {
         const r = await axios.get(url, {
           headers: { 'Authorization': `Zoho-oauthtoken ${accessToken}` },
           responseType: 'arraybuffer',
           timeout: 5000,
         });
-        results.push({ url, status: r.status, contentType: r.headers['content-type'], size: r.data.length });
+        const ct = r.headers['content-type'] || '';
+        imageResults.push({ url, status: r.status, contentType: ct, size: r.data.length, isImage: ct.startsWith('image/') });
       } catch (e) {
-        results.push({ url, status: e.response?.status || 'network error', error: e.message });
+        imageResults.push({ url, status: e.response?.status || 'network error', error: e.message });
+      }
+    }
+
+    // --- JSON endpoints (Books, CRM — may contain photo URL inside JSON) ---
+    let booksUser = null;
+    try {
+      const r = await axios.get(`${apiDomain}/books/v3/users/current?organization_id=${process.env.ZOHO_ORG_ID}`, {
+        headers: { 'Authorization': `Zoho-oauthtoken ${accessToken}` },
+        timeout: 5000,
+      });
+      booksUser = r.data;
+    } catch (e) {
+      booksUser = { error: e.message, status: e.response?.status };
+    }
+
+    let crmUser = null;
+    try {
+      const r = await axios.get(`https://www.zohoapis.com/crm/v2/users?type=CurrentUser`, {
+        headers: { 'Authorization': `Zoho-oauthtoken ${accessToken}` },
+        timeout: 5000,
+      });
+      crmUser = r.data;
+    } catch (e) {
+      crmUser = { error: e.message, status: e.response?.status };
+    }
+
+    // --- Try photo URLs extracted from CRM/Books ---
+    const extraImageTests = [];
+    const crmPhotoUrl = crmUser?.users?.[0]?.full_name ? null : null; // placeholder
+    const crmImageLink = crmUser?.users?.[0]?.image_link;
+    const booksPhotoUrl = booksUser?.data?.photo_url || booksUser?.user?.photo_url;
+    for (const url of [crmImageLink, booksPhotoUrl].filter(Boolean)) {
+      try {
+        const r = await axios.get(url, {
+          headers: { 'Authorization': `Zoho-oauthtoken ${accessToken}` },
+          responseType: 'arraybuffer',
+          timeout: 5000,
+        });
+        const ct = r.headers['content-type'] || '';
+        extraImageTests.push({ url, status: r.status, contentType: ct, size: r.data.length, isImage: ct.startsWith('image/') });
+      } catch (e) {
+        extraImageTests.push({ url, status: e.response?.status || 'network error', error: e.message });
       }
     }
 
     res.json({
-      photo_in_db:   !!row.photo_length,
-      photo_length:  row.photo_length || 0,
-      zoho_user_info: zohoUserInfo,
-      photo_endpoint_tests: results,
+      photo_in_db:        !!(row.photo_length > 0),
+      photo_size_bytes:   row.photo_length || 0,
+      photo_preview:      row.photo ? row.photo.substring(0, 60) : null,
+      zoho_user_info:     zohoUserInfo,
+      image_endpoint_tests: imageResults,
+      books_user_response:  booksUser,
+      crm_user_response:    crmUser,
+      extra_image_tests:    extraImageTests,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
