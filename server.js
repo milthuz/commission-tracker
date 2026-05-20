@@ -2041,6 +2041,27 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'healthy' });
 });
 
+// Temporary debug — shows photo status for current user
+app.get('/api/debug/photo', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT email, display_name, is_admin, LENGTH(photo) as photo_length, LEFT(photo, 100) as photo_preview FROM user_tokens WHERE email = $1',
+      [req.user.email]
+    );
+    const row = result.rows[0] || {};
+    res.json({
+      email:        row.email,
+      display_name: row.display_name,
+      is_admin:     row.is_admin,
+      photo_stored: !!row.photo_length,
+      photo_length: row.photo_length || 0,
+      photo_preview: row.photo_preview || null,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ============================================================================
 // START SERVER
 // ============================================================================
