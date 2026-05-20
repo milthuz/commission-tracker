@@ -282,11 +282,8 @@ app.get('/api/auth/callback', async (req, res) => {
     );
 
     const userInfo = userInfoResponse.data;
-    console.log('✅ User info retrieved:', {
-      email: userInfo.Email,
-      firstName: userInfo.First_Name,
-      lastName: userInfo.Last_Name,
-    });
+    // Log the FULL Zoho user info so we can see every available field
+    console.log('✅ Full Zoho user info:', JSON.stringify(userInfo, null, 2));
 
     const userEmail = userInfo.Email;
     const userName = `${userInfo.First_Name || ''} ${userInfo.Last_Name || ''}`.trim() || userEmail;
