@@ -2052,21 +2052,56 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'healthy' });
 });
 
-// Temporary debug — shows photo status for current user
+// Debug — tests Zoho photo endpoints live and shows full user info
 app.get('/api/debug/photo', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(
-      'SELECT email, display_name, is_admin, LENGTH(photo) as photo_length, LEFT(photo, 100) as photo_preview FROM user_tokens WHERE email = $1',
+    // Get stored token
+    const tokenResult = await pool.query(
+      'SELECT access_token, api_domain, LENGTH(photo) as photo_length FROM user_tokens WHERE email = $1',
       [req.user.email]
     );
-    const row = result.rows[0] || {};
+    const row = tokenResult.rows[0] || {};
+    const accessToken = row.access_token;
+
+    // Fetch fresh user info from Zoho
+    let zohoUserInfo = null;
+    try {
+      const uRes = await axios.get('https://accounts.zoho.com/oauth/user/info', {
+        headers: { 'Authorization': `Zoho-oauthtoken ${accessToken}` },
+      });
+      zohoUserInfo = uRes.data;
+    } catch (e) {
+      zohoUserInfo = { error: e.message, status: e.response?.status };
+    }
+
+    // Test each photo endpoint
+    const endpoints = [
+      `https://accounts.zoho.com/api/v1/user/${zohoUserInfo?.ZUID}/photo`,
+      `https://accounts.zoho.com/api/v1/user/self/photo`,
+      `https://accounts.zoho.ca/api/v1/user/${zohoUserInfo?.ZUID}/photo`,
+      `https://accounts.zoho.ca/api/v1/user/self/photo`,
+      zohoUserInfo?.profile_photo_url,
+    ].filter(Boolean);
+
+    const results = [];
+    for (const url of endpoints) {
+      try {
+        const r = await axios.get(url, {
+          headers: { 'Authorization': `Zoho-oauthtoken ${accessToken}` },
+          responseType: 'arraybuffer',
+          timeout: 5000,
+        });
+        results.push({ url, status: r.status, contentType: r.headers['content-type'], size: r.data.length });
+      } catch (e) {
+        results.push({ url, status: e.response?.status || 'network error', error: e.message });
+      }
+    }
+
     res.json({
-      email:        row.email,
-      display_name: row.display_name,
-      is_admin:     row.is_admin,
-      photo_stored: !!row.photo_length,
-      photo_length: row.photo_length || 0,
-      photo_preview: row.photo_preview || null,
+      photo_in_db:   !!row.photo_length,
+      photo_length:  row.photo_length || 0,
+      zoho_user_info: zohoUserInfo,
+      photo_endpoint_tests: results,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
