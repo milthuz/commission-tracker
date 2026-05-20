@@ -290,12 +290,40 @@ app.get('/api/auth/callback', async (req, res) => {
 
     console.log('User Email:', userEmail);
     console.log('User Name:', userName);
-    // Use Zoho photo if provided, otherwise generate an avatar from initials
-    const zohoPhoto = userInfo.profile_photo_url || null;
-    const initials  = encodeURIComponent(userName || userEmail);
-    const userPhoto = zohoPhoto ||
-      `https://ui-avatars.com/api/?name=${initials}&background=3C50E0&color=fff&size=128&bold=true&rounded=true`;
-    console.log('Profile photo:', zohoPhoto ? 'from Zoho' : 'generated avatar');
+    // Fetch the actual profile photo from Zoho's dedicated photo endpoint
+    let userPhoto = null;
+    const photoEndpoints = [
+      // Try the ZUID-based endpoint first
+      `${accountsUrl}/api/v1/user/${userInfo.ZUID}/photo`,
+      // Then the self endpoint
+      `${accountsUrl}/api/v1/user/self/photo`,
+      // Then the profile_photo_url if Zoho provided one
+      userInfo.profile_photo_url,
+    ].filter(Boolean);
+
+    for (const photoUrl of photoEndpoints) {
+      try {
+        const photoRes = await axios.get(photoUrl, {
+          headers: { 'Authorization': `Zoho-oauthtoken ${access_token}` },
+          responseType: 'arraybuffer',
+          timeout: 8000,
+        });
+        const contentType = photoRes.headers['content-type'] || 'image/jpeg';
+        // Only store if it's actually an image
+        if (contentType.startsWith('image/')) {
+          const b64 = Buffer.from(photoRes.data).toString('base64');
+          userPhoto = `data:${contentType};base64,${b64}`;
+          console.log(`✅ Profile photo fetched from ${photoUrl}`);
+          break;
+        }
+      } catch (photoErr) {
+        console.log(`⚠️ Photo not found at ${photoUrl}: ${photoErr.message}`);
+      }
+    }
+
+    if (!userPhoto) {
+      console.log('⚠️ No profile photo available from Zoho for this account');
+    }
 
     // Store tokens in database with error handling
     try {
@@ -313,12 +341,11 @@ app.get('/api/auth/callback', async (req, res) => {
       return res.status(500).json({ error: 'Failed to store tokens in database' });
     }
 
-    // Create JWT token
+    // Create JWT — photo stored in DB, not JWT (base64 would be too large for URL)
     const jwtToken = jwt.sign(
       {
         email:   userEmail,
         name:    userName,
-        photo:   userPhoto,
         zoho_id: userInfo.ZUID,
         isAdmin: true
       },
