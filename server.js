@@ -329,14 +329,13 @@ app.get('/api/auth/callback', async (req, res) => {
       return res.status(500).json({ error: 'Failed to store tokens in database' });
     }
 
-    // Create JWT token
+    // Create JWT token — keep it small, photo is fetched from DB separately
     const jwtToken = jwt.sign(
-      { 
-        email: userEmail, 
+      {
+        email: userEmail,
         name: userName,
-        photo: userPhoto,
         zoho_id: userInfo.ZUID,
-        isAdmin: true 
+        isAdmin: true
       },
       process.env.JWT_SECRET || 'your-secret-key',
       { expiresIn: '7d' }
@@ -383,18 +382,37 @@ app.get('/api/auth/token', authenticateToken, async (req, res) => {
   }
 });
 
-// 4. Verify JWT token
-app.get('/api/auth/verify', authenticateToken, (req, res) => {
-  // If authenticateToken middleware passes, token is valid
-  res.json({ 
-    valid: true, 
-    user: {
-      email: req.user.email,
-      name: req.user.name || req.user.email,
-      photo: req.user.photo || null,
-      zoho_id: req.user.zoho_id || req.user.email
-    }
-  });
+// 4. Verify JWT token — fetches photo and display_name from DB so JWT stays small
+app.get('/api/auth/verify', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT photo, display_name, is_admin FROM user_tokens WHERE email = $1',
+      [req.user.email]
+    );
+    const row = result.rows[0] || {};
+    res.json({
+      valid: true,
+      user: {
+        email:   req.user.email,
+        name:    row.display_name || req.user.name || req.user.email,
+        photo:   row.photo        || null,
+        zoho_id: req.user.zoho_id || req.user.email,
+        isAdmin: row.is_admin     != null ? row.is_admin : req.user.isAdmin,
+      }
+    });
+  } catch (error) {
+    // Fallback: return JWT data if DB lookup fails
+    res.json({
+      valid: true,
+      user: {
+        email:   req.user.email,
+        name:    req.user.name  || req.user.email,
+        photo:   null,
+        zoho_id: req.user.zoho_id || req.user.email,
+        isAdmin: req.user.isAdmin || false,
+      }
+    });
+  }
 });
 
 // ============================================================================
