@@ -293,25 +293,9 @@ app.get('/api/auth/callback', async (req, res) => {
 
     console.log('User Email:', userEmail);
     console.log('User Name:', userName);
-    console.log('Profile photo URL from Zoho:', userInfo.profile_photo_url || 'NOT PROVIDED');
-
-    // Zoho profile photo URLs require auth — download and store as base64 data URI
-    let userPhoto = null;
-    if (userInfo.profile_photo_url) {
-      try {
-        const photoResponse = await axios.get(userInfo.profile_photo_url, {
-          headers: { 'Authorization': `Zoho-oauthtoken ${access_token}` },
-          responseType: 'arraybuffer',
-          timeout: 5000,
-        });
-        const contentType = photoResponse.headers['content-type'] || 'image/jpeg';
-        const base64 = Buffer.from(photoResponse.data).toString('base64');
-        userPhoto = `data:${contentType};base64,${base64}`;
-        console.log('✅ Profile photo downloaded and encoded as base64');
-      } catch (photoErr) {
-        console.warn('⚠️ Could not download profile photo:', photoErr.message);
-      }
-    }
+    // Use Zoho profile photo URL directly — it is publicly accessible
+    const userPhoto = userInfo.profile_photo_url || null;
+    console.log('Profile photo URL from Zoho:', userPhoto || 'NOT PROVIDED');
 
     // Store tokens in database with error handling
     try {
@@ -329,11 +313,12 @@ app.get('/api/auth/callback', async (req, res) => {
       return res.status(500).json({ error: 'Failed to store tokens in database' });
     }
 
-    // Create JWT token — keep it small, photo is fetched from DB separately
+    // Create JWT token
     const jwtToken = jwt.sign(
       {
-        email: userEmail,
-        name: userName,
+        email:   userEmail,
+        name:    userName,
+        photo:   userPhoto,
         zoho_id: userInfo.ZUID,
         isAdmin: true
       },
@@ -382,7 +367,7 @@ app.get('/api/auth/token', authenticateToken, async (req, res) => {
   }
 });
 
-// 4. Verify JWT token — fetches photo and display_name from DB so JWT stays small
+// 4. Verify JWT token
 app.get('/api/auth/verify', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -395,19 +380,18 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
       user: {
         email:   req.user.email,
         name:    row.display_name || req.user.name || req.user.email,
-        photo:   row.photo        || null,
+        photo:   row.photo || req.user.photo || null,
         zoho_id: req.user.zoho_id || req.user.email,
-        isAdmin: row.is_admin     != null ? row.is_admin : req.user.isAdmin,
+        isAdmin: row.is_admin != null ? row.is_admin : (req.user.isAdmin || false),
       }
     });
   } catch (error) {
-    // Fallback: return JWT data if DB lookup fails
     res.json({
       valid: true,
       user: {
         email:   req.user.email,
         name:    req.user.name  || req.user.email,
-        photo:   null,
+        photo:   req.user.photo || null,
         zoho_id: req.user.zoho_id || req.user.email,
         isAdmin: req.user.isAdmin || false,
       }
