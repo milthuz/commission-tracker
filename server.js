@@ -12,11 +12,9 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bodyParser = require('body-parser');
 const { Pool } = require('pg');
+const ZohoCRMService = require('./services/zohoCRMService');
 
 dotenv.config();
-
-// Import invoice routes
-const invoiceRoutes = require('./routes/invoiceRoutes');
 
 const app = express();
 
@@ -105,12 +103,6 @@ const ZOHO_CONFIG = {
   redirect_uri: process.env.ZOHO_REDIRECT_URI || 'http://localhost:5000/api/auth/callback',
   accounts_url: 'https://accounts.zoho.com',
 };
-
-// ============================================================================
-// INVOICE ROUTES
-// ============================================================================
-
-app.use('/api/invoices', invoiceRoutes);
 
 // ============================================================================
 // AUTH ROUTES
@@ -286,8 +278,6 @@ app.get('/api/auth/verify', authenticateToken, (req, res) => {
 // ============================================================================
 // ZOHO CRM ROUTES
 // ============================================================================
-
-const ZohoCRMService = require('./services/zohoCRMService');
 
 // GET /api/crm/deals — fetch all deals from Zoho CRM
 app.get('/api/crm/deals', authenticateToken, async (req, res) => {
