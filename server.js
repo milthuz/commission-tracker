@@ -128,8 +128,7 @@ app.get('/api/auth/zoho', (req, res) => {
     `&response_type=code` +
     `&redirect_uri=${ZOHO_CONFIG.redirect_uri}` +
     `&state=${state}` +
-    `&access_type=offline` +
-    `&prompt=login`;
+    `&access_type=offline`;
 
   res.json({ authUrl, state });
 });
