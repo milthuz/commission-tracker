@@ -293,9 +293,12 @@ app.get('/api/auth/callback', async (req, res) => {
 
     console.log('User Email:', userEmail);
     console.log('User Name:', userName);
-    // Use Zoho profile photo URL directly — it is publicly accessible
-    const userPhoto = userInfo.profile_photo_url || null;
-    console.log('Profile photo URL from Zoho:', userPhoto || 'NOT PROVIDED');
+    // Use Zoho photo if provided, otherwise generate an avatar from initials
+    const zohoPhoto = userInfo.profile_photo_url || null;
+    const initials  = encodeURIComponent(userName || userEmail);
+    const userPhoto = zohoPhoto ||
+      `https://ui-avatars.com/api/?name=${initials}&background=3C50E0&color=fff&size=128&bold=true&rounded=true`;
+    console.log('Profile photo:', zohoPhoto ? 'from Zoho' : 'generated avatar');
 
     // Store tokens in database with error handling
     try {
