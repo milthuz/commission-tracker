@@ -38,10 +38,20 @@ async function initializeDatabase() {
         refresh_token TEXT,
         api_domain VARCHAR(255),
         expires_at BIGINT,
+        crm_access_token TEXT,
+        crm_refresh_token TEXT,
+        crm_expires_at BIGINT,
+        is_admin BOOLEAN DEFAULT false,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
+
+    // Add CRM columns if they don't exist (for existing tables)
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_access_token TEXT`);
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_refresh_token TEXT`);
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_expires_at BIGINT`);
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT false`);
     console.log('✅ Database tables initialized');
   } catch (error) {
     console.error('Database initialization error:', error);
@@ -113,8 +123,7 @@ app.get('/api/auth/zoho', (req, res) => {
   const state = Math.random().toString(36).substring(7);
   
   const authUrl = `${ZOHO_CONFIG.accounts_url}/oauth/v2/auth?` +
-    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE,` +
-    `ZohoCRM.modules.ALL,ZohoCRM.settings.ALL` +
+    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE` +
     `&client_id=${ZOHO_CONFIG.client_id}` +
     `&response_type=code` +
     `&redirect_uri=${ZOHO_CONFIG.redirect_uri}` +
@@ -273,6 +282,85 @@ app.get('/api/auth/verify', authenticateToken, (req, res) => {
       zoho_id: req.user.zoho_id || req.user.email
     }
   });
+});
+
+// ============================================================================
+// ZOHO CRM AUTH (separate OAuth flow for CRM)
+// ============================================================================
+
+// 1. Initiate CRM OAuth
+app.get('/api/auth/zoho-crm', authenticateToken, (req, res) => {
+  const state = Math.random().toString(36).substring(7);
+
+  const authUrl = `${ZOHO_CONFIG.accounts_url}/oauth/v2/auth?` +
+    `scope=ZohoCRM.modules.ALL,ZohoCRM.settings.ALL` +
+    `&client_id=${ZOHO_CONFIG.client_id}` +
+    `&response_type=code` +
+    `&redirect_uri=${process.env.ZOHO_CRM_REDIRECT_URI || ZOHO_CONFIG.redirect_uri.replace('/callback', '/crm-callback')}` +
+    `&state=${state}` +
+    `&access_type=offline` +
+    `&prompt=consent`;
+
+  res.json({ authUrl, state });
+});
+
+// 2. Handle CRM OAuth callback
+app.get('/api/auth/crm-callback', async (req, res) => {
+  const { code, accounts_server } = req.query;
+
+  if (!code) {
+    return res.status(400).json({ error: 'No authorization code' });
+  }
+
+  try {
+    const accountsUrl = accounts_server || ZOHO_CONFIG.accounts_url;
+
+    const tokenResponse = await axios.post(
+      `${accountsUrl}/oauth/v2/token`,
+      new URLSearchParams({
+        grant_type: 'authorization_code',
+        client_id: ZOHO_CONFIG.client_id,
+        client_secret: ZOHO_CONFIG.client_secret,
+        redirect_uri: process.env.ZOHO_CRM_REDIRECT_URI || ZOHO_CONFIG.redirect_uri.replace('/callback', '/crm-callback'),
+        code,
+      }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+
+    const { access_token, refresh_token, expires_in } = tokenResponse.data;
+
+    // Store CRM tokens — find admin user to attach to
+    await pool.query(
+      `UPDATE user_tokens
+       SET crm_access_token = $1, crm_refresh_token = $2, crm_expires_at = $3, updated_at = CURRENT_TIMESTAMP
+       WHERE is_admin = true`,
+      [access_token, refresh_token, Date.now() + (expires_in * 1000)]
+    );
+
+    console.log('✅ CRM tokens stored successfully');
+
+    // Redirect back to admin panel
+    const redirectUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/admin/sync?crm=connected`;
+    res.redirect(redirectUrl);
+  } catch (error) {
+    console.error('CRM OAuth callback error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'CRM token exchange failed', details: error.message, zohoError: error.response?.data });
+  }
+});
+
+// 3. Check CRM connection status
+app.get('/api/auth/crm-status', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT crm_access_token, crm_expires_at FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
+    );
+    const row = result.rows[0];
+    const connected = !!(row?.crm_access_token);
+    const expired = row?.crm_expires_at ? Date.now() > parseInt(row.crm_expires_at) : true;
+    res.json({ connected, expired });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to check CRM status' });
+  }
 });
 
 // ============================================================================
