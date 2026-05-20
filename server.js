@@ -290,10 +290,28 @@ app.get('/api/auth/callback', async (req, res) => {
 
     const userEmail = userInfo.Email;
     const userName = `${userInfo.First_Name || ''} ${userInfo.Last_Name || ''}`.trim() || userEmail;
-    const userPhoto = userInfo.profile_photo_url || null;
 
     console.log('User Email:', userEmail);
     console.log('User Name:', userName);
+    console.log('Profile photo URL from Zoho:', userInfo.profile_photo_url || 'NOT PROVIDED');
+
+    // Zoho profile photo URLs require auth — download and store as base64 data URI
+    let userPhoto = null;
+    if (userInfo.profile_photo_url) {
+      try {
+        const photoResponse = await axios.get(userInfo.profile_photo_url, {
+          headers: { 'Authorization': `Zoho-oauthtoken ${access_token}` },
+          responseType: 'arraybuffer',
+          timeout: 5000,
+        });
+        const contentType = photoResponse.headers['content-type'] || 'image/jpeg';
+        const base64 = Buffer.from(photoResponse.data).toString('base64');
+        userPhoto = `data:${contentType};base64,${base64}`;
+        console.log('✅ Profile photo downloaded and encoded as base64');
+      } catch (photoErr) {
+        console.warn('⚠️ Could not download profile photo:', photoErr.message);
+      }
+    }
 
     // Store tokens in database with error handling
     try {
