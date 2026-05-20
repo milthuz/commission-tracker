@@ -128,7 +128,8 @@ app.get('/api/auth/zoho', (req, res) => {
     `&response_type=code` +
     `&redirect_uri=${ZOHO_CONFIG.redirect_uri}` +
     `&state=${state}` +
-    `&access_type=offline`;
+    `&access_type=offline` +
+    `&prompt=consent`;
 
   res.json({ authUrl, state });
 });
@@ -146,6 +147,9 @@ app.get('/api/auth/callback', async (req, res) => {
 
     console.log('OAuth callback received:');
     console.log('Code:', code.substring(0, 20) + '...');
+    console.log('accounts_server from Zoho:', accounts_server || 'NOT PROVIDED');
+    console.log('Using accountsUrl:', accountsUrl);
+    console.log('redirect_uri being sent:', ZOHO_CONFIG.redirect_uri);
     console.log('Client ID:', ZOHO_CONFIG.client_id ? 'SET' : 'MISSING');
     console.log('Client Secret:', ZOHO_CONFIG.client_secret ? 'SET' : 'MISSING');
 
