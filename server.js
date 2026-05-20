@@ -1831,37 +1831,65 @@ app.get('/api/commissions/invoices', authenticateToken, async (req, res) => {
   }
 });
 
-// POST /api/commissions/approve
+// POST /api/commissions/approve — supports { repName, year, month } OR { invoiceNumbers: [...] }
 app.post('/api/commissions/approve', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
-  const { invoiceNumbers } = req.body;
+  const { repName, year, month, invoiceNumbers } = req.body;
   try {
+    let result;
     if (Array.isArray(invoiceNumbers) && invoiceNumbers.length > 0) {
-      await pool.query(
+      result = await pool.query(
         `UPDATE invoices SET commission_paid = true, updated_at = CURRENT_TIMESTAMP
-         WHERE invoice_number = ANY($1)`,
+         WHERE invoice_number = ANY($1) RETURNING invoice_number`,
         [invoiceNumbers]
       );
+    } else if (repName && year && month) {
+      const startDate = new Date(`${year}-${String(month).padStart(2, '0')}-01`);
+      const endDate   = new Date(startDate);
+      endDate.setMonth(endDate.getMonth() + 1);
+      result = await pool.query(
+        `UPDATE invoices SET commission_paid = true, updated_at = CURRENT_TIMESTAMP
+         WHERE salesperson_name = $1 AND organization_id = $2
+           AND date >= $3 AND date < $4 AND status = 'paid'
+         RETURNING invoice_number`,
+        [repName, process.env.ZOHO_ORG_ID, startDate, endDate]
+      );
+    } else {
+      return res.status(400).json({ error: 'Provide repName+year+month or invoiceNumbers' });
     }
-    res.json({ success: true });
+    res.json({ success: true, invoicesUpdated: result.rowCount });
   } catch (error) {
     res.status(500).json({ error: 'Failed to approve commissions', details: error.message });
   }
 });
 
-// POST /api/commissions/unapprove
+// POST /api/commissions/unapprove — supports { repName, year, month } OR { invoiceNumbers: [...] }
 app.post('/api/commissions/unapprove', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
-  const { invoiceNumbers } = req.body;
+  const { repName, year, month, invoiceNumbers } = req.body;
   try {
+    let result;
     if (Array.isArray(invoiceNumbers) && invoiceNumbers.length > 0) {
-      await pool.query(
+      result = await pool.query(
         `UPDATE invoices SET commission_paid = false, updated_at = CURRENT_TIMESTAMP
-         WHERE invoice_number = ANY($1)`,
+         WHERE invoice_number = ANY($1) RETURNING invoice_number`,
         [invoiceNumbers]
       );
+    } else if (repName && year && month) {
+      const startDate = new Date(`${year}-${String(month).padStart(2, '0')}-01`);
+      const endDate   = new Date(startDate);
+      endDate.setMonth(endDate.getMonth() + 1);
+      result = await pool.query(
+        `UPDATE invoices SET commission_paid = false, updated_at = CURRENT_TIMESTAMP
+         WHERE salesperson_name = $1 AND organization_id = $2
+           AND date >= $3 AND date < $4
+         RETURNING invoice_number`,
+        [repName, process.env.ZOHO_ORG_ID, startDate, endDate]
+      );
+    } else {
+      return res.status(400).json({ error: 'Provide repName+year+month or invoiceNumbers' });
     }
-    res.json({ success: true });
+    res.json({ success: true, invoicesUpdated: result.rowCount });
   } catch (error) {
     res.status(500).json({ error: 'Failed to unapprove commissions', details: error.message });
   }
