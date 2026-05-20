@@ -42,24 +42,116 @@ async function initializeDatabase() {
         crm_refresh_token TEXT,
         crm_expires_at BIGINT,
         is_admin BOOLEAN DEFAULT false,
+        photo TEXT,
+        display_name VARCHAR(255),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
 
-    // Add CRM columns if they don't exist (for existing tables)
+    // Add columns if they don't exist (for existing tables)
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_access_token TEXT`);
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_refresh_token TEXT`);
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_expires_at BIGINT`);
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT false`);
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS photo TEXT`);
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS display_name VARCHAR(255)`);
+
+    // Invoices table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS invoices (
+        id SERIAL PRIMARY KEY,
+        invoice_number VARCHAR(255) UNIQUE NOT NULL,
+        salesperson_name VARCHAR(255),
+        customer_name VARCHAR(255),
+        total DECIMAL(12,2) DEFAULT 0,
+        status VARCHAR(50) DEFAULT 'paid',
+        date TIMESTAMP,
+        commission DECIMAL(12,2) DEFAULT 0,
+        commission_paid BOOLEAN DEFAULT false,
+        organization_id VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS customer_name VARCHAR(255)`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS commission_paid BOOLEAN DEFAULT false`);
+
+    // User preferences table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_preferences (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        language VARCHAR(10) DEFAULT 'en',
+        currency VARCHAR(10) DEFAULT 'CAD',
+        date_format VARCHAR(20) DEFAULT 'YYYY-MM-DD',
+        timezone VARCHAR(50) DEFAULT 'America/Toronto',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // Salespeople table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS salespeople (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) UNIQUE NOT NULL,
+        is_active BOOLEAN DEFAULT true,
+        commission_rate DECIMAL(5,2) DEFAULT 10.0,
+        base_salary DECIMAL(10,2) DEFAULT 0,
+        invoice_count INT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS invoice_count INT DEFAULT 0`);
+
+    // Excluded customers table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS excluded_customers (
+        id SERIAL PRIMARY KEY,
+        customer_name VARCHAR(255) NOT NULL,
+        excluded_by VARCHAR(255),
+        organization_id VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(customer_name, organization_id)
+      );
+    `);
+
+    // Releases table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS releases (
+        id SERIAL PRIMARY KEY,
+        version VARCHAR(50) NOT NULL,
+        name VARCHAR(255),
+        notes TEXT,
+        url VARCHAR(500),
+        date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // Sync log table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS sync_log (
+        id SERIAL PRIMARY KEY,
+        synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        invoice_count INT DEFAULT 0,
+        status VARCHAR(50) DEFAULT 'success',
+        organization_id VARCHAR(255),
+        message TEXT
+      );
+    `);
+
     console.log('✅ Database tables initialized');
   } catch (error) {
     console.error('Database initialization error:', error);
   }
 }
 
-// Initialize on startup
-initializeDatabase();
+// Initialize DB, then start server
+let dbReady = false;
+initializeDatabase().then(() => { dbReady = true; });
 
 // ============================================================================
 // MIDDLEWARE
@@ -207,11 +299,12 @@ app.get('/api/auth/callback', async (req, res) => {
     // Store tokens in database with error handling
     try {
       await pool.query(
-        `INSERT INTO user_tokens (email, access_token, refresh_token, api_domain, expires_at)
-         VALUES ($1, $2, $3, $4, $5)
+        `INSERT INTO user_tokens (email, access_token, refresh_token, api_domain, expires_at, photo, display_name)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (email) DO UPDATE SET
-         access_token = $2, refresh_token = $3, api_domain = $4, expires_at = $5, updated_at = CURRENT_TIMESTAMP`,
-        [userEmail, access_token, refresh_token, api_domain, Date.now() + expires_in * 1000]
+         access_token = $2, refresh_token = $3, api_domain = $4, expires_at = $5,
+         photo = $6, display_name = $7, updated_at = CURRENT_TIMESTAMP`,
+        [userEmail, access_token, refresh_token, api_domain, Date.now() + expires_in * 1000, userPhoto, userName]
       );
       console.log('✅ Tokens stored in database for:', userEmail);
     } catch (dbError) {
@@ -544,21 +637,30 @@ async function autoSyncInvoices() {
     let syncedCount = 0;
     for (const inv of allInvoices) {
       const salesperson = inv.salesperson_name || 'Unassigned';
+      const customerName = inv.customer_name || inv.contact_name || null;
       const total = parseFloat(inv.total) || 0;
       // Commission only for PAID invoices
       const commission = inv.status === 'paid' ? (total * 0.1) : 0;
       const invDate = new Date(inv.date || new Date());
 
       await pool.query(
-        `INSERT INTO invoices 
-         (invoice_number, salesperson_name, total, status, date, commission, organization_id) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `INSERT INTO invoices
+         (invoice_number, salesperson_name, customer_name, total, status, date, commission, organization_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT (invoice_number) DO UPDATE SET
-         status = $4, total = $3, commission = $6, updated_at = CURRENT_TIMESTAMP`,
-        [inv.invoice_number, salesperson, total, inv.status, invDate, commission, process.env.ZOHO_ORG_ID]
+         status = $5, total = $4, commission = $7, customer_name = COALESCE($3, invoices.customer_name),
+         updated_at = CURRENT_TIMESTAMP`,
+        [inv.invoice_number, salesperson, customerName, total, inv.status, invDate, commission, process.env.ZOHO_ORG_ID]
       );
       syncedCount++;
     }
+
+    // Log the sync
+    await pool.query(
+      `INSERT INTO sync_log (invoice_count, status, organization_id, message)
+       VALUES ($1, 'success', $2, $3)`,
+      [syncedCount, process.env.ZOHO_ORG_ID, `Synced ${paidInvoices.length} paid + ${overdueInvoices.length} overdue`]
+    );
 
     console.log(`✅ [AUTO-SYNC] Successfully synced ${syncedCount} invoices at ${new Date().toISOString()}`);
     console.log(`💰 [AUTO-SYNC] Commission calculated ONLY on paid invoices`);
@@ -712,17 +814,19 @@ app.post('/api/sync/invoices', authenticateToken, async (req, res) => {
     // Insert invoices into database
     for (const inv of allInvoices) {
       const salesperson = inv.salesperson_name || 'Unassigned';
+      const customerName = inv.customer_name || inv.contact_name || null;
       const total = parseFloat(inv.total) || 0;
-      const commission = (total * 0.1); // 10% commission
+      const commission = inv.status === 'paid' ? (total * 0.1) : 0;
       const invDate = new Date(inv.date || new Date());
 
       await pool.query(
-        `INSERT INTO invoices 
-         (invoice_number, salesperson_name, total, status, date, commission, organization_id) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `INSERT INTO invoices
+         (invoice_number, salesperson_name, customer_name, total, status, date, commission, organization_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT (invoice_number) DO UPDATE SET
-         status = $4, total = $3, commission = $6, updated_at = CURRENT_TIMESTAMP`,
-        [inv.invoice_number, salesperson, total, inv.status, invDate, commission, process.env.ZOHO_ORG_ID]
+         status = $5, total = $4, commission = $7, customer_name = COALESCE($3, invoices.customer_name),
+         updated_at = CURRENT_TIMESTAMP`,
+        [inv.invoice_number, salesperson, customerName, total, inv.status, invDate, commission, process.env.ZOHO_ORG_ID]
       );
     }
 
@@ -931,39 +1035,53 @@ app.get('/api/invoices', authenticateToken, async (req, res) => {
   const { start, end, salesperson } = req.query;
 
   try {
-    // Parse dates properly - add end of day to end date
-    const startDate = new Date(start);
-    const endDate = new Date(end);
-    endDate.setHours(23, 59, 59, 999); // Set to end of day
+    const startDate = new Date(start || new Date().getFullYear() + '-01-01');
+    const endDate = new Date(end || new Date().toISOString().split('T')[0]);
+    endDate.setHours(23, 59, 59, 999);
 
     console.log('📄 Fetching invoices from database...');
-    console.log('📅 Date range:', startDate, 'to', endDate);
 
-    // Query database for all invoices
     let query = `
-      SELECT 
+      SELECT
         invoice_number,
         salesperson_name,
+        customer_name,
         date,
         total,
         commission,
-        status,
-        organization_id
+        commission_paid,
+        status
       FROM invoices
       WHERE organization_id = $1
       AND date >= $2
       AND date <= $3
-      AND status = 'paid'
     `;
-    
+
     const params = [process.env.ZOHO_ORG_ID, startDate, endDate];
     let paramIndex = 4;
 
-    // If salesperson filter provided
+    // Handle comma-separated salesperson filter
     if (salesperson) {
-      query += ` AND salesperson_name = $${paramIndex}`;
-      params.push(salesperson);
-      paramIndex++;
+      const names = salesperson.split(',').map(s => s.trim()).filter(Boolean);
+      if (names.length === 1) {
+        query += ` AND salesperson_name = $${paramIndex}`;
+        params.push(names[0]);
+        paramIndex++;
+      } else if (names.length > 1) {
+        const placeholders = names.map((_, i) => `$${paramIndex + i}`).join(', ');
+        query += ` AND salesperson_name IN (${placeholders})`;
+        params.push(...names);
+        paramIndex += names.length;
+      }
+    } else if (!isAdmin) {
+      // Non-admins only see their own invoices
+      const tokenResult = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
+      const myName = tokenResult.rows[0]?.display_name || req.user.name;
+      if (myName) {
+        query += ` AND salesperson_name = $${paramIndex}`;
+        params.push(myName);
+        paramIndex++;
+      }
     }
 
     query += ` ORDER BY date DESC`;
@@ -973,21 +1091,882 @@ app.get('/api/invoices', authenticateToken, async (req, res) => {
     const invoices = result.rows.map(row => ({
       invoice_number: row.invoice_number,
       salesperson_name: row.salesperson_name || 'Unassigned',
+      customer_name: row.customer_name || '',
       date: row.date,
-      total: row.total,
-      commission: row.commission,
+      total: parseFloat(row.total) || 0,
+      commission: parseFloat(row.commission) || 0,
+      commissionPaid: row.commission_paid || false,
       status: row.status,
     }));
 
     console.log(`✅ Found ${invoices.length} invoices`);
-
-    res.json({ 
-      invoices,
-      dateRange: { start: startDate, end: endDate }
-    });
+    res.json({ invoices, dateRange: { start: startDate, end: endDate } });
   } catch (error) {
     console.error('❌ Error fetching invoices:', error);
     res.status(500).json({ error: 'Failed to fetch invoices', details: error.message });
+  }
+});
+
+// ============================================================================
+// USER PROFILE & PREFERENCES
+// ============================================================================
+
+// GET /api/user/profile
+app.get('/api/user/profile', authenticateToken, async (req, res) => {
+  const { email } = req.user;
+  try {
+    const tokenResult = await pool.query(
+      'SELECT email, photo, display_name, is_admin, created_at FROM user_tokens WHERE email = $1',
+      [email]
+    );
+    const td = tokenResult.rows[0] || {};
+
+    const prefResult = await pool.query(
+      'SELECT language, currency, date_format, timezone FROM user_preferences WHERE email = $1',
+      [email]
+    );
+    const prefs = prefResult.rows[0] || {};
+
+    const repName = td.display_name || req.user.name || email;
+
+    const statsResult = await pool.query(
+      `SELECT COUNT(*) AS paid_invoices,
+              COALESCE(SUM(commission), 0) AS total_commission,
+              COALESCE(SUM(total), 0) AS total_revenue
+       FROM invoices
+       WHERE salesperson_name = $1 AND status = 'paid' AND organization_id = $2`,
+      [repName, process.env.ZOHO_ORG_ID]
+    );
+    const stats = statsResult.rows[0] || {};
+
+    const spResult = await pool.query(
+      'SELECT name, is_active, commission_rate FROM salespeople WHERE name = $1',
+      [repName]
+    );
+    const sp = spResult.rows[0];
+
+    res.json({
+      email: td.email || email,
+      name: td.display_name || req.user.name || email,
+      photo: td.photo || req.user.photo || null,
+      isAdmin: td.is_admin != null ? td.is_admin : (req.user.isAdmin || false),
+      preferences: {
+        language:   prefs.language    || 'en',
+        currency:   prefs.currency    || 'CAD',
+        dateFormat: prefs.date_format || 'YYYY-MM-DD',
+        timezone:   prefs.timezone    || 'America/Toronto',
+      },
+      salesperson: sp ? {
+        name:           sp.name,
+        isActive:       sp.is_active,
+        commissionRate: parseFloat(sp.commission_rate) || 10,
+      } : null,
+      stats: {
+        paidInvoices:    parseInt(stats.paid_invoices)    || 0,
+        totalCommission: parseFloat(stats.total_commission) || 0,
+        totalRevenue:    parseFloat(stats.total_revenue)   || 0,
+      },
+      memberSince: td.created_at || null,
+    });
+  } catch (error) {
+    console.error('Profile error:', error);
+    res.status(500).json({ error: 'Failed to fetch profile', details: error.message });
+  }
+});
+
+// PUT /api/user/preferences
+app.put('/api/user/preferences', authenticateToken, async (req, res) => {
+  const { email } = req.user;
+  const { displayName, language, currency, dateFormat, timezone } = req.body;
+  try {
+    if (displayName !== undefined) {
+      await pool.query(
+        `UPDATE user_tokens SET display_name = $1, updated_at = CURRENT_TIMESTAMP WHERE email = $2`,
+        [displayName, email]
+      );
+    }
+    await pool.query(
+      `INSERT INTO user_preferences (email, language, currency, date_format, timezone)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (email) DO UPDATE SET
+         language = $2, currency = $3, date_format = $4, timezone = $5,
+         updated_at = CURRENT_TIMESTAMP`,
+      [email, language || 'en', currency || 'CAD', dateFormat || 'YYYY-MM-DD', timezone || 'America/Toronto']
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Preferences error:', error);
+    res.status(500).json({ error: 'Failed to save preferences', details: error.message });
+  }
+});
+
+// ============================================================================
+// DASHBOARD
+// ============================================================================
+
+// GET /api/dashboard?year=
+app.get('/api/dashboard', authenticateToken, async (req, res) => {
+  const year = parseInt(req.query.year) || new Date().getFullYear();
+  try {
+    const startDate = new Date(year, 0, 1);
+    const endDate   = new Date(year, 11, 31, 23, 59, 59, 999);
+
+    const cardsResult = await pool.query(`
+      SELECT
+        COALESCE(SUM(CASE WHEN status = 'paid'    THEN total ELSE 0 END), 0) AS paid_revenue,
+        COALESCE(SUM(CASE WHEN status = 'paid'    THEN commission ELSE 0 END), 0) AS total_commission,
+        COUNT(*)                                                               AS total_invoices,
+        COALESCE(SUM(CASE WHEN status = 'overdue' THEN total ELSE 0 END), 0) AS overdue_amount,
+        COUNT(CASE WHEN status = 'paid'    THEN 1 END)                       AS paid_count,
+        COUNT(CASE WHEN status = 'overdue' THEN 1 END)                       AS overdue_count
+      FROM invoices
+      WHERE organization_id = $1 AND date >= $2 AND date <= $3
+    `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
+
+    const monthlyResult = await pool.query(`
+      SELECT
+        TO_CHAR(date, 'Mon') AS month,
+        EXTRACT(MONTH FROM date) AS month_num,
+        COALESCE(SUM(CASE WHEN status = 'paid'    THEN total ELSE 0 END), 0) AS revenue,
+        COALESCE(SUM(CASE WHEN status = 'overdue' THEN total ELSE 0 END), 0) AS overdue,
+        COALESCE(SUM(CASE WHEN status = 'paid'    THEN commission ELSE 0 END), 0) AS commission
+      FROM invoices
+      WHERE organization_id = $1 AND date >= $2 AND date <= $3
+      GROUP BY TO_CHAR(date, 'Mon'), EXTRACT(MONTH FROM date)
+      ORDER BY month_num
+    `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
+
+    const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const mmap = {};
+    monthlyResult.rows.forEach(r => { mmap[r.month] = r; });
+    const monthlyTrend = MONTHS.map(m => ({
+      month:      m,
+      revenue:    parseFloat(mmap[m]?.revenue)    || 0,
+      overdue:    parseFloat(mmap[m]?.overdue)    || 0,
+      commission: parseFloat(mmap[m]?.commission) || 0,
+    }));
+
+    const repResult = await pool.query(`
+      SELECT salesperson_name AS name,
+             COUNT(*) AS invoices,
+             COALESCE(SUM(total), 0) AS sales,
+             COALESCE(SUM(commission), 0) AS commission
+      FROM invoices
+      WHERE organization_id = $1 AND status = 'paid' AND date >= $2 AND date <= $3
+      GROUP BY salesperson_name ORDER BY commission DESC LIMIT 10
+    `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
+
+    const statusResult = await pool.query(`
+      SELECT status, COUNT(*) AS count, COALESCE(SUM(total), 0) AS total
+      FROM invoices WHERE organization_id = $1 AND date >= $2 AND date <= $3
+      GROUP BY status
+    `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
+
+    const customerResult = await pool.query(`
+      SELECT
+        COALESCE(NULLIF(TRIM(customer_name), ''), 'Unknown') AS name,
+        COUNT(*) AS invoices,
+        COALESCE(SUM(total), 0) AS total
+      FROM invoices
+      WHERE organization_id = $1 AND status = 'paid' AND date >= $2 AND date <= $3
+        AND COALESCE(NULLIF(TRIM(customer_name), ''), '') != ''
+      GROUP BY COALESCE(NULLIF(TRIM(customer_name), ''), 'Unknown')
+      ORDER BY total DESC LIMIT 10
+    `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
+
+    const recentResult = await pool.query(`
+      SELECT invoice_number, customer_name, salesperson_name, total, commission, status, date
+      FROM invoices
+      WHERE organization_id = $1 AND date >= $2 AND date <= $3
+      ORDER BY date DESC LIMIT 20
+    `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
+
+    const cards = cardsResult.rows[0] || {};
+    res.json({
+      cards: {
+        paidRevenue:     parseFloat(cards.paid_revenue)     || 0,
+        totalCommission: parseFloat(cards.total_commission) || 0,
+        totalInvoices:   parseInt(cards.total_invoices)     || 0,
+        overdueAmount:   parseFloat(cards.overdue_amount)   || 0,
+        paidCount:       parseInt(cards.paid_count)         || 0,
+        overdueCount:    parseInt(cards.overdue_count)      || 0,
+      },
+      monthlyTrend,
+      commissionsByRep: repResult.rows.map(r => ({
+        name:       r.name,
+        invoices:   parseInt(r.invoices),
+        sales:      parseFloat(r.sales),
+        commission: parseFloat(r.commission),
+      })),
+      statusBreakdown: statusResult.rows.map(r => ({
+        status: r.status,
+        count:  parseInt(r.count),
+        total:  parseFloat(r.total),
+      })),
+      topCustomers: customerResult.rows.map(r => ({
+        name:     r.name,
+        invoices: parseInt(r.invoices),
+        total:    parseFloat(r.total),
+      })),
+      recentInvoices: recentResult.rows.map(r => ({
+        invoiceNumber: r.invoice_number,
+        customer:      r.customer_name || 'Unknown',
+        salesperson:   r.salesperson_name || 'Unknown',
+        total:         parseFloat(r.total),
+        commission:    parseFloat(r.commission),
+        status:        r.status,
+        date:          r.date,
+      })),
+      year,
+    });
+  } catch (error) {
+    console.error('Dashboard error:', error);
+    res.status(500).json({ error: 'Failed to fetch dashboard data', details: error.message });
+  }
+});
+
+// ============================================================================
+// INVOICES ADDITIONAL ENDPOINTS
+// ============================================================================
+
+// GET /api/invoices/stats
+app.get('/api/invoices/stats', authenticateToken, async (req, res) => {
+  const { start, end, salesperson } = req.query;
+  try {
+    const startDate = new Date(start || new Date().getFullYear() + '-01-01');
+    const endDate   = new Date(end   || new Date().toISOString().split('T')[0]);
+    endDate.setHours(23, 59, 59, 999);
+
+    let where = `WHERE organization_id = $1 AND date >= $2 AND date <= $3`;
+    const params = [process.env.ZOHO_ORG_ID, startDate, endDate];
+    let idx = 4;
+
+    if (salesperson) {
+      const names = salesperson.split(',').map(s => s.trim()).filter(Boolean);
+      if (names.length === 1) {
+        where += ` AND salesperson_name = $${idx}`;
+        params.push(names[0]); idx++;
+      } else if (names.length > 1) {
+        const ph = names.map((_, i) => `$${idx + i}`).join(', ');
+        where += ` AND salesperson_name IN (${ph})`;
+        params.push(...names); idx += names.length;
+      }
+    }
+
+    const result = await pool.query(`
+      SELECT
+        COUNT(*) AS total_invoices,
+        COALESCE(SUM(CASE WHEN status = 'paid'    THEN total ELSE 0 END), 0) AS paid_total,
+        COALESCE(SUM(CASE WHEN status = 'overdue' THEN total ELSE 0 END), 0) AS overdue_total,
+        COALESCE(SUM(total), 0)                                               AS total_amount,
+        COALESCE(SUM(CASE WHEN status = 'paid'    THEN commission ELSE 0 END), 0) AS total_commission
+      FROM invoices ${where}
+    `, params);
+
+    const row = result.rows[0] || {};
+    res.json({
+      totalInvoices:   parseInt(row.total_invoices)    || 0,
+      paidTotal:       parseFloat(row.paid_total)      || 0,
+      overdueTotal:    parseFloat(row.overdue_total)   || 0,
+      totalAmount:     parseFloat(row.total_amount)    || 0,
+      totalCommission: parseFloat(row.total_commission) || 0,
+    });
+  } catch (error) {
+    console.error('Invoices stats error:', error);
+    res.status(500).json({ error: 'Failed to fetch stats', details: error.message });
+  }
+});
+
+// POST /api/invoices/sync — admin-triggered sync
+app.post('/api/invoices/sync', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    await autoSyncInvoices();
+    res.json({ success: true, message: 'Sync completed' });
+  } catch (error) {
+    res.status(500).json({ error: 'Sync failed', details: error.message });
+  }
+});
+
+// POST /api/invoices/incremental-sync
+app.post('/api/invoices/incremental-sync', authenticateToken, async (req, res) => {
+  try {
+    await autoSyncInvoices();
+    const countResult = await pool.query(
+      'SELECT COUNT(*) AS cnt FROM invoices WHERE organization_id = $1',
+      [process.env.ZOHO_ORG_ID]
+    );
+    res.json({ success: true, totalSynced: parseInt(countResult.rows[0].cnt) || 0, needsBulkImport: false });
+  } catch (error) {
+    res.status(500).json({ error: 'Incremental sync failed', details: error.message });
+  }
+});
+
+// POST /api/invoices/bulk-import
+app.post('/api/invoices/bulk-import', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    await autoSyncInvoices();
+    const countResult = await pool.query(
+      'SELECT COUNT(*) AS cnt FROM invoices WHERE organization_id = $1',
+      [process.env.ZOHO_ORG_ID]
+    );
+    res.json({ success: true, imported: parseInt(countResult.rows[0].cnt) || 0 });
+  } catch (error) {
+    res.status(500).json({ error: 'Bulk import failed', details: error.message });
+  }
+});
+
+// GET /api/invoices/:invoiceNumber/pdf
+app.get('/api/invoices/:invoiceNumber/pdf', authenticateToken, async (req, res) => {
+  res.status(501).json({ error: 'PDF download not yet implemented' });
+});
+
+// GET /api/invoices/:invoiceNumber/preview
+app.get('/api/invoices/:invoiceNumber/preview', (req, res) => {
+  res.status(501).send('<html><body style="font-family:sans-serif;padding:2rem"><p>Preview not yet implemented</p></body></html>');
+});
+
+// POST /api/invoices/:invoiceNumber/email
+app.post('/api/invoices/:invoiceNumber/email', authenticateToken, async (req, res) => {
+  res.status(501).json({ error: 'Email sending not yet implemented' });
+});
+
+// ============================================================================
+// SALESPEOPLE
+// ============================================================================
+
+// GET /api/salespeople — names for dropdown filters
+app.get('/api/salespeople', authenticateToken, async (req, res) => {
+  try {
+    const spResult = await pool.query('SELECT name FROM salespeople ORDER BY name');
+    if (spResult.rows.length > 0) {
+      return res.json({ salespeople: spResult.rows.map(r => r.name) });
+    }
+    const invResult = await pool.query(
+      `SELECT DISTINCT salesperson_name FROM invoices
+       WHERE organization_id = $1 AND salesperson_name IS NOT NULL
+         AND salesperson_name != 'Unassigned'
+       ORDER BY salesperson_name`,
+      [process.env.ZOHO_ORG_ID]
+    );
+    res.json({ salespeople: invResult.rows.map(r => r.salesperson_name) });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch salespeople', details: error.message });
+  }
+});
+
+// GET /api/salespeople/all — full records with stats (admin)
+app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    // Auto-register reps from invoices
+    await pool.query(`
+      INSERT INTO salespeople (name)
+      SELECT DISTINCT salesperson_name FROM invoices
+      WHERE salesperson_name IS NOT NULL AND salesperson_name != 'Unassigned'
+        AND salesperson_name NOT IN (SELECT name FROM salespeople)
+      ON CONFLICT (name) DO NOTHING
+    `);
+    // Update invoice counts
+    await pool.query(`
+      UPDATE salespeople sp SET invoice_count = (
+        SELECT COUNT(*) FROM invoices i
+        WHERE i.salesperson_name = sp.name AND i.organization_id = $1 AND i.status = 'paid'
+      )
+    `, [process.env.ZOHO_ORG_ID]);
+
+    const result = await pool.query(
+      `SELECT name, is_active, commission_rate, base_salary, invoice_count
+       FROM salespeople ORDER BY name`
+    );
+    res.json({
+      salespeople: result.rows.map(r => ({
+        name:           r.name,
+        isActive:       r.is_active,
+        commissionRate: parseFloat(r.commission_rate) || 10,
+        baseSalary:     parseFloat(r.base_salary)     || 0,
+        invoiceCount:   parseInt(r.invoice_count)     || 0,
+      }))
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch salespeople', details: error.message });
+  }
+});
+
+// PUT /api/salespeople/:name/status
+app.put('/api/salespeople/:name/status', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const { isActive } = req.body;
+  try {
+    await pool.query(
+      `INSERT INTO salespeople (name, is_active) VALUES ($1, $2)
+       ON CONFLICT (name) DO UPDATE SET is_active = $2, updated_at = CURRENT_TIMESTAMP`,
+      [req.params.name, isActive]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update status', details: error.message });
+  }
+});
+
+// PUT /api/salespeople/:name/commission-rate
+app.put('/api/salespeople/:name/commission-rate', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const { commissionRate } = req.body;
+  try {
+    await pool.query(
+      `INSERT INTO salespeople (name, commission_rate) VALUES ($1, $2)
+       ON CONFLICT (name) DO UPDATE SET commission_rate = $2, updated_at = CURRENT_TIMESTAMP`,
+      [req.params.name, parseFloat(commissionRate) || 10]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update commission rate', details: error.message });
+  }
+});
+
+// PUT /api/salespeople/:name/base-salary
+app.put('/api/salespeople/:name/base-salary', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const { baseSalary } = req.body;
+  try {
+    await pool.query(
+      `INSERT INTO salespeople (name, base_salary) VALUES ($1, $2)
+       ON CONFLICT (name) DO UPDATE SET base_salary = $2, updated_at = CURRENT_TIMESTAMP`,
+      [req.params.name, parseFloat(baseSalary) || 0]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update base salary', details: error.message });
+  }
+});
+
+// ============================================================================
+// ADMIN USERS
+// ============================================================================
+
+// GET /api/admin/users
+app.get('/api/admin/users', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const result = await pool.query(
+      `SELECT email, is_admin, created_at, updated_at AS last_login
+       FROM user_tokens ORDER BY created_at DESC`
+    );
+    res.json({
+      users: result.rows.map(r => ({
+        email:     r.email,
+        isAdmin:   r.is_admin,
+        createdAt: r.created_at,
+        lastLogin: r.last_login,
+      }))
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch users', details: error.message });
+  }
+});
+
+// PUT /api/admin/users/:email/admin
+app.put('/api/admin/users/:email/admin', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const targetEmail = decodeURIComponent(req.params.email);
+  const { makeAdmin } = req.body;
+  if (targetEmail === req.user.email && !makeAdmin) {
+    return res.status(400).json({ error: 'Cannot remove your own admin status' });
+  }
+  try {
+    await pool.query(
+      `UPDATE user_tokens SET is_admin = $1, updated_at = CURRENT_TIMESTAMP WHERE email = $2`,
+      [makeAdmin, targetEmail]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update admin status', details: error.message });
+  }
+});
+
+// ============================================================================
+// EXCLUDED CUSTOMERS
+// ============================================================================
+
+// GET /api/excluded-customers
+app.get('/api/excluded-customers', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const result = await pool.query(
+      `SELECT id, customer_name, excluded_by, created_at FROM excluded_customers
+       WHERE organization_id = $1 ORDER BY customer_name`,
+      [process.env.ZOHO_ORG_ID]
+    );
+    res.json({ excludedCustomers: result.rows });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch excluded customers', details: error.message });
+  }
+});
+
+// POST /api/excluded-customers
+app.post('/api/excluded-customers', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const { customerName } = req.body;
+  if (!customerName) return res.status(400).json({ error: 'customerName required' });
+  try {
+    await pool.query(
+      `INSERT INTO excluded_customers (customer_name, excluded_by, organization_id)
+       VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+      [customerName, req.user.email, process.env.ZOHO_ORG_ID]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to exclude customer', details: error.message });
+  }
+});
+
+// DELETE /api/excluded-customers/:id
+app.delete('/api/excluded-customers/:id', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    await pool.query(`DELETE FROM excluded_customers WHERE id = $1`, [req.params.id]);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to remove exclusion', details: error.message });
+  }
+});
+
+// GET /api/customers/search?q=
+app.get('/api/customers/search', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const { q } = req.query;
+  if (!q || q.length < 2) return res.json({ customers: [] });
+  try {
+    const result = await pool.query(
+      `SELECT
+         customer_name AS name,
+         COUNT(*) AS invoice_count,
+         COALESCE(SUM(total), 0) AS total_spent
+       FROM invoices
+       WHERE organization_id = $1 AND customer_name ILIKE $2
+         AND (customer_name NOT IN (
+           SELECT customer_name FROM excluded_customers WHERE organization_id = $1
+         ) OR customer_name IS NULL)
+       GROUP BY customer_name ORDER BY total_spent DESC LIMIT 20`,
+      [process.env.ZOHO_ORG_ID, `%${q}%`]
+    );
+    res.json({
+      customers: result.rows.map(r => ({
+        name:         r.name,
+        invoiceCount: parseInt(r.invoice_count),
+        totalSpent:   parseFloat(r.total_spent),
+      }))
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Customer search failed', details: error.message });
+  }
+});
+
+// ============================================================================
+// SYNC STATUS
+// ============================================================================
+
+// GET /api/sync/status
+app.get('/api/sync/status', authenticateToken, async (req, res) => {
+  try {
+    const logResult = await pool.query(
+      `SELECT synced_at, invoice_count, status, message FROM sync_log
+       WHERE organization_id = $1 ORDER BY synced_at DESC LIMIT 1`,
+      [process.env.ZOHO_ORG_ID]
+    );
+    const countResult = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM invoices WHERE organization_id = $1`,
+      [process.env.ZOHO_ORG_ID]
+    );
+    const last = logResult.rows[0];
+    res.json({
+      lastSyncAt:    last?.synced_at    || null,
+      lastSyncCount: last?.invoice_count || 0,
+      status:        last?.status        || 'never',
+      totalInvoices: parseInt(countResult.rows[0].cnt) || 0,
+      message:       last?.message       || null,
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to get sync status', details: error.message });
+  }
+});
+
+// ============================================================================
+// COMMISSIONS REPORT
+// ============================================================================
+
+// GET /api/commissions/report?year=&repName=&month=
+app.get('/api/commissions/report', authenticateToken, async (req, res) => {
+  const { email, isAdmin, name: jwtName } = req.user;
+  const { year, repName, month } = req.query;
+  const targetYear = year || new Date().getFullYear().toString();
+
+  try {
+    const tokenResult = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
+    const myName    = tokenResult.rows[0]?.display_name || jwtName || email;
+    const targetRep = isAdmin ? (repName || myName) : myName;
+
+    const spResult = await pool.query('SELECT commission_rate FROM salespeople WHERE name = $1', [targetRep]);
+    const commissionRate = parseFloat(spResult.rows[0]?.commission_rate) || 10;
+
+    const startDate = new Date(`${targetYear}-01-01`);
+    const endDate   = new Date(`${targetYear}-12-31T23:59:59.999`);
+
+    const monthlyResult = await pool.query(`
+      SELECT
+        EXTRACT(MONTH FROM date) AS month_num,
+        COUNT(*) AS invoices,
+        COALESCE(SUM(total), 0) AS revenue,
+        COALESCE(SUM(commission), 0) AS commission,
+        COALESCE(SUM(CASE WHEN commission_paid THEN commission ELSE 0 END), 0) AS paid_commission,
+        COALESCE(SUM(CASE WHEN status = 'paid' THEN total ELSE 0 END), 0) AS paid_revenue,
+        COUNT(CASE WHEN commission_paid THEN 1 END) AS commission_paid_count,
+        COUNT(CASE WHEN status = 'paid'    THEN 1 END) AS commission_qualifying_count
+      FROM invoices
+      WHERE salesperson_name = $1 AND organization_id = $2 AND date >= $3 AND date <= $4
+      GROUP BY EXTRACT(MONTH FROM date) ORDER BY month_num
+    `, [targetRep, process.env.ZOHO_ORG_ID, startDate, endDate]);
+
+    const mMap = {};
+    monthlyResult.rows.forEach(r => { mMap[parseInt(r.month_num)] = r; });
+    const months = Array.from({ length: 12 }, (_, i) => {
+      const m = mMap[i + 1] || {};
+      return {
+        month:                    i + 1,
+        invoices:                 parseInt(m.invoices)                    || 0,
+        revenue:                  parseFloat(m.revenue)                  || 0,
+        commission:               parseFloat(m.commission)               || 0,
+        paidCommission:           parseFloat(m.paid_commission)          || 0,
+        paidRevenue:              parseFloat(m.paid_revenue)             || 0,
+        commissionPaidCount:      parseInt(m.commission_paid_count)      || 0,
+        commissionQualifyingCount: parseInt(m.commission_qualifying_count) || 0,
+      };
+    });
+
+    const customerResult = await pool.query(`
+      SELECT COALESCE(customer_name, 'Unknown') AS customer_name,
+             COUNT(*) AS invoices,
+             COALESCE(SUM(total), 0) AS revenue,
+             COALESCE(SUM(commission), 0) AS commission
+      FROM invoices
+      WHERE salesperson_name = $1 AND organization_id = $2
+        AND date >= $3 AND date <= $4 AND status = 'paid'
+      GROUP BY customer_name ORDER BY revenue DESC LIMIT 20
+    `, [targetRep, process.env.ZOHO_ORG_ID, startDate, endDate]);
+
+    const currentMonthNum  = new Date().getMonth();  // 0-indexed
+    const currentMonthData = months[currentMonthNum];
+    const ytdCommission    = months.reduce((s, m) => s + m.commission, 0);
+    const ytdRevenue       = months.reduce((s, m) => s + m.revenue,    0);
+    const ytdInvoices      = months.reduce((s, m) => s + m.invoices,   0);
+
+    res.json({
+      repName: targetRep,
+      commissionRate,
+      year: targetYear,
+      months,
+      customers: customerResult.rows.map(r => ({
+        customerName: r.customer_name,
+        invoices:     parseInt(r.invoices),
+        revenue:      parseFloat(r.revenue),
+        commission:   parseFloat(r.commission),
+      })),
+      summary: {
+        currentMonth: {
+          commission: currentMonthData.commission,
+          revenue:    currentMonthData.paidRevenue,
+          invoices:   currentMonthData.invoices,
+        },
+        ytd: { commission: ytdCommission, revenue: ytdRevenue, invoices: ytdInvoices },
+      },
+    });
+  } catch (error) {
+    console.error('Commission report error:', error);
+    res.status(500).json({ error: 'Failed to fetch commission report', details: error.message });
+  }
+});
+
+// GET /api/commissions/invoices?repName=&year=&month=
+app.get('/api/commissions/invoices', authenticateToken, async (req, res) => {
+  const { email, isAdmin, name: jwtName } = req.user;
+  const { repName, year, month } = req.query;
+  try {
+    const tokenResult = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
+    const myName    = tokenResult.rows[0]?.display_name || jwtName || email;
+    const targetRep = isAdmin ? (repName || myName) : myName;
+    const targetYear = year || new Date().getFullYear().toString();
+
+    let startDate, endDate;
+    if (month && month !== 'all') {
+      startDate = new Date(`${targetYear}-${String(month).padStart(2, '0')}-01`);
+      endDate   = new Date(startDate);
+      endDate.setMonth(endDate.getMonth() + 1);
+    } else {
+      startDate = new Date(`${targetYear}-01-01`);
+      endDate   = new Date(`${targetYear}-12-31T23:59:59.999`);
+    }
+
+    const result = await pool.query(`
+      SELECT invoice_number, customer_name, date, total, commission, status, commission_paid
+      FROM invoices
+      WHERE salesperson_name = $1 AND organization_id = $2 AND date >= $3 AND date < $4
+      ORDER BY date DESC
+    `, [targetRep, process.env.ZOHO_ORG_ID, startDate, endDate]);
+
+    res.json({
+      invoices: result.rows.map(r => ({
+        invoiceNumber:  r.invoice_number,
+        customerName:   r.customer_name || 'Unknown',
+        date:           r.date,
+        total:          parseFloat(r.total),
+        commission:     parseFloat(r.commission),
+        status:         r.status,
+        commissionPaid: r.commission_paid || false,
+      }))
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch commission invoices', details: error.message });
+  }
+});
+
+// POST /api/commissions/approve
+app.post('/api/commissions/approve', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const { invoiceNumbers } = req.body;
+  try {
+    if (Array.isArray(invoiceNumbers) && invoiceNumbers.length > 0) {
+      await pool.query(
+        `UPDATE invoices SET commission_paid = true, updated_at = CURRENT_TIMESTAMP
+         WHERE invoice_number = ANY($1)`,
+        [invoiceNumbers]
+      );
+    }
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to approve commissions', details: error.message });
+  }
+});
+
+// POST /api/commissions/unapprove
+app.post('/api/commissions/unapprove', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const { invoiceNumbers } = req.body;
+  try {
+    if (Array.isArray(invoiceNumbers) && invoiceNumbers.length > 0) {
+      await pool.query(
+        `UPDATE invoices SET commission_paid = false, updated_at = CURRENT_TIMESTAMP
+         WHERE invoice_number = ANY($1)`,
+        [invoiceNumbers]
+      );
+    }
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to unapprove commissions', details: error.message });
+  }
+});
+
+// Recalculate job state
+let recalcJob = { status: 'idle', processed: 0, total: 0, message: '' };
+
+// POST /api/commissions/recalculate
+app.post('/api/commissions/recalculate', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  if (recalcJob.status === 'running') return res.status(409).json({ error: 'Already running' });
+
+  recalcJob = { status: 'running', processed: 0, total: 0, message: 'Starting...' };
+  res.json({ success: true, message: 'Recalculation started' });
+
+  (async () => {
+    try {
+      const countRes = await pool.query(
+        'SELECT COUNT(*) AS cnt FROM invoices WHERE organization_id = $1',
+        [process.env.ZOHO_ORG_ID]
+      );
+      recalcJob.total = parseInt(countRes.rows[0].cnt) || 0;
+
+      const spRes = await pool.query('SELECT name, commission_rate FROM salespeople');
+      const rateMap = {};
+      spRes.rows.forEach(r => { rateMap[r.name] = parseFloat(r.commission_rate) || 10; });
+
+      const invRes = await pool.query(
+        'SELECT id, salesperson_name, total, status FROM invoices WHERE organization_id = $1',
+        [process.env.ZOHO_ORG_ID]
+      );
+      for (const inv of invRes.rows) {
+        if (recalcJob.status === 'stopping') break;
+        const rate       = rateMap[inv.salesperson_name] || 10;
+        const commission = inv.status === 'paid' ? (parseFloat(inv.total) * rate / 100) : 0;
+        await pool.query(
+          'UPDATE invoices SET commission = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+          [commission, inv.id]
+        );
+        recalcJob.processed++;
+        recalcJob.message = `Processed ${recalcJob.processed} of ${recalcJob.total}`;
+      }
+      recalcJob.status  = recalcJob.status === 'stopping' ? 'stopped' : 'completed';
+      recalcJob.message = `Recalculated ${recalcJob.processed} invoices`;
+    } catch (error) {
+      recalcJob.status  = 'error';
+      recalcJob.message = error.message;
+    }
+  })();
+});
+
+// POST /api/commissions/recalculate/stop
+app.post('/api/commissions/recalculate/stop', authenticateToken, async (req, res) => {
+  if (recalcJob.status === 'running') recalcJob.status = 'stopping';
+  res.json({ success: true });
+});
+
+// GET /api/commissions/recalculate/status
+app.get('/api/commissions/recalculate/status', authenticateToken, async (req, res) => {
+  res.json(recalcJob);
+});
+
+// ============================================================================
+// RELEASES MANAGEMENT
+// ============================================================================
+
+// GET /api/releases
+app.get('/api/releases', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM releases ORDER BY date DESC LIMIT 50');
+    res.json({ releases: result.rows });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch releases', details: error.message });
+  }
+});
+
+// GET /api/releases/generate-notes — stub (returns template)
+app.get('/api/releases/generate-notes', authenticateToken, async (req, res) => {
+  res.json({
+    notes: '## ✨ New Features\n- \n\n## 🎨 UI Improvements\n- \n\n## 🔧 Bug Fixes\n- \n',
+    commitCount: 0,
+    sinceTag: '',
+  });
+});
+
+// GET /api/releases/workflow-status
+app.get('/api/releases/workflow-status', authenticateToken, async (req, res) => {
+  res.json({ status: 'completed', conclusion: 'success' });
+});
+
+// POST /api/releases/create
+app.post('/api/releases/create', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const { version, releaseNotes } = req.body;
+  if (!version) return res.status(400).json({ error: 'Version required' });
+  try {
+    await pool.query(
+      `INSERT INTO releases (version, name, notes, url, date)
+       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)`,
+      [`v${version}`, `v${version}`, releaseNotes || '', `https://github.com/releases/v${version}`]
+    );
+    res.json({ success: true, version });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to create release', details: error.message });
   }
 });
 
@@ -1010,15 +1989,25 @@ app.listen(PORT, () => {
   console.log(`📚 Zoho Books Organization ID: ${process.env.ZOHO_ORG_ID}`);
   console.log(`🔐 Frontend redirect: ${process.env.FRONTEND_URL}`);
   console.log(`🗄️  Database connected: ${process.env.DATABASE_URL ? 'Yes' : 'No'}`);
-  
-  // Start automatic invoice sync
-  // startAutoSync();  // Commented out - function not defined yet
+
+  // Wait for DB to be ready before starting auto-sync (up to 30 seconds)
+  const waitForDb = (attempts = 0) => {
+    if (dbReady) {
+      startAutoSync();
+    } else if (attempts < 30) {
+      setTimeout(() => waitForDb(attempts + 1), 1000);
+    } else {
+      console.warn('⚠️ DB not ready after 30s, starting sync anyway');
+      startAutoSync();
+    }
+  };
+  waitForDb();
 });
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('Shutting down gracefully...');
-  // stopAutoSync();  // Commented out - function not defined yet
+  stopAutoSync();
   await pool.end();
   process.exit(0);
 });
