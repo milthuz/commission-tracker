@@ -121,7 +121,8 @@ app.get('/api/auth/zoho', (req, res) => {
   const state = Math.random().toString(36).substring(7);
   
   const authUrl = `${ZOHO_CONFIG.accounts_url}/oauth/v2/auth?` +
-    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE` +
+    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE,` +
+    `ZohoCRM.modules.Deals.READ,ZohoCRM.modules.Contacts.READ,ZohoCRM.settings.fields.READ` +
     `&client_id=${ZOHO_CONFIG.client_id}` +
     `&response_type=code` +
     `&redirect_uri=${ZOHO_CONFIG.redirect_uri}` +
@@ -280,6 +281,62 @@ app.get('/api/auth/verify', authenticateToken, (req, res) => {
       zoho_id: req.user.zoho_id || req.user.email
     }
   });
+});
+
+// ============================================================================
+// ZOHO CRM ROUTES
+// ============================================================================
+
+const ZohoCRMService = require('./services/zohoCRMService');
+
+// GET /api/crm/deals — fetch all deals from Zoho CRM
+app.get('/api/crm/deals', authenticateToken, async (req, res) => {
+  try {
+    const { email } = req.user;
+    const tokenData = await ensureValidToken(email);
+    const crm = new ZohoCRMService(tokenData.access_token);
+    const result = await crm.getDeals({ perPage: 200 });
+    const deals = (result.data || []).map(d => crm.transformDeal(d));
+    res.json({ deals, count: deals.length });
+  } catch (error) {
+    console.error('CRM deals error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Failed to fetch CRM deals', details: error.message });
+  }
+});
+
+// GET /api/crm/deals/sold — fetch only SOLD deals (Deposit Information Received)
+app.get('/api/crm/deals/sold', authenticateToken, async (req, res) => {
+  try {
+    const { email } = req.user;
+    const tokenData = await ensureValidToken(email);
+    const crm = new ZohoCRMService(tokenData.access_token);
+    const result = await crm.getSoldDeals();
+    const deals = (result.data || []).map(d => crm.transformDeal(d));
+    res.json({ deals, count: deals.length });
+  } catch (error) {
+    console.error('CRM sold deals error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Failed to fetch sold deals', details: error.message });
+  }
+});
+
+// GET /api/crm/fields — inspect all Deal field names (useful for setup)
+app.get('/api/crm/fields', authenticateToken, async (req, res) => {
+  try {
+    const { email } = req.user;
+    const tokenData = await ensureValidToken(email);
+    const crm = new ZohoCRMService(tokenData.access_token);
+    const fields = await crm.getDealFields();
+    // Return just name + label + data_type for readability
+    const simplified = fields.map(f => ({
+      api_name: f.api_name,
+      label: f.field_label,
+      type: f.data_type,
+    }));
+    res.json({ fields: simplified, count: simplified.length });
+  } catch (error) {
+    console.error('CRM fields error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Failed to fetch CRM fields', details: error.message });
+  }
 });
 
 // ============================================================================
