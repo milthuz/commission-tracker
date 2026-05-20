@@ -290,14 +290,18 @@ app.get('/api/auth/callback', async (req, res) => {
 
     console.log('User Email:', userEmail);
     console.log('User Name:', userName);
-    // Fetch the actual profile photo from Zoho's dedicated photo endpoint
+    // Fetch the actual profile photo from Zoho Contacts (confirmed working endpoint)
     let userPhoto = null;
+    const ZUID = userInfo.ZUID;
     const photoEndpoints = [
-      // Try the ZUID-based endpoint first
-      `${accountsUrl}/api/v1/user/${userInfo.ZUID}/photo`,
-      // Then the self endpoint
+      // ✅ Confirmed working: contacts.zoho.com thumbnail by ZUID
+      ZUID ? `https://contacts.zoho.com/file?t=user&fs=thumb&ID=${ZUID}` : null,
+      // Fallback: full-size contacts photo
+      ZUID ? `https://contacts.zoho.com/file?t=user&fs=original&ID=${ZUID}` : null,
+      // Legacy accounts endpoints (usually 404 but try anyway)
+      `${accountsUrl}/api/v1/user/${ZUID}/photo`,
       `${accountsUrl}/api/v1/user/self/photo`,
-      // Then the profile_photo_url if Zoho provided one
+      // profile_photo_url from user info if present
       userInfo.profile_photo_url,
     ].filter(Boolean);
 
@@ -313,8 +317,10 @@ app.get('/api/auth/callback', async (req, res) => {
         if (contentType.startsWith('image/')) {
           const b64 = Buffer.from(photoRes.data).toString('base64');
           userPhoto = `data:${contentType};base64,${b64}`;
-          console.log(`✅ Profile photo fetched from ${photoUrl}`);
+          console.log(`✅ Profile photo fetched (${photoRes.data.length} bytes) from ${photoUrl}`);
           break;
+        } else {
+          console.log(`⚠️ Non-image response from ${photoUrl}: ${contentType}`);
         }
       } catch (photoErr) {
         console.log(`⚠️ Photo not found at ${photoUrl}: ${photoErr.message}`);
@@ -423,6 +429,55 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
         isAdmin: req.user.isAdmin || false,
       }
     });
+  }
+});
+
+// 5. Force-refresh profile photo from Zoho (no re-login needed)
+app.post('/api/auth/refresh-photo', authenticateToken, async (req, res) => {
+  try {
+    const tokenResult = await pool.query(
+      'SELECT access_token FROM user_tokens WHERE email = $1',
+      [req.user.email]
+    );
+    const row = tokenResult.rows[0];
+    if (!row) return res.status(404).json({ error: 'User not found' });
+
+    const accessToken = row.access_token;
+    const ZUID = req.user.zoho_id;
+
+    const photoEndpoints = [
+      ZUID ? `https://contacts.zoho.com/file?t=user&fs=thumb&ID=${ZUID}` : null,
+      ZUID ? `https://contacts.zoho.com/file?t=user&fs=original&ID=${ZUID}` : null,
+    ].filter(Boolean);
+
+    let userPhoto = null;
+    for (const photoUrl of photoEndpoints) {
+      try {
+        const photoRes = await axios.get(photoUrl, {
+          headers: { 'Authorization': `Zoho-oauthtoken ${accessToken}` },
+          responseType: 'arraybuffer',
+          timeout: 8000,
+        });
+        const contentType = photoRes.headers['content-type'] || 'image/jpeg';
+        if (contentType.startsWith('image/')) {
+          const b64 = Buffer.from(photoRes.data).toString('base64');
+          userPhoto = `data:${contentType};base64,${b64}`;
+          console.log(`✅ Photo refreshed (${photoRes.data.length} bytes) for ${req.user.email}`);
+          break;
+        }
+      } catch (e) {
+        console.log(`⚠️ Photo refresh failed at ${photoUrl}: ${e.message}`);
+      }
+    }
+
+    if (userPhoto) {
+      await pool.query('UPDATE user_tokens SET photo = $1, updated_at = CURRENT_TIMESTAMP WHERE email = $2', [userPhoto, req.user.email]);
+      res.json({ success: true, message: 'Photo updated successfully' });
+    } else {
+      res.status(404).json({ success: false, message: 'Could not fetch photo from Zoho' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -2079,9 +2134,11 @@ app.get('/api/debug/photo', authenticateToken, async (req, res) => {
 
     // --- IMAGE endpoints (try as binary) ---
     const imageEndpoints = [
+      // ✅ Confirmed working pattern
+      ZUID ? `https://contacts.zoho.com/file?t=user&fs=thumb&ID=${ZUID}` : null,
+      ZUID ? `https://contacts.zoho.com/file?t=user&fs=original&ID=${ZUID}` : null,
       `https://accounts.zoho.com/api/v1/user/${ZUID}/photo`,
       `https://accounts.zoho.com/api/v1/user/self/photo`,
-      `https://contacts.zoho.com/api/v1/user/${ZUID}/photo`,
       zohoUserInfo?.profile_photo_url,
     ].filter(Boolean);
 
