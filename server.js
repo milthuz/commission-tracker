@@ -511,9 +511,8 @@ app.get('/api/auth/crm-status', authenticateToken, async (req, res) => {
 // GET /api/crm/deals — fetch all deals from Zoho CRM
 app.get('/api/crm/deals', authenticateToken, async (req, res) => {
   try {
-    const { email } = req.user;
-    const tokenData = await ensureValidToken(email);
-    const crm = new ZohoCRMService(tokenData.access_token);
+    const crmToken = await ensureValidCrmToken();
+    const crm = new ZohoCRMService(crmToken);
     const result = await crm.getDeals({ perPage: 200 });
     const deals = (result.data || []).map(d => crm.transformDeal(d));
     res.json({ deals, count: deals.length });
@@ -526,9 +525,8 @@ app.get('/api/crm/deals', authenticateToken, async (req, res) => {
 // GET /api/crm/deals/sold — fetch only SOLD deals (Deposit Information Received)
 app.get('/api/crm/deals/sold', authenticateToken, async (req, res) => {
   try {
-    const { email } = req.user;
-    const tokenData = await ensureValidToken(email);
-    const crm = new ZohoCRMService(tokenData.access_token);
+    const crmToken = await ensureValidCrmToken();
+    const crm = new ZohoCRMService(crmToken);
     const result = await crm.getSoldDeals();
     const deals = (result.data || []).map(d => crm.transformDeal(d));
     res.json({ deals, count: deals.length });
@@ -541,11 +539,9 @@ app.get('/api/crm/deals/sold', authenticateToken, async (req, res) => {
 // GET /api/crm/fields — inspect all Deal field names (useful for setup)
 app.get('/api/crm/fields', authenticateToken, async (req, res) => {
   try {
-    const { email } = req.user;
-    const tokenData = await ensureValidToken(email);
-    const crm = new ZohoCRMService(tokenData.access_token);
+    const crmToken = await ensureValidCrmToken();
+    const crm = new ZohoCRMService(crmToken);
     const fields = await crm.getDealFields();
-    // Return just name + label + data_type for readability
     const simplified = fields.map(f => ({
       api_name: f.api_name,
       label: f.field_label,
@@ -795,6 +791,63 @@ async function ensureValidToken(email) {
   }
 
   return tokenData;
+}
+
+// ============================================================================
+// CRM TOKEN HELPER - Get and auto-refresh CRM access token
+// ============================================================================
+
+async function ensureValidCrmToken() {
+  const result = await pool.query(
+    `SELECT crm_access_token, crm_refresh_token, crm_expires_at
+     FROM user_tokens WHERE is_admin = true AND crm_access_token IS NOT NULL
+     ORDER BY updated_at DESC LIMIT 1`
+  );
+
+  if (!result.rows.length) {
+    throw new Error('CRM not connected. Please connect Zoho CRM in the Admin Panel.');
+  }
+
+  let row = result.rows[0];
+  const expiresAt = row.crm_expires_at ? parseInt(row.crm_expires_at) : null;
+
+  // Refresh if expired or expiring within 5 minutes
+  if (expiresAt && expiresAt < Date.now() + 5 * 60 * 1000) {
+    if (!row.crm_refresh_token) {
+      console.log('⚠️ CRM token expired but no refresh token available');
+      return row.crm_access_token;
+    }
+
+    console.log('🔄 Refreshing CRM token...');
+    try {
+      const refreshRes = await axios.post(
+        'https://accounts.zoho.com/oauth/v2/token',
+        new URLSearchParams({
+          grant_type: 'refresh_token',
+          client_id: process.env.ZOHO_CLIENT_ID,
+          client_secret: process.env.ZOHO_CLIENT_SECRET,
+          refresh_token: row.crm_refresh_token,
+        }),
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+      );
+
+      const newToken = refreshRes.data.access_token;
+      const newExpiry = Date.now() + (parseInt(refreshRes.data.expires_in) || 3600) * 1000;
+
+      await pool.query(
+        `UPDATE user_tokens SET crm_access_token = $1, crm_expires_at = $2, updated_at = CURRENT_TIMESTAMP
+         WHERE is_admin = true`,
+        [newToken, newExpiry]
+      );
+
+      console.log('✅ CRM token refreshed');
+      return newToken;
+    } catch (err) {
+      console.error('❌ CRM token refresh failed:', err.message);
+    }
+  }
+
+  return row.crm_access_token;
 }
 
 // ============================================================================
