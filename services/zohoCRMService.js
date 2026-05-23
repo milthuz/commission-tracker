@@ -53,10 +53,8 @@ class ZohoCRMService {
     }
   }
 
-  // Get all SOLD deals — any deal that has a Deposit_Information_Received date set.
-  // We search by this custom date field (not Stage) because deals often move past
-  // "Deposit Information Received" to a final closed stage, which would exclude them
-  // from a Stage-based filter.
+  // Get all SOLD deals — searches by Stage AND fetches the Deposit_Information_Received
+  // custom date field which records the exact date the deal reached that stage.
   // Fetches all pages to handle large datasets.
   async getSoldDeals(params = {}) {
     try {
@@ -68,7 +66,7 @@ class ZohoCRMService {
         const response = await axios.get(`${CRM_BASE_URL}/Deals/search`, {
           headers: this.headers,
           params: {
-            criteria: `(Deposit_Information_Received:greater_than:2020-01-01)`,
+            criteria: `(Stage:equals:Deposit Information Received)`,
             per_page: 200,
             page,
             fields: 'Deal_Name,Stage,Owner,Closing_Date,Deposit_Information_Received,Lead_Source_Group,Account_Name,Amount,Created_Time,Modified_Time',
