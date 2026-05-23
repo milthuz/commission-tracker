@@ -673,6 +673,74 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/crm/sold-deals-db — show everything in the crm_sold_deals table
+// Useful to audit what sold_date each deal was stamped with
+app.get('/api/crm/sold-deals-db', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const result = await pool.query(`
+      SELECT deal_id, deal_name, owner_name, lead_source_group, points,
+             sold_date, closing_date_crm, first_seen_at
+      FROM crm_sold_deals
+      ORDER BY sold_date DESC
+    `);
+
+    // Group by month so it's easy to read
+    const byMonth = {};
+    for (const row of result.rows) {
+      const key = row.sold_date ? row.sold_date.toISOString().slice(0, 7) : 'unknown';
+      if (!byMonth[key]) byMonth[key] = [];
+      byMonth[key].push({
+        deal_name:        row.deal_name,
+        owner:            row.owner_name,
+        lead_source_group: row.lead_source_group,
+        points:           row.points,
+        sold_date:        row.sold_date,
+        closing_date_crm: row.closing_date_crm,
+        first_seen_at:    row.first_seen_at,
+      });
+    }
+
+    res.json({
+      total: result.rows.length,
+      by_month: byMonth,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/crm/sold-deals-db/reset — wipe the table and re-sync from CRM
+// Use this if the initial import landed deals in the wrong months
+app.post('/api/crm/sold-deals-db/reset', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    await pool.query('TRUNCATE TABLE crm_sold_deals');
+    const crmToken = await ensureValidCrmToken();
+    const crm = new ZohoCRMService(crmToken);
+    const syncResult = await syncCrmSoldDeals(crm);
+    res.json({ success: true, message: 'Table reset and re-synced', ...syncResult });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PATCH /api/crm/sold-deals-db/:dealId — manually correct a deal's sold_date
+app.patch('/api/crm/sold-deals-db/:dealId', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const { soldDate } = req.body; // expects "YYYY-MM-DD"
+  if (!soldDate) return res.status(400).json({ error: 'soldDate required (YYYY-MM-DD)' });
+  try {
+    await pool.query(
+      'UPDATE crm_sold_deals SET sold_date = $1, updated_at = CURRENT_TIMESTAMP WHERE deal_id = $2',
+      [soldDate, req.params.dealId]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // GET /api/crm/debug — inspect raw deal data to diagnose missing fields / date issues
 // Usage: /api/crm/debug?year=2026&month=5
 app.get('/api/crm/debug', authenticateToken, async (req, res) => {
