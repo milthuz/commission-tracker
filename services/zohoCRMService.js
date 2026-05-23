@@ -53,11 +53,37 @@ class ZohoCRMService {
     }
   }
 
-  // Get all SOLD deals — searches by Stage AND fetches the Deposit_Information_Received
-  // custom date field which records the exact date the deal reached that stage.
-  // Fetches all pages to handle large datasets.
+  // Get all SOLD deals — any deal that has a Deposit_Information_Received date set,
+  // regardless of current stage (deals may have moved past that stage to a final state).
+  // Uses COQL (CRM Object Query Language) which supports NULL checks on date fields.
+  // Falls back to Stage-based search if COQL fails.
   async getSoldDeals(params = {}) {
     try {
+      const allDeals = [];
+      let offset = 0;
+      const limit = 200;
+      let hasMore = true;
+
+      while (hasMore) {
+        const query = `SELECT id, Deal_Name, Stage, Owner, Closing_Date, Deposit_Information_Received, Lead_Source_Group, Account_Name, Amount, Created_Time, Modified_Time FROM Deals WHERE Deposit_Information_Received is not null LIMIT ${limit} OFFSET ${offset}`;
+
+        const response = await axios.post(`${CRM_BASE_URL}/coql`, { select_query: query }, {
+          headers: { ...this.headers, 'Content-Type': 'application/json' },
+        });
+
+        const deals = response.data?.data || [];
+        allDeals.push(...deals);
+
+        hasMore = response.data?.info?.more_records === true;
+        offset += limit;
+      }
+
+      console.log(`✅ COQL: fetched ${allDeals.length} sold deals`);
+      return { data: allDeals };
+    } catch (coqlError) {
+      console.warn('⚠️ COQL failed, falling back to Stage search:', coqlError.response?.data?.message || coqlError.message);
+
+      // Fallback: search by Stage (misses deals that moved past this stage)
       const allDeals = [];
       let page = 1;
       let hasMore = true;
@@ -80,10 +106,8 @@ class ZohoCRMService {
         page++;
       }
 
+      console.log(`✅ Fallback Stage search: fetched ${allDeals.length} sold deals`);
       return { data: allDeals };
-    } catch (error) {
-      console.error('CRM getSoldDeals error:', error.response?.data || error.message);
-      throw error;
     }
   }
 
