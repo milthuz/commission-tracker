@@ -81,7 +81,8 @@ class ZohoCRMService {
       console.log(`✅ COQL: fetched ${allDeals.length} sold deals`);
       return { data: allDeals };
     } catch (coqlError) {
-      console.warn('⚠️ COQL failed, falling back to Stage search:', coqlError.response?.data?.message || coqlError.message);
+      const errDetail = coqlError.response?.data || coqlError.message;
+      console.warn('⚠️ COQL failed (status:', coqlError.response?.status, ') — falling back to Stage search. Error:', JSON.stringify(errDetail));
 
       // Fallback: search by Stage (misses deals that moved past this stage)
       const allDeals = [];
