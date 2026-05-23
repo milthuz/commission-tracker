@@ -140,10 +140,11 @@ class ZohoCRMService {
       ''
     ).toLowerCase().trim();
 
-    if (sourceGroup === 'outbound') return 2;
-    if (sourceGroup === 'inbound') return 1;
-    if (sourceGroup === 'partners') return 1;
-    return 1; // default
+    // 2pts for any outbound deal
+    if (sourceGroup.includes('outbound')) return 2;
+
+    // 1pt for inbound, partner, or anything else
+    return 1;
   }
 
   // Calculate monthly bonus based on total points (not cumulative — highest tier wins)
