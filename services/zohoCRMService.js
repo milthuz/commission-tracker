@@ -88,15 +88,15 @@ class ZohoCRMService {
     }
   }
 
-  // Get SOLD deals filtered by a specific month and year
-  // Uses Modified_Time (when the deal was last updated / moved to this stage)
-  // rather than Closing_Date, which reps often leave at the original expected date
+  // Get SOLD deals filtered by a specific month and year (based on Closing_Date)
+  // NOTE: The /api/crm/points endpoint no longer uses this — it queries the
+  // crm_sold_deals DB table instead, which stores a stable sold_date per deal.
   async getSoldDealsByMonth(year, month) {
     const allDeals = await this.getSoldDeals();
     return (allDeals.data || []).filter(deal => {
-      const soldDate = deal.Modified_Time || deal.Closing_Date;
-      if (!soldDate) return false;
-      const d = new Date(soldDate);
+      const closeDate = deal.Closing_Date || deal.Created_Time;
+      if (!closeDate) return false;
+      const d = new Date(closeDate);
       return d.getFullYear() === year && d.getMonth() + 1 === month;
     });
   }

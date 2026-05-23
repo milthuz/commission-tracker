@@ -143,6 +143,26 @@ async function initializeDatabase() {
       );
     `);
 
+    // CRM sold deals — stores the date we first observed each deal as sold.
+    // sold_date is immutable once set: future CRM edits don't change it.
+    // Historical deals (existing on first sync) use Closing_Date from CRM.
+    // New deals use CURRENT_DATE (the date we first see them in "Deposit Information Received").
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS crm_sold_deals (
+        deal_id       VARCHAR(255) PRIMARY KEY,
+        deal_name     VARCHAR(500) DEFAULT '',
+        account_name  VARCHAR(500) DEFAULT '',
+        owner_name    VARCHAR(255) DEFAULT '',
+        lead_source_group VARCHAR(255) DEFAULT '',
+        points        INT DEFAULT 1,
+        sold_date     DATE NOT NULL,
+        closing_date_crm DATE,
+        amount        DECIMAL(12,2) DEFAULT 0,
+        first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
     console.log('✅ Database tables initialized');
   } catch (error) {
     console.error('Database initialization error:', error);
@@ -565,33 +585,74 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     const crmToken = await ensureValidCrmToken();
     const crm = new ZohoCRMService(crmToken);
 
-    // Fetch all SOLD deals for this month
-    const deals = await crm.getSoldDealsByMonth(year, month);
+    // Sync all sold deals to DB — stamps new deals with today, keeps existing sold_date
+    await syncCrmSoldDeals(crm);
+
+    // Query DB for deals in the requested month using the stable sold_date
+    const startDate = new Date(year, month - 1, 1);
+    const endDate   = new Date(year, month, 0); // last day of month
+
+    let dealsQuery = `
+      SELECT deal_id, deal_name, account_name, owner_name, lead_source_group, points, sold_date
+      FROM crm_sold_deals
+      WHERE sold_date >= $1 AND sold_date <= $2
+    `;
+    const dealsParams = [startDate, endDate];
+
+    if (repFilter) {
+      dealsQuery += ` AND LOWER(owner_name) LIKE $3`;
+      dealsParams.push(`%${repFilter}%`);
+    }
+    dealsQuery += ` ORDER BY sold_date DESC`;
+
+    const dealsResult = await pool.query(dealsQuery, dealsParams);
+    const deals = dealsResult.rows;
 
     // Build per-rep summary
-    let summary = crm.buildPointsSummary(deals);
-
-    // Filter to specific rep if requested
-    if (repFilter) {
-      summary = summary.filter(r => r.repName.toLowerCase().includes(repFilter));
+    const repMap = {};
+    for (const deal of deals) {
+      const rep = deal.owner_name || 'Unassigned';
+      if (!repMap[rep]) repMap[rep] = { repName: rep, totalPoints: 0, deals: [] };
+      repMap[rep].totalPoints += deal.points;
+      repMap[rep].deals.push({
+        crm_deal_id:       deal.deal_id,
+        deal_name:         deal.deal_name,
+        account_name:      deal.account_name,
+        lead_source_group: deal.lead_source_group,
+        points:            deal.points,
+        close_date:        deal.sold_date,
+      });
     }
 
-    // Annual points: count from PLAN_START_DATE (May 1, 2026) — comp plan v7.7 effective date
-    // Uses Modified_Time (actual stage-change date) same as monthly filter
-    const annualDeals = await crm.getSoldDeals();
+    let summary = Object.values(repMap).map(rep => {
+      const quotaMet = rep.totalPoints >= MONTHLY_QUOTA;
+      const monthlyBonus = ZohoCRMService.calculateMonthlyBonus(rep.totalPoints);
+      return {
+        repName:       rep.repName,
+        totalPoints:   rep.totalPoints,
+        quota:         MONTHLY_QUOTA,
+        quotaMet,
+        pointsToQuota: Math.max(0, MONTHLY_QUOTA - rep.totalPoints),
+        monthlyBonus,
+        bonusTier:     MONTHLY_BONUS_TIERS.find(t => rep.totalPoints >= t.points) || null,
+        nextBonusTier: MONTHLY_BONUS_TIERS.slice().reverse().find(t => rep.totalPoints < t.points) || null,
+        deals:         rep.deals,
+      };
+    }).sort((a, b) => b.totalPoints - a.totalPoints);
+
+    // Annual points: query DB from PLAN_START_DATE (May 1, 2026)
+    const annualResult = await pool.query(`
+      SELECT owner_name, SUM(points) AS annual_points
+      FROM crm_sold_deals
+      WHERE sold_date >= $1
+      GROUP BY owner_name
+    `, [PLAN_START_DATE]);
+
     const annualByRep = {};
-    for (const rawDeal of annualDeals.data || []) {
-      const deal = crm.transformDeal(rawDeal);
-      const soldDate = rawDeal.Modified_Time || rawDeal.Closing_Date;
-      if (!soldDate) continue;
-      const d = new Date(soldDate);
-      // Only count deals on or after the plan start date
-      if (d < PLAN_START_DATE) continue;
-      if (!annualByRep[deal.sales_rep_name]) annualByRep[deal.sales_rep_name] = 0;
-      annualByRep[deal.sales_rep_name] += deal.points;
+    for (const row of annualResult.rows) {
+      annualByRep[row.owner_name] = parseInt(row.annual_points) || 0;
     }
 
-    // Attach annual points + annual bonus to each rep
     summary = summary.map(rep => ({
       ...rep,
       annualPoints: annualByRep[rep.repName] || 0,
@@ -601,10 +662,10 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     res.json({
       year,
       month,
-      quota: MONTHLY_QUOTA,
+      quota:      MONTHLY_QUOTA,
       bonusTiers: MONTHLY_BONUS_TIERS,
       totalDeals: deals.length,
-      reps: summary,
+      reps:       summary,
     });
   } catch (error) {
     console.error('CRM points error:', error.response?.data || error.message);
@@ -881,6 +942,49 @@ function stopAutoSync() {
     clearInterval(syncInterval);
     console.log('⏹️ [AUTO-SYNC] Stopped automatic sync scheduler');
   }
+}
+
+// ============================================================================
+// CRM SOLD DEALS SYNC — stamps each deal with the date we first see it sold
+// ============================================================================
+
+async function syncCrmSoldDeals(crm) {
+  const allSold = await crm.getSoldDeals();
+  const deals = allSold.data || [];
+  let newCount = 0;
+
+  for (const rawDeal of deals) {
+    const deal = crm.transformDeal(rawDeal);
+    const closingDateCrm = rawDeal.Closing_Date || null;
+
+    // sold_date logic:
+    //   - New deal (not yet in DB): use Closing_Date if set, otherwise today.
+    //     Historical deals already have their Closing_Date so they land correctly.
+    //     Future new deals where rep hasn't set a close date also land today.
+    //   - Existing deal (already in DB): sold_date is NEVER updated — it stays
+    //     as whatever date we stamped when we first saw it.
+    const result = await pool.query(`
+      INSERT INTO crm_sold_deals
+        (deal_id, deal_name, account_name, owner_name, lead_source_group, points, sold_date, closing_date_crm, amount)
+      VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::date, CURRENT_DATE), $7::date, $8)
+      ON CONFLICT (deal_id) DO UPDATE SET
+        deal_name         = EXCLUDED.deal_name,
+        account_name      = EXCLUDED.account_name,
+        owner_name        = EXCLUDED.owner_name,
+        lead_source_group = EXCLUDED.lead_source_group,
+        points            = EXCLUDED.points,
+        closing_date_crm  = EXCLUDED.closing_date_crm,
+        amount            = EXCLUDED.amount,
+        updated_at        = CURRENT_TIMESTAMP
+      RETURNING (xmax = 0) AS inserted
+    `, [deal.crm_deal_id, deal.deal_name, deal.account_name, deal.sales_rep_name,
+        deal.lead_source_group, deal.points, closingDateCrm, deal.amount]);
+
+    if (result.rows[0]?.inserted) newCount++;
+  }
+
+  console.log(`✅ CRM sync: ${deals.length} deals processed, ${newCount} new`);
+  return { total: deals.length, newCount };
 }
 
 // ============================================================================
