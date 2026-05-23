@@ -554,6 +554,46 @@ app.get('/api/crm/fields', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/crm/views — list all custom views for the Deals module
+app.get('/api/crm/views', authenticateToken, async (req, res) => {
+  try {
+    const crmToken = await ensureValidCrmToken();
+    const response = await axios.get('https://www.zohoapis.com/crm/v2/Deals/views', {
+      headers: { 'Authorization': `Zoho-oauthtoken ${crmToken}` },
+    });
+    const views = (response.data?.custom_views || []).map(v => ({
+      id: v.id,
+      name: v.name,
+      display_value: v.display_value,
+      category: v.category,
+    }));
+    res.json({ views, count: views.length });
+  } catch (error) {
+    console.error('CRM views error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Failed to fetch CRM views', details: error.message });
+  }
+});
+
+// GET /api/crm/reports — list all reports in Zoho CRM
+app.get('/api/crm/reports', authenticateToken, async (req, res) => {
+  try {
+    const crmToken = await ensureValidCrmToken();
+    const response = await axios.get('https://www.zohoapis.com/crm/v2/reports', {
+      headers: { 'Authorization': `Zoho-oauthtoken ${crmToken}` },
+    });
+    // Filter by name if query param provided
+    const search = (req.query.search || '').toLowerCase();
+    let reports = response.data?.reports || [];
+    if (search) {
+      reports = reports.filter(r => r.name?.toLowerCase().includes(search));
+    }
+    res.json({ reports: reports.map(r => ({ id: r.id, name: r.name, module: r.module, type: r.report_type })), count: reports.length });
+  } catch (error) {
+    console.error('CRM reports error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Failed to fetch CRM reports', details: error.message });
+  }
+});
+
 // ============================================================================
 // COMMISSION API ROUTES
 // ============================================================================
