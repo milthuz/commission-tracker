@@ -117,6 +117,8 @@ async function initializeDatabase() {
         UNIQUE(customer_name, organization_id)
       );
     `);
+    await pool.query(`ALTER TABLE excluded_customers ADD COLUMN IF NOT EXISTS organization_id VARCHAR(255)`);
+    await pool.query(`ALTER TABLE excluded_customers ADD COLUMN IF NOT EXISTS excluded_by VARCHAR(255)`);
 
     // Releases table
     await pool.query(`
