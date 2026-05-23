@@ -3,6 +3,22 @@ const axios = require('axios');
 
 const CRM_BASE_URL = 'https://www.zohoapis.com/crm/v2';
 
+// Monthly bonus tiers (not cumulative — highest tier wins)
+const MONTHLY_BONUS_TIERS = [
+  { points: 30, bonus: 1000 },
+  { points: 25, bonus: 500 },
+  { points: 20, bonus: 250 },
+];
+
+// Annual bonus tiers
+const ANNUAL_BONUS_TIERS = [
+  { points: 360, bonus: 10000 },
+  { points: 300, bonus: 7500 },
+  { points: 240, bonus: 5000 },
+];
+
+const MONTHLY_QUOTA = 15;
+
 class ZohoCRMService {
   constructor(accessToken) {
     this.accessToken = accessToken;
@@ -15,7 +31,7 @@ class ZohoCRMService {
   // DEALS
   // ============================================================
 
-  // Get all deals (optionally filter by stage)
+  // Get all deals
   async getDeals(params = {}) {
     try {
       const response = await axios.get(`${CRM_BASE_URL}/Deals`, {
@@ -25,10 +41,8 @@ class ZohoCRMService {
           page: params.page || 1,
           sort_by: params.sortBy || 'Modified_Time',
           sort_order: params.sortOrder || 'desc',
-          ...params,
         },
       });
-
       return response.data;
     } catch (error) {
       console.error('CRM getDeals error:', error.response?.data || error.message);
@@ -36,24 +50,47 @@ class ZohoCRMService {
     }
   }
 
-  // Get deals with "Deposit Information Received" stage (SOLD deals)
+  // Get all SOLD deals (Stage = "Deposit Information Received")
+  // Fetches all pages to handle large datasets
   async getSoldDeals(params = {}) {
     try {
-      // Use search criteria to filter by stage
-      const response = await axios.get(`${CRM_BASE_URL}/Deals/search`, {
-        headers: this.headers,
-        params: {
-          criteria: `(Stage:equals:Deposit Information Received)`,
-          per_page: params.perPage || 200,
-          page: params.page || 1,
-        },
-      });
+      const allDeals = [];
+      let page = 1;
+      let hasMore = true;
 
-      return response.data;
+      while (hasMore) {
+        const response = await axios.get(`${CRM_BASE_URL}/Deals/search`, {
+          headers: this.headers,
+          params: {
+            criteria: `(Stage:equals:Deposit Information Received)`,
+            per_page: 200,
+            page,
+          },
+        });
+
+        const deals = response.data?.data || [];
+        allDeals.push(...deals);
+
+        hasMore = response.data?.info?.more_records === true && deals.length === 200;
+        page++;
+      }
+
+      return { data: allDeals };
     } catch (error) {
       console.error('CRM getSoldDeals error:', error.response?.data || error.message);
       throw error;
     }
+  }
+
+  // Get SOLD deals filtered by a specific month and year (based on Closing_Date)
+  async getSoldDealsByMonth(year, month) {
+    const allDeals = await this.getSoldDeals();
+    return (allDeals.data || []).filter(deal => {
+      const closeDate = deal.Closing_Date || deal.Created_Time;
+      if (!closeDate) return false;
+      const d = new Date(closeDate);
+      return d.getFullYear() === year && d.getMonth() + 1 === month;
+    });
   }
 
   // Get a single deal by ID
@@ -62,7 +99,6 @@ class ZohoCRMService {
       const response = await axios.get(`${CRM_BASE_URL}/Deals/${dealId}`, {
         headers: this.headers,
       });
-
       return response.data?.data?.[0] || null;
     } catch (error) {
       console.error('CRM getDeal error:', error.response?.data || error.message);
@@ -74,14 +110,12 @@ class ZohoCRMService {
   // FIELDS METADATA
   // ============================================================
 
-  // Get all field definitions for the Deals module
   async getDealFields() {
     try {
       const response = await axios.get(`${CRM_BASE_URL}/settings/fields`, {
         headers: this.headers,
         params: { module: 'Deals' },
       });
-
       return response.data?.fields || [];
     } catch (error) {
       console.error('CRM getDealFields error:', error.response?.data || error.message);
@@ -90,32 +124,43 @@ class ZohoCRMService {
   }
 
   // ============================================================
-  // TRANSFORM
+  // POINTS CALCULATION (Comp Plan v7.7)
   // ============================================================
 
-  // Calculate points for a deal based on comp plan rules
+  // Calculate points for a single deal
+  // Source: Lead_Source_Group field
+  //   Outbound → 2pts
+  //   Inbound  → 1pt
+  //   Partners → 1pt
+  //   +1pt for payment processing (added by Zentact integration later)
   calculatePoints(deal) {
-    const dealType = (deal.Deal_Type || deal.deal_type || '').toLowerCase();
-    const hasPaymentProcessing =
-      deal.Payment_Processing_Attachment === true ||
-      deal.Payment_Processing_Attachment === 'true' ||
-      deal.hasPaymentProcessing === true;
+    const sourceGroup = (
+      deal.Lead_Source_Group ||
+      deal.lead_source_group ||
+      ''
+    ).toLowerCase().trim();
 
-    let points = 0;
+    if (sourceGroup === 'outbound') return 2;
+    if (sourceGroup === 'inbound') return 1;
+    if (sourceGroup === 'partners') return 1;
+    return 1; // default
+  }
 
-    if (dealType.includes('outbound')) {
-      points = 2;
-    } else if (dealType.includes('inbound')) {
-      points = 1;
-    } else {
-      points = 1; // default to inbound if unknown
+  // Calculate monthly bonus based on total points (not cumulative — highest tier wins)
+  static calculateMonthlyBonus(totalPoints) {
+    if (totalPoints < MONTHLY_QUOTA) return 0; // quota not met
+    for (const tier of MONTHLY_BONUS_TIERS) {
+      if (totalPoints >= tier.points) return tier.bonus;
     }
+    return 0;
+  }
 
-    if (hasPaymentProcessing) {
-      points += 1;
+  // Calculate annual bonus based on total annual points
+  static calculateAnnualBonus(totalPoints) {
+    for (const tier of ANNUAL_BONUS_TIERS) {
+      if (totalPoints >= tier.points) return tier.bonus;
     }
-
-    return points;
+    return 0;
   }
 
   // Transform a raw CRM deal into our app's format
@@ -123,23 +168,56 @@ class ZohoCRMService {
     const points = this.calculatePoints(crmDeal);
 
     return {
-      crm_deal_id: crmDeal.id,
-      deal_name: crmDeal.Deal_Name || '',
-      sales_rep_name: crmDeal.Owner?.name || crmDeal.owner_name || 'Unassigned',
-      stage: crmDeal.Stage || '',
-      deal_type: crmDeal.Deal_Type || 'inbound',
-      has_payment_processing:
-        crmDeal.Payment_Processing_Attachment === true ||
-        crmDeal.Payment_Processing_Attachment === 'true',
+      crm_deal_id:      crmDeal.id,
+      deal_name:        crmDeal.Deal_Name || '',
+      sales_rep_name:   crmDeal.Owner?.name || 'Unassigned',
+      stage:            crmDeal.Stage || '',
+      lead_source_group: crmDeal.Lead_Source_Group || '',
       points,
-      close_date: crmDeal.Closing_Date || crmDeal.Modified_Time || null,
-      created_time: crmDeal.Created_Time || null,
-      modified_time: crmDeal.Modified_Time || null,
-      account_name: crmDeal.Account_Name?.name || crmDeal.Account_Name || '',
-      amount: parseFloat(crmDeal.Amount) || 0,
-      is_sold: (crmDeal.Stage || '').toLowerCase().includes('deposit'),
+      close_date:       crmDeal.Closing_Date || null,
+      created_time:     crmDeal.Created_Time || null,
+      account_name:     crmDeal.Account_Name?.name || crmDeal.Account_Name || '',
+      amount:           parseFloat(crmDeal.Amount) || 0,
+      is_sold:          (crmDeal.Stage || '').toLowerCase().includes('deposit'),
     };
+  }
+
+  // ============================================================
+  // POINTS SUMMARY — full breakdown per rep for a given month
+  // ============================================================
+
+  buildPointsSummary(deals) {
+    const repMap = {};
+
+    for (const rawDeal of deals) {
+      const deal = this.transformDeal(rawDeal);
+      const rep = deal.sales_rep_name;
+
+      if (!repMap[rep]) {
+        repMap[rep] = { repName: rep, totalPoints: 0, deals: [] };
+      }
+
+      repMap[rep].totalPoints += deal.points;
+      repMap[rep].deals.push(deal);
+    }
+
+    return Object.values(repMap).map(rep => {
+      const quotaMet = rep.totalPoints >= MONTHLY_QUOTA;
+      const monthlyBonus = ZohoCRMService.calculateMonthlyBonus(rep.totalPoints);
+
+      return {
+        repName:      rep.repName,
+        totalPoints:  rep.totalPoints,
+        quota:        MONTHLY_QUOTA,
+        quotaMet,
+        pointsToQuota: Math.max(0, MONTHLY_QUOTA - rep.totalPoints),
+        monthlyBonus,
+        bonusTier: MONTHLY_BONUS_TIERS.find(t => rep.totalPoints >= t.points) || null,
+        nextBonusTier: MONTHLY_BONUS_TIERS.slice().reverse().find(t => rep.totalPoints < t.points) || null,
+        deals: rep.deals,
+      };
+    }).sort((a, b) => b.totalPoints - a.totalPoints);
   }
 }
 
-module.exports = ZohoCRMService;
+module.exports = { ZohoCRMService, MONTHLY_QUOTA, MONTHLY_BONUS_TIERS, ANNUAL_BONUS_TIERS };

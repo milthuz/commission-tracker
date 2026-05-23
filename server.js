@@ -12,7 +12,7 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bodyParser = require('body-parser');
 const { Pool } = require('pg');
-const ZohoCRMService = require('./services/zohoCRMService');
+const { ZohoCRMService, MONTHLY_QUOTA, MONTHLY_BONUS_TIERS, ANNUAL_BONUS_TIERS } = require('./services/zohoCRMService');
 
 dotenv.config();
 
@@ -551,6 +551,62 @@ app.get('/api/crm/fields', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('CRM fields error:', error.response?.data || error.message);
     res.status(500).json({ error: 'Failed to fetch CRM fields', details: error.message });
+  }
+});
+
+// GET /api/crm/points — points & quota summary per rep for a given month/year
+// Query params: year, month, repName (optional)
+app.get('/api/crm/points', authenticateToken, async (req, res) => {
+  try {
+    const year  = parseInt(req.query.year)  || new Date().getFullYear();
+    const month = parseInt(req.query.month) || new Date().getMonth() + 1;
+    const repFilter = (req.query.repName || '').trim().toLowerCase();
+
+    const crmToken = await ensureValidCrmToken();
+    const crm = new ZohoCRMService(crmToken);
+
+    // Fetch all SOLD deals for this month
+    const deals = await crm.getSoldDealsByMonth(year, month);
+
+    // Build per-rep summary
+    let summary = crm.buildPointsSummary(deals);
+
+    // Filter to specific rep if requested
+    if (repFilter) {
+      summary = summary.filter(r => r.repName.toLowerCase().includes(repFilter));
+    }
+
+    // Annual points: fetch all months YTD for annual bonus tracking
+    const annualDeals = await crm.getSoldDeals();
+    const annualByRep = {};
+    for (const rawDeal of annualDeals.data || []) {
+      const deal = crm.transformDeal(rawDeal);
+      const closeDate = deal.close_date;
+      if (!closeDate) continue;
+      const d = new Date(closeDate);
+      if (d.getFullYear() !== year) continue;
+      if (!annualByRep[deal.sales_rep_name]) annualByRep[deal.sales_rep_name] = 0;
+      annualByRep[deal.sales_rep_name] += deal.points;
+    }
+
+    // Attach annual points + annual bonus to each rep
+    summary = summary.map(rep => ({
+      ...rep,
+      annualPoints: annualByRep[rep.repName] || 0,
+      annualBonus:  ZohoCRMService.calculateAnnualBonus(annualByRep[rep.repName] || 0),
+    }));
+
+    res.json({
+      year,
+      month,
+      quota: MONTHLY_QUOTA,
+      bonusTiers: MONTHLY_BONUS_TIERS,
+      totalDeals: deals.length,
+      reps: summary,
+    });
+  } catch (error) {
+    console.error('CRM points error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Failed to calculate points', details: error.message });
   }
 });
 
