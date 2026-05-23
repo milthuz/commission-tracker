@@ -53,10 +53,11 @@ class ZohoCRMService {
     }
   }
 
-  // Get all SOLD deals (Stage = "Deposit Information Received")
-  // Fetches all pages to handle large datasets
-  // fields param is required — Zoho search returns only default fields otherwise,
-  // which excludes Closing_Date and Lead_Source_Group
+  // Get all SOLD deals — any deal that has a Deposit_Information_Received date set.
+  // We search by this custom date field (not Stage) because deals often move past
+  // "Deposit Information Received" to a final closed stage, which would exclude them
+  // from a Stage-based filter.
+  // Fetches all pages to handle large datasets.
   async getSoldDeals(params = {}) {
     try {
       const allDeals = [];
@@ -67,17 +68,17 @@ class ZohoCRMService {
         const response = await axios.get(`${CRM_BASE_URL}/Deals/search`, {
           headers: this.headers,
           params: {
-            criteria: `(Stage:equals:Deposit Information Received)`,
+            criteria: `(Deposit_Information_Received:is_not_empty)`,
             per_page: 200,
             page,
-            fields: 'Deal_Name,Stage,Owner,Closing_Date,Lead_Source_Group,Account_Name,Amount,Created_Time,Modified_Time',
+            fields: 'Deal_Name,Stage,Owner,Closing_Date,Deposit_Information_Received,Lead_Source_Group,Account_Name,Amount,Created_Time,Modified_Time',
           },
         });
 
         const deals = response.data?.data || [];
         allDeals.push(...deals);
 
-        hasMore = response.data?.info?.more_records === true && deals.length === 200;
+        hasMore = response.data?.info?.more_records === true;
         page++;
       }
 

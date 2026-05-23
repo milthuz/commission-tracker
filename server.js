@@ -1023,18 +1023,17 @@ async function syncCrmSoldDeals(crm) {
 
   for (const rawDeal of deals) {
     const deal = crm.transformDeal(rawDeal);
-    const closingDateCrm = rawDeal.Closing_Date || null;
 
-    // sold_date logic:
-    //   - New deal (not yet in DB): use Closing_Date if set, otherwise today.
-    //     Historical deals already have their Closing_Date so they land correctly.
-    //     Future new deals where rep hasn't set a close date also land today.
-    //   - Existing deal (already in DB): sold_date is NEVER updated — it stays
-    //     as whatever date we stamped when we first saw it.
+    // sold_date = Deposit_Information_Received date (the custom CRM field that records
+    // exactly when the deal reached that stage). Fall back to Closing_Date, then today.
+    const depositDate = rawDeal.Deposit_Information_Received || null;
+    const closingDateCrm = rawDeal.Closing_Date || null;
+    const soldDateSource = depositDate || closingDateCrm; // preferred → fallback
+
     const result = await pool.query(`
       INSERT INTO crm_sold_deals
         (deal_id, deal_name, account_name, owner_name, lead_source_group, points, sold_date, closing_date_crm, amount)
-      VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::date, CURRENT_DATE), $7::date, $8)
+      VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::date, CURRENT_DATE), $8::date, $9)
       ON CONFLICT (deal_id) DO UPDATE SET
         deal_name         = EXCLUDED.deal_name,
         account_name      = EXCLUDED.account_name,
@@ -1044,9 +1043,10 @@ async function syncCrmSoldDeals(crm) {
         closing_date_crm  = EXCLUDED.closing_date_crm,
         amount            = EXCLUDED.amount,
         updated_at        = CURRENT_TIMESTAMP
+        -- sold_date intentionally NOT updated — immutable once set
       RETURNING (xmax = 0) AS inserted
     `, [deal.crm_deal_id, deal.deal_name, deal.account_name, deal.sales_rep_name,
-        deal.lead_source_group, deal.points, closingDateCrm, deal.amount]);
+        deal.lead_source_group, deal.points, soldDateSource, closingDateCrm, deal.amount]);
 
     if (result.rows[0]?.inserted) newCount++;
   }
