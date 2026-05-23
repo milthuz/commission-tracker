@@ -611,6 +611,59 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/crm/debug — inspect raw deal data to diagnose missing fields / date issues
+// Usage: /api/crm/debug?year=2026&month=5
+app.get('/api/crm/debug', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const year  = parseInt(req.query.year)  || new Date().getFullYear();
+    const month = parseInt(req.query.month) || new Date().getMonth() + 1;
+
+    const crmToken = await ensureValidCrmToken();
+    const crm = new ZohoCRMService(crmToken);
+    const allSold = await crm.getSoldDeals();
+    const allDeals = allSold.data || [];
+
+    // Show raw key fields for every deal so we can spot missing data
+    const raw = allDeals.map(d => ({
+      id:                d.id,
+      name:              d.Deal_Name,
+      stage:             d.Stage,
+      closing_date:      d.Closing_Date      || null,
+      modified_time:     d.Modified_Time     || null,
+      created_time:      d.Created_Time      || null,
+      lead_source_group: d.Lead_Source_Group || null,
+      owner:             d.Owner?.name       || null,
+    }));
+
+    // Apply the same month filter the points endpoint uses
+    const filtered = raw.filter(d => {
+      const dateStr = d.closing_date || d.created_time;
+      if (!dateStr) return false;
+      const dt = new Date(dateStr);
+      return dt.getFullYear() === year && dt.getMonth() + 1 === month;
+    });
+
+    // Count how many are missing Closing_Date or Lead_Source_Group
+    const missingCloseDate = raw.filter(d => !d.closing_date).length;
+    const missingSourceGroup = raw.filter(d => !d.lead_source_group).length;
+
+    res.json({
+      total_sold_all_time: allDeals.length,
+      missing_closing_date: missingCloseDate,
+      missing_lead_source_group: missingSourceGroup,
+      filtered_for_month: filtered.length,
+      year,
+      month,
+      deals_this_month: filtered,
+      sample_all_time: raw.slice(0, 10),
+    });
+  } catch (error) {
+    console.error('CRM debug error:', error.response?.data || error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // GET /api/crm/views — list all custom views for the Deals module
 app.get('/api/crm/views', authenticateToken, async (req, res) => {
   try {

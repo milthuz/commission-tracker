@@ -55,6 +55,8 @@ class ZohoCRMService {
 
   // Get all SOLD deals (Stage = "Deposit Information Received")
   // Fetches all pages to handle large datasets
+  // fields param is required — Zoho search returns only default fields otherwise,
+  // which excludes Closing_Date and Lead_Source_Group
   async getSoldDeals(params = {}) {
     try {
       const allDeals = [];
@@ -68,6 +70,7 @@ class ZohoCRMService {
             criteria: `(Stage:equals:Deposit Information Received)`,
             per_page: 200,
             page,
+            fields: 'Deal_Name,Stage,Owner,Closing_Date,Lead_Source_Group,Account_Name,Amount,Created_Time,Modified_Time',
           },
         });
 
