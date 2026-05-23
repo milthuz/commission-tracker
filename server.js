@@ -577,13 +577,14 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     }
 
     // Annual points: count from PLAN_START_DATE (May 1, 2026) — comp plan v7.7 effective date
+    // Uses Modified_Time (actual stage-change date) same as monthly filter
     const annualDeals = await crm.getSoldDeals();
     const annualByRep = {};
     for (const rawDeal of annualDeals.data || []) {
       const deal = crm.transformDeal(rawDeal);
-      const closeDate = deal.close_date;
-      if (!closeDate) continue;
-      const d = new Date(closeDate);
+      const soldDate = rawDeal.Modified_Time || rawDeal.Closing_Date;
+      if (!soldDate) continue;
+      const d = new Date(soldDate);
       // Only count deals on or after the plan start date
       if (d < PLAN_START_DATE) continue;
       if (!annualByRep[deal.sales_rep_name]) annualByRep[deal.sales_rep_name] = 0;
@@ -636,9 +637,9 @@ app.get('/api/crm/debug', authenticateToken, async (req, res) => {
       owner:             d.Owner?.name       || null,
     }));
 
-    // Apply the same month filter the points endpoint uses
+    // Apply the same month filter the points endpoint uses (Modified_Time primary)
     const filtered = raw.filter(d => {
-      const dateStr = d.closing_date || d.created_time;
+      const dateStr = d.modified_time || d.closing_date;
       if (!dateStr) return false;
       const dt = new Date(dateStr);
       return dt.getFullYear() === year && dt.getMonth() + 1 === month;
