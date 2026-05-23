@@ -12,7 +12,7 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bodyParser = require('body-parser');
 const { Pool } = require('pg');
-const { ZohoCRMService, MONTHLY_QUOTA, MONTHLY_BONUS_TIERS, ANNUAL_BONUS_TIERS } = require('./services/zohoCRMService');
+const { ZohoCRMService, MONTHLY_QUOTA, MONTHLY_BONUS_TIERS, ANNUAL_BONUS_TIERS, PLAN_START_DATE } = require('./services/zohoCRMService');
 
 dotenv.config();
 
@@ -576,7 +576,7 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       summary = summary.filter(r => r.repName.toLowerCase().includes(repFilter));
     }
 
-    // Annual points: fetch all months YTD for annual bonus tracking
+    // Annual points: count from PLAN_START_DATE (May 1, 2026) — comp plan v7.7 effective date
     const annualDeals = await crm.getSoldDeals();
     const annualByRep = {};
     for (const rawDeal of annualDeals.data || []) {
@@ -584,7 +584,8 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       const closeDate = deal.close_date;
       if (!closeDate) continue;
       const d = new Date(closeDate);
-      if (d.getFullYear() !== year) continue;
+      // Only count deals on or after the plan start date
+      if (d < PLAN_START_DATE) continue;
       if (!annualByRep[deal.sales_rep_name]) annualByRep[deal.sales_rep_name] = 0;
       annualByRep[deal.sales_rep_name] += deal.points;
     }

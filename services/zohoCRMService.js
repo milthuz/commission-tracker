@@ -3,6 +3,9 @@ const axios = require('axios');
 
 const CRM_BASE_URL = 'https://www.zohoapis.com/crm/v2';
 
+// Comp plan v7.7 effective date — annual points only count from this date forward
+const PLAN_START_DATE = new Date('2026-05-01');
+
 // Monthly bonus tiers (not cumulative — highest tier wins)
 const MONTHLY_BONUS_TIERS = [
   { points: 30, bonus: 1000 },
@@ -221,4 +224,4 @@ class ZohoCRMService {
   }
 }
 
-module.exports = { ZohoCRMService, MONTHLY_QUOTA, MONTHLY_BONUS_TIERS, ANNUAL_BONUS_TIERS };
+module.exports = { ZohoCRMService, MONTHLY_QUOTA, MONTHLY_BONUS_TIERS, ANNUAL_BONUS_TIERS, PLAN_START_DATE };
