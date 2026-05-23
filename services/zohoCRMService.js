@@ -68,7 +68,7 @@ class ZohoCRMService {
         const response = await axios.get(`${CRM_BASE_URL}/Deals/search`, {
           headers: this.headers,
           params: {
-            criteria: `(Deposit_Information_Received:is_not_empty)`,
+            criteria: `(Deposit_Information_Received:greater_than:2020-01-01)`,
             per_page: 200,
             page,
             fields: 'Deal_Name,Stage,Owner,Closing_Date,Deposit_Information_Received,Lead_Source_Group,Account_Name,Amount,Created_Time,Modified_Time',
