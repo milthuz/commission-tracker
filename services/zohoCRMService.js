@@ -58,8 +58,10 @@ class ZohoCRMService {
   // Uses COQL (CRM Object Query Language) which supports NULL checks on date fields.
   // Falls back to Stage-based search if COQL fails.
   async getSoldDeals(params = {}) {
+    // Step 1: COQL — all deals where Deposit_Information_Received custom field is set.
+    // These are historical deals (including ones that moved past the stage).
+    const coqlDeals = [];
     try {
-      const allDeals = [];
       let offset = 0;
       const limit = 200;
       let hasMore = true;
@@ -72,20 +74,25 @@ class ZohoCRMService {
         });
 
         const deals = response.data?.data || [];
-        allDeals.push(...deals);
+        coqlDeals.push(...deals);
 
         hasMore = response.data?.info?.more_records === true;
         offset += limit;
       }
-
-      console.log(`✅ COQL: fetched ${allDeals.length} sold deals`);
-      return { data: allDeals };
+      console.log(`✅ COQL: fetched ${coqlDeals.length} deals with Deposit_Information_Received set`);
     } catch (coqlError) {
       const errDetail = coqlError.response?.data || coqlError.message;
-      console.warn('⚠️ COQL failed (status:', coqlError.response?.status, ') — falling back to Stage search. Error:', JSON.stringify(errDetail));
+      console.warn('⚠️ COQL failed (status:', coqlError.response?.status, '):', JSON.stringify(errDetail));
+    }
 
-      // Fallback: search by Stage (misses deals that moved past this stage)
-      const allDeals = [];
+    // Build a set of IDs already captured by COQL
+    const coqlIds = new Set(coqlDeals.map(d => d.id));
+
+    // Step 2: Stage search — deals currently IN "Deposit Information Received" stage.
+    // Many of these won't have the custom date field set, so COQL misses them.
+    // We use Closing_Date as their sold_date fallback.
+    const stageDeals = [];
+    try {
       let page = 1;
       let hasMore = true;
 
@@ -101,15 +108,21 @@ class ZohoCRMService {
         });
 
         const deals = response.data?.data || [];
-        allDeals.push(...deals);
+        stageDeals.push(...deals);
 
         hasMore = response.data?.info?.more_records === true;
         page++;
       }
-
-      console.log(`✅ Fallback Stage search: fetched ${allDeals.length} sold deals`);
-      return { data: allDeals };
+      console.log(`✅ Stage search: fetched ${stageDeals.length} active deals in stage`);
+    } catch (stageError) {
+      console.warn('⚠️ Stage search failed:', stageError.response?.data?.message || stageError.message);
     }
+
+    // Merge: COQL results + stage deals not already in COQL
+    const newFromStage = stageDeals.filter(d => !coqlIds.has(d.id));
+    console.log(`📊 Merged: ${coqlDeals.length} COQL + ${newFromStage.length} stage-only = ${coqlDeals.length + newFromStage.length} total`);
+
+    return { data: [...coqlDeals, ...newFromStage] };
   }
 
   // Get SOLD deals filtered by a specific month and year (based on Closing_Date)
