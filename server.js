@@ -576,6 +576,29 @@ app.get('/api/crm/fields', authenticateToken, async (req, res) => {
   }
 });
 
+// Background CRM sync — runs at most once every 5 minutes to avoid hammering Zoho
+let lastCrmSync = 0;
+let crmSyncRunning = false;
+
+function triggerBackgroundCrmSync() {
+  const now = Date.now();
+  if (crmSyncRunning || now - lastCrmSync < 5 * 60 * 1000) return; // throttle: 5 min
+  crmSyncRunning = true;
+  (async () => {
+    try {
+      const crmToken = await ensureValidCrmToken();
+      const crm = new ZohoCRMService(crmToken);
+      const result = await syncCrmSoldDeals(crm);
+      lastCrmSync = Date.now();
+      console.log('✅ Background CRM sync complete:', result);
+    } catch (err) {
+      console.error('❌ Background CRM sync failed:', err.message);
+    } finally {
+      crmSyncRunning = false;
+    }
+  })();
+}
+
 // GET /api/crm/points — points & quota summary per rep for a given month/year
 // Query params: year, month, repName (optional)
 app.get('/api/crm/points', authenticateToken, async (req, res) => {
@@ -584,11 +607,8 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     const month = parseInt(req.query.month) || new Date().getMonth() + 1;
     const repFilter = (req.query.repName || '').trim().toLowerCase();
 
-    const crmToken = await ensureValidCrmToken();
-    const crm = new ZohoCRMService(crmToken);
-
-    // Sync all sold deals to DB — stamps new deals with today, keeps existing sold_date
-    await syncCrmSoldDeals(crm);
+    // Kick off a background sync (non-blocking) — DB may be up to 5 min stale
+    triggerBackgroundCrmSync();
 
     // Query DB for deals in the requested month using the stable sold_date
     const startDate = new Date(year, month - 1, 1);
