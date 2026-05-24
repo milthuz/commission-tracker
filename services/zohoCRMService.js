@@ -67,7 +67,7 @@ class ZohoCRMService {
       let hasMore = true;
 
       while (hasMore) {
-        const query = `SELECT id, Deal_Name, Stage, Owner, Owner.name, Closing_Date, Deposit_Information_Received, Lead_Source_Group, Account_Name, Amount, Created_Time, Modified_Time FROM Deals WHERE Deposit_Information_Received is not null LIMIT ${limit} OFFSET ${offset}`;
+        const query = `SELECT id, Deal_Name, Stage, Owner, Closing_Date, Deposit_Information_Received, Lead_Source_Group, Account_Name, Amount, Created_Time, Modified_Time FROM Deals WHERE Deposit_Information_Received is not null LIMIT ${limit} OFFSET ${offset}`;
 
         const response = await axios.post(`${CRM_BASE_URL}/coql`, { select_query: query }, {
           headers: { ...this.headers, 'Content-Type': 'application/json' },
@@ -118,11 +118,42 @@ class ZohoCRMService {
       console.warn('⚠️ Stage search failed:', stageError.response?.data?.message || stageError.message);
     }
 
-    // Merge: COQL results + stage deals not already in COQL
-    const newFromStage = stageDeals.filter(d => !coqlIds.has(d.id));
-    console.log(`📊 Merged: ${coqlDeals.length} COQL + ${newFromStage.length} stage-only = ${coqlDeals.length + newFromStage.length} total`);
+    // Step 3: COQL for recently-closed deals that moved PAST the deposit stage
+    // without the custom field being set. These are invisible to both queries above.
+    // We query deals where Closing_Date is within the last 6 months AND the
+    // Deposit_Information_Received field is null — they'll use Closing_Date as sold_date.
+    const recentDeals = [];
+    const sixMonthsAgo = new Date();
+    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+    const dateStr = sixMonthsAgo.toISOString().slice(0, 10); // YYYY-MM-DD
+    try {
+      let offset = 0;
+      const limit = 200;
+      let hasMore = true;
+      while (hasMore) {
+        const query = `SELECT id, Deal_Name, Stage, Owner, Closing_Date, Deposit_Information_Received, Lead_Source_Group, Account_Name, Amount, Created_Time, Modified_Time FROM Deals WHERE Deposit_Information_Received is null AND Closing_Date >= '${dateStr}' LIMIT ${limit} OFFSET ${offset}`;
+        const response = await axios.post(`${CRM_BASE_URL}/coql`, { select_query: query }, {
+          headers: { ...this.headers, 'Content-Type': 'application/json' },
+        });
+        const deals = response.data?.data || [];
+        recentDeals.push(...deals);
+        hasMore = response.data?.info?.more_records === true;
+        offset += limit;
+      }
+      console.log(`✅ COQL recent: fetched ${recentDeals.length} deals with Closing_Date >= ${dateStr} and no deposit field`);
+    } catch (recentError) {
+      console.warn('⚠️ COQL recent query failed:', recentError.response?.data?.message || recentError.message);
+    }
 
-    return { data: [...coqlDeals, ...newFromStage] };
+    // Merge all three sources, deduplicating by ID
+    const allIds = new Set(coqlDeals.map(d => d.id));
+    const newFromStage = stageDeals.filter(d => !allIds.has(d.id));
+    newFromStage.forEach(d => allIds.add(d.id));
+    const newFromRecent = recentDeals.filter(d => !allIds.has(d.id));
+
+    console.log(`📊 Final merge: ${coqlDeals.length} COQL + ${newFromStage.length} stage-only + ${newFromRecent.length} recent-closed = ${coqlDeals.length + newFromStage.length + newFromRecent.length} total`);
+
+    return { data: [...coqlDeals, ...newFromStage, ...newFromRecent] };
   }
 
   // Get SOLD deals filtered by a specific month and year (based on Closing_Date)
