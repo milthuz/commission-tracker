@@ -65,7 +65,7 @@ class ZohoCRMService {
       let hasMore = true;
 
       while (hasMore) {
-        const query = `SELECT id, Deal_Name, Stage, Owner, Closing_Date, Deposit_Information_Received, Lead_Source_Group, Account_Name, Amount, Created_Time, Modified_Time FROM Deals WHERE Deposit_Information_Received is not null LIMIT ${limit} OFFSET ${offset}`;
+        const query = `SELECT id, Deal_Name, Stage, Owner, Owner.name, Closing_Date, Deposit_Information_Received, Lead_Source_Group, Account_Name, Amount, Created_Time, Modified_Time FROM Deals WHERE Deposit_Information_Received is not null LIMIT ${limit} OFFSET ${offset}`;
 
         const response = await axios.post(`${CRM_BASE_URL}/coql`, { select_query: query }, {
           headers: { ...this.headers, 'Content-Type': 'application/json' },
@@ -200,10 +200,18 @@ class ZohoCRMService {
   transformDeal(crmDeal) {
     const points = this.calculatePoints(crmDeal);
 
+    // Owner can come back as an object {id, name}, a plain string, or via
+    // the COQL explicit "Owner.name" field — handle all three shapes
+    const ownerName =
+      (typeof crmDeal.Owner === 'object' && crmDeal.Owner?.name) ||
+      (typeof crmDeal.Owner === 'string' && crmDeal.Owner) ||
+      crmDeal['Owner.name'] ||
+      'Unassigned';
+
     return {
       crm_deal_id:      crmDeal.id,
       deal_name:        crmDeal.Deal_Name || '',
-      sales_rep_name:   crmDeal.Owner?.name || 'Unassigned',
+      sales_rep_name:   ownerName,
       stage:            crmDeal.Stage || '',
       lead_source_group: crmDeal.Lead_Source_Group || '',
       points,
