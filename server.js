@@ -713,18 +713,41 @@ app.get('/api/crm/sold-deals-db', authenticateToken, async (req, res) => {
 });
 
 // POST /api/crm/sold-deals-db/reset — wipe the table and re-sync from CRM
-// Use this if the initial import landed deals in the wrong months
+// Use this if the initial import landed deals in the wrong months.
+// Responds immediately (202) then runs the sync in the background to avoid
+// Heroku's 30-second request timeout.
+let crmResetStatus = { running: false, startedAt: null, result: null, error: null };
+
 app.post('/api/crm/sold-deals-db/reset', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
-  try {
-    await pool.query('TRUNCATE TABLE crm_sold_deals');
-    const crmToken = await ensureValidCrmToken();
-    const crm = new ZohoCRMService(crmToken);
-    const syncResult = await syncCrmSoldDeals(crm);
-    res.json({ success: true, message: 'Table reset and re-synced', ...syncResult });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+  if (crmResetStatus.running) {
+    return res.status(409).json({ error: 'Reset already in progress', startedAt: crmResetStatus.startedAt });
   }
+
+  // Respond immediately — sync runs in background
+  crmResetStatus = { running: true, startedAt: new Date().toISOString(), result: null, error: null };
+  res.json({ success: true, message: 'Reset started — poll /api/crm/sold-deals-db/reset-status for result' });
+
+  // Run async without blocking the response
+  (async () => {
+    try {
+      await pool.query('TRUNCATE TABLE crm_sold_deals');
+      const crmToken = await ensureValidCrmToken();
+      const crm = new ZohoCRMService(crmToken);
+      const syncResult = await syncCrmSoldDeals(crm);
+      crmResetStatus = { running: false, startedAt: crmResetStatus.startedAt, result: syncResult, error: null };
+      console.log('✅ CRM reset complete:', syncResult);
+    } catch (err) {
+      crmResetStatus = { running: false, startedAt: crmResetStatus.startedAt, result: null, error: err.message };
+      console.error('❌ CRM reset failed:', err.message);
+    }
+  })();
+});
+
+// GET /api/crm/sold-deals-db/reset-status — poll for background reset progress
+app.get('/api/crm/sold-deals-db/reset-status', authenticateToken, (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  res.json(crmResetStatus);
 });
 
 // PATCH /api/crm/sold-deals-db/:dealId — manually correct a deal's sold_date
