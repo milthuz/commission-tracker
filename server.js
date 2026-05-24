@@ -1136,11 +1136,17 @@ async function ensureValidCrmToken() {
   let row = result.rows[0];
   const expiresAt = row.crm_expires_at ? parseInt(row.crm_expires_at) : null;
 
-  // Refresh if expired or expiring within 5 minutes
-  if (expiresAt && expiresAt < Date.now() + 5 * 60 * 1000) {
+  // Refresh if: token is expired/expiring within 5 min, OR expiry unknown
+  const needsRefresh = !expiresAt || expiresAt < Date.now() + 5 * 60 * 1000;
+
+  if (needsRefresh) {
     if (!row.crm_refresh_token) {
-      console.log('⚠️ CRM token expired but no refresh token available');
-      return row.crm_access_token;
+      if (!expiresAt) {
+        // No expiry info — assume token is still valid and proceed
+        console.log('⚠️ CRM token has no expiry info, proceeding with existing token');
+        return row.crm_access_token;
+      }
+      throw new Error('CRM token expired and no refresh token available. Please reconnect CRM in Admin Panel.');
     }
 
     console.log('🔄 Refreshing CRM token...');
@@ -1157,18 +1163,30 @@ async function ensureValidCrmToken() {
       );
 
       const newToken = refreshRes.data.access_token;
+      const newRefreshToken = refreshRes.data.refresh_token || row.crm_refresh_token;
       const newExpiry = Date.now() + (parseInt(refreshRes.data.expires_in) || 3600) * 1000;
 
+      if (!newToken) {
+        throw new Error(`Zoho refresh returned no access_token: ${JSON.stringify(refreshRes.data)}`);
+      }
+
       await pool.query(
-        `UPDATE user_tokens SET crm_access_token = $1, crm_expires_at = $2, updated_at = CURRENT_TIMESTAMP
+        `UPDATE user_tokens
+         SET crm_access_token = $1, crm_refresh_token = $2, crm_expires_at = $3, updated_at = CURRENT_TIMESTAMP
          WHERE is_admin = true`,
-        [newToken, newExpiry]
+        [newToken, newRefreshToken, newExpiry]
       );
 
-      console.log('✅ CRM token refreshed');
+      console.log('✅ CRM token refreshed successfully');
       return newToken;
     } catch (err) {
-      console.error('❌ CRM token refresh failed:', err.message);
+      console.error('❌ CRM token refresh failed:', err.response?.data || err.message);
+      // If we have a non-expired token, use it as fallback; otherwise throw
+      if (expiresAt && expiresAt > Date.now()) {
+        console.warn('⚠️ Using existing token despite refresh failure (still valid)');
+        return row.crm_access_token;
+      }
+      throw new Error(`CRM token expired and refresh failed: ${err.message}. Please reconnect CRM in Admin Panel.`);
     }
   }
 
