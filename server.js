@@ -695,6 +695,48 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/crm/sync-debug — run getSoldDeals() live and return raw counts + samples
+app.get('/api/crm/sync-debug', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const crmToken = await ensureValidCrmToken();
+    const crm = new ZohoCRMService(crmToken);
+    const result = await crm.getSoldDeals();
+    const deals = result.data || [];
+
+    const byMonth = {};
+    deals.forEach(d => {
+      const dep = d.Deposit_Information_Received || null;
+      const close = d.Closing_Date || null;
+      const date = dep || close || 'NO_DATE';
+      const month = date !== 'NO_DATE' ? date.toString().slice(0, 7) : 'NO_DATE';
+      if (!byMonth[month]) byMonth[month] = 0;
+      byMonth[month]++;
+    });
+
+    // Sample of deals missing Deposit_Information_Received
+    const missingDateField = deals
+      .filter(d => !d.Deposit_Information_Received)
+      .slice(0, 10)
+      .map(d => ({
+        id: d.id,
+        name: d.Deal_Name,
+        stage: d.Stage,
+        closing_date: d.Closing_Date,
+        deposit_field: d.Deposit_Information_Received,
+        owner: d.Owner?.name || d['Owner.name'] || d.Owner,
+      }));
+
+    res.json({
+      total: deals.length,
+      byMonth,
+      sampleMissingDepositField: missingDateField,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/crm/sold-deals-db — show everything in the crm_sold_deals table
 // Useful to audit what sold_date each deal was stamped with
 app.get('/api/crm/sold-deals-db', authenticateToken, async (req, res) => {
