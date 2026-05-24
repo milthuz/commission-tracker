@@ -1085,10 +1085,10 @@ async function syncCrmSoldDeals(crm) {
         owner_name        = EXCLUDED.owner_name,
         lead_source_group = EXCLUDED.lead_source_group,
         points            = EXCLUDED.points,
+        sold_date         = COALESCE(EXCLUDED.sold_date, crm_sold_deals.sold_date),
         closing_date_crm  = EXCLUDED.closing_date_crm,
         amount            = EXCLUDED.amount,
         updated_at        = CURRENT_TIMESTAMP
-        -- sold_date intentionally NOT updated — immutable once set
       RETURNING (xmax = 0) AS inserted
     `, [deal.crm_deal_id, deal.deal_name, deal.account_name, deal.sales_rep_name,
         deal.lead_source_group, deal.points, soldDateSource, closingDateCrm, deal.amount]);
