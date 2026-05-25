@@ -1529,6 +1529,20 @@ async function syncZentactMerchants() {
   if (!apiKey) throw new Error('ZENTACT_API_KEY env var not set');
 
   const zentact = new ZentactService(apiKey);
+
+  // One-time cleanup: clear activated_at that was incorrectly stamped during the initial
+  // bulk import (activated_at = created_at means we set it the moment we first saw the record,
+  // not because of a real activation event).
+  const cleaned = await pool.query(`
+    UPDATE zentact_merchants
+    SET activated_at = NULL
+    WHERE activated_at IS NOT NULL
+      AND DATE(activated_at) = DATE(created_at)
+  `);
+  if (cleaned.rowCount > 0) {
+    console.log(`🧹 Cleared ${cleaned.rowCount} bulk-import activated_at stamps (not real activation events)`);
+  }
+
   const rawMerchants = await zentact.getMerchantAccounts();
 
   let newCount = 0;
@@ -1593,14 +1607,16 @@ async function syncZentactMerchants() {
 
     if (m.status === 'ACTIVE') activatedCount++;
 
-    // Compute activated_at in JS to avoid PostgreSQL type-inference issues with $5 in CASE
-    const activatedAt = m.status === 'ACTIVE' ? new Date().toISOString().split('T')[0] : null;
 
+    // activated_at is intentionally NULL on INSERT — Zentact has no date fields.
+    // We detect activation by watching for a status *transition* to ACTIVE in the
+    // ON CONFLICT clause below. Merchants that were already ACTIVE on first sync
+    // keep activated_at = NULL so they don't flood a single month with fake history.
     const result = await pool.query(`
       INSERT INTO zentact_merchants
         (merchant_account_id, organization_id, business_name, invitee_email, status,
          sales_rep_email, sales_rep_name, opportunity_id, activated_at, raw_attributes)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9::jsonb)
       ON CONFLICT (merchant_account_id) DO UPDATE SET
         status          = EXCLUDED.status,
         business_name   = EXCLUDED.business_name,
@@ -1608,15 +1624,20 @@ async function syncZentactMerchants() {
         sales_rep_name  = COALESCE($7, zentact_merchants.sales_rep_name),
         opportunity_id  = COALESCE(EXCLUDED.opportunity_id,  zentact_merchants.opportunity_id),
         activated_at    = CASE
-          WHEN EXCLUDED.status = 'ACTIVE' AND zentact_merchants.activated_at IS NULL
-            THEN EXCLUDED.activated_at
-          ELSE zentact_merchants.activated_at
+          -- Status just changed TO active → stamp today (real activation event)
+          WHEN zentact_merchants.status <> 'ACTIVE' AND EXCLUDED.status = 'ACTIVE'
+            THEN CURRENT_DATE
+          -- Already had a real activation date → keep it
+          WHEN zentact_merchants.activated_at IS NOT NULL
+            THEN zentact_merchants.activated_at
+          -- Was already active with no date (bulk-imported baseline) → leave NULL
+          ELSE NULL
         END,
         raw_attributes  = EXCLUDED.raw_attributes,
         updated_at      = CURRENT_TIMESTAMP
       RETURNING (xmax = 0) AS inserted
     `, [m.merchant_account_id, m.organization_id, m.business_name, m.invitee_email,
-        m.status, m.sales_rep_email, repName, m.opportunity_id, activatedAt, m.raw_attributes]);
+        m.status, m.sales_rep_email, repName, m.opportunity_id, m.raw_attributes]);
 
     if (result.rows[0]?.inserted) newCount++;
   }
