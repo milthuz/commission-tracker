@@ -1138,6 +1138,31 @@ app.get('/api/zentact/raw-sample', authenticateToken, async (req, res) => {
   }
 });
 
+// DELETE /api/zentact/flush — wipes all Zentact merchants from DB
+// Next auto-sync (within 1h) will re-pull everything fresh from Zentact.
+// Requires admin + an explicit ?confirm=YES query param so this can't fire by accident.
+app.delete('/api/zentact/flush', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  if (req.query.confirm !== 'YES') {
+    return res.status(400).json({
+      error: 'Add ?confirm=YES to confirm. This will delete ALL Zentact merchants from the DB.',
+    });
+  }
+  try {
+    const before = await pool.query('SELECT COUNT(*) AS n FROM zentact_merchants');
+    const beforeCount = parseInt(before.rows[0].n) || 0;
+    await pool.query('DELETE FROM zentact_merchants');
+    console.log(`🗑️  Zentact flush: deleted ${beforeCount} merchants. Next sync will refetch.`);
+    res.json({
+      success: true,
+      deleted: beforeCount,
+      note: 'All merchants will be re-synced from Zentact on the next auto-sync (every hour) or you can trigger one manually.',
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // GET /api/zentact/probe/:merchantId — probes undocumented Zentact endpoints to find the
 // "Boarded" date. Tries several URL patterns and returns whatever responds with 200.
 app.get('/api/zentact/probe/:merchantId', authenticateToken, async (req, res) => {
