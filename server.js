@@ -999,13 +999,25 @@ app.get('/api/zentact/attribute-keys', authenticateToken, async (req, res) => {
 });
 
 // GET /api/zentact/merchants — list all merchants in DB
+// Query params: ?unassigned=true to only return merchants without a rep
+//               ?active=true to only return ACTIVE merchants
 app.get('/api/zentact/merchants', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   try {
+    const where = [];
+    if (req.query.unassigned === 'true') {
+      where.push(`(sales_rep_name IS NULL OR sales_rep_name = '')`);
+    }
+    if (req.query.active === 'true') {
+      where.push(`status = 'ACTIVE'`);
+    }
+    const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
     const result = await pool.query(`
       SELECT merchant_account_id, business_name, status, sales_rep_email,
-             sales_rep_name, opportunity_id, activated_at, bonus_amount, points, updated_at
+             sales_rep_name, opportunity_id, activated_at, bonus_amount, points,
+             raw_attributes, updated_at
       FROM zentact_merchants
+      ${whereSql}
       ORDER BY activated_at DESC NULLS LAST, created_at DESC
     `);
     res.json({ merchants: result.rows, total: result.rows.length });
