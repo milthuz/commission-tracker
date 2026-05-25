@@ -1106,10 +1106,11 @@ function stopAutoSync() {
 async function syncCrmSoldDeals(crm) {
   const allSold = await crm.getSoldDeals();
   const deals = allSold.data || [];
+  // userMap is built from Stage search results (which return full Owner {id,name})
+  // and used to resolve owner names on COQL deals (which return Owner {id} only)
+  const userMap = allSold.userMap || {};
+  console.log(`👥 User map has ${Object.keys(userMap).length} entries:`, JSON.stringify(userMap));
   let newCount = 0;
-
-  // Fetch users once to resolve owner names (COQL returns Owner as {id} only)
-  const userMap = await crm.getCRMUsers();
 
   for (const rawDeal of deals) {
     const deal = crm.transformDeal(rawDeal, userMap);

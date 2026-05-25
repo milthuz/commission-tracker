@@ -89,9 +89,10 @@ class ZohoCRMService {
     const coqlIds = new Set(coqlDeals.map(d => d.id));
 
     // Step 2: Stage search — deals currently IN "Deposit Information Received" stage.
-    // Many of these won't have the custom date field set, so COQL misses them.
-    // We use Closing_Date as their sold_date fallback.
+    // The REST search API returns Owner as {id, name} — use this to build a user map
+    // that can resolve owner names for COQL deals (which only return {id}).
     const stageDeals = [];
+    const userMapFromStage = {}; // {userId → name} built from Stage search owner objects
     try {
       let page = 1;
       let hasMore = true;
@@ -108,15 +109,28 @@ class ZohoCRMService {
         });
 
         const deals = response.data?.data || [];
+        // Extract user names while we have them
+        deals.forEach(d => {
+          if (d.Owner?.id && d.Owner?.name) {
+            userMapFromStage[d.Owner.id] = d.Owner.name;
+          }
+        });
         stageDeals.push(...deals);
 
         hasMore = response.data?.info?.more_records === true;
         page++;
       }
-      console.log(`✅ Stage search: fetched ${stageDeals.length} active deals in stage`);
+      console.log(`✅ Stage search: fetched ${stageDeals.length} active deals, built user map with ${Object.keys(userMapFromStage).length} users`);
     } catch (stageError) {
       console.warn('⚠️ Stage search failed:', stageError.response?.data?.message || stageError.message);
     }
+
+    // Back-fill owner names on COQL deals using the Stage search user map
+    coqlDeals.forEach(d => {
+      if (d.Owner?.id && !d.Owner?.name && userMapFromStage[d.Owner.id]) {
+        d.Owner.name = userMapFromStage[d.Owner.id];
+      }
+    });
 
     // Step 3: COQL for recently-closed deals that moved PAST the deposit stage
     // without the custom field being set. These are invisible to both queries above.
@@ -140,6 +154,12 @@ class ZohoCRMService {
         hasMore = response.data?.info?.more_records === true;
         offset += limit;
       }
+      // Back-fill owner names on recent deals too
+      recentDeals.forEach(d => {
+        if (d.Owner?.id && !d.Owner?.name && userMapFromStage[d.Owner.id]) {
+          d.Owner.name = userMapFromStage[d.Owner.id];
+        }
+      });
       console.log(`✅ COQL recent: fetched ${recentDeals.length} deals with Closing_Date >= ${dateStr} and no deposit field`);
     } catch (recentError) {
       console.warn('⚠️ COQL recent query failed:', recentError.response?.data?.message || recentError.message);
@@ -153,7 +173,7 @@ class ZohoCRMService {
 
     console.log(`📊 Final merge: ${coqlDeals.length} COQL + ${newFromStage.length} stage-only + ${newFromRecent.length} recent-closed = ${coqlDeals.length + newFromStage.length + newFromRecent.length} total`);
 
-    return { data: [...coqlDeals, ...newFromStage, ...newFromRecent] };
+    return { data: [...coqlDeals, ...newFromStage, ...newFromRecent], userMap: userMapFromStage };
   }
 
   // Get SOLD deals filtered by a specific month and year (based on Closing_Date)
