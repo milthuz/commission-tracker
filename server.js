@@ -615,17 +615,21 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     const endDate   = new Date(year, month, 0); // last day of month
 
     let dealsQuery = `
-      SELECT deal_id, deal_name, account_name, owner_name, lead_source_group, points, sold_date
-      FROM crm_sold_deals
-      WHERE sold_date >= $1 AND sold_date <= $2
+      SELECT c.deal_id, c.deal_name, c.account_name, c.owner_name, c.lead_source_group, c.points, c.sold_date
+      FROM crm_sold_deals c
+      WHERE c.sold_date >= $1 AND c.sold_date <= $2
+        AND (
+          c.owner_name IN (SELECT name FROM salespeople WHERE is_active = true)
+          OR c.owner_name IS NULL
+        )
     `;
     const dealsParams = [startDate, endDate];
 
     if (repFilter) {
-      dealsQuery += ` AND LOWER(owner_name) LIKE $3`;
+      dealsQuery += ` AND LOWER(c.owner_name) LIKE $3`;
       dealsParams.push(`%${repFilter}%`);
     }
-    dealsQuery += ` ORDER BY sold_date DESC`;
+    dealsQuery += ` ORDER BY c.sold_date DESC`;
 
     const dealsResult = await pool.query(dealsQuery, dealsParams);
     const deals = dealsResult.rows;
@@ -1141,6 +1145,18 @@ async function syncCrmSoldDeals(crm) {
 
     if (result.rows[0]?.inserted) newCount++;
   }
+
+  // Upsert all unique CRM rep names into salespeople table.
+  // New reps default to active=true. Existing reps keep their current is_active status.
+  const uniqueReps = [...new Set(deals.map(d => crm.transformDeal(d, userMap).sales_rep_name).filter(n => n && n !== 'Unassigned'))];
+  for (const repName of uniqueReps) {
+    await pool.query(`
+      INSERT INTO salespeople (name, is_active)
+      VALUES ($1, true)
+      ON CONFLICT (name) DO NOTHING
+    `, [repName]);
+  }
+  console.log(`👥 Upserted ${uniqueReps.length} CRM reps into salespeople table`);
 
   console.log(`✅ CRM sync: ${deals.length} deals processed, ${newCount} new`);
   return { total: deals.length, newCount };
