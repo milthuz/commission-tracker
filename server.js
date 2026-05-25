@@ -1138,6 +1138,64 @@ app.get('/api/zentact/raw-sample', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/zentact/probe/:merchantId — probes undocumented Zentact endpoints to find the
+// "Boarded" date. Tries several URL patterns and returns whatever responds with 200.
+app.get('/api/zentact/probe/:merchantId', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const apiKey = process.env.ZENTACT_API_KEY;
+  if (!apiKey) return res.status(400).json({ error: 'ZENTACT_API_KEY not set' });
+
+  const baseV1 = process.env.ZENTACT_API_URL || 'https://api.zentact.com/api/v1';
+  const baseV2 = baseV1.replace('/v1', '/v2');
+  const baseDashboard = baseV1.replace('/api/v1', '/api');
+  const headers = { 'X-API-Key': apiKey, 'Content-Type': 'application/json' };
+  const id = req.params.merchantId;
+
+  const endpoints = [
+    `${baseV1}/merchant-accounts/${id}/events`,
+    `${baseV1}/merchant-accounts/${id}/activity`,
+    `${baseV1}/merchant-accounts/${id}/timeline`,
+    `${baseV1}/merchant-accounts/${id}/history`,
+    `${baseV1}/merchant-accounts/${id}/audit`,
+    `${baseV1}/merchant-accounts/${id}/audit-log`,
+    `${baseV1}/merchant-accounts/${id}/log`,
+    `${baseV1}/merchant-accounts/${id}/status-history`,
+    `${baseV1}/merchant-accounts/${id}/lifecycle`,
+    `${baseV1}/merchant-accounts/${id}/onboarding`,
+    `${baseV1}/merchant-accounts/${id}/status-updates`,
+    `${baseV1}/events?merchantAccountId=${id}`,
+    `${baseV1}/activity?merchantAccountId=${id}`,
+    `${baseV1}/audit?merchantAccountId=${id}`,
+    `${baseV1}/audit-events?merchantAccountId=${id}`,
+    `${baseV1}/merchant-account-events?merchantAccountId=${id}`,
+    `${baseV1}/dashboard/merchant-accounts/${id}/timeline`,
+    `${baseV1}/dashboard/merchant-accounts/${id}/events`,
+    `${baseV2}/merchant-accounts/${id}/events`,
+    `${baseV2}/merchant-accounts/${id}/activity`,
+    `${baseV2}/audit-events?merchantAccountId=${id}`,
+  ];
+
+  const results = [];
+  for (const url of endpoints) {
+    try {
+      const r = await axios.get(url, { headers, timeout: 5000, validateStatus: () => true });
+      results.push({
+        url,
+        status: r.status,
+        ok: r.status >= 200 && r.status < 300,
+        sample: r.status === 200 ? JSON.stringify(r.data).slice(0, 500) : (r.data?.message || r.data?.error || null),
+      });
+    } catch (e) {
+      results.push({ url, error: e.message });
+    }
+  }
+
+  // Return only successes first, then errors
+  const success = results.filter(r => r.ok);
+  const fail = results.filter(r => !r.ok);
+  res.json({ merchantId: id, hits: success, misses: fail.length, all: results });
+});
+
 app.get('/api/zentact/attribute-keys', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   try {
