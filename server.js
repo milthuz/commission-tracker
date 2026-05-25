@@ -106,6 +106,7 @@ async function initializeDatabase() {
       );
     `);
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS invoice_count INT DEFAULT 0`);
+    await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS aliases JSONB DEFAULT '[]'::jsonb`);
 
     // Excluded customers table
     await pool.query(`
@@ -1581,14 +1582,29 @@ async function syncZentactMerchants() {
     // Zentact uses { name: 'sales_rep', value: 'FirstName' } — match against salespeople table
     let repName = null;
     if (m.sales_rep_raw) {
-      // 1. Exact match (handles if Zentact stores full names)
+      // 1. Exact match
       const exactRes = await pool.query(
         `SELECT name FROM salespeople WHERE LOWER(name) = LOWER($1) LIMIT 1`,
         [m.sales_rep_raw]
       );
       repName = exactRes.rows[0]?.name || null;
 
-      // 2. First-name prefix match — "Dora" → "Dora Smith"
+      // 2. Alias match — admin-configured nicknames ("Gaby" → "Gabriella Daly")
+      if (!repName) {
+        const aliasRes = await pool.query(
+          `SELECT name FROM salespeople
+           WHERE aliases @> $1::jsonb
+              OR EXISTS (
+                SELECT 1 FROM jsonb_array_elements_text(aliases) a
+                WHERE LOWER(a) = LOWER($2)
+              )
+           LIMIT 1`,
+          [JSON.stringify([m.sales_rep_raw]), m.sales_rep_raw]
+        );
+        repName = aliasRes.rows[0]?.name || null;
+      }
+
+      // 3. First-name prefix match — "Dora" → "Dora Smith"
       if (!repName) {
         const firstRes = await pool.query(
           `SELECT name FROM salespeople
@@ -1600,8 +1616,8 @@ async function syncZentactMerchants() {
         repName = firstRes.rows[0]?.name || null;
       }
 
-      // 3. Use the raw value as-is so the merchant is never "Unassigned"
-      //    (admin can later merge via Salespeople panel if the name doesn't match)
+      // 4. Use the raw value as-is so the merchant is never "Unassigned"
+      //    (admin can later add it as an alias via Salespeople panel)
       if (!repName) repName = m.sales_rep_raw;
     }
 
@@ -2560,7 +2576,7 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
     `, [process.env.ZOHO_ORG_ID]);
 
     const result = await pool.query(
-      `SELECT name, is_active, commission_rate, base_salary, invoice_count
+      `SELECT name, is_active, commission_rate, base_salary, invoice_count, aliases
        FROM salespeople ORDER BY name`
     );
     res.json({
@@ -2570,6 +2586,7 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
         commissionRate: parseFloat(r.commission_rate) || 10,
         baseSalary:     parseFloat(r.base_salary)     || 0,
         invoiceCount:   parseInt(r.invoice_count)     || 0,
+        aliases:        Array.isArray(r.aliases) ? r.aliases : [],
       }))
     });
   } catch (error) {
@@ -2622,6 +2639,49 @@ app.put('/api/salespeople/:name/base-salary', authenticateToken, async (req, res
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update base salary', details: error.message });
+  }
+});
+
+// PUT /api/salespeople/:name/aliases — set the list of alias names (e.g. ["Gaby","Gabi"])
+app.put('/api/salespeople/:name/aliases', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const raw = req.body?.aliases;
+  if (!Array.isArray(raw)) return res.status(400).json({ error: 'aliases must be an array of strings' });
+  // Clean: strings only, trimmed, deduped (case-insensitive), drop empties
+  const seen = new Set();
+  const clean = [];
+  for (const v of raw) {
+    if (typeof v !== 'string') continue;
+    const trimmed = v.trim();
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    clean.push(trimmed);
+  }
+  try {
+    const result = await pool.query(
+      `UPDATE salespeople SET aliases = $1::jsonb, updated_at = CURRENT_TIMESTAMP
+       WHERE name = $2
+       RETURNING name, aliases`,
+      [JSON.stringify(clean), req.params.name]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Salesperson not found' });
+
+    // After aliases change, re-link existing zentact_merchants whose sales_rep_name
+    // matches one of these aliases (case-insensitive) to the canonical name.
+    if (clean.length > 0) {
+      await pool.query(
+        `UPDATE zentact_merchants
+         SET sales_rep_name = $1, updated_at = CURRENT_TIMESTAMP
+         WHERE sales_rep_name IS NOT NULL
+           AND LOWER(sales_rep_name) = ANY($2::text[])`,
+        [req.params.name, clean.map(a => a.toLowerCase())]
+      );
+    }
+    res.json({ success: true, aliases: result.rows[0].aliases });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update aliases', details: error.message });
   }
 });
 
