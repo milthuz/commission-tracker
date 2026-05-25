@@ -136,10 +136,16 @@ class ZentactService {
   // TRANSFORM — raw Zentact merchant → our internal format
   // ============================================================
   transformMerchant(merchant) {
-    const attrs = merchant.merchantAccountAttributes || merchant.customAttributes || [];
+    const attrs = merchant.merchantAccountAttributes || merchant.customAttributes || merchant.attributes || [];
 
-    const salesRepEmail = ZentactService.getAttribute(attrs, 'Salesrep_email');
-    const opportunityId = ZentactService.getAttribute(attrs, 'Opportunity_ID');
+    // Zentact stores the rep as { name: 'sales_rep', value: 'FirstName' }
+    // Also keep Salesrep_email as a fallback in case it's configured on some accounts
+    const salesRepRaw   = ZentactService.getAttribute(attrs, 'sales_rep')
+                       || ZentactService.getAttribute(attrs, 'Salesrep_email')
+                       || null;
+    const opportunityId = ZentactService.getAttribute(attrs, 'Opportunity_ID')
+                       || ZentactService.getAttribute(attrs, 'opportunity_id')
+                       || null;
 
     return {
       merchant_account_id: merchant.merchantAccountId,
@@ -147,7 +153,8 @@ class ZentactService {
       business_name:       merchant.businessName    || '',
       invitee_email:       merchant.inviteeEmail    || null,
       status:              merchant.status          || '',
-      sales_rep_email:     salesRepEmail,
+      sales_rep_raw:       salesRepRaw,   // raw value from Zentact (e.g. "Dora", "Jay")
+      sales_rep_email:     null,          // not used by this org — kept for schema compat
       opportunity_id:      opportunityId,
       raw_attributes:      JSON.stringify(attrs),
     };

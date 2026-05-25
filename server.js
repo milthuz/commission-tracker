@@ -1546,16 +1546,42 @@ async function syncZentactMerchants() {
     const m = zentact.transformMerchant(raw);
 
     // --- Rep name resolution ---
-    // 1. Try Salesrep_email → user_tokens.email → display_name
+    // Zentact uses { name: 'sales_rep', value: 'FirstName' } — match against salespeople table
     let repName = null;
-    if (m.sales_rep_email) {
+    if (m.sales_rep_raw) {
+      // 1. Exact match (handles if Zentact stores full names)
+      const exactRes = await pool.query(
+        `SELECT name FROM salespeople WHERE LOWER(name) = LOWER($1) LIMIT 1`,
+        [m.sales_rep_raw]
+      );
+      repName = exactRes.rows[0]?.name || null;
+
+      // 2. First-name prefix match — "Dora" → "Dora Smith"
+      if (!repName) {
+        const firstRes = await pool.query(
+          `SELECT name FROM salespeople
+           WHERE LOWER(name) ILIKE LOWER($1) || ' %'
+              OR LOWER(name) ILIKE '% ' || LOWER($1)
+           LIMIT 1`,
+          [m.sales_rep_raw]
+        );
+        repName = firstRes.rows[0]?.name || null;
+      }
+
+      // 3. Use the raw value as-is so the merchant is never "Unassigned"
+      //    (admin can later merge via Salespeople panel if the name doesn't match)
+      if (!repName) repName = m.sales_rep_raw;
+    }
+
+    // 4. Fallback: email lookup (legacy / other orgs)
+    if (!repName && m.sales_rep_email) {
       const userRes = await pool.query(
         `SELECT display_name FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1`,
         [m.sales_rep_email]
       );
       repName = userRes.rows[0]?.display_name || null;
     }
-    // 2. Try Opportunity_ID → crm_sold_deals.owner_name
+    // 5. Fallback: Opportunity_ID → crm_sold_deals.owner_name
     if (!repName && m.opportunity_id) {
       const dealRes = await pool.query(
         `SELECT owner_name FROM crm_sold_deals WHERE deal_id = $1 LIMIT 1`,
@@ -1563,7 +1589,7 @@ async function syncZentactMerchants() {
       );
       repName = dealRes.rows[0]?.owner_name || null;
     }
-    // 3. Fall back to the existing rep name already in DB (don't overwrite with null)
+    // 6. Fall back to the existing rep name already in DB (don't overwrite with a worse value)
 
     if (m.status === 'ACTIVE') activatedCount++;
 
