@@ -1497,13 +1497,14 @@ async function syncZentactMerchants() {
 
     if (m.status === 'ACTIVE') activatedCount++;
 
+    // Compute activated_at in JS to avoid PostgreSQL type-inference issues with $5 in CASE
+    const activatedAt = m.status === 'ACTIVE' ? new Date().toISOString().split('T')[0] : null;
+
     const result = await pool.query(`
       INSERT INTO zentact_merchants
         (merchant_account_id, organization_id, business_name, invitee_email, status,
          sales_rep_email, sales_rep_name, opportunity_id, activated_at, raw_attributes)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
-        CASE WHEN $5 = 'ACTIVE' THEN CURRENT_DATE ELSE NULL END,
-        $9::jsonb)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
       ON CONFLICT (merchant_account_id) DO UPDATE SET
         status          = EXCLUDED.status,
         business_name   = EXCLUDED.business_name,
@@ -1512,14 +1513,14 @@ async function syncZentactMerchants() {
         opportunity_id  = COALESCE(EXCLUDED.opportunity_id,  zentact_merchants.opportunity_id),
         activated_at    = CASE
           WHEN EXCLUDED.status = 'ACTIVE' AND zentact_merchants.activated_at IS NULL
-            THEN CURRENT_DATE
+            THEN EXCLUDED.activated_at
           ELSE zentact_merchants.activated_at
         END,
         raw_attributes  = EXCLUDED.raw_attributes,
         updated_at      = CURRENT_TIMESTAMP
       RETURNING (xmax = 0) AS inserted
     `, [m.merchant_account_id, m.organization_id, m.business_name, m.invitee_email,
-        m.status, m.sales_rep_email, repName, m.opportunity_id, m.raw_attributes]);
+        m.status, m.sales_rep_email, repName, m.opportunity_id, activatedAt, m.raw_attributes]);
 
     if (result.rows[0]?.inserted) newCount++;
   }
