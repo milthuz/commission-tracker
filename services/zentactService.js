@@ -29,9 +29,11 @@ class ZentactService {
   // Zentact stores custom fields as [{key: 'Salesrep_email', value: '...'}]
   // ============================================================
   static getAttribute(attributes = [], key) {
-    const attr = (attributes || []).find(
-      a => a.key === key || a.key?.toLowerCase() === key?.toLowerCase()
-    );
+    const attr = (attributes || []).find(a => {
+      // Zentact uses { name, value } — also guard against { key, value } just in case
+      const attrKey = a.name ?? a.key ?? '';
+      return attrKey === key || attrKey.toLowerCase() === key.toLowerCase();
+    });
     return attr?.value || null;
   }
 
