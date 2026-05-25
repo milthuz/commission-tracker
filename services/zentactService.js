@@ -59,22 +59,49 @@ class ZentactService {
 
         const data = response.data;
 
-        // Handle both array and paginated object responses
+        // Log the raw response shape on the first page so we can see the real structure
+        if (pageIndex === 0) {
+          console.log('📦 Zentact raw response shape:', JSON.stringify(
+            Array.isArray(data)
+              ? { isArray: true, length: data.length, sample: data[0] }
+              : { keys: Object.keys(data || {}), sample: JSON.stringify(data).slice(0, 300) }
+          ));
+        }
+
+        // Safely extract an array from whatever shape the API returns.
+        // We only assign a value to `items` if it's actually an array.
         let items = [];
         let totalCount = 0;
 
         if (Array.isArray(data)) {
+          // Top-level array
           items = data;
           totalCount = data.length;
-          hasMore = false; // no pagination info — assume single page
-        } else {
-          items = data.items || data.data || data.merchantAccounts || [];
-          totalCount = data.totalCount || data.total || items.length;
+          hasMore = false;
+        } else if (data && typeof data === 'object') {
+          // Paginated envelope — find the first key that holds an array
+          const arrayVal = (
+            (Array.isArray(data.items)            && data.items)            ||
+            (Array.isArray(data.data)             && data.data)             ||
+            (Array.isArray(data.merchantAccounts) && data.merchantAccounts) ||
+            (Array.isArray(data.records)          && data.records)          ||
+            (Array.isArray(data.results)          && data.results)          ||
+            []
+          );
+          items = arrayVal;
+          totalCount = (
+            data.totalCount || data.total || data.totalRecords ||
+            data.count      || items.length
+          );
           const fetched = (pageIndex + 1) * pageSize;
-          hasMore = items.length === pageSize && fetched < totalCount;
+          hasMore = items.length > 0 && items.length === pageSize && fetched < totalCount;
+        } else {
+          // Unexpected response — stop and log
+          console.warn('⚠️ Zentact: unexpected response type, stopping pagination. data =', data);
+          hasMore = false;
         }
 
-        merchants.push(...items);
+        if (items.length > 0) merchants.push(...items);
         console.log(`✅ Zentact page ${pageIndex}: ${items.length} merchants (total so far: ${merchants.length} / ${totalCount})`);
         pageIndex++;
       } catch (error) {
