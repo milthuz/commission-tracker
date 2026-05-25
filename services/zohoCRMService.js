@@ -184,7 +184,26 @@ class ZohoCRMService {
 
   // Fetch all CRM users and return a {userId → name} map.
   // Used to resolve owner names when COQL returns Owner as {id} only.
+  // Uses COQL (no extra scope needed) with REST API fallback.
   async getCRMUsers() {
+    // Try COQL on the Users module first — no extra scope required
+    try {
+      const query = `SELECT id, Full_Name, Email FROM Users LIMIT 200 OFFSET 0`;
+      const response = await axios.post(`${CRM_BASE_URL}/coql`, { select_query: query }, {
+        headers: { ...this.headers, 'Content-Type': 'application/json' },
+      });
+      const users = response.data?.data || [];
+      if (users.length > 0) {
+        const map = {};
+        users.forEach(u => { map[u.id] = u.Full_Name || u.Email || 'Unknown'; });
+        console.log(`✅ Fetched ${users.length} CRM users via COQL`);
+        return map;
+      }
+    } catch (coqlErr) {
+      console.warn('⚠️ COQL Users query failed, trying REST API:', coqlErr.response?.data?.message || coqlErr.message);
+    }
+
+    // Fallback: REST API (requires ZohoCRM.users.READ scope)
     try {
       const response = await axios.get(`${CRM_BASE_URL}/users`, {
         headers: this.headers,
@@ -193,10 +212,10 @@ class ZohoCRMService {
       const users = response.data?.users || [];
       const map = {};
       users.forEach(u => { map[u.id] = u.full_name || u.name || u.email || 'Unknown'; });
-      console.log(`✅ Fetched ${users.length} CRM users for owner name resolution`);
+      console.log(`✅ Fetched ${users.length} CRM users via REST API`);
       return map;
-    } catch (err) {
-      console.warn('⚠️ Failed to fetch CRM users:', err.response?.data?.message || err.message);
+    } catch (restErr) {
+      console.warn('⚠️ REST Users API also failed:', restErr.response?.data?.message || restErr.message);
       return {};
     }
   }
