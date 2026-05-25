@@ -908,18 +908,32 @@ app.get('/api/zentact/status', authenticateToken, async (req, res) => {
 
     const result = await pool.query(`
       SELECT
-        COUNT(*)                                        AS total,
-        COUNT(CASE WHEN status = 'ACTIVE' THEN 1 END)  AS active,
-        MAX(updated_at)                                 AS last_sync
+        COUNT(*)                                                       AS total,
+        COUNT(CASE WHEN status = 'ACTIVE' THEN 1 END)                 AS active,
+        COUNT(CASE WHEN sales_rep_email IS NOT NULL THEN 1 END)       AS with_rep_email,
+        COUNT(CASE WHEN sales_rep_name  IS NOT NULL THEN 1 END)       AS assigned,
+        MAX(updated_at)                                                AS last_sync
       FROM zentact_merchants
     `);
     const row = result.rows[0];
 
+    // Sample 3 merchants to expose their raw_attributes so we can debug field names
+    const sampleRes = await pool.query(`
+      SELECT merchant_account_id, business_name, sales_rep_email, sales_rep_name,
+             raw_attributes
+      FROM zentact_merchants
+      ORDER BY created_at
+      LIMIT 3
+    `);
+
     res.json({
-      connected: true,
-      total:     parseInt(row.total)  || 0,
-      active:    parseInt(row.active) || 0,
-      lastSync:  row.last_sync        || null,
+      connected:    true,
+      total:        parseInt(row.total)           || 0,
+      active:       parseInt(row.active)          || 0,
+      withRepEmail: parseInt(row.with_rep_email)  || 0,
+      assigned:     parseInt(row.assigned)        || 0,
+      lastSync:     row.last_sync                 || null,
+      debugSamples: sampleRes.rows,
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
