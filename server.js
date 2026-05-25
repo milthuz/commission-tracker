@@ -956,6 +956,33 @@ app.get('/api/zentact/sync-status', authenticateToken, (req, res) => {
   res.json(zentactSyncStatus);
 });
 
+// GET /api/zentact/attribute-keys — shows what attribute keys are stored in the DB (debug)
+app.get('/api/zentact/attribute-keys', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    // Show distinct attribute keys stored in raw_attributes JSONB
+    const keysRes = await pool.query(`
+      SELECT DISTINCT jsonb_object_keys(raw_attributes) AS key
+      FROM zentact_merchants
+      WHERE raw_attributes IS NOT NULL AND raw_attributes <> 'null'::jsonb
+      ORDER BY key
+    `);
+    // Also show a sample merchant's full raw_attributes
+    const sampleRes = await pool.query(`
+      SELECT merchant_account_id, business_name, sales_rep_email, sales_rep_name,
+             raw_attributes
+      FROM zentact_merchants
+      LIMIT 3
+    `);
+    res.json({
+      attributeKeys: keysRes.rows.map(r => r.key),
+      samples: sampleRes.rows,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // GET /api/zentact/merchants — list all merchants in DB
 app.get('/api/zentact/merchants', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
@@ -1378,24 +1405,45 @@ async function autoSyncInvoices() {
 }
 
 // Schedule auto-sync to run every 4 hours (14400000 ms)
-const AUTO_SYNC_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours
+const AUTO_SYNC_INTERVAL         = 4  * 60 * 60 * 1000; // 4 hours  — invoices
+const ZENTACT_AUTO_SYNC_INTERVAL = 12 * 60 * 60 * 1000; // 12 hours — Zentact merchants
 
 let syncInterval;
+let zentactSyncIntervalHandle;
+
+async function autoSyncZentact() {
+  if (!process.env.ZENTACT_API_KEY) return; // skip if not configured
+  try {
+    console.log('🔄 [AUTO-SYNC] Starting automatic Zentact merchant sync...');
+    const result = await syncZentactMerchants();
+    console.log(`✅ [AUTO-SYNC] Zentact done: ${result.total} total, ${result.active} active, ${result.newCount} new`);
+  } catch (err) {
+    console.error('❌ [AUTO-SYNC] Zentact sync error:', err.message);
+  }
+}
 
 function startAutoSync() {
-  console.log('⏰ [AUTO-SYNC] Starting automatic sync scheduler (every 4 hours)');
-  
-  // Run sync immediately on startup
+  console.log('⏰ [AUTO-SYNC] Starting automatic sync scheduler (invoices every 4h, Zentact every 12h)');
+
+  // Invoices — run immediately, then every 4 hours
   autoSyncInvoices();
-  
-  // Then run every 4 hours
   syncInterval = setInterval(autoSyncInvoices, AUTO_SYNC_INTERVAL);
+
+  // Zentact — first run after 1 minute (give DB time to settle), then every 12 hours
+  setTimeout(() => {
+    autoSyncZentact();
+    zentactSyncIntervalHandle = setInterval(autoSyncZentact, ZENTACT_AUTO_SYNC_INTERVAL);
+  }, 60 * 1000);
 }
 
 function stopAutoSync() {
   if (syncInterval) {
     clearInterval(syncInterval);
-    console.log('⏹️ [AUTO-SYNC] Stopped automatic sync scheduler');
+    console.log('⏹️ [AUTO-SYNC] Stopped invoice sync scheduler');
+  }
+  if (zentactSyncIntervalHandle) {
+    clearInterval(zentactSyncIntervalHandle);
+    console.log('⏹️ [AUTO-SYNC] Stopped Zentact sync scheduler');
   }
 }
 
@@ -1471,6 +1519,14 @@ async function syncZentactMerchants() {
 
   let newCount = 0;
   let activatedCount = 0;
+
+  // Log the first merchant's full structure so we can see what fields are available
+  if (rawMerchants.length > 0) {
+    const sample = rawMerchants[0];
+    const attrs = sample.merchantAccountAttributes || sample.customAttributes || sample.attributes || [];
+    console.log('🔍 Zentact first merchant keys:', Object.keys(sample).join(', '));
+    console.log('🔍 Zentact first merchant attributes:', JSON.stringify(attrs).slice(0, 500));
+  }
 
   for (const raw of rawMerchants) {
     const m = zentact.transformMerchant(raw);
