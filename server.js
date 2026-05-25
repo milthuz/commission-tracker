@@ -791,6 +791,110 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
+// GET /api/crm/points/annual — full month-by-month points & bonus breakdown for one rep
+// Used by Commission Report to show points alongside invoice commissions.
+// Query params: year (required), repName (required)
+app.get('/api/crm/points/annual', authenticateToken, async (req, res) => {
+  try {
+    const year    = parseInt(req.query.year)       || new Date().getFullYear();
+    const repName = (req.query.repName || '').trim();
+    if (!repName) return res.status(400).json({ error: 'repName required' });
+
+    // CRM sold deals grouped by month for this rep & year
+    const crmResult = await pool.query(`
+      SELECT EXTRACT(MONTH FROM sold_date) AS month,
+             SUM(points) AS crm_points
+      FROM crm_sold_deals
+      WHERE EXTRACT(YEAR FROM sold_date) = $1
+        AND LOWER(owner_name) = LOWER($2)
+      GROUP BY EXTRACT(MONTH FROM sold_date)
+    `, [year, repName]);
+
+    // Zentact activations grouped by month for this rep & year
+    const zentactResult = await pool.query(`
+      SELECT EXTRACT(MONTH FROM activated_at) AS month,
+             SUM(points)       AS zentact_points,
+             COUNT(*)          AS activations,
+             SUM(bonus_amount) AS zentact_bonus
+      FROM zentact_merchants
+      WHERE EXTRACT(YEAR FROM activated_at) = $1
+        AND LOWER(sales_rep_name) = LOWER($2)
+        AND status = 'ACTIVE'
+      GROUP BY EXTRACT(MONTH FROM activated_at)
+    `, [year, repName]);
+
+    const crmByMonth = {};
+    for (const r of crmResult.rows) {
+      crmByMonth[parseInt(r.month)] = parseInt(r.crm_points) || 0;
+    }
+    const zentactByMonth = {};
+    for (const r of zentactResult.rows) {
+      zentactByMonth[parseInt(r.month)] = {
+        points:      parseInt(r.zentact_points)  || 0,
+        activations: parseInt(r.activations)     || 0,
+        bonus:       parseFloat(r.zentact_bonus) || 0,
+      };
+    }
+
+    const months = [];
+    for (let m = 1; m <= 12; m++) {
+      const crmPts  = crmByMonth[m]    || 0;
+      const zentact = zentactByMonth[m] || { points: 0, activations: 0, bonus: 0 };
+      const total   = crmPts + zentact.points;
+      months.push({
+        month:             m,
+        crmPoints:         crmPts,
+        zentactPoints:     zentact.points,
+        zentactActivations: zentact.activations,
+        zentactBonus:      zentact.bonus,
+        totalPoints:       total,
+        quotaMet:          total >= MONTHLY_QUOTA,
+        monthlyBonus:      ZohoCRMService.calculateMonthlyBonus(total),
+      });
+    }
+
+    // Annual totals — only from PLAN_START_DATE forward
+    const [crmAnn, zentactAnn] = await Promise.all([
+      pool.query(
+        `SELECT COALESCE(SUM(points), 0) AS pts FROM crm_sold_deals
+         WHERE sold_date >= $1 AND LOWER(owner_name) = LOWER($2)`,
+        [PLAN_START_DATE, repName]
+      ),
+      pool.query(
+        `SELECT COALESCE(SUM(points), 0) AS pts, COALESCE(COUNT(*), 0) AS acts, COALESCE(SUM(bonus_amount), 0) AS bonus
+         FROM zentact_merchants
+         WHERE activated_at >= $1 AND LOWER(sales_rep_name) = LOWER($2) AND status = 'ACTIVE'`,
+        [PLAN_START_DATE, repName]
+      ),
+    ]);
+
+    const annualCrm     = parseInt(crmAnn.rows[0]?.pts)       || 0;
+    const annualZentact = parseInt(zentactAnn.rows[0]?.pts)    || 0;
+    const annualTotal   = annualCrm + annualZentact;
+    const annualBonus   = ZohoCRMService.calculateAnnualBonus(annualTotal);
+    const nextTier      = ANNUAL_BONUS_TIERS.slice().reverse().find(t => annualTotal < t.points) || null;
+
+    res.json({
+      repName,
+      year,
+      months,
+      annual: {
+        totalPoints:    annualTotal,
+        crmPoints:      annualCrm,
+        zentactPoints:  annualZentact,
+        zentactBonus:   parseFloat(zentactAnn.rows[0]?.bonus) || 0,
+        annualBonus,
+        nextTier,
+        ptsToNextTier: nextTier ? nextTier.points - annualTotal : 0,
+        tiers: ANNUAL_BONUS_TIERS,
+      },
+    });
+  } catch (err) {
+    console.error('CRM points/annual error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ZENTACT ROUTES
 // ============================================================================
 
