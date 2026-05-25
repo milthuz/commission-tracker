@@ -972,6 +972,49 @@ app.get('/api/zentact/sync-status', authenticateToken, (req, res) => {
 });
 
 // GET /api/zentact/attribute-keys — shows what attribute keys are stored in the DB (debug)
+// GET /api/zentact/raw-sample — fetches one merchant LIVE from Zentact and returns
+// the complete raw response. Useful to discover undocumented date fields.
+app.get('/api/zentact/raw-sample', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const apiKey = process.env.ZENTACT_API_KEY;
+    if (!apiKey) return res.status(400).json({ error: 'ZENTACT_API_KEY not set' });
+
+    const baseUrl = process.env.ZENTACT_API_URL || 'https://api.zentact.com/api/v1';
+    const headers = { 'X-API-Key': apiKey, 'Content-Type': 'application/json' };
+
+    // Fetch a few merchants in the list view
+    const listResp = await axios.get(`${baseUrl}/merchant-accounts`, {
+      headers, params: { pageSize: 3, pageIndex: 0 },
+    });
+    const inner = listResp.data?.data || {};
+    const rows = inner.rows || listResp.data?.rows || [];
+
+    // Also fetch a single merchant by ID (the single-GET endpoint sometimes
+    // returns more fields than the list endpoint)
+    let singleMerchant = null;
+    if (rows[0]?.merchantAccountId) {
+      try {
+        const single = await axios.get(
+          `${baseUrl}/merchant-accounts/${rows[0].merchantAccountId}`,
+          { headers }
+        );
+        singleMerchant = single.data;
+      } catch (e) {
+        singleMerchant = { error: e.response?.data?.message || e.message };
+      }
+    }
+
+    res.json({
+      listSample: rows.slice(0, 3),
+      singleSample: singleMerchant,
+      hint: 'Look for date/timestamp fields anywhere in the JSON (createdAt, updatedAt, activatedAt, statusChangedAt, etc.)',
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.response?.data || error.message });
+  }
+});
+
 app.get('/api/zentact/attribute-keys', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   try {
