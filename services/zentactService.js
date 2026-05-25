@@ -79,22 +79,33 @@ class ZentactService {
           totalCount = data.length;
           hasMore = false;
         } else if (data && typeof data === 'object') {
-          // Paginated envelope — find the first key that holds an array
+          // Paginated envelope — find the first key that holds an array.
+          // Zentact uses: { status: 'ok', data: { pagination: {...}, rows: [...] } }
+          const inner = data.data && typeof data.data === 'object' && !Array.isArray(data.data) ? data.data : null;
           const arrayVal = (
-            (Array.isArray(data.items)            && data.items)            ||
-            (Array.isArray(data.data)             && data.data)             ||
-            (Array.isArray(data.merchantAccounts) && data.merchantAccounts) ||
-            (Array.isArray(data.records)          && data.records)          ||
-            (Array.isArray(data.results)          && data.results)          ||
+            (inner && Array.isArray(inner.rows)          && inner.rows)          ||
+            (inner && Array.isArray(inner.items)         && inner.items)         ||
+            (inner && Array.isArray(inner.data)          && inner.data)          ||
+            (Array.isArray(data.items)                   && data.items)          ||
+            (Array.isArray(data.data)                    && data.data)           ||
+            (Array.isArray(data.merchantAccounts)        && data.merchantAccounts) ||
+            (Array.isArray(data.records)                 && data.records)        ||
+            (Array.isArray(data.results)                 && data.results)        ||
             []
           );
           items = arrayVal;
+          const pagination = inner?.pagination || {};
           totalCount = (
-            data.totalCount || data.total || data.totalRecords ||
-            data.count      || items.length
+            pagination.total  || data.totalCount || data.total ||
+            data.totalRecords || data.count      || items.length
           );
-          const fetched = (pageIndex + 1) * pageSize;
-          hasMore = items.length > 0 && items.length === pageSize && fetched < totalCount;
+          // Use hasNextPage from pagination envelope if available, otherwise estimate
+          if (typeof pagination.hasNextPage === 'boolean') {
+            hasMore = pagination.hasNextPage;
+          } else {
+            const fetched = (pageIndex + 1) * pageSize;
+            hasMore = items.length > 0 && items.length === pageSize && fetched < totalCount;
+          }
         } else {
           // Unexpected response — stop and log
           console.warn('⚠️ Zentact: unexpected response type, stopping pagination. data =', data);
