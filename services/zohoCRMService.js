@@ -120,12 +120,40 @@ class ZohoCRMService {
         hasMore = response.data?.info?.more_records === true;
         page++;
       }
-      console.log(`✅ Stage search: fetched ${stageDeals.length} active deals, built user map with ${Object.keys(userMapFromStage).length} users`);
+      console.log(`✅ Stage search: fetched ${stageDeals.length} active deals, built user map with ${Object.keys(userMapFromStage).length} users from stage`);
     } catch (stageError) {
       console.warn('⚠️ Stage search failed:', stageError.response?.data?.message || stageError.message);
     }
 
-    // Back-fill owner names on COQL deals using the Stage search user map
+    // Expand the user map by pulling recent deals via the regular REST API.
+    // The REST /Deals endpoint always returns Owner as {id, name} — gives us
+    // all active reps even if they have no current deposit-stage deals.
+    try {
+      for (let page = 1; page <= 5; page++) {
+        const response = await axios.get(`${CRM_BASE_URL}/Deals`, {
+          headers: this.headers,
+          params: {
+            per_page: 200,
+            page,
+            sort_by: 'Modified_Time',
+            sort_order: 'desc',
+            fields: 'Owner',
+          },
+        });
+        const deals = response.data?.data || [];
+        deals.forEach(d => {
+          if (d.Owner?.id && d.Owner?.name) {
+            userMapFromStage[d.Owner.id] = d.Owner.name;
+          }
+        });
+        if (!response.data?.info?.more_records) break;
+      }
+      console.log(`✅ User map expanded to ${Object.keys(userMapFromStage).length} users after REST deal scan`);
+    } catch (expandErr) {
+      console.warn('⚠️ User map expansion failed:', expandErr.response?.data?.message || expandErr.message);
+    }
+
+    // Back-fill owner names on COQL deals using the expanded user map
     coqlDeals.forEach(d => {
       if (d.Owner?.id && !d.Owner?.name && userMapFromStage[d.Owner.id]) {
         d.Owner.name = userMapFromStage[d.Owner.id];
