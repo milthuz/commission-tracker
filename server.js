@@ -222,7 +222,11 @@ app.use(cors({
   },
   credentials: true,
 }));
-app.use(bodyParser.json());
+app.use(bodyParser.json({
+  // Capture the raw body so webhook HMAC signatures can be verified
+  verify: (req, _res, buf) => { req.rawBody = buf; },
+  limit: '10mb',
+}));
 
 // JWT middleware
 const authenticateToken = (req, res, next) => {
@@ -972,6 +976,125 @@ app.get('/api/zentact/sync-status', authenticateToken, (req, res) => {
 });
 
 // GET /api/zentact/attribute-keys — shows what attribute keys are stored in the DB (debug)
+// POST /api/zentact/webhook — receives Zentact "Merchant Account Status Updates"
+// Configure in Zentact dashboard → Configure → Webhooks with this URL and a shared
+// secret. Save the secret to Heroku env var ZENTACT_WEBHOOK_SECRET.
+app.post('/api/zentact/webhook', async (req, res) => {
+  const crypto = require('crypto');
+  const secret = process.env.ZENTACT_WEBHOOK_SECRET;
+  const signature = req.headers['x-hmac-signature'];
+
+  // Signature verification (only enforced if secret is set)
+  if (secret) {
+    if (!signature || !req.rawBody) {
+      console.warn('⚠️ Zentact webhook: missing signature or raw body');
+      return res.status(401).json({ error: 'Missing signature' });
+    }
+    const expected = crypto.createHmac('sha256', secret).update(req.rawBody).digest('base64');
+    const a = Buffer.from(signature);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      console.warn('⚠️ Zentact webhook: signature mismatch');
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+  }
+
+  const evt = req.body || {};
+  const merchantId = evt.merchantAccountId;
+  const status = evt.status;
+  const createdAtUnix = evt.createdAt;
+
+  if (!merchantId || !status) {
+    return res.status(400).json({ error: 'Missing merchantAccountId or status' });
+  }
+
+  // Convert Unix timestamp → ISO date (YYYY-MM-DD)
+  const eventDate = createdAtUnix
+    ? new Date(createdAtUnix * 1000).toISOString().split('T')[0]
+    : new Date().toISOString().split('T')[0];
+
+  try {
+    // If status is ACTIVE → set activated_at to the event date (only if NULL,
+    // so we never overwrite a confirmed date with a later status change).
+    // For any status change, update the status itself.
+    await pool.query(`
+      INSERT INTO zentact_merchants (merchant_account_id, status, activated_at)
+      VALUES ($1, $2, CASE WHEN $2 = 'ACTIVE' THEN $3::date ELSE NULL END)
+      ON CONFLICT (merchant_account_id) DO UPDATE SET
+        status = EXCLUDED.status,
+        activated_at = CASE
+          WHEN EXCLUDED.status = 'ACTIVE' AND zentact_merchants.activated_at IS NULL
+            THEN $3::date
+          ELSE zentact_merchants.activated_at
+        END,
+        updated_at = CURRENT_TIMESTAMP
+    `, [merchantId, status, eventDate]);
+
+    console.log(`📡 Zentact webhook: ${merchantId} → ${status} (${eventDate})`);
+    res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error('❌ Zentact webhook error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/zentact/import-assignments — bulk update sales_rep_name + activated_at
+// Body: { rows: [{ merchant: 'Business Name', salesRep: 'Rep Name', activatedAt: 'YYYY-MM-DD' }] }
+// Matches merchants by business_name (case-insensitive, trimmed).
+app.post('/api/zentact/import-assignments', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const { rows, dryRun } = req.body || {};
+  if (!Array.isArray(rows)) return res.status(400).json({ error: 'rows must be an array' });
+
+  // Load all merchants once and build a name → ID map (lowercase, trimmed)
+  const allMerchants = await pool.query(
+    `SELECT merchant_account_id, business_name, sales_rep_name, activated_at FROM zentact_merchants`
+  );
+  const byName = new Map();
+  for (const m of allMerchants.rows) {
+    if (m.business_name) byName.set(m.business_name.trim().toLowerCase(), m);
+  }
+
+  const results = { matched: [], unmatched: [], updated: 0 };
+  for (const row of rows) {
+    const merchantName = (row.merchant || '').trim();
+    const salesRep     = (row.salesRep || '').trim() || null;
+    const activatedAt  = (row.activatedAt || '').trim() || null;
+
+    if (!merchantName) {
+      results.unmatched.push({ ...row, reason: 'empty merchant name' });
+      continue;
+    }
+    const found = byName.get(merchantName.toLowerCase());
+    if (!found) {
+      results.unmatched.push({ ...row, reason: 'business_name not found in DB' });
+      continue;
+    }
+
+    results.matched.push({
+      merchant_account_id: found.merchant_account_id,
+      merchant: found.business_name,
+      newSalesRep: salesRep,
+      newActivatedAt: activatedAt,
+      oldSalesRep: found.sales_rep_name,
+      oldActivatedAt: found.activated_at,
+    });
+
+    if (!dryRun) {
+      await pool.query(`
+        UPDATE zentact_merchants
+        SET sales_rep_name = COALESCE($1, sales_rep_name),
+            activated_at  = COALESCE($2::date, activated_at),
+            updated_at    = CURRENT_TIMESTAMP
+        WHERE merchant_account_id = $3
+      `, [salesRep, activatedAt, found.merchant_account_id]);
+      results.updated++;
+    }
+  }
+
+  res.json(results);
+});
+
 // GET /api/zentact/raw-sample — fetches one merchant LIVE from Zentact and returns
 // the complete raw response. Useful to discover undocumented date fields.
 app.get('/api/zentact/raw-sample', authenticateToken, async (req, res) => {
