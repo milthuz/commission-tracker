@@ -1529,6 +1529,18 @@ async function syncZentactMerchants() {
   if (!apiKey) throw new Error('ZENTACT_API_KEY env var not set');
 
   const zentact = new ZentactService(apiKey);
+
+  // Backfill: any ACTIVE merchant that lost its activated_at (from earlier cleanup bug)
+  // gets today's date so they appear on the tracker for this month.
+  const backfilled = await pool.query(`
+    UPDATE zentact_merchants
+    SET activated_at = CURRENT_DATE, updated_at = CURRENT_TIMESTAMP
+    WHERE status = 'ACTIVE' AND activated_at IS NULL
+  `);
+  if (backfilled.rowCount > 0) {
+    console.log(`📅 Backfilled activated_at for ${backfilled.rowCount} ACTIVE merchants`);
+  }
+
   const rawMerchants = await zentact.getMerchantAccounts();
 
   let newCount = 0;
