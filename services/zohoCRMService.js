@@ -182,6 +182,25 @@ class ZohoCRMService {
     }
   }
 
+  // Fetch all CRM users and return a {userId → name} map.
+  // Used to resolve owner names when COQL returns Owner as {id} only.
+  async getCRMUsers() {
+    try {
+      const response = await axios.get(`${CRM_BASE_URL}/users`, {
+        headers: this.headers,
+        params: { type: 'AllUsers', per_page: 200 },
+      });
+      const users = response.data?.users || [];
+      const map = {};
+      users.forEach(u => { map[u.id] = u.full_name || u.name || u.email || 'Unknown'; });
+      console.log(`✅ Fetched ${users.length} CRM users for owner name resolution`);
+      return map;
+    } catch (err) {
+      console.warn('⚠️ Failed to fetch CRM users:', err.response?.data?.message || err.message);
+      return {};
+    }
+  }
+
   // ============================================================
   // FIELDS METADATA
   // ============================================================
@@ -240,30 +259,41 @@ class ZohoCRMService {
     return 0;
   }
 
-  // Transform a raw CRM deal into our app's format
-  transformDeal(crmDeal) {
+  // Transform a raw CRM deal into our app's format.
+  // userMap: optional {userId → name} from getCRMUsers(), used to resolve
+  // owner names when COQL returns Owner as {id} only (no name property).
+  transformDeal(crmDeal, userMap = {}) {
     const points = this.calculatePoints(crmDeal);
 
-    // Owner can come back as an object {id, name}, a plain string, or via
-    // the COQL explicit "Owner.name" field — handle all three shapes
+    // Owner resolution — try every possible shape Zoho API can return:
+    // 1. Object with name: {id, name}  (Stage search API)
+    // 2. Object ID-only: {id}          (COQL — resolve via userMap)
+    // 3. Plain string                   (unlikely but safe)
+    const ownerId = typeof crmDeal.Owner === 'object' ? crmDeal.Owner?.id : null;
     const ownerName =
       (typeof crmDeal.Owner === 'object' && crmDeal.Owner?.name) ||
+      (ownerId && userMap[ownerId]) ||
       (typeof crmDeal.Owner === 'string' && crmDeal.Owner) ||
-      crmDeal['Owner.name'] ||
       'Unassigned';
 
+    // Account_Name can be an object {id, name} or a plain string
+    const accountName =
+      (typeof crmDeal.Account_Name === 'object' && crmDeal.Account_Name?.name) ||
+      (typeof crmDeal.Account_Name === 'string' && crmDeal.Account_Name) ||
+      '';
+
     return {
-      crm_deal_id:      crmDeal.id,
-      deal_name:        crmDeal.Deal_Name || '',
-      sales_rep_name:   ownerName,
-      stage:            crmDeal.Stage || '',
+      crm_deal_id:       crmDeal.id,
+      deal_name:         crmDeal.Deal_Name || '',
+      sales_rep_name:    ownerName,
+      stage:             crmDeal.Stage || '',
       lead_source_group: crmDeal.Lead_Source_Group || '',
       points,
-      close_date:       crmDeal.Closing_Date || null,
-      created_time:     crmDeal.Created_Time || null,
-      account_name:     crmDeal.Account_Name?.name || crmDeal.Account_Name || '',
-      amount:           parseFloat(crmDeal.Amount) || 0,
-      is_sold:          (crmDeal.Stage || '').toLowerCase().includes('deposit'),
+      close_date:        crmDeal.Closing_Date || null,
+      created_time:      crmDeal.Created_Time || null,
+      account_name:      accountName,
+      amount:            parseFloat(crmDeal.Amount) || 0,
+      is_sold:           (crmDeal.Stage || '').toLowerCase().includes('deposit'),
     };
   }
 

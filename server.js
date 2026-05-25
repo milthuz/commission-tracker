@@ -1108,8 +1108,11 @@ async function syncCrmSoldDeals(crm) {
   const deals = allSold.data || [];
   let newCount = 0;
 
+  // Fetch users once to resolve owner names (COQL returns Owner as {id} only)
+  const userMap = await crm.getCRMUsers();
+
   for (const rawDeal of deals) {
-    const deal = crm.transformDeal(rawDeal);
+    const deal = crm.transformDeal(rawDeal, userMap);
 
     // sold_date = Deposit_Information_Received date (the custom CRM field that records
     // exactly when the deal reached that stage). Fall back to Closing_Date, then today.
