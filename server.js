@@ -13,6 +13,7 @@ const jwt = require('jsonwebtoken');
 const bodyParser = require('body-parser');
 const { Pool } = require('pg');
 const { ZohoCRMService, MONTHLY_QUOTA, MONTHLY_BONUS_TIERS, ANNUAL_BONUS_TIERS, PLAN_START_DATE } = require('./services/zohoCRMService');
+const { ZentactService } = require('./services/zentactService');
 
 dotenv.config();
 
@@ -162,6 +163,28 @@ async function initializeDatabase() {
         amount        DECIMAL(12,2) DEFAULT 0,
         first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // Zentact merchants — stores all merchant accounts pulled from Zentact API.
+    // activated_at is stamped the first time we see status = ACTIVE (never overwritten).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS zentact_merchants (
+        id                  SERIAL PRIMARY KEY,
+        merchant_account_id VARCHAR(255) UNIQUE NOT NULL,
+        organization_id     VARCHAR(255),
+        business_name       VARCHAR(500) DEFAULT '',
+        invitee_email       VARCHAR(255),
+        status              VARCHAR(50)  DEFAULT '',
+        sales_rep_email     VARCHAR(255),
+        sales_rep_name      VARCHAR(255),
+        opportunity_id      VARCHAR(255),
+        activated_at        DATE,
+        points              INT          DEFAULT 1,
+        bonus_amount        DECIMAL(10,2) DEFAULT 100.00,
+        raw_attributes      JSONB,
+        created_at          TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+        updated_at          TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
       );
     `);
 
@@ -634,12 +657,13 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     const dealsResult = await pool.query(dealsQuery, dealsParams);
     const deals = dealsResult.rows;
 
-    // Build per-rep summary
+    // Build per-rep summary from CRM deals
     const repMap = {};
     for (const deal of deals) {
       const rep = deal.owner_name || 'Unassigned';
-      if (!repMap[rep]) repMap[rep] = { repName: rep, totalPoints: 0, deals: [] };
+      if (!repMap[rep]) repMap[rep] = { repName: rep, totalPoints: 0, crmPoints: 0, deals: [], zentactMerchants: [] };
       repMap[rep].totalPoints += deal.points;
+      repMap[rep].crmPoints   += deal.points;
       repMap[rep].deals.push({
         crm_deal_id:       deal.deal_id,
         deal_name:         deal.deal_name,
@@ -650,23 +674,60 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       });
     }
 
+    // Merge Zentact activations for the same month
+    const zentactResult = await pool.query(`
+      SELECT merchant_account_id, business_name, sales_rep_name, sales_rep_email,
+             opportunity_id, points, bonus_amount, activated_at
+      FROM zentact_merchants
+      WHERE activated_at >= $1 AND activated_at <= $2
+        AND status = 'ACTIVE'
+        AND (
+          sales_rep_name IN (SELECT name FROM salespeople WHERE is_active = true)
+          OR sales_rep_name IS NULL
+        )
+    `, [startDate, endDate]);
+
+    for (const merchant of zentactResult.rows) {
+      const rep = merchant.sales_rep_name || 'Unassigned';
+      if (!repMap[rep]) repMap[rep] = { repName: rep, totalPoints: 0, crmPoints: 0, deals: [], zentactMerchants: [] };
+      const pts = parseInt(merchant.points) || 1;
+      repMap[rep].totalPoints += pts;
+      repMap[rep].zentactMerchants.push({
+        merchant_account_id: merchant.merchant_account_id,
+        business_name:       merchant.business_name,
+        sales_rep_name:      merchant.sales_rep_name,
+        opportunity_id:      merchant.opportunity_id,
+        points:              pts,
+        bonus_amount:        parseFloat(merchant.bonus_amount) || 100,
+        activated_at:        merchant.activated_at,
+      });
+    }
+
     let summary = Object.values(repMap).map(rep => {
+      const zentactMerchants = rep.zentactMerchants || [];
+      const zentactPoints = zentactMerchants.reduce((s, m) => s + (m.points || 1), 0);
+      const zentactBonus  = zentactMerchants.reduce((s, m) => s + (m.bonus_amount || 100), 0);
       const quotaMet = rep.totalPoints >= MONTHLY_QUOTA;
       const monthlyBonus = ZohoCRMService.calculateMonthlyBonus(rep.totalPoints);
       return {
-        repName:       rep.repName,
-        totalPoints:   rep.totalPoints,
-        quota:         MONTHLY_QUOTA,
+        repName:             rep.repName,
+        totalPoints:         rep.totalPoints,   // CRM + Zentact combined
+        crmPoints:           rep.crmPoints || 0,
+        zentactPoints,
+        zentactActivations:  zentactMerchants.length,
+        zentactBonus,
+        quota:               MONTHLY_QUOTA,
         quotaMet,
-        pointsToQuota: Math.max(0, MONTHLY_QUOTA - rep.totalPoints),
+        pointsToQuota:       Math.max(0, MONTHLY_QUOTA - rep.totalPoints),
         monthlyBonus,
         bonusTier:     MONTHLY_BONUS_TIERS.find(t => rep.totalPoints >= t.points) || null,
         nextBonusTier: MONTHLY_BONUS_TIERS.slice().reverse().find(t => rep.totalPoints < t.points) || null,
-        deals:         rep.deals,
+        deals:               rep.deals,
+        zentactMerchants,
       };
     }).sort((a, b) => b.totalPoints - a.totalPoints);
 
-    // Annual points: query DB from PLAN_START_DATE (May 1, 2026)
+    // Annual CRM points from PLAN_START_DATE (May 1, 2026)
     const annualResult = await pool.query(`
       SELECT owner_name, SUM(points) AS annual_points
       FROM crm_sold_deals
@@ -679,23 +740,154 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       annualByRep[row.owner_name] = parseInt(row.annual_points) || 0;
     }
 
-    summary = summary.map(rep => ({
-      ...rep,
-      annualPoints: annualByRep[rep.repName] || 0,
-      annualBonus:  ZohoCRMService.calculateAnnualBonus(annualByRep[rep.repName] || 0),
-    }));
+    // Annual Zentact points from PLAN_START_DATE
+    const annualZentactResult = await pool.query(`
+      SELECT sales_rep_name,
+             SUM(points)  AS zentact_points,
+             COUNT(*)     AS activations,
+             SUM(bonus_amount) AS zentact_bonus
+      FROM zentact_merchants
+      WHERE activated_at >= $1 AND status = 'ACTIVE'
+      GROUP BY sales_rep_name
+    `, [PLAN_START_DATE]);
+
+    const annualZentactByRep = {};
+    for (const row of annualZentactResult.rows) {
+      annualZentactByRep[row.sales_rep_name] = {
+        points:      parseInt(row.zentact_points)  || 0,
+        activations: parseInt(row.activations)     || 0,
+        bonus:       parseFloat(row.zentact_bonus) || 0,
+      };
+    }
+
+    summary = summary.map(rep => {
+      const crmAnnual     = annualByRep[rep.repName]         || 0;
+      const zentactAnnual = annualZentactByRep[rep.repName]  || { points: 0, activations: 0, bonus: 0 };
+      const totalAnnual   = crmAnnual + zentactAnnual.points;
+      return {
+        ...rep,
+        annualPoints:             totalAnnual,
+        annualBonus:              ZohoCRMService.calculateAnnualBonus(totalAnnual),
+        annualZentactActivations: zentactAnnual.activations,
+        annualZentactBonus:       zentactAnnual.bonus,
+      };
+    });
+
+    const totalZentactActivations = zentactResult.rows.length;
 
     res.json({
       year,
       month,
-      quota:      MONTHLY_QUOTA,
-      bonusTiers: MONTHLY_BONUS_TIERS,
-      totalDeals: deals.length,
-      reps:       summary,
+      quota:                   MONTHLY_QUOTA,
+      bonusTiers:              MONTHLY_BONUS_TIERS,
+      totalDeals:              deals.length,
+      totalZentactActivations,
+      reps:                    summary,
     });
   } catch (error) {
     console.error('CRM points error:', error.response?.data || error.message);
     res.status(500).json({ error: 'Failed to calculate points', details: error.message });
+  }
+});
+
+// ============================================================================
+// ZENTACT ROUTES
+// ============================================================================
+
+// GET /api/zentact/status — connection health + merchant counts
+app.get('/api/zentact/status', authenticateToken, async (req, res) => {
+  try {
+    const apiKey = process.env.ZENTACT_API_KEY;
+    if (!apiKey) {
+      return res.json({ connected: false, reason: 'ZENTACT_API_KEY not set' });
+    }
+
+    const result = await pool.query(`
+      SELECT
+        COUNT(*)                                        AS total,
+        COUNT(CASE WHEN status = 'ACTIVE' THEN 1 END)  AS active,
+        MAX(updated_at)                                 AS last_sync
+      FROM zentact_merchants
+    `);
+    const row = result.rows[0];
+
+    res.json({
+      connected: true,
+      total:     parseInt(row.total)  || 0,
+      active:    parseInt(row.active) || 0,
+      lastSync:  row.last_sync        || null,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/zentact/sync — background sync of all merchant accounts
+let zentactSyncStatus = { running: false, startedAt: null, result: null, error: null };
+
+app.post('/api/zentact/sync', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  if (zentactSyncStatus.running) {
+    return res.status(409).json({ error: 'Sync already in progress', startedAt: zentactSyncStatus.startedAt });
+  }
+
+  zentactSyncStatus = { running: true, startedAt: new Date().toISOString(), result: null, error: null };
+  res.json({ success: true, message: 'Zentact sync started — poll /api/zentact/sync-status' });
+
+  (async () => {
+    try {
+      const result = await syncZentactMerchants();
+      zentactSyncStatus = { running: false, startedAt: zentactSyncStatus.startedAt, result, error: null };
+      console.log('✅ Zentact sync complete:', result);
+    } catch (err) {
+      zentactSyncStatus = { running: false, startedAt: zentactSyncStatus.startedAt, result: null, error: err.message };
+      console.error('❌ Zentact sync failed:', err.message);
+    }
+  })();
+});
+
+// GET /api/zentact/sync-status — poll background sync progress
+app.get('/api/zentact/sync-status', authenticateToken, (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  res.json(zentactSyncStatus);
+});
+
+// GET /api/zentact/merchants — list all merchants in DB
+app.get('/api/zentact/merchants', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const result = await pool.query(`
+      SELECT merchant_account_id, business_name, status, sales_rep_email,
+             sales_rep_name, opportunity_id, activated_at, bonus_amount, points, updated_at
+      FROM zentact_merchants
+      ORDER BY activated_at DESC NULLS LAST, created_at DESC
+    `);
+    res.json({ merchants: result.rows, total: result.rows.length });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PATCH /api/zentact/merchants/:merchantId/rep — manually assign a rep name
+app.patch('/api/zentact/merchants/:merchantId/rep', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const { repName } = req.body;
+  if (!repName) return res.status(400).json({ error: 'repName required' });
+  try {
+    await pool.query(
+      `UPDATE zentact_merchants
+       SET sales_rep_name = $1, updated_at = CURRENT_TIMESTAMP
+       WHERE merchant_account_id = $2`,
+      [repName, req.params.merchantId]
+    );
+    // Ensure the rep is in salespeople table
+    await pool.query(
+      `INSERT INTO salespeople (name, is_active) VALUES ($1, true) ON CONFLICT (name) DO NOTHING`,
+      [repName]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -1160,6 +1352,88 @@ async function syncCrmSoldDeals(crm) {
 
   console.log(`✅ CRM sync: ${deals.length} deals processed, ${newCount} new`);
   return { total: deals.length, newCount };
+}
+
+// ============================================================================
+// ZENTACT SYNC — pull all merchant accounts, resolve rep names, stamp activated_at
+// ============================================================================
+
+async function syncZentactMerchants() {
+  const apiKey = process.env.ZENTACT_API_KEY;
+  if (!apiKey) throw new Error('ZENTACT_API_KEY env var not set');
+
+  const zentact = new ZentactService(apiKey);
+  const rawMerchants = await zentact.getMerchantAccounts();
+
+  let newCount = 0;
+  let activatedCount = 0;
+
+  for (const raw of rawMerchants) {
+    const m = zentact.transformMerchant(raw);
+
+    // --- Rep name resolution ---
+    // 1. Try Salesrep_email → user_tokens.email → display_name
+    let repName = null;
+    if (m.sales_rep_email) {
+      const userRes = await pool.query(
+        `SELECT display_name FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+        [m.sales_rep_email]
+      );
+      repName = userRes.rows[0]?.display_name || null;
+    }
+    // 2. Try Opportunity_ID → crm_sold_deals.owner_name
+    if (!repName && m.opportunity_id) {
+      const dealRes = await pool.query(
+        `SELECT owner_name FROM crm_sold_deals WHERE deal_id = $1 LIMIT 1`,
+        [m.opportunity_id]
+      );
+      repName = dealRes.rows[0]?.owner_name || null;
+    }
+    // 3. Fall back to the existing rep name already in DB (don't overwrite with null)
+
+    if (m.status === 'ACTIVE') activatedCount++;
+
+    const result = await pool.query(`
+      INSERT INTO zentact_merchants
+        (merchant_account_id, organization_id, business_name, invitee_email, status,
+         sales_rep_email, sales_rep_name, opportunity_id, activated_at, raw_attributes)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+        CASE WHEN $5 = 'ACTIVE' THEN CURRENT_DATE ELSE NULL END,
+        $9::jsonb)
+      ON CONFLICT (merchant_account_id) DO UPDATE SET
+        status          = EXCLUDED.status,
+        business_name   = EXCLUDED.business_name,
+        sales_rep_email = COALESCE(EXCLUDED.sales_rep_email, zentact_merchants.sales_rep_email),
+        sales_rep_name  = COALESCE($7, zentact_merchants.sales_rep_name),
+        opportunity_id  = COALESCE(EXCLUDED.opportunity_id,  zentact_merchants.opportunity_id),
+        activated_at    = CASE
+          WHEN EXCLUDED.status = 'ACTIVE' AND zentact_merchants.activated_at IS NULL
+            THEN CURRENT_DATE
+          ELSE zentact_merchants.activated_at
+        END,
+        raw_attributes  = EXCLUDED.raw_attributes,
+        updated_at      = CURRENT_TIMESTAMP
+      RETURNING (xmax = 0) AS inserted
+    `, [m.merchant_account_id, m.organization_id, m.business_name, m.invitee_email,
+        m.status, m.sales_rep_email, repName, m.opportunity_id, m.raw_attributes]);
+
+    if (result.rows[0]?.inserted) newCount++;
+  }
+
+  // Upsert resolved rep names into salespeople table so they appear in the tracker
+  const activeRepsRes = await pool.query(
+    `SELECT DISTINCT sales_rep_name FROM zentact_merchants
+     WHERE sales_rep_name IS NOT NULL AND sales_rep_name <> ''`
+  );
+  for (const row of activeRepsRes.rows) {
+    await pool.query(
+      `INSERT INTO salespeople (name, is_active) VALUES ($1, true) ON CONFLICT (name) DO NOTHING`,
+      [row.sales_rep_name]
+    );
+  }
+
+  console.log(`✅ Zentact sync: ${rawMerchants.length} total, ${activatedCount} active, ${newCount} new`);
+  return { total: rawMerchants.length, active: activatedCount, newCount };
 }
 
 // ============================================================================

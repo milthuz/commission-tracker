@@ -1,0 +1,136 @@
+// services/zentactService.js
+const axios = require('axios');
+
+// Base URL is configurable via env var — swap to production by setting ZENTACT_API_URL
+const ZENTACT_BASE_URL = process.env.ZENTACT_API_URL || 'https://api.zentact.com/api/v1';
+
+// Merchant account statuses
+const MERCHANT_STATUS = {
+  INITIATED: 'INITIATED',
+  INVITED: 'INVITED',
+  INVITE_ACCEPTED: 'INVITE_ACCEPTED',
+  APPLICATION_IN_PROGRESS: 'APPLICATION_IN_PROGRESS',
+  ACTIVE: 'ACTIVE',
+  REJECTED: 'REJECTED',
+  CLOSED: 'CLOSED',
+};
+
+class ZentactService {
+  constructor(apiKey) {
+    this.apiKey = apiKey;
+    this.headers = {
+      'X-API-Key': apiKey,
+      'Content-Type': 'application/json',
+    };
+  }
+
+  // ============================================================
+  // HELPER — extract a value from merchantAccountAttributes[]
+  // Zentact stores custom fields as [{key: 'Salesrep_email', value: '...'}]
+  // ============================================================
+  static getAttribute(attributes = [], key) {
+    const attr = (attributes || []).find(
+      a => a.key === key || a.key?.toLowerCase() === key?.toLowerCase()
+    );
+    return attr?.value || null;
+  }
+
+  // ============================================================
+  // MERCHANT ACCOUNTS
+  // ============================================================
+
+  // Fetch all merchant accounts with pagination
+  async getMerchantAccounts(filterParams = {}) {
+    const merchants = [];
+    let pageIndex = 0;
+    const pageSize = 1000; // Zentact max
+    let hasMore = true;
+
+    while (hasMore) {
+      try {
+        const response = await axios.get(`${ZENTACT_BASE_URL}/merchant-accounts`, {
+          headers: this.headers,
+          params: {
+            pageSize,
+            pageIndex,
+            ...filterParams,
+          },
+        });
+
+        const data = response.data;
+
+        // Handle both array and paginated object responses
+        let items = [];
+        let totalCount = 0;
+
+        if (Array.isArray(data)) {
+          items = data;
+          totalCount = data.length;
+          hasMore = false; // no pagination info — assume single page
+        } else {
+          items = data.items || data.data || data.merchantAccounts || [];
+          totalCount = data.totalCount || data.total || items.length;
+          const fetched = (pageIndex + 1) * pageSize;
+          hasMore = items.length === pageSize && fetched < totalCount;
+        }
+
+        merchants.push(...items);
+        console.log(`✅ Zentact page ${pageIndex}: ${items.length} merchants (total so far: ${merchants.length} / ${totalCount})`);
+        pageIndex++;
+      } catch (error) {
+        const errDetail = error.response?.data || error.message;
+        console.error('❌ Zentact getMerchantAccounts error (page', pageIndex, '):', JSON.stringify(errDetail));
+        throw error;
+      }
+    }
+
+    return merchants;
+  }
+
+  // Get only ACTIVE merchants
+  async getActiveMerchants() {
+    return this.getMerchantAccounts({ status: MERCHANT_STATUS.ACTIVE });
+  }
+
+  // ============================================================
+  // TRANSFORM — raw Zentact merchant → our internal format
+  // ============================================================
+  transformMerchant(merchant) {
+    const attrs = merchant.merchantAccountAttributes || merchant.customAttributes || [];
+
+    const salesRepEmail = ZentactService.getAttribute(attrs, 'Salesrep_email');
+    const opportunityId = ZentactService.getAttribute(attrs, 'Opportunity_ID');
+
+    return {
+      merchant_account_id: merchant.merchantAccountId,
+      organization_id:     merchant.organizationId  || null,
+      business_name:       merchant.businessName    || '',
+      invitee_email:       merchant.inviteeEmail    || null,
+      status:              merchant.status          || '',
+      sales_rep_email:     salesRepEmail,
+      opportunity_id:      opportunityId,
+      raw_attributes:      JSON.stringify(attrs),
+    };
+  }
+
+  // ============================================================
+  // CONNECTION TEST
+  // ============================================================
+  async testConnection() {
+    try {
+      const response = await axios.get(`${ZENTACT_BASE_URL}/merchant-accounts`, {
+        headers: this.headers,
+        params: { pageSize: 1, pageIndex: 0 },
+      });
+      return { ok: true, status: response.status };
+    } catch (error) {
+      return {
+        ok: false,
+        status: error.response?.status,
+        message: error.response?.data?.message || error.message,
+      };
+    }
+  }
+}
+
+module.exports = { ZentactService, ZENTACT_BASE_URL, MERCHANT_STATUS };
