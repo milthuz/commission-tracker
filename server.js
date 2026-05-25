@@ -1530,15 +1530,18 @@ async function syncZentactMerchants() {
 
   const zentact = new ZentactService(apiKey);
 
-  // Backfill: any ACTIVE merchant that lost its activated_at (from earlier cleanup bug)
-  // gets today's date so they appear on the tracker for this month.
-  const backfilled = await pool.query(`
+  // One-time cleanup: clear activated_at values that look like a bulk-import stamp
+  // (activated_at = created_at, both on today's date) so we can replace them with the
+  // real earliest-transaction date.
+  const cleaned = await pool.query(`
     UPDATE zentact_merchants
-    SET activated_at = CURRENT_DATE, updated_at = CURRENT_TIMESTAMP
-    WHERE status = 'ACTIVE' AND activated_at IS NULL
+    SET activated_at = NULL
+    WHERE activated_at IS NOT NULL
+      AND DATE(activated_at) = DATE(created_at)
+      AND DATE(activated_at) >= CURRENT_DATE - INTERVAL '7 days'
   `);
-  if (backfilled.rowCount > 0) {
-    console.log(`📅 Backfilled activated_at for ${backfilled.rowCount} ACTIVE merchants`);
+  if (cleaned.rowCount > 0) {
+    console.log(`🧹 Cleared ${cleaned.rowCount} bulk-import activated_at stamps — will replace with real transaction dates`);
   }
 
   const rawMerchants = await zentact.getMerchantAccounts();
@@ -1605,10 +1608,30 @@ async function syncZentactMerchants() {
 
     if (m.status === 'ACTIVE') activatedCount++;
 
-    // activated_at rules (Zentact has no date fields so we approximate):
-    //   INSERT (new merchant): if ACTIVE → stamp today; otherwise NULL
-    //   UPDATE (existing):     keep existing date; only change if NULL and now ACTIVE
-    const activatedAt = m.status === 'ACTIVE' ? new Date().toISOString().split('T')[0] : null;
+    // For ACTIVE merchants, look up the real activation date from the merchant's
+    // earliest payment transaction. We only do this if we don't already have a
+    // date in the DB (lookup is expensive — one API call per merchant).
+    let activatedAt = null;
+    if (m.status === 'ACTIVE') {
+      const existing = await pool.query(
+        `SELECT activated_at FROM zentact_merchants WHERE merchant_account_id = $1`,
+        [m.merchant_account_id]
+      );
+      const currentDate = existing.rows[0]?.activated_at;
+
+      // Re-lookup the real date if missing OR if the stored date looks like a
+      // bulk-import stamp (created_at === activated_at on the same day)
+      if (!currentDate) {
+        try {
+          activatedAt = await zentact.getEarliestTransactionDate(m.merchant_account_id);
+        } catch (e) {
+          console.warn(`⚠️ Could not fetch earliest tx date for ${m.merchant_account_id}:`, e.message);
+        }
+        // If no transactions yet, leave NULL — merchant is approved but hasn't processed
+      } else {
+        activatedAt = currentDate;
+      }
+    }
 
     const result = await pool.query(`
       INSERT INTO zentact_merchants

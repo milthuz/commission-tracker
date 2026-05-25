@@ -161,6 +161,72 @@ class ZentactService {
   }
 
   // ============================================================
+  // EARLIEST TRANSACTION DATE — proxy for the activation date
+  // Zentact doesn't expose an activatedAt field on merchants, so we
+  // query /v2/transactions for the merchant and return the earliest createdAt.
+  // ============================================================
+  async getEarliestTransactionDate(merchantAccountId, lookbackYears = 5) {
+    const endDate = new Date();
+    const startDate = new Date();
+    startDate.setFullYear(endDate.getFullYear() - lookbackYears);
+
+    const fmt = d => d.toISOString().split('T')[0]; // YYYY-MM-DD
+
+    let earliest = null;
+    let pageIndex = 0;
+    const pageSize = 100;
+    let hasMore = true;
+    let pagesFetched = 0;
+    const MAX_PAGES = 50; // safety cap (5000 transactions per merchant)
+
+    while (hasMore && pagesFetched < MAX_PAGES) {
+      try {
+        const response = await axios.get(`${ZENTACT_BASE_URL}/transactions`, {
+          headers: this.headers,
+          params: {
+            merchantAccountId,
+            startDate: fmt(startDate),
+            endDate:   fmt(endDate),
+            pageSize,
+            pageIndex,
+          },
+        });
+
+        const data = response.data;
+        const inner = data?.data && typeof data.data === 'object' && !Array.isArray(data.data) ? data.data : null;
+        const rows = (inner?.rows) || (Array.isArray(data?.data) ? data.data : []) || (Array.isArray(data) ? data : []);
+
+        for (const tx of rows) {
+          const created = tx.createdAt || tx.created_at;
+          if (created) {
+            const d = new Date(created);
+            if (!isNaN(d) && (earliest === null || d < earliest)) {
+              earliest = d;
+            }
+          }
+        }
+
+        const pagination = inner?.pagination || {};
+        if (typeof pagination.hasNextPage === 'boolean') {
+          hasMore = pagination.hasNextPage;
+        } else {
+          hasMore = rows.length === pageSize;
+        }
+        pageIndex++;
+        pagesFetched++;
+      } catch (error) {
+        const status = error.response?.status;
+        // 404 / no transactions → just stop
+        if (status === 404) return null;
+        console.warn(`⚠️ Zentact tx lookup failed for ${merchantAccountId} (page ${pageIndex}):`, error.response?.data?.message || error.message);
+        break;
+      }
+    }
+
+    return earliest ? earliest.toISOString().split('T')[0] : null;
+  }
+
+  // ============================================================
   // CONNECTION TEST
   // ============================================================
   async testConnection() {
