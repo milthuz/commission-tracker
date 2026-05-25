@@ -1420,7 +1420,7 @@ async function autoSyncInvoices() {
 
 // Schedule auto-sync to run every 4 hours (14400000 ms)
 const AUTO_SYNC_INTERVAL         = 4  * 60 * 60 * 1000; // 4 hours  — invoices
-const ZENTACT_AUTO_SYNC_INTERVAL = 12 * 60 * 60 * 1000; // 12 hours — Zentact merchants
+const ZENTACT_AUTO_SYNC_INTERVAL = 1 * 60 * 60 * 1000; // 1 hour — Zentact merchants
 
 let syncInterval;
 let zentactSyncIntervalHandle;
