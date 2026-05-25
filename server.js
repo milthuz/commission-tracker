@@ -1013,6 +1013,23 @@ app.get('/api/zentact/merchants', authenticateToken, async (req, res) => {
   }
 });
 
+// PATCH /api/zentact/merchants/:merchantId/activated-at — manually set the activation date
+app.patch('/api/zentact/merchants/:merchantId/activated-at', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const { activatedAt } = req.body; // ISO date string YYYY-MM-DD or null to clear
+  try {
+    await pool.query(
+      `UPDATE zentact_merchants
+       SET activated_at = $1, updated_at = CURRENT_TIMESTAMP
+       WHERE merchant_account_id = $2`,
+      [activatedAt || null, req.params.merchantId]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // PATCH /api/zentact/merchants/:merchantId/rep — manually assign a rep name
 app.patch('/api/zentact/merchants/:merchantId/rep', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
@@ -1608,9 +1625,10 @@ async function syncZentactMerchants() {
 
     if (m.status === 'ACTIVE') activatedCount++;
 
-    // For ACTIVE merchants, look up the real activation date from the merchant's
-    // earliest payment transaction. We only do this if we don't already have a
-    // date in the DB (lookup is expensive — one API call per merchant).
+    // For ACTIVE merchants, look up the real activation date. Best historical
+    // proxy = earliest billing statement month (if a merchant was billed in
+    // March, they were boarded by then). Fall back to first transaction date
+    // if no statements yet. Skip if we already have a date stored.
     let activatedAt = null;
     if (m.status === 'ACTIVE') {
       const existing = await pool.query(
@@ -1619,15 +1637,18 @@ async function syncZentactMerchants() {
       );
       const currentDate = existing.rows[0]?.activated_at;
 
-      // Re-lookup the real date if missing OR if the stored date looks like a
-      // bulk-import stamp (created_at === activated_at on the same day)
       if (!currentDate) {
         try {
-          activatedAt = await zentact.getEarliestTransactionDate(m.merchant_account_id);
+          // 1. Earliest statement month (best boarded-date proxy)
+          activatedAt = await zentact.getEarliestStatementDate(m.merchant_account_id);
+          // 2. Fall back to first transaction if no statements
+          if (!activatedAt) {
+            activatedAt = await zentact.getEarliestTransactionDate(m.merchant_account_id);
+          }
         } catch (e) {
-          console.warn(`⚠️ Could not fetch earliest tx date for ${m.merchant_account_id}:`, e.message);
+          console.warn(`⚠️ Could not fetch activation date for ${m.merchant_account_id}:`, e.message);
         }
-        // If no transactions yet, leave NULL — merchant is approved but hasn't processed
+        // If still no date, leave NULL — merchant is approved but never billed/transacted
       } else {
         activatedAt = currentDate;
       }

@@ -227,6 +227,59 @@ class ZentactService {
   }
 
   // ============================================================
+  // EARLIEST STATEMENT MONTH — better activation proxy than first transaction
+  // Returns the first day of the merchant's earliest billing statement month.
+  // ============================================================
+  async getEarliestStatementDate(merchantAccountId) {
+    let earliest = null; // {year, month}
+    let pageIndex = 0;
+    const pageSize = 100;
+    let hasMore = true;
+    let pagesFetched = 0;
+    const MAX_PAGES = 20;
+
+    while (hasMore && pagesFetched < MAX_PAGES) {
+      try {
+        const response = await axios.get(`${ZENTACT_BASE_URL}/reports/statements`, {
+          headers: this.headers,
+          params: { merchantAccountId, pageSize, pageIndex },
+        });
+
+        const data = response.data;
+        const inner = data?.data && typeof data.data === 'object' && !Array.isArray(data.data) ? data.data : null;
+        const rows = (inner?.rows) || (Array.isArray(data?.data) ? data.data : []) || (Array.isArray(data) ? data : []);
+
+        for (const stmt of rows) {
+          const y = parseInt(stmt.year);
+          const m = parseInt(stmt.month);
+          if (!y || !m) continue;
+          if (!earliest || y < earliest.year || (y === earliest.year && m < earliest.month)) {
+            earliest = { year: y, month: m };
+          }
+        }
+
+        const pagination = inner?.pagination || {};
+        if (typeof pagination.hasNextPage === 'boolean') {
+          hasMore = pagination.hasNextPage;
+        } else {
+          hasMore = rows.length === pageSize;
+        }
+        pageIndex++;
+        pagesFetched++;
+      } catch (error) {
+        const status = error.response?.status;
+        if (status === 404) return null;
+        console.warn(`⚠️ Zentact statements lookup failed for ${merchantAccountId}:`, error.response?.data?.message || error.message);
+        break;
+      }
+    }
+
+    if (!earliest) return null;
+    const mm = String(earliest.month).padStart(2, '0');
+    return `${earliest.year}-${mm}-01`;
+  }
+
+  // ============================================================
   // CONNECTION TEST
   // ============================================================
   async testConnection() {
