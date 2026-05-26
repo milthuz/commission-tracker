@@ -228,17 +228,33 @@ app.use(bodyParser.json({
   limit: '10mb',
 }));
 
-// JWT middleware
-const authenticateToken = (req, res, next) => {
+// JWT middleware — also supports admin impersonation via X-Impersonate-As header.
+// When an admin sends X-Impersonate-As: <salesperson_name>, the request is treated
+// as if it came from that salesperson (isAdmin=false, name=impersonated). Useful
+// for testing what regular users see without logging out.
+const authenticateToken = async (req, res, next) => {
   const token = req.headers['authorization']?.split(' ')[1];
-  
-  if (!token) {
-    return res.status(401).json({ error: 'No token provided' });
-  }
+  if (!token) return res.status(401).json({ error: 'No token provided' });
 
   try {
     const user = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
     req.user = user;
+
+    const impersonateName = req.headers['x-impersonate-as'];
+    if (impersonateName && user.isAdmin === true) {
+      const result = await pool.query(
+        'SELECT name FROM salespeople WHERE LOWER(name) = LOWER($1) LIMIT 1',
+        [String(impersonateName).trim()]
+      );
+      if (result.rows.length > 0) {
+        req.user.realAdminEmail = user.email;
+        req.user.realAdminName  = user.name;
+        req.user.email          = null;  // skip display_name lookup → use impersonated name directly
+        req.user.name           = result.rows[0].name; // canonical casing from DB
+        req.user.isAdmin        = false;
+        req.user.impersonating  = true;
+      }
+    }
     next();
   } catch (error) {
     res.status(401).json({ error: 'Invalid token' });
@@ -426,11 +442,13 @@ app.get('/api/auth/token', authenticateToken, async (req, res) => {
 // 4. Verify JWT token
 app.get('/api/auth/verify', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(
-      'SELECT photo, display_name, is_admin FROM user_tokens WHERE email = $1',
-      [req.user.email]
-    );
-    const row = result.rows[0] || {};
+    // When impersonating, req.user.email is cleared — skip the lookup
+    const row = req.user.impersonating
+      ? {}
+      : (await pool.query(
+          'SELECT photo, display_name, is_admin FROM user_tokens WHERE email = $1',
+          [req.user.email]
+        )).rows[0] || {};
     res.json({
       valid: true,
       user: {
@@ -439,6 +457,9 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
         photo:   row.photo || req.user.photo || null,
         zoho_id: req.user.zoho_id || req.user.email,
         isAdmin: row.is_admin != null ? row.is_admin : (req.user.isAdmin || false),
+        impersonating:   req.user.impersonating || false,
+        realAdminEmail:  req.user.realAdminEmail || null,
+        realAdminName:   req.user.realAdminName  || null,
       }
     });
   } catch (error) {
