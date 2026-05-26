@@ -20,6 +20,78 @@ dotenv.config();
 const app = express();
 
 // ============================================================================
+// PERMISSION CATALOG — all features that can be gated via roles
+// ============================================================================
+const PERMISSION_CATALOG = [
+  // Commission Tracker
+  { key: 'tracker:view_own',           label: 'View own row in Commission Tracker',          category: 'Commission Tracker' },
+  { key: 'tracker:view_all_totals',    label: 'View all reps totals (no details)',           category: 'Commission Tracker' },
+  { key: 'tracker:view_all_details',   label: 'View all reps deals + merchants details',     category: 'Commission Tracker' },
+  { key: 'tracker:assign_merchants',   label: 'Assign unassigned Zentact merchants to reps', category: 'Commission Tracker' },
+
+  // Commission Report
+  { key: 'report:view_own',            label: 'View own commission report',                  category: 'Commission Report' },
+  { key: 'report:view_others',         label: "View other reps' commission reports",         category: 'Commission Report' },
+  { key: 'report:approve',             label: 'Approve / unapprove commissions',             category: 'Commission Report' },
+
+  // Invoices
+  { key: 'invoices:view_own',          label: 'View own invoices',                           category: 'Invoices' },
+  { key: 'invoices:view_all',          label: "View all reps' invoices",                     category: 'Invoices' },
+  { key: 'invoices:send_email',        label: 'Email invoices to customers',                 category: 'Invoices' },
+
+  // Admin Panel
+  { key: 'admin:access',               label: 'Access the Admin Panel',                      category: 'Admin Panel' },
+  { key: 'admin:integrations',         label: 'Manage Zoho / Zentact integrations',          category: 'Admin Panel' },
+  { key: 'admin:salespeople',          label: 'Manage salespeople (commission %, aliases)',  category: 'Admin Panel' },
+  { key: 'admin:customers',            label: 'Manage customer exclusions',                  category: 'Admin Panel' },
+  { key: 'admin:users',                label: 'Manage admin user access',                    category: 'Admin Panel' },
+  { key: 'admin:roles',                label: 'Manage roles and permissions',                category: 'Admin Panel' },
+  { key: 'admin:releases',             label: 'Push new app releases',                       category: 'Admin Panel' },
+  { key: 'admin:impersonate',          label: 'Use impersonation mode',                      category: 'Admin Panel' },
+
+  // Syncs
+  { key: 'sync:books',                 label: 'Trigger Zoho Books sync manually',            category: 'Syncs' },
+  { key: 'sync:crm',                   label: 'Trigger Zoho CRM sync manually',              category: 'Syncs' },
+  { key: 'sync:zentact',               label: 'Trigger Zentact merchant sync manually',      category: 'Syncs' },
+  { key: 'sync:recalc',                label: 'Recalculate all commissions',                 category: 'Syncs' },
+];
+
+// Returns the effective permission set for a user (union of all their roles)
+async function getUserPermissions(email) {
+  if (!email) return new Set();
+  try {
+    const result = await pool.query(
+      `SELECT r.permissions FROM roles r
+       JOIN user_roles ur ON ur.role_id = r.id
+       WHERE LOWER(ur.user_email) = LOWER($1)`,
+      [email]
+    );
+    const set = new Set();
+    for (const row of result.rows) {
+      const perms = Array.isArray(row.permissions) ? row.permissions : [];
+      for (const p of perms) set.add(p);
+    }
+    return set;
+  } catch {
+    return new Set();
+  }
+}
+
+// Check helper: wildcards (*) grant all
+function userHasPermission(permSet, requiredPerm) {
+  if (!permSet) return false;
+  if (permSet.has('*')) return true;
+  if (permSet.has(requiredPerm)) return true;
+  // Also support category wildcards like "admin:*"
+  const colon = requiredPerm.indexOf(':');
+  if (colon > 0) {
+    const wildcard = requiredPerm.slice(0, colon) + ':*';
+    if (permSet.has(wildcard)) return true;
+  }
+  return false;
+}
+
+// ============================================================================
 // DATABASE CONNECTION
 // ============================================================================
 
@@ -107,6 +179,47 @@ async function initializeDatabase() {
     `);
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS invoice_count INT DEFAULT 0`);
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS aliases JSONB DEFAULT '[]'::jsonb`);
+
+    // ROLES & PERMISSIONS — RBAC system
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS roles (
+        id          SERIAL PRIMARY KEY,
+        name        VARCHAR(100) UNIQUE NOT NULL,
+        description TEXT DEFAULT '',
+        permissions JSONB DEFAULT '[]'::jsonb,
+        is_system   BOOLEAN DEFAULT false,
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_roles (
+        user_email  VARCHAR(255) NOT NULL,
+        role_id     INT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+        assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (user_email, role_id)
+      );
+    `);
+    // Seed preset roles (only inserted once if name not already present)
+    await pool.query(`
+      INSERT INTO roles (name, description, permissions, is_system)
+      VALUES
+        ('Sales Rep', 'Standard salesperson — sees own data only',
+         '["tracker:view_own","tracker:view_all_totals","report:view_own","invoices:view_own"]'::jsonb, false),
+        ('Manager', 'Team manager — full team visibility, can approve commissions',
+         '["tracker:view_own","tracker:view_all_totals","tracker:view_all_details","tracker:assign_merchants","report:view_own","report:view_others","report:approve","invoices:view_own","invoices:view_all","invoices:send_email"]'::jsonb, false),
+        ('Administrator', 'Full access to everything',
+         '["*"]'::jsonb, true)
+      ON CONFLICT (name) DO NOTHING;
+    `);
+    // Auto-assign 'Administrator' role to existing is_admin users
+    await pool.query(`
+      INSERT INTO user_roles (user_email, role_id)
+      SELECT u.email, r.id
+      FROM user_tokens u CROSS JOIN roles r
+      WHERE u.is_admin = true AND r.name = 'Administrator'
+      ON CONFLICT DO NOTHING;
+    `);
 
     // Excluded customers table
     await pool.query(`
@@ -449,6 +562,15 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
           'SELECT photo, display_name, is_admin FROM user_tokens WHERE email = $1',
           [req.user.email]
         )).rows[0] || {};
+
+    // Load effective permissions for this user (impersonation lookup uses
+    // realAdminEmail since user_roles is keyed by email)
+    const permLookupEmail = req.user.impersonating ? null : req.user.email;
+    const permSet = await getUserPermissions(permLookupEmail);
+    // Super-admins always get the full set (wildcard)
+    const isAdmin = row.is_admin != null ? row.is_admin : (req.user.isAdmin || false);
+    const permissions = isAdmin ? ['*'] : [...permSet];
+
     res.json({
       valid: true,
       user: {
@@ -456,7 +578,8 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
         name:    row.display_name || req.user.name || req.user.email,
         photo:   row.photo || req.user.photo || null,
         zoho_id: req.user.zoho_id || req.user.email,
-        isAdmin: row.is_admin != null ? row.is_admin : (req.user.isAdmin || false),
+        isAdmin,
+        permissions,
         impersonating:   req.user.impersonating || false,
         realAdminEmail:  req.user.realAdminEmail || null,
         realAdminName:   req.user.realAdminName  || null,
@@ -3222,6 +3345,145 @@ app.put('/api/salespeople/:name/aliases', authenticateToken, async (req, res) =>
 });
 
 // ============================================================================
+// ROLES & PERMISSIONS (RBAC)
+// ============================================================================
+
+// GET /api/permissions/catalog — list all available permissions
+app.get('/api/permissions/catalog', authenticateToken, (req, res) => {
+  res.json({ catalog: PERMISSION_CATALOG });
+});
+
+// GET /api/roles — list all roles
+app.get('/api/roles', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const result = await pool.query(`
+      SELECT r.id, r.name, r.description, r.permissions, r.is_system, r.created_at, r.updated_at,
+             COUNT(ur.user_email) AS user_count
+      FROM roles r
+      LEFT JOIN user_roles ur ON ur.role_id = r.id
+      GROUP BY r.id
+      ORDER BY r.is_system DESC, r.name ASC
+    `);
+    res.json({
+      roles: result.rows.map(r => ({
+        id:           r.id,
+        name:         r.name,
+        description:  r.description,
+        permissions:  Array.isArray(r.permissions) ? r.permissions : [],
+        isSystem:     r.is_system,
+        userCount:    parseInt(r.user_count) || 0,
+      })),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/roles — create a new role
+app.post('/api/roles', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const { name, description, permissions } = req.body || {};
+  if (!name || typeof name !== 'string') return res.status(400).json({ error: 'name required' });
+  const perms = Array.isArray(permissions) ? permissions : [];
+  try {
+    const result = await pool.query(
+      `INSERT INTO roles (name, description, permissions, is_system)
+       VALUES ($1, $2, $3::jsonb, false)
+       RETURNING id, name, description, permissions, is_system`,
+      [name.trim(), description || '', JSON.stringify(perms)]
+    );
+    res.json({ success: true, role: result.rows[0] });
+  } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ error: 'A role with that name already exists' });
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT /api/roles/:id — update an existing role (name, description, permissions)
+app.put('/api/roles/:id', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const { name, description, permissions } = req.body || {};
+  const perms = Array.isArray(permissions) ? permissions : null;
+  try {
+    // System roles can have their permissions edited but not be renamed/deleted? Allow rename here for flexibility.
+    const sets = [];
+    const params = [];
+    let paramIdx = 1;
+    if (name !== undefined) { sets.push(`name = $${paramIdx++}`); params.push(name.trim()); }
+    if (description !== undefined) { sets.push(`description = $${paramIdx++}`); params.push(description); }
+    if (perms !== null) { sets.push(`permissions = $${paramIdx++}::jsonb`); params.push(JSON.stringify(perms)); }
+    sets.push(`updated_at = CURRENT_TIMESTAMP`);
+    params.push(req.params.id);
+
+    const result = await pool.query(
+      `UPDATE roles SET ${sets.join(', ')} WHERE id = $${paramIdx} RETURNING id, name, description, permissions, is_system`,
+      params
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Role not found' });
+    res.json({ success: true, role: result.rows[0] });
+  } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ error: 'A role with that name already exists' });
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE /api/roles/:id — delete a custom role (system roles can't be deleted)
+app.delete('/api/roles/:id', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const check = await pool.query('SELECT is_system FROM roles WHERE id = $1', [req.params.id]);
+    if (check.rowCount === 0) return res.status(404).json({ error: 'Role not found' });
+    if (check.rows[0].is_system) return res.status(400).json({ error: 'Cannot delete a system role' });
+    await pool.query('DELETE FROM roles WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/users/:email/roles — list roles assigned to a user
+app.get('/api/users/:email/roles', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const result = await pool.query(`
+      SELECT r.id, r.name, r.description, r.permissions, r.is_system
+      FROM roles r
+      JOIN user_roles ur ON ur.role_id = r.id
+      WHERE LOWER(ur.user_email) = LOWER($1)
+      ORDER BY r.is_system DESC, r.name ASC
+    `, [req.params.email]);
+    res.json({ roles: result.rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT /api/users/:email/roles — set the user's full list of roles (replaces existing)
+// Body: { roleIds: [1, 2, 3] }
+app.put('/api/users/:email/roles', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const roleIds = Array.isArray(req.body?.roleIds) ? req.body.roleIds.map(Number).filter(n => !isNaN(n)) : null;
+  if (roleIds === null) return res.status(400).json({ error: 'roleIds array required' });
+  const email = req.params.email;
+  try {
+    await pool.query('BEGIN');
+    await pool.query('DELETE FROM user_roles WHERE LOWER(user_email) = LOWER($1)', [email]);
+    for (const roleId of roleIds) {
+      await pool.query(
+        'INSERT INTO user_roles (user_email, role_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+        [email, roleId]
+      );
+    }
+    await pool.query('COMMIT');
+    res.json({ success: true, assigned: roleIds.length });
+  } catch (error) {
+    await pool.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================================
 // ADMIN USERS
 // ============================================================================
 
@@ -3233,12 +3495,25 @@ app.get('/api/admin/users', authenticateToken, async (req, res) => {
       `SELECT email, is_admin, created_at, updated_at AS last_login
        FROM user_tokens ORDER BY created_at DESC`
     );
+    // Batch-fetch roles per user
+    const rolesByUser = {};
+    const rolesRes = await pool.query(`
+      SELECT ur.user_email, r.id, r.name
+      FROM user_roles ur
+      JOIN roles r ON r.id = ur.role_id
+    `);
+    for (const row of rolesRes.rows) {
+      const key = row.user_email.toLowerCase();
+      if (!rolesByUser[key]) rolesByUser[key] = [];
+      rolesByUser[key].push({ id: row.id, name: row.name });
+    }
     res.json({
       users: result.rows.map(r => ({
         email:     r.email,
         isAdmin:   r.is_admin,
         createdAt: r.created_at,
         lastLogin: r.last_login,
+        roles:     rolesByUser[r.email.toLowerCase()] || [],
       }))
     });
   } catch (error) {
