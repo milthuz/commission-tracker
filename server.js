@@ -1526,6 +1526,32 @@ app.get('/api/crm/deal-by-name', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/crm/account/:id — fetch an Account from Zoho CRM (for diagnostic)
+app.get('/api/crm/account/:id', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const crmToken = await ensureValidCrmToken();
+    if (!crmToken) return res.status(400).json({ error: 'CRM not connected' });
+    const crm = new ZohoCRMService(crmToken);
+    const account = await crm.getAccount(req.params.id);
+    if (!account) return res.status(404).json({ error: 'Account not found' });
+
+    // Highlight source-related fields
+    const sourceKeys = Object.keys(account).filter(k => /source|lead/i.test(k));
+    const sourceFields = {};
+    sourceKeys.forEach(k => sourceFields[k] = account[k]);
+
+    res.json({
+      id: account.id,
+      Account_Name: account.Account_Name,
+      sourceFields,
+      all_keys: Object.keys(account),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.response?.data || error.message });
+  }
+});
+
 // POST /api/crm/sync — non-destructive manual CRM sync (upserts, preserves sold_date)
 // Runs in background to avoid Heroku 30-sec timeout.
 let crmSyncStatus = { running: false, startedAt: null, result: null, error: null };
@@ -1908,8 +1934,42 @@ async function syncCrmSoldDeals(crm) {
   const userMap = allSold.userMap || {};
   console.log(`👥 User map has ${Object.keys(userMap).length} entries:`, JSON.stringify(userMap));
   let newCount = 0;
+  let additionalLocationResolved = 0;
+
+  // Cache accounts within this sync to avoid re-fetching the same one for multiple deals
+  const accountCache = new Map();
 
   for (const rawDeal of deals) {
+    // SPECIAL CASE: "Additional Location" deals don't carry their own lead source —
+    // the real source is on the parent Account (it's a new branch of an existing client).
+    const ls = (rawDeal.Lead_Source || '').toLowerCase().trim();
+    if (ls === 'additional location') {
+      const accountId =
+        rawDeal.Account_ID ||
+        (typeof rawDeal.Account_Name === 'object' ? rawDeal.Account_Name?.id : null);
+      if (accountId) {
+        let account = accountCache.get(accountId);
+        if (account === undefined) {
+          account = await crm.getAccount(accountId);
+          accountCache.set(accountId, account);
+        }
+        if (account) {
+          const acctSource = account.Lead_Source || null;
+          const acctGroup  = account.Lead_Source_Group || null;
+          if (acctSource || acctGroup) {
+            // Override the deal's source values with the parent Account's
+            if (acctSource) rawDeal.Lead_Source = acctSource;
+            if (acctGroup)  rawDeal.Lead_Source_Group = acctGroup;
+            additionalLocationResolved++;
+            console.log(
+              `📍 Deal ${rawDeal.id} '${rawDeal.Deal_Name}' (Additional Location) → ` +
+              `using Account ${accountId} source: '${acctSource}' / group: '${acctGroup}'`
+            );
+          }
+        }
+      }
+    }
+
     const deal = crm.transformDeal(rawDeal, userMap);
 
     // sold_date = Deposit_Information_Received date (the custom CRM field that records
@@ -1951,8 +2011,8 @@ async function syncCrmSoldDeals(crm) {
   }
   console.log(`👥 Upserted ${uniqueReps.length} CRM reps into salespeople table`);
 
-  console.log(`✅ CRM sync: ${deals.length} deals processed, ${newCount} new`);
-  return { total: deals.length, newCount };
+  console.log(`✅ CRM sync: ${deals.length} deals processed, ${newCount} new, ${additionalLocationResolved} 'Additional Location' resolved via Account`);
+  return { total: deals.length, newCount, additionalLocationResolved };
 }
 
 // ============================================================================

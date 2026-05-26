@@ -230,6 +230,27 @@ class ZohoCRMService {
     }
   }
 
+  // Fetch an Account by ID. Used to resolve lead source for "Additional Location"
+  // deals, where the deal itself doesn't carry the real source (it's on the parent
+  // Account, since these are new branches of existing customers).
+  async getAccount(accountId) {
+    if (!accountId) return null;
+    try {
+      const response = await axios.get(`${CRM_BASE_URL}/Accounts/${accountId}`, {
+        headers: this.headers,
+        validateStatus: () => true,
+      });
+      if (response.status >= 400) {
+        console.warn(`⚠️ Account ${accountId} fetch returned ${response.status}`);
+        return null;
+      }
+      return response.data?.data?.[0] || null;
+    } catch (error) {
+      console.warn(`⚠️ CRM getAccount error for ${accountId}:`, error.message);
+      return null;
+    }
+  }
+
   // Fetch all CRM users and return a {userId → name} map.
   // Used to resolve owner names when COQL returns Owner as {id} only.
   // Uses COQL (no extra scope needed) with REST API fallback.
