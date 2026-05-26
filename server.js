@@ -1489,7 +1489,7 @@ app.get('/api/crm/deal-by-name', authenticateToken, async (req, res) => {
     // Look up what we have stored in our DB
     const dbRes = await pool.query(
       `SELECT deal_id, deal_name, account_name, owner_name, lead_source_group, points,
-              sold_date, closing_date_crm, amount, created_at, updated_at
+              sold_date, closing_date_crm, amount, first_seen_at, updated_at
        FROM crm_sold_deals
        WHERE deal_name ILIKE $1 OR account_name ILIKE $1`,
       [`%${q}%`]
