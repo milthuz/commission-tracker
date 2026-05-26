@@ -1467,6 +1467,65 @@ app.get('/api/crm/sold-deals-db/reset-status', authenticateToken, (req, res) => 
   res.json(crmResetStatus);
 });
 
+// GET /api/crm/deal-by-name?q=Ivona — find a deal by name and return BOTH the raw
+// Zoho CRM response AND what we stored in our DB. Useful for diagnosing missing fields.
+app.get('/api/crm/deal-by-name', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const q = (req.query.q || '').toString().trim();
+  if (!q) return res.status(400).json({ error: 'q param required' });
+  try {
+    const crmToken = await ensureValidCrmToken();
+    if (!crmToken) return res.status(400).json({ error: 'CRM not connected' });
+    const crm = new ZohoCRMService(crmToken);
+
+    // Search CRM for deals matching the name
+    const searchUrl = `https://www.zohoapis.com/crm/v2/Deals/search?criteria=(Deal_Name:starts_with:${encodeURIComponent(q)})`;
+    const crmRes = await axios.get(searchUrl, {
+      headers: { Authorization: `Zoho-oauthtoken ${crmToken}` },
+      validateStatus: () => true,
+    });
+    const rawDeals = crmRes.data?.data || [];
+
+    // Look up what we have stored in our DB
+    const dbRes = await pool.query(
+      `SELECT deal_id, deal_name, account_name, owner_name, lead_source_group, points,
+              sold_date, closing_date_crm, amount, created_at, updated_at
+       FROM crm_sold_deals
+       WHERE deal_name ILIKE $1 OR account_name ILIKE $1`,
+      [`%${q}%`]
+    );
+
+    // For each raw deal, expose all keys containing "source" / "lead" to make it
+    // easy to spot which field has the value.
+    const rawSummary = rawDeals.map(d => {
+      const sourceKeys = Object.keys(d).filter(k => /source|lead/i.test(k));
+      const sourceFields = {};
+      sourceKeys.forEach(k => sourceFields[k] = d[k]);
+      return {
+        id: d.id,
+        Deal_Name: d.Deal_Name,
+        Stage: d.Stage,
+        Account_Name: typeof d.Account_Name === 'object' ? d.Account_Name?.name : d.Account_Name,
+        Owner: typeof d.Owner === 'object' ? d.Owner?.name : d.Owner,
+        Closing_Date: d.Closing_Date,
+        Modified_Time: d.Modified_Time,
+        sourceFields,
+        all_keys: Object.keys(d),
+      };
+    });
+
+    res.json({
+      query: q,
+      crm_raw_count: rawDeals.length,
+      crm_summary: rawSummary,
+      db_count: dbRes.rows.length,
+      db_rows: dbRes.rows,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.response?.data || error.message });
+  }
+});
+
 // POST /api/crm/sync — non-destructive manual CRM sync (upserts, preserves sold_date)
 // Runs in background to avoid Heroku 30-sec timeout.
 let crmSyncStatus = { running: false, startedAt: null, result: null, error: null };
