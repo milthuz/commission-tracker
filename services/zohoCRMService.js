@@ -67,7 +67,7 @@ class ZohoCRMService {
       let hasMore = true;
 
       while (hasMore) {
-        const query = `SELECT id, Deal_Name, Stage, Owner, Closing_Date, Deposit_Information_Received, Lead_Source_Group, Account_Name, Amount, Created_Time, Modified_Time FROM Deals WHERE Deposit_Information_Received is not null LIMIT ${limit} OFFSET ${offset}`;
+        const query = `SELECT id, Deal_Name, Stage, Owner, Closing_Date, Deposit_Information_Received, Lead_Source_Group, Lead_Source, Account_Name, Amount, Created_Time, Modified_Time FROM Deals WHERE Deposit_Information_Received is not null LIMIT ${limit} OFFSET ${offset}`;
 
         const response = await axios.post(`${CRM_BASE_URL}/coql`, { select_query: query }, {
           headers: { ...this.headers, 'Content-Type': 'application/json' },
@@ -104,7 +104,7 @@ class ZohoCRMService {
             criteria: `(Stage:equals:Deposit Information Received)`,
             per_page: 200,
             page,
-            fields: 'Deal_Name,Stage,Owner,Closing_Date,Deposit_Information_Received,Lead_Source_Group,Account_Name,Amount,Created_Time,Modified_Time',
+            fields: 'Deal_Name,Stage,Owner,Closing_Date,Deposit_Information_Received,Lead_Source_Group,Lead_Source,Account_Name,Amount,Created_Time,Modified_Time',
           },
         });
 
@@ -173,7 +173,7 @@ class ZohoCRMService {
       const limit = 200;
       let hasMore = true;
       while (hasMore) {
-        const query = `SELECT id, Deal_Name, Stage, Owner, Closing_Date, Deposit_Information_Received, Lead_Source_Group, Account_Name, Amount, Created_Time, Modified_Time FROM Deals WHERE Deposit_Information_Received is null AND Closing_Date >= '${dateStr}' LIMIT ${limit} OFFSET ${offset}`;
+        const query = `SELECT id, Deal_Name, Stage, Owner, Closing_Date, Deposit_Information_Received, Lead_Source_Group, Lead_Source, Account_Name, Amount, Created_Time, Modified_Time FROM Deals WHERE Deposit_Information_Received is null AND Closing_Date >= '${dateStr}' LIMIT ${limit} OFFSET ${offset}`;
         const response = await axios.post(`${CRM_BASE_URL}/coql`, { select_query: query }, {
           headers: { ...this.headers, 'Content-Type': 'application/json' },
         });
@@ -290,11 +290,11 @@ class ZohoCRMService {
   // ============================================================
 
   // Calculate points for a single deal
-  // Source: Lead_Source_Group field
-  //   Outbound → 2pts
-  //   Inbound  → 1pt
-  //   Partners → 1pt
-  //   +1pt for payment processing (added by Zentact integration later)
+  // Primary: Lead_Source_Group field (Outbound → 2pts, otherwise → 1pt)
+  // Fallback: when Lead_Source_Group is empty, infer from Lead_Source
+  //   Cold Call / Walk-in / Door-to-door / Outbound → 2pts
+  //   Everything else (Web Form, Inbound, Referral, Additional Location, Partners) → 1pt
+  // +1pt for payment processing is added later by the Zentact integration.
   calculatePoints(deal) {
     const sourceGroup = (
       deal.Lead_Source_Group ||
@@ -302,10 +302,16 @@ class ZohoCRMService {
       ''
     ).toLowerCase().trim();
 
-    // 2pts for any outbound deal
-    if (sourceGroup.includes('outbound')) return 2;
+    // If Lead_Source_Group is set, trust it
+    if (sourceGroup) {
+      if (sourceGroup.includes('outbound')) return 2;
+      return 1;
+    }
 
-    // 1pt for inbound, partner, or anything else
+    // Fallback to Lead_Source when Lead_Source_Group is empty
+    const leadSource = (deal.Lead_Source || deal.lead_source || '').toLowerCase().trim();
+    if (!leadSource) return 1;
+    if (/cold[\s-]?call|walk[\s-]?in|outbound|door[\s-]?to[\s-]?door/.test(leadSource)) return 2;
     return 1;
   }
 
@@ -354,7 +360,9 @@ class ZohoCRMService {
       deal_name:         crmDeal.Deal_Name || '',
       sales_rep_name:    ownerName,
       stage:             crmDeal.Stage || '',
-      lead_source_group: crmDeal.Lead_Source_Group || '',
+      // Display the group when set, fall back to the raw Lead_Source so the tracker
+      // never shows '—' when Zoho has SOME source info
+      lead_source_group: crmDeal.Lead_Source_Group || crmDeal.Lead_Source || '',
       points,
       close_date:        crmDeal.Closing_Date || null,
       created_time:      crmDeal.Created_Time || null,
