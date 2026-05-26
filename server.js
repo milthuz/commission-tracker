@@ -3014,11 +3014,15 @@ app.post('/api/invoices/:invoiceNumber/email', authenticateToken, async (req, re
 
 // GET /api/salespeople — names for dropdown filters
 app.get('/api/salespeople', authenticateToken, async (req, res) => {
+  // By default returns ACTIVE salespeople only. Add ?includeInactive=true to get all.
+  const includeInactive = req.query.includeInactive === 'true';
   try {
-    const spResult = await pool.query('SELECT name FROM salespeople ORDER BY name');
+    const where = includeInactive ? '' : 'WHERE is_active = true';
+    const spResult = await pool.query(`SELECT name FROM salespeople ${where} ORDER BY name`);
     if (spResult.rows.length > 0) {
       return res.json({ salespeople: spResult.rows.map(r => r.name) });
     }
+    // Fallback: pull from invoices if salespeople table is empty
     const invResult = await pool.query(
       `SELECT DISTINCT salesperson_name FROM invoices
        WHERE organization_id = $1 AND salesperson_name IS NOT NULL
