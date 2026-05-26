@@ -727,6 +727,7 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
         monthlyBonus,
         bonusTier:     MONTHLY_BONUS_TIERS.find(t => rep.totalPoints >= t.points) || null,
         nextBonusTier: MONTHLY_BONUS_TIERS.slice().reverse().find(t => rep.totalPoints < t.points) || null,
+        dealsCount:          rep.deals.length,  // survives privacy stripping
         deals:               rep.deals,
         zentactMerchants,
       };
@@ -780,6 +781,37 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
 
     const totalZentactActivations = zentactResult.rows.length;
 
+    // PRIVACY: non-admin users can see all reps' TOTALS but only the
+    // line-item details of their OWN row. Strip deals[] and zentactMerchants[]
+    // from other reps' rows.
+    const isAdmin = req.user.isAdmin === true;
+    let viewerName = (req.user.name || '').trim().toLowerCase();
+    // Resolve viewer's salesperson name via user_tokens.display_name (in case
+    // the JWT name differs from the CRM display name)
+    if (req.user.email) {
+      try {
+        const r = await pool.query(
+          `SELECT display_name FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+          [req.user.email]
+        );
+        const display = r.rows[0]?.display_name;
+        if (display) viewerName = display.trim().toLowerCase();
+      } catch { /* ignore */ }
+    }
+
+    if (!isAdmin) {
+      summary = summary.map(rep => {
+        const isOwnRow = rep.repName.trim().toLowerCase() === viewerName;
+        if (isOwnRow) return rep;
+        return {
+          ...rep,
+          deals: [],
+          zentactMerchants: [],
+          restricted: true, // flag for the frontend
+        };
+      });
+    }
+
     res.json({
       year,
       month,
@@ -787,6 +819,8 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       bonusTiers:              MONTHLY_BONUS_TIERS,
       totalDeals:              deals.length,
       totalZentactActivations,
+      isAdmin,
+      viewerName,
       reps:                    summary,
     });
   } catch (error) {
