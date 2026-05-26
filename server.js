@@ -1732,12 +1732,14 @@ async function autoSyncInvoices() {
   }
 }
 
-// Schedule auto-sync to run every 4 hours (14400000 ms)
-const AUTO_SYNC_INTERVAL         = 4  * 60 * 60 * 1000; // 4 hours  — invoices
-const ZENTACT_AUTO_SYNC_INTERVAL = 1 * 60 * 60 * 1000; // 1 hour — Zentact merchants
+// Schedule auto-sync intervals
+const AUTO_SYNC_INTERVAL         = 4 * 60 * 60 * 1000; // 4 hours  — Books invoices
+const ZENTACT_AUTO_SYNC_INTERVAL = 1 * 60 * 60 * 1000; // 1 hour   — Zentact merchants
+const CRM_AUTO_SYNC_INTERVAL     = 1 * 60 * 60 * 1000; // 1 hour   — CRM sold deals
 
 let syncInterval;
 let zentactSyncIntervalHandle;
+let crmSyncIntervalHandle;
 
 async function autoSyncZentact() {
   if (!process.env.ZENTACT_API_KEY) return; // skip if not configured
@@ -1750,18 +1752,40 @@ async function autoSyncZentact() {
   }
 }
 
+async function autoSyncCrm() {
+  try {
+    console.log('🔄 [AUTO-SYNC] Starting automatic CRM sold-deals sync...');
+    const crmToken = await ensureValidCrmToken();
+    if (!crmToken) {
+      console.log('⚠️ [AUTO-SYNC] CRM not connected — skipping');
+      return;
+    }
+    const crm = new ZohoCRMService(crmToken);
+    const result = await syncCrmSoldDeals(crm);
+    console.log(`✅ [AUTO-SYNC] CRM done: ${result.total} deals processed, ${result.newCount} new`);
+  } catch (err) {
+    console.error('❌ [AUTO-SYNC] CRM sync error:', err.message);
+  }
+}
+
 function startAutoSync() {
-  console.log('⏰ [AUTO-SYNC] Starting automatic sync scheduler (invoices every 4h, Zentact every 12h)');
+  console.log('⏰ [AUTO-SYNC] Starting automatic sync scheduler (Books 4h, Zentact 1h, CRM 1h)');
 
   // Invoices — run immediately, then every 4 hours
   autoSyncInvoices();
   syncInterval = setInterval(autoSyncInvoices, AUTO_SYNC_INTERVAL);
 
-  // Zentact — first run after 5 seconds (give DB time to settle), then every 12 hours
+  // Zentact — first run after 5 seconds, then every 1 hour
   setTimeout(() => {
     autoSyncZentact();
     zentactSyncIntervalHandle = setInterval(autoSyncZentact, ZENTACT_AUTO_SYNC_INTERVAL);
   }, 5 * 1000);
+
+  // CRM — first run after 10 seconds (stagger from Zentact), then every 1 hour
+  setTimeout(() => {
+    autoSyncCrm();
+    crmSyncIntervalHandle = setInterval(autoSyncCrm, CRM_AUTO_SYNC_INTERVAL);
+  }, 10 * 1000);
 }
 
 function stopAutoSync() {
@@ -1772,6 +1796,10 @@ function stopAutoSync() {
   if (zentactSyncIntervalHandle) {
     clearInterval(zentactSyncIntervalHandle);
     console.log('⏹️ [AUTO-SYNC] Stopped Zentact sync scheduler');
+  }
+  if (crmSyncIntervalHandle) {
+    clearInterval(crmSyncIntervalHandle);
+    console.log('⏹️ [AUTO-SYNC] Stopped CRM sync scheduler');
   }
 }
 
