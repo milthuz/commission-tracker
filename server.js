@@ -977,6 +977,28 @@ app.get('/api/zentact/sync-status', authenticateToken, (req, res) => {
 
 // GET /api/zentact/attribute-keys — shows what attribute keys are stored in the DB (debug)
 // POST /api/zentact/webhook — receives Zentact "Merchant Account Status Updates"
+// Track webhook activity for diagnostic purposes
+const webhookStats = {
+  received_total:           0,
+  received_active:          0,
+  received_other:           0,
+  invalid_signature_count:  0,
+  missing_signature_count:  0,
+  last_received_at:         null,
+  last_event:               null,
+  recent_events:            [], // last 20 events
+};
+
+// GET /api/zentact/webhook-status — check if webhook is configured and receiving traffic
+app.get('/api/zentact/webhook-status', authenticateToken, (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  res.json({
+    secret_configured: !!process.env.ZENTACT_WEBHOOK_SECRET,
+    webhook_url: `${req.protocol}://${req.get('host')}/api/zentact/webhook`,
+    stats: webhookStats,
+  });
+});
+
 // Configure in Zentact dashboard → Configure → Webhooks with this URL and a shared
 // secret. Save the secret to Heroku env var ZENTACT_WEBHOOK_SECRET.
 app.post('/api/zentact/webhook', async (req, res) => {
@@ -987,6 +1009,7 @@ app.post('/api/zentact/webhook', async (req, res) => {
   // Signature verification (only enforced if secret is set)
   if (secret) {
     if (!signature || !req.rawBody) {
+      webhookStats.missing_signature_count++;
       console.warn('⚠️ Zentact webhook: missing signature or raw body');
       return res.status(401).json({ error: 'Missing signature' });
     }
@@ -994,6 +1017,7 @@ app.post('/api/zentact/webhook', async (req, res) => {
     const a = Buffer.from(signature);
     const b = Buffer.from(expected);
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      webhookStats.invalid_signature_count++;
       console.warn('⚠️ Zentact webhook: signature mismatch');
       return res.status(401).json({ error: 'Invalid signature' });
     }
@@ -1029,6 +1053,17 @@ app.post('/api/zentact/webhook', async (req, res) => {
         END,
         updated_at = CURRENT_TIMESTAMP
     `, [merchantId, status, eventDate]);
+
+    // Update webhook stats
+    webhookStats.received_total++;
+    if (status === 'ACTIVE') webhookStats.received_active++; else webhookStats.received_other++;
+    webhookStats.last_received_at = new Date().toISOString();
+    webhookStats.last_event = { merchantId, status, eventDate };
+    webhookStats.recent_events.unshift({
+      received_at: webhookStats.last_received_at,
+      merchantId, status, eventDate,
+    });
+    if (webhookStats.recent_events.length > 20) webhookStats.recent_events.length = 20;
 
     console.log(`📡 Zentact webhook: ${merchantId} → ${status} (${eventDate})`);
     res.status(200).json({ ok: true });
