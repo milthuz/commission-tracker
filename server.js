@@ -1467,6 +1467,40 @@ app.get('/api/crm/sold-deals-db/reset-status', authenticateToken, (req, res) => 
   res.json(crmResetStatus);
 });
 
+// POST /api/crm/sync — non-destructive manual CRM sync (upserts, preserves sold_date)
+// Runs in background to avoid Heroku 30-sec timeout.
+let crmSyncStatus = { running: false, startedAt: null, result: null, error: null };
+
+app.post('/api/crm/sync', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  if (crmSyncStatus.running) {
+    return res.status(409).json({ error: 'CRM sync already in progress', startedAt: crmSyncStatus.startedAt });
+  }
+
+  crmSyncStatus = { running: true, startedAt: new Date().toISOString(), result: null, error: null };
+  res.json({ success: true, message: 'CRM sync started — poll /api/crm/sync-status for result' });
+
+  (async () => {
+    try {
+      const crmToken = await ensureValidCrmToken();
+      if (!crmToken) throw new Error('CRM not connected — please reconnect Zoho CRM');
+      const crm = new ZohoCRMService(crmToken);
+      const result = await syncCrmSoldDeals(crm);
+      crmSyncStatus = { running: false, startedAt: crmSyncStatus.startedAt, result, error: null };
+      console.log('✅ Manual CRM sync complete:', result);
+    } catch (err) {
+      crmSyncStatus = { running: false, startedAt: crmSyncStatus.startedAt, result: null, error: err.message };
+      console.error('❌ Manual CRM sync failed:', err.message);
+    }
+  })();
+});
+
+// GET /api/crm/sync-status — poll manual sync progress
+app.get('/api/crm/sync-status', authenticateToken, (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  res.json(crmSyncStatus);
+});
+
 // PATCH /api/crm/sold-deals-db/:dealId — manually correct a deal's sold_date
 app.patch('/api/crm/sold-deals-db/:dealId', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
