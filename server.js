@@ -3647,6 +3647,61 @@ app.get('/api/sync/status', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/sync/all-status — unified "last updated" info for every integration
+// Used by the global header widget to show data freshness at a glance.
+app.get('/api/sync/all-status', authenticateToken, async (req, res) => {
+  try {
+    // Books — most recent successful sync_log entry
+    const booksRes = await pool.query(
+      `SELECT synced_at, invoice_count, status FROM sync_log
+       WHERE organization_id = $1 ORDER BY synced_at DESC LIMIT 1`,
+      [process.env.ZOHO_ORG_ID]
+    );
+    const booksCount = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM invoices WHERE organization_id = $1`,
+      [process.env.ZOHO_ORG_ID]
+    );
+
+    // CRM — most recent updated_at on the deals table
+    const crmRes = await pool.query(
+      `SELECT MAX(updated_at) AS last_at, COUNT(*) AS cnt FROM crm_sold_deals`
+    );
+
+    // Zentact — most recent updated_at + webhook stats (in-memory)
+    const zentRes = await pool.query(
+      `SELECT MAX(updated_at) AS last_at, COUNT(*) AS cnt,
+              COUNT(CASE WHEN status = 'ACTIVE' THEN 1 END) AS active
+       FROM zentact_merchants`
+    );
+
+    res.json({
+      books: {
+        lastSyncAt:    booksRes.rows[0]?.synced_at  || null,
+        invoiceCount:  parseInt(booksCount.rows[0]?.cnt) || 0,
+        status:        booksRes.rows[0]?.status     || 'never',
+        autoSyncEvery: '4h',
+      },
+      crm: {
+        lastSyncAt:  crmRes.rows[0]?.last_at || null,
+        dealCount:   parseInt(crmRes.rows[0]?.cnt) || 0,
+        autoSyncEvery: '1h',
+      },
+      zentact: {
+        lastSyncAt:    zentRes.rows[0]?.last_at || null,
+        merchantCount: parseInt(zentRes.rows[0]?.cnt)    || 0,
+        activeCount:   parseInt(zentRes.rows[0]?.active) || 0,
+        autoSyncEvery: '1h',
+        webhookConfigured: !!process.env.ZENTACT_WEBHOOK_SECRET,
+        webhookLastReceivedAt: webhookStats.last_received_at,
+        webhookTotalReceived:  webhookStats.received_total,
+      },
+      serverTime: new Date().toISOString(),
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to get all-status', details: error.message });
+  }
+});
+
 // ============================================================================
 // COMMISSIONS REPORT
 // ============================================================================
