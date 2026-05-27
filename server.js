@@ -3976,6 +3976,21 @@ app.get('/api/releases', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/releases/latest — most recent release version (public, no auth needed for login screen)
+app.get('/api/releases/latest', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT version, name, date FROM releases ORDER BY date DESC LIMIT 1');
+    const r = result.rows[0];
+    res.json({
+      version: r?.version || null,
+      name:    r?.name    || null,
+      date:    r?.date    || null,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // GET /api/releases/generate-notes — generates release notes from GitHub commits
 // since the last published tag. Categorizes by prefix (feat/fix/style/etc).
 app.get('/api/releases/generate-notes', authenticateToken, async (req, res) => {
