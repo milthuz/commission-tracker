@@ -3976,13 +3976,148 @@ app.get('/api/releases', authenticateToken, async (req, res) => {
   }
 });
 
-// GET /api/releases/generate-notes — stub (returns template)
+// GET /api/releases/generate-notes — generates release notes from GitHub commits
+// since the last published tag. Categorizes by prefix (feat/fix/style/etc).
 app.get('/api/releases/generate-notes', authenticateToken, async (req, res) => {
-  res.json({
-    notes: '## ✨ New Features\n- \n\n## 🎨 UI Improvements\n- \n\n## 🔧 Bug Fixes\n- \n',
-    commitCount: 0,
-    sinceTag: '',
-  });
+  const token = process.env.GITHUB_TOKEN;
+  const owner = process.env.GITHUB_OWNER || 'milthuz';
+  // Pull notes from BOTH frontend + backend repos so a release covers all commits
+  const repos = (process.env.GITHUB_REPOS || 'commission-tracker,commission-tracker-frontend')
+    .split(',').map(s => s.trim()).filter(Boolean);
+
+  if (!token) {
+    return res.json({
+      notes: '## ✨ New Features\n- \n\n## 🎨 UI Improvements\n- \n\n## 🔧 Bug Fixes\n- \n',
+      commitCount: 0,
+      sinceTag: '',
+      warning: 'GITHUB_TOKEN env var not set — returning empty template. Add it to Heroku Config Vars to enable auto-generation.',
+    });
+  }
+
+  const ghHeaders = {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/vnd.github+json',
+    'User-Agent': 'commission-tracker',
+  };
+
+  // Pull commits since the last release tag from one repo
+  async function commitsSinceLatestTag(repo) {
+    // 1. Get latest tag (or fall back to no tag → all commits, up to 100)
+    let sinceDate = null;
+    let sinceTag  = null;
+    try {
+      const tagsRes = await axios.get(
+        `https://api.github.com/repos/${owner}/${repo}/tags?per_page=1`,
+        { headers: ghHeaders, validateStatus: () => true }
+      );
+      if (tagsRes.status === 200 && Array.isArray(tagsRes.data) && tagsRes.data[0]) {
+        sinceTag = tagsRes.data[0].name;
+        // Get the commit date of that tag
+        const tagSha = tagsRes.data[0].commit?.sha;
+        if (tagSha) {
+          const commitRes = await axios.get(
+            `https://api.github.com/repos/${owner}/${repo}/commits/${tagSha}`,
+            { headers: ghHeaders, validateStatus: () => true }
+          );
+          if (commitRes.status === 200) {
+            sinceDate = commitRes.data?.commit?.committer?.date || null;
+          }
+        }
+      }
+    } catch (_e) { /* ignore */ }
+
+    // 2. List commits since that date (or last 100 if no tag)
+    const params = new URLSearchParams({ per_page: '100' });
+    if (sinceDate) params.set('since', sinceDate);
+    const commitsRes = await axios.get(
+      `https://api.github.com/repos/${owner}/${repo}/commits?${params.toString()}`,
+      { headers: ghHeaders, validateStatus: () => true }
+    );
+    if (commitsRes.status !== 200 || !Array.isArray(commitsRes.data)) return { commits: [], sinceTag };
+    return {
+      commits: commitsRes.data.map(c => ({
+        sha:     c.sha?.slice(0, 7),
+        message: (c.commit?.message || '').split('\n')[0], // first line only
+        date:    c.commit?.committer?.date,
+        url:     c.html_url,
+        repo,
+      })),
+      sinceTag,
+    };
+  }
+
+  try {
+    const results = await Promise.all(repos.map(commitsSinceLatestTag));
+    const allCommits = results.flatMap(r => r.commits);
+    const sinceTag = results.find(r => r.sinceTag)?.sinceTag || '';
+
+    // Filter out merge commits and Claude co-author footers
+    const filtered = allCommits.filter(c => {
+      const m = c.message.toLowerCase();
+      if (m.startsWith('merge ')) return false;
+      if (m.startsWith('co-authored-by')) return false;
+      return true;
+    });
+
+    // Categorize by prefix (conventional commits + common keywords)
+    const categories = {
+      features:  [],
+      ui:        [],
+      fixes:     [],
+      improvements: [],
+      other:     [],
+    };
+    for (const c of filtered) {
+      const m = c.message.toLowerCase();
+      // Skip co-author and "fix typo" type commits
+      if (/^(chore|ci|docs|test|build|deps?):/i.test(c.message)) continue;
+      if (/^(feat|add|new):/i.test(c.message) || /\b(add|new feature|implement)/i.test(m)) {
+        categories.features.push(c);
+      } else if (/^(fix|bug)/i.test(c.message) || /\b(fix|resolve|repair)/i.test(m)) {
+        categories.fixes.push(c);
+      } else if (/^(style|ui|design):/i.test(c.message) || /\b(ui|design|layout|visual)/i.test(m)) {
+        categories.ui.push(c);
+      } else if (/^(refactor|perf|improve)/i.test(c.message) || /\b(improve|refactor|update|enhance)/i.test(m)) {
+        categories.improvements.push(c);
+      } else {
+        categories.other.push(c);
+      }
+    }
+
+    // Build markdown notes
+    const formatCommit = (c) => `- ${c.message}`;
+    const sections = [];
+    if (categories.features.length)     sections.push('## ✨ New Features\n' + categories.features.map(formatCommit).join('\n'));
+    if (categories.ui.length)           sections.push('## 🎨 UI Improvements\n' + categories.ui.map(formatCommit).join('\n'));
+    if (categories.fixes.length)        sections.push('## 🔧 Bug Fixes\n' + categories.fixes.map(formatCommit).join('\n'));
+    if (categories.improvements.length) sections.push('## 🚀 Improvements\n' + categories.improvements.map(formatCommit).join('\n'));
+    if (categories.other.length)        sections.push('## 📝 Other Changes\n' + categories.other.map(formatCommit).join('\n'));
+
+    const notes = sections.length > 0
+      ? sections.join('\n\n')
+      : '## ✨ New Features\n- \n\n## 🎨 UI Improvements\n- \n\n## 🔧 Bug Fixes\n- \n';
+
+    res.json({
+      notes,
+      commitCount: filtered.length,
+      sinceTag,
+      categories: {
+        features:     categories.features.length,
+        ui:           categories.ui.length,
+        fixes:        categories.fixes.length,
+        improvements: categories.improvements.length,
+        other:        categories.other.length,
+      },
+    });
+  } catch (error) {
+    console.error('generate-notes error:', error.message);
+    res.status(500).json({
+      notes: '## ✨ New Features\n- \n\n## 🎨 UI Improvements\n- \n\n## 🔧 Bug Fixes\n- \n',
+      commitCount: 0,
+      sinceTag: '',
+      error: error.message,
+    });
+  }
 });
 
 // GET /api/releases/workflow-status
