@@ -247,6 +247,19 @@ async function initializeDatabase() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    // One-time migration: fix broken release URLs from the old buggy format
+    {
+      const owner = process.env.GITHUB_OWNER || 'milthuz';
+      const repo  = process.env.GITHUB_PRIMARY_REPO || 'commission-tracker';
+      const fix = await pool.query(
+        `UPDATE releases
+         SET url = 'https://github.com/${owner}/${repo}/releases/tag/' || version
+         WHERE url LIKE 'https://github.com/releases/%' OR url IS NULL OR url = ''`
+      );
+      if (fix.rowCount > 0) {
+        console.log(`🔧 Repaired ${fix.rowCount} release URLs (legacy/empty)`);
+      }
+    }
 
     // Sync log table
     await pool.query(`
@@ -3970,7 +3983,17 @@ app.get('/api/commissions/recalculate/status', authenticateToken, async (req, re
 app.get('/api/releases', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM releases ORDER BY date DESC LIMIT 50');
-    res.json({ releases: result.rows });
+    const owner = process.env.GITHUB_OWNER || 'milthuz';
+    const repo  = process.env.GITHUB_PRIMARY_REPO || 'commission-tracker';
+    // Repair any broken legacy URLs on the fly so the frontend always gets a valid link
+    const releases = result.rows.map(r => {
+      let url = r.url;
+      if (!url || url === '' || /^https:\/\/github\.com\/releases\//.test(url)) {
+        url = `https://github.com/${owner}/${repo}/releases/tag/${r.version}`;
+      }
+      return { ...r, url };
+    });
+    res.json({ releases });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch releases', details: error.message });
   }
