@@ -4125,20 +4125,92 @@ app.get('/api/releases/workflow-status', authenticateToken, async (req, res) => 
   res.json({ status: 'completed', conclusion: 'success' });
 });
 
-// POST /api/releases/create
+// POST /api/releases/create — create a real GitHub release on the primary repo
+// AND store the record in our releases table. The 'View' button on the
+// frontend uses the stored URL, which now points to the actual GitHub release.
 app.post('/api/releases/create', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   const { version, releaseNotes } = req.body;
   if (!version) return res.status(400).json({ error: 'Version required' });
+
+  const token   = process.env.GITHUB_TOKEN;
+  const owner   = process.env.GITHUB_OWNER || 'milthuz';
+  // Primary repo is where the GitHub release lives. Defaults to the backend repo.
+  const repo    = process.env.GITHUB_PRIMARY_REPO || 'commission-tracker';
+  const tagName = `v${String(version).replace(/^v/, '')}`;
+
+  let releaseUrl = `https://github.com/${owner}/${repo}/releases/tag/${tagName}`;
+  let warning   = null;
+
+  // If GITHUB_TOKEN is set, create a real GitHub release via the API.
+  // Otherwise fall back to a constructed URL (which may 404 until the user
+  // manually creates the release on GitHub).
+  if (token) {
+    try {
+      const ghRes = await axios.post(
+        `https://api.github.com/repos/${owner}/${repo}/releases`,
+        {
+          tag_name:         tagName,
+          name:             tagName,
+          body:             releaseNotes || '',
+          target_commitish: 'main',
+          draft:            false,
+          prerelease:       false,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept:        'application/vnd.github+json',
+            'User-Agent':  'commission-tracker',
+          },
+          validateStatus: () => true,
+        }
+      );
+      if (ghRes.status >= 200 && ghRes.status < 300 && ghRes.data?.html_url) {
+        releaseUrl = ghRes.data.html_url;
+      } else if (ghRes.status === 422) {
+        // Tag already exists on GitHub — link to it anyway
+        warning = `GitHub tag ${tagName} already exists; using existing release URL.`;
+      } else {
+        warning = `GitHub release creation returned ${ghRes.status}: ${JSON.stringify(ghRes.data).slice(0, 200)}`;
+        console.warn('⚠️ GitHub release create:', warning);
+      }
+    } catch (e) {
+      warning = `Could not call GitHub API: ${e.message}`;
+      console.warn('⚠️ GitHub release create error:', e.message);
+    }
+  } else {
+    warning = 'GITHUB_TOKEN not set — release recorded in DB only, no GitHub release created.';
+  }
+
   try {
     await pool.query(
       `INSERT INTO releases (version, name, notes, url, date)
        VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)`,
-      [`v${version}`, `v${version}`, releaseNotes || '', `https://github.com/releases/v${version}`]
+      [tagName, tagName, releaseNotes || '', releaseUrl]
     );
-    res.json({ success: true, version });
+    res.json({ success: true, version: tagName, url: releaseUrl, warning });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to create release', details: error.message });
+    res.status(500).json({ error: 'Failed to save release record', details: error.message });
+  }
+});
+
+// PATCH /api/releases/fix-urls — admin tool to bulk-fix broken release URLs
+// stored under the old buggy format (https://github.com/releases/vX.X.X)
+app.patch('/api/releases/fix-urls', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const owner = process.env.GITHUB_OWNER || 'milthuz';
+  const repo  = process.env.GITHUB_PRIMARY_REPO || 'commission-tracker';
+  try {
+    const result = await pool.query(
+      `UPDATE releases
+       SET url = 'https://github.com/${owner}/${repo}/releases/tag/' || version
+       WHERE url LIKE 'https://github.com/releases/%'
+       RETURNING version, url`
+    );
+    res.json({ success: true, fixed: result.rowCount, releases: result.rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
