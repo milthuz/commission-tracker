@@ -2250,9 +2250,12 @@ async function syncZentactMerchants() {
     // Zentact uses { name: 'sales_rep', value: 'FirstName' } — match against salespeople table
     let repName = null;
     if (m.sales_rep_raw) {
-      // 1. Exact match
+      // 1. Exact match — only against ACTIVE salespeople so deactivated
+      //    standalone first-name records (e.g. lone "Erika") never beat the
+      //    canonical full-name rep that has the alias set.
       const exactRes = await pool.query(
-        `SELECT name FROM salespeople WHERE LOWER(name) = LOWER($1) LIMIT 1`,
+        `SELECT name FROM salespeople
+         WHERE LOWER(name) = LOWER($1) AND is_active = true LIMIT 1`,
         [m.sales_rep_raw]
       );
       repName = exactRes.rows[0]?.name || null;
@@ -3340,18 +3343,43 @@ app.put('/api/salespeople/:name/aliases', authenticateToken, async (req, res) =>
     );
     if (result.rowCount === 0) return res.status(404).json({ error: 'Salesperson not found' });
 
-    // After aliases change, re-link existing zentact_merchants whose sales_rep_name
-    // matches one of these aliases (case-insensitive) to the canonical name.
+    let deactivatedStandalones = [];
+    let mergedMerchants = 0;
     if (clean.length > 0) {
-      await pool.query(
+      const aliasesLower = clean.map(a => a.toLowerCase());
+
+      // 1. Re-link existing zentact_merchants whose sales_rep_name matches one
+      //    of these aliases (case-insensitive) to the canonical name.
+      const linkRes = await pool.query(
         `UPDATE zentact_merchants
          SET sales_rep_name = $1, updated_at = CURRENT_TIMESTAMP
          WHERE sales_rep_name IS NOT NULL
            AND LOWER(sales_rep_name) = ANY($2::text[])`,
-        [req.params.name, clean.map(a => a.toLowerCase())]
+        [req.params.name, aliasesLower]
       );
+      mergedMerchants = linkRes.rowCount;
+
+      // 2. Auto-deactivate any STANDALONE salespeople records whose name matches
+      //    an alias of this rep (excluding the canonical rep itself).
+      //    This prevents the sync's exact-match step from re-assigning merchants
+      //    to the standalone "Erika" instead of falling through to the alias match.
+      const deactRes = await pool.query(
+        `UPDATE salespeople
+         SET is_active = false, updated_at = CURRENT_TIMESTAMP
+         WHERE is_active = true
+           AND LOWER(name) = ANY($1::text[])
+           AND LOWER(name) <> LOWER($2)
+         RETURNING name`,
+        [aliasesLower, req.params.name]
+      );
+      deactivatedStandalones = deactRes.rows.map(r => r.name);
     }
-    res.json({ success: true, aliases: result.rows[0].aliases });
+    res.json({
+      success: true,
+      aliases: result.rows[0].aliases,
+      mergedMerchants,
+      deactivatedStandalones,
+    });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update aliases', details: error.message });
   }
