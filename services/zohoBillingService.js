@@ -24,6 +24,8 @@ class ZohoBillingService {
     this.headers = {
       Authorization: `Zoho-oauthtoken ${accessToken}`,
       'Content-Type': 'application/json',
+      // Required by Zoho Billing — without this header we get 401
+      'X-com-zoho-subscriptions-organizationid': orgId,
     };
   }
 
