@@ -3826,7 +3826,8 @@ app.get('/api/billing/probe', authenticateToken, async (req, res) => {
       adminEmail: admin.email,
       apiDomain: admin.api_domain,
       orgId,
-      tokenPrefix: token?.slice(0, 15) + '...',
+      tokenPrefix: typeof token === 'string' ? token.slice(0, 15) + '...' : String(token).slice(0, 50),
+      tokenType: typeof token,
       tokenExpiresIn: admin.expires_at ? Math.round((parseInt(admin.expires_at) - Date.now()) / 1000) + 's' : 'unknown',
       results,
     });
