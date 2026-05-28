@@ -3846,12 +3846,17 @@ app.get('/api/billing/probe', authenticateToken, async (req, res) => {
 });
 
 // GET /api/invoices/enrich-preview/:invoiceNumber — fetches ONE invoice from Zoho Books
-// with full line items, classifies each as hardware/SaaS via cached plan_codes,
-// and returns the analysis (without storing). Useful for verifying logic.
+// with full line items, classifies it as hardware OR SaaS via cached plan_codes,
+// and computes commission_payable_date with customer-level linking.
+//
+// Rules (per user spec):
+//   - Invoices are PURE: either 100% hardware or 100% SaaS (never mixed)
+//   - SaaS invoice payable when: status=paid AND subscription_activation_date set
+//   - Hardware invoice payable when: status=paid AND the same customer has at least
+//     ONE paid SaaS invoice with subscription_activation_date set
 app.get('/api/invoices/enrich-preview/:invoiceNumber', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   try {
-    // 1. Find the invoice ID via the Books list endpoint (by invoice_number)
     const adminResult = await pool.query(
       'SELECT email, access_token, api_domain FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
     );
@@ -3860,6 +3865,7 @@ app.get('/api/invoices/enrich-preview/:invoiceNumber', authenticateToken, async 
     const tokenData = await ensureValidToken(admin.email);
     const accessToken = typeof tokenData === 'string' ? tokenData : tokenData?.access_token;
 
+    // 1. Find the invoice ID
     const searchRes = await axios.get(
       `${admin.api_domain}/books/v3/invoices`,
       {
@@ -3871,7 +3877,7 @@ app.get('/api/invoices/enrich-preview/:invoiceNumber', authenticateToken, async 
     const found = searchRes.data?.invoices?.[0];
     if (!found) return res.status(404).json({ error: 'Invoice not found in Zoho' });
 
-    // 2. Fetch full invoice with line items
+    // 2. Fetch full invoice details
     const detailRes = await axios.get(
       `${admin.api_domain}/books/v3/invoices/${found.invoice_id}`,
       {
@@ -3883,71 +3889,141 @@ app.get('/api/invoices/enrich-preview/:invoiceNumber', authenticateToken, async 
     const inv = detailRes.data?.invoice;
     if (!inv) return res.status(500).json({ error: 'Failed to fetch invoice details', body: detailRes.data });
 
-    // 3. Load cached plan_codes for matching
+    // 3. Load cached plan_codes
     const plansRes = await pool.query('SELECT plan_code FROM zoho_plans');
     const planCodes = new Set(plansRes.rows.map(r => (r.plan_code || '').toLowerCase().trim()));
 
-    // 4. Classify line items
-    let hardwareAmount = 0;
-    let saasAmount     = 0;
+    // 4. Classify line items (and decide invoice TYPE)
+    let totalAmount = 0;
+    let saasLineCount = 0;
+    let hardwareLineCount = 0;
     let earliestSubActivation = null;
     const classified = (inv.line_items || []).map(li => {
       const sku = (li.sku || li.item_code || '').trim();
       const isSaaS = sku ? planCodes.has(sku.toLowerCase()) : false;
       const amount = parseFloat(li.item_total) || (parseFloat(li.rate) * parseInt(li.quantity)) || 0;
-      if (isSaaS) saasAmount += amount; else hardwareAmount += amount;
-      // Some Zoho Books templates expose subscription dates per line; collect the earliest
+      totalAmount += amount;
+      if (isSaaS) saasLineCount++; else hardwareLineCount++;
       const subDate = li.subscription_activation_date || li.start_date || null;
       if (subDate) {
         const d = new Date(subDate);
         if (!earliestSubActivation || d < earliestSubActivation) earliestSubActivation = d;
       }
       return {
-        name:     li.name,
-        sku,
-        quantity: li.quantity,
-        rate:     li.rate,
-        amount,
-        type:     isSaaS ? 'saas' : 'hardware',
+        name: li.name, sku, quantity: li.quantity, rate: li.rate, amount,
+        type: isSaaS ? 'saas' : 'hardware',
         plan_matched: isSaaS,
         subscription_activation_date: subDate,
       };
     });
+    // Invoice type: majority of lines determines it (user said they're pure anyway)
+    const invoiceType = saasLineCount > hardwareLineCount ? 'saas'
+                      : hardwareLineCount > saasLineCount ? 'hardware'
+                      : (saasLineCount > 0 ? 'saas' : 'unknown');
 
-    // 5. Detect paid date + subscription activation at invoice level if available
+    // 5. Detect paid date + invoice-level activation
     const paidDate = inv.last_payment_date || (inv.status === 'paid' ? inv.date : null);
     const subActivation = earliestSubActivation
       ? earliestSubActivation.toISOString().slice(0, 10)
       : (inv.cf_subscription_activation_date || inv.subscription_activation_date || null);
 
-    // 6. Commission payable date = max(paid_date, subscription_activation)
-    let payableDate = null;
-    if (paidDate && subActivation) {
-      payableDate = paidDate > subActivation ? paidDate : subActivation;
-    } else if (paidDate || subActivation) {
-      payableDate = paidDate || subActivation;
+    // 6. Customer linking: for HARDWARE invoices, find this customer's first paid SaaS
+    //    invoice (with subscription_activation_date) to determine when SaaS started.
+    let firstSaasInvoice = null;
+    if (invoiceType === 'hardware' && inv.customer_id) {
+      const custInvRes = await axios.get(
+        `${admin.api_domain}/books/v3/invoices`,
+        {
+          params: {
+            organization_id: process.env.ZOHO_ORG_ID,
+            customer_id: inv.customer_id,
+            status: 'paid',
+            sort_column: 'date',
+            sort_order: 'A',
+            per_page: 50,
+          },
+          headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+          validateStatus: () => true,
+        }
+      );
+      const customerInvoices = custInvRes.data?.invoices || [];
+      // Walk the customer's paid invoices and find the first one that has any
+      // SaaS line item (matches a plan_code). We need the detail call again for line items.
+      for (const ci of customerInvoices) {
+        if (ci.invoice_id === inv.invoice_id) continue; // skip self
+        const det = await axios.get(
+          `${admin.api_domain}/books/v3/invoices/${ci.invoice_id}`,
+          {
+            params: { organization_id: process.env.ZOHO_ORG_ID },
+            headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+            validateStatus: () => true,
+          }
+        );
+        const det_inv = det.data?.invoice;
+        if (!det_inv) continue;
+        const hasSaas = (det_inv.line_items || []).some(li => {
+          const sku = (li.sku || li.item_code || '').toLowerCase().trim();
+          return sku && planCodes.has(sku);
+        });
+        if (hasSaas) {
+          const subDateFromLines = (det_inv.line_items || [])
+            .map(li => li.subscription_activation_date || li.start_date)
+            .filter(Boolean)
+            .map(d => new Date(d))
+            .sort((a, b) => a - b)[0];
+          firstSaasInvoice = {
+            invoice_number: det_inv.invoice_number,
+            invoice_id: det_inv.invoice_id,
+            date: det_inv.date,
+            last_payment_date: det_inv.last_payment_date,
+            subscription_activation_date: subDateFromLines
+              ? subDateFromLines.toISOString().slice(0, 10)
+              : (det_inv.cf_subscription_activation_date || null),
+          };
+          break;
+        }
+      }
     }
 
+    // 7. Compute commission_payable_date based on invoice type
+    let payableDate = null;
     let commissionStatus = 'calculated';
-    if (inv.status !== 'paid')           commissionStatus = 'pending_payment';
-    else if (!subActivation)             commissionStatus = 'pending_saas';
-    else                                 commissionStatus = 'eligible';
+    if (inv.status !== 'paid') {
+      commissionStatus = 'pending_payment';
+    } else if (invoiceType === 'saas') {
+      // SaaS invoice: paid + activation date on the invoice itself
+      if (subActivation) {
+        payableDate = paidDate > subActivation ? paidDate : subActivation;
+        commissionStatus = 'eligible';
+      } else {
+        commissionStatus = 'pending_saas';
+      }
+    } else if (invoiceType === 'hardware') {
+      // Hardware invoice: paid + customer has paid SaaS with activation
+      if (firstSaasInvoice && firstSaasInvoice.subscription_activation_date) {
+        const saasDate = firstSaasInvoice.subscription_activation_date;
+        payableDate = paidDate > saasDate ? paidDate : saasDate;
+        commissionStatus = 'eligible';
+      } else {
+        commissionStatus = 'pending_saas';
+      }
+    }
 
     res.json({
       invoice_number: inv.invoice_number,
       customer_name:  inv.customer_name,
+      customer_id:    inv.customer_id,
       status:         inv.status,
       total:          inv.total,
       balance:        inv.balance,
       date:           inv.date,
       paid_date:      paidDate,
+      invoice_type:   invoiceType,
       subscription_activation_date: subActivation,
+      first_saas_invoice: firstSaasInvoice,
       commission_payable_date: payableDate,
       commission_status: commissionStatus,
-      hardware_amount: hardwareAmount,
-      saas_amount: saasAmount,
       classified_line_items: classified,
-      raw_keys_top: Object.keys(inv).filter(k => /subscription|date|activation|paid/i.test(k)),
     });
   } catch (error) {
     res.status(500).json({ error: error.message, body: error.response?.data });
