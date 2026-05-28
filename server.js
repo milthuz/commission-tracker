@@ -3763,7 +3763,9 @@ app.get('/api/billing/probe', authenticateToken, async (req, res) => {
     const admin = adminResult.rows[0];
     if (!admin) return res.status(400).json({ error: 'No admin token' });
 
-    const token = await ensureValidToken(admin.email);
+    const tokenData = await ensureValidToken(admin.email);
+    const token = typeof tokenData === 'string' ? tokenData : tokenData?.access_token;
+    if (!token) return res.status(400).json({ error: 'No access_token in token data', tokenData });
     const orgId = process.env.ZOHO_ORG_ID;
     const headers = {
       Authorization: `Zoho-oauthtoken ${token}`,
@@ -3844,8 +3846,9 @@ app.post('/api/billing/sync', authenticateToken, async (req, res) => {
     if (!adminResult.rows[0]) return res.status(400).json({ error: 'No admin Zoho token available' });
     const admin = adminResult.rows[0];
 
-    // Ensure token is valid
-    const token = await ensureValidToken(admin.email);
+    // Ensure token is valid — ensureValidToken returns the full row, we need just access_token
+    const tokenData = await ensureValidToken(admin.email);
+    const token = typeof tokenData === 'string' ? tokenData : tokenData?.access_token;
     if (!token) return res.status(400).json({ error: 'Could not refresh Zoho token' });
 
     const orgId = process.env.ZOHO_ORG_ID;
