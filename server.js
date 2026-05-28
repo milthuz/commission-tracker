@@ -150,6 +150,15 @@ async function initializeDatabase() {
     `);
     await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS customer_name VARCHAR(255)`);
     await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS commission_paid BOOLEAN DEFAULT false`);
+    // Enriched fields for the new commission workflow (hardware/SaaS classification)
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS line_items JSONB DEFAULT '[]'::jsonb`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS hardware_amount DECIMAL(12,2) DEFAULT 0`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS saas_amount DECIMAL(12,2) DEFAULT 0`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS subscription_activation_date DATE`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS paid_date DATE`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS commission_payable_date DATE`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS commission_status VARCHAR(50) DEFAULT 'calculated'`);
+    // commission_status values: calculated | pending_payment | pending_saas | eligible | approved | paid
 
     // User preferences table
     await pool.query(`
@@ -3833,6 +3842,115 @@ app.get('/api/billing/probe', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/invoices/enrich-preview/:invoiceNumber — fetches ONE invoice from Zoho Books
+// with full line items, classifies each as hardware/SaaS via cached plan_codes,
+// and returns the analysis (without storing). Useful for verifying logic.
+app.get('/api/invoices/enrich-preview/:invoiceNumber', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    // 1. Find the invoice ID via the Books list endpoint (by invoice_number)
+    const adminResult = await pool.query(
+      'SELECT email, access_token, api_domain FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
+    );
+    const admin = adminResult.rows[0];
+    if (!admin) return res.status(400).json({ error: 'No admin Zoho token' });
+    const tokenData = await ensureValidToken(admin.email);
+    const accessToken = typeof tokenData === 'string' ? tokenData : tokenData?.access_token;
+
+    const searchRes = await axios.get(
+      `${admin.api_domain}/books/v3/invoices`,
+      {
+        params: { organization_id: process.env.ZOHO_ORG_ID, invoice_number: req.params.invoiceNumber },
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+        validateStatus: () => true,
+      }
+    );
+    const found = searchRes.data?.invoices?.[0];
+    if (!found) return res.status(404).json({ error: 'Invoice not found in Zoho' });
+
+    // 2. Fetch full invoice with line items
+    const detailRes = await axios.get(
+      `${admin.api_domain}/books/v3/invoices/${found.invoice_id}`,
+      {
+        params: { organization_id: process.env.ZOHO_ORG_ID },
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+        validateStatus: () => true,
+      }
+    );
+    const inv = detailRes.data?.invoice;
+    if (!inv) return res.status(500).json({ error: 'Failed to fetch invoice details', body: detailRes.data });
+
+    // 3. Load cached plan_codes for matching
+    const plansRes = await pool.query('SELECT plan_code FROM zoho_plans');
+    const planCodes = new Set(plansRes.rows.map(r => (r.plan_code || '').toLowerCase().trim()));
+
+    // 4. Classify line items
+    let hardwareAmount = 0;
+    let saasAmount     = 0;
+    let earliestSubActivation = null;
+    const classified = (inv.line_items || []).map(li => {
+      const sku = (li.sku || li.item_code || '').trim();
+      const isSaaS = sku ? planCodes.has(sku.toLowerCase()) : false;
+      const amount = parseFloat(li.item_total) || (parseFloat(li.rate) * parseInt(li.quantity)) || 0;
+      if (isSaaS) saasAmount += amount; else hardwareAmount += amount;
+      // Some Zoho Books templates expose subscription dates per line; collect the earliest
+      const subDate = li.subscription_activation_date || li.start_date || null;
+      if (subDate) {
+        const d = new Date(subDate);
+        if (!earliestSubActivation || d < earliestSubActivation) earliestSubActivation = d;
+      }
+      return {
+        name:     li.name,
+        sku,
+        quantity: li.quantity,
+        rate:     li.rate,
+        amount,
+        type:     isSaaS ? 'saas' : 'hardware',
+        plan_matched: isSaaS,
+        subscription_activation_date: subDate,
+      };
+    });
+
+    // 5. Detect paid date + subscription activation at invoice level if available
+    const paidDate = inv.last_payment_date || (inv.status === 'paid' ? inv.date : null);
+    const subActivation = earliestSubActivation
+      ? earliestSubActivation.toISOString().slice(0, 10)
+      : (inv.cf_subscription_activation_date || inv.subscription_activation_date || null);
+
+    // 6. Commission payable date = max(paid_date, subscription_activation)
+    let payableDate = null;
+    if (paidDate && subActivation) {
+      payableDate = paidDate > subActivation ? paidDate : subActivation;
+    } else if (paidDate || subActivation) {
+      payableDate = paidDate || subActivation;
+    }
+
+    let commissionStatus = 'calculated';
+    if (inv.status !== 'paid')           commissionStatus = 'pending_payment';
+    else if (!subActivation)             commissionStatus = 'pending_saas';
+    else                                 commissionStatus = 'eligible';
+
+    res.json({
+      invoice_number: inv.invoice_number,
+      customer_name:  inv.customer_name,
+      status:         inv.status,
+      total:          inv.total,
+      balance:        inv.balance,
+      date:           inv.date,
+      paid_date:      paidDate,
+      subscription_activation_date: subActivation,
+      commission_payable_date: payableDate,
+      commission_status: commissionStatus,
+      hardware_amount: hardwareAmount,
+      saas_amount: saasAmount,
+      classified_line_items: classified,
+      raw_keys_top: Object.keys(inv).filter(k => /subscription|date|activation|paid/i.test(k)),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message, body: error.response?.data });
   }
 });
 
