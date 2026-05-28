@@ -3752,6 +3752,87 @@ app.get('/api/billing/plans', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/billing/probe — try multiple Billing API URLs and report which one responds
+// Useful to diagnose region/scope/auth issues.
+app.get('/api/billing/probe', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const adminResult = await pool.query(
+      'SELECT email, access_token, api_domain, expires_at FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
+    );
+    const admin = adminResult.rows[0];
+    if (!admin) return res.status(400).json({ error: 'No admin token' });
+
+    const token = await ensureValidToken(admin.email);
+    const orgId = process.env.ZOHO_ORG_ID;
+    const headers = {
+      Authorization: `Zoho-oauthtoken ${token}`,
+      'X-com-zoho-subscriptions-organizationid': orgId,
+    };
+
+    // Try every plausible URL variant
+    const baseDomain = (admin.api_domain || '').replace(/\/$/, '');
+    const variants = [
+      // Variants WITH the api_domain (matches user's region)
+      `${baseDomain}/billing/v1/plans`,
+      `${baseDomain}/subscriptions/v1/plans`,
+      // Direct subscriptions domain (older URL, still works)
+      'https://subscriptions.zoho.com/api/v1/plans',
+      'https://www.zohoapis.com/billing/v1/plans',
+      'https://www.zohoapis.com/subscriptions/v1/plans',
+      'https://www.zohoapis.ca/billing/v1/plans',
+      'https://www.zohoapis.eu/billing/v1/plans',
+    ];
+
+    const results = [];
+    for (const url of variants) {
+      // Try with and without organization_id in query
+      for (const useOrgParam of [true, false]) {
+        // Try with org_id in header AND in query, then no header
+        for (const useOrgHeader of [true, false]) {
+          const params = useOrgParam ? { per_page: 1, organization_id: orgId } : { per_page: 1 };
+          const reqHeaders = useOrgHeader ? headers : { Authorization: headers.Authorization };
+          try {
+            const r = await axios.get(url, { headers: reqHeaders, params, validateStatus: () => true, timeout: 8000 });
+            results.push({
+              url,
+              orgParam: useOrgParam,
+              orgHeader: useOrgHeader,
+              status: r.status,
+              ok: r.status >= 200 && r.status < 300,
+              snippet: typeof r.data === 'object' ? JSON.stringify(r.data).slice(0, 200) : String(r.data).slice(0, 200),
+            });
+            // Early exit if we found one that works
+            if (r.status >= 200 && r.status < 300) {
+              return res.json({
+                success: true,
+                workingUrl: url,
+                orgParam: useOrgParam,
+                orgHeader: useOrgHeader,
+                allResults: results,
+              });
+            }
+          } catch (e) {
+            results.push({ url, orgParam: useOrgParam, orgHeader: useOrgHeader, error: e.message });
+          }
+        }
+      }
+    }
+
+    res.json({
+      success: false,
+      adminEmail: admin.email,
+      apiDomain: admin.api_domain,
+      orgId,
+      tokenPrefix: token?.slice(0, 15) + '...',
+      tokenExpiresIn: admin.expires_at ? Math.round((parseInt(admin.expires_at) - Date.now()) / 1000) + 's' : 'unknown',
+      results,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // POST /api/billing/sync — fetch all plans from Zoho Billing and upsert into our DB
 app.post('/api/billing/sync', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
