@@ -14,6 +14,7 @@ const bodyParser = require('body-parser');
 const { Pool } = require('pg');
 const { ZohoCRMService, MONTHLY_QUOTA, MONTHLY_BONUS_TIERS, ANNUAL_BONUS_TIERS, PLAN_START_DATE } = require('./services/zohoCRMService');
 const { ZentactService } = require('./services/zentactService');
+const { ZohoBillingService } = require('./services/zohoBillingService');
 
 dotenv.config();
 
@@ -270,6 +271,27 @@ async function initializeDatabase() {
         status VARCHAR(50) DEFAULT 'success',
         organization_id VARCHAR(255),
         message TEXT
+      );
+    `);
+
+    // Zoho Billing plans — used to classify Books invoice line items as SaaS vs Hardware
+    // The plan_code is matched against the line item's SKU (item_code) on Books invoices.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS zoho_plans (
+        plan_code        VARCHAR(255) PRIMARY KEY,
+        name             VARCHAR(500) DEFAULT '',
+        description      TEXT DEFAULT '',
+        recurring_price  DECIMAL(12,2) DEFAULT 0,
+        interval         VARCHAR(50) DEFAULT '',
+        interval_unit    VARCHAR(50) DEFAULT '',
+        currency_code    VARCHAR(10) DEFAULT '',
+        product_id       VARCHAR(255) DEFAULT '',
+        product_name     VARCHAR(500) DEFAULT '',
+        status           VARCHAR(50) DEFAULT '',
+        is_saas          BOOLEAN DEFAULT true,
+        raw              JSONB,
+        created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
 
@@ -3690,6 +3712,123 @@ app.get('/api/sync/status', authenticateToken, async (req, res) => {
 
 // GET /api/sync/all-status — unified "last updated" info for every integration
 // Used by the global header widget to show data freshness at a glance.
+// ============================================================================
+// ZOHO BILLING — plans (used to identify SaaS line items vs hardware)
+// ============================================================================
+
+// GET /api/billing/status — connection + plan counts
+app.get('/api/billing/status', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT COUNT(*) AS total,
+             COUNT(CASE WHEN status = 'active' THEN 1 END) AS active,
+             MAX(updated_at) AS last_sync
+      FROM zoho_plans
+    `);
+    const row = result.rows[0];
+    res.json({
+      total:    parseInt(row.total)  || 0,
+      active:   parseInt(row.active) || 0,
+      lastSync: row.last_sync        || null,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/billing/plans — list all plans we've cached
+app.get('/api/billing/plans', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const result = await pool.query(`
+      SELECT plan_code, name, description, recurring_price, interval, interval_unit,
+             currency_code, product_name, status, is_saas, updated_at
+      FROM zoho_plans
+      ORDER BY status ASC, plan_code ASC
+    `);
+    res.json({ plans: result.rows, total: result.rows.length });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/billing/sync — fetch all plans from Zoho Billing and upsert into our DB
+app.post('/api/billing/sync', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    // Use the most recent admin's Zoho token (same pattern as autoSyncInvoices)
+    const adminResult = await pool.query(
+      'SELECT email, access_token, api_domain, expires_at FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
+    );
+    if (!adminResult.rows[0]) return res.status(400).json({ error: 'No admin Zoho token available' });
+    const admin = adminResult.rows[0];
+
+    // Ensure token is valid
+    const token = await ensureValidToken(admin.email);
+    if (!token) return res.status(400).json({ error: 'Could not refresh Zoho token' });
+
+    const orgId = process.env.ZOHO_ORG_ID;
+    const billing = new ZohoBillingService(token, admin.api_domain, orgId);
+
+    // Quick connection test first
+    const conn = await billing.testConnection();
+    if (!conn.ok) {
+      return res.status(400).json({
+        error: 'Zoho Billing connection failed',
+        status: conn.status,
+        body: conn.body,
+        hint: 'You may need to re-authorize Zoho with the ZohoSubscriptions scope (ZohoSubscriptions.plans.READ).',
+      });
+    }
+
+    const result = await billing.getPlans();
+    if (!result.ok) {
+      return res.status(500).json({ error: 'Failed to fetch plans', details: result.error });
+    }
+
+    let upserted = 0;
+    for (const p of result.plans) {
+      await pool.query(`
+        INSERT INTO zoho_plans (
+          plan_code, name, description, recurring_price, interval, interval_unit,
+          currency_code, product_id, product_name, status, raw, updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, CURRENT_TIMESTAMP)
+        ON CONFLICT (plan_code) DO UPDATE SET
+          name             = EXCLUDED.name,
+          description      = EXCLUDED.description,
+          recurring_price  = EXCLUDED.recurring_price,
+          interval         = EXCLUDED.interval,
+          interval_unit    = EXCLUDED.interval_unit,
+          currency_code    = EXCLUDED.currency_code,
+          product_id       = EXCLUDED.product_id,
+          product_name     = EXCLUDED.product_name,
+          status           = EXCLUDED.status,
+          raw              = EXCLUDED.raw,
+          updated_at       = CURRENT_TIMESTAMP
+      `, [
+        p.plan_code,
+        p.name || '',
+        p.description || '',
+        parseFloat(p.recurring_price) || 0,
+        p.interval || '',
+        p.interval_unit || '',
+        p.currency_code || '',
+        p.product_id || '',
+        p.product_name || '',
+        p.status || '',
+        JSON.stringify(p),
+      ]);
+      upserted++;
+    }
+
+    res.json({ success: true, fetched: result.plans.length, upserted });
+  } catch (error) {
+    console.error('billing sync error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/api/sync/all-status', authenticateToken, async (req, res) => {
   try {
     // Books — most recent successful sync_log entry
