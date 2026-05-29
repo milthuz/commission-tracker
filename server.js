@@ -1936,7 +1936,13 @@ app.get('/api/crm/reports', authenticateToken, async (req, res) => {
 // AUTO-SYNC INVOICES (runs every 4 hours)
 // ============================================================================
 
+// Tracked in memory so /api/sync/status can show 'syncing' in real time
+let invoiceSyncRunning = false;
+let invoiceSyncStartedAt = null;
+
 async function autoSyncInvoices() {
+  invoiceSyncRunning = true;
+  invoiceSyncStartedAt = new Date().toISOString();
   try {
     console.log('🔄 [AUTO-SYNC] Starting automatic invoice sync...');
     
@@ -2081,6 +2087,8 @@ async function autoSyncInvoices() {
     console.log(`💰 [AUTO-SYNC] Commission calculated ONLY on paid invoices`);
   } catch (error) {
     console.error(`❌ [AUTO-SYNC] Sync failed: ${error.message}`);
+  } finally {
+    invoiceSyncRunning = false;
   }
 }
 
@@ -3730,10 +3738,15 @@ app.get('/api/sync/status', authenticateToken, async (req, res) => {
     );
     const last = logResult.rows[0];
     const invoiceCount = parseInt(countResult.rows[0].cnt) || 0;
+    // Live in-memory state takes precedence over last completed sync_log entry
+    const liveSyncStatus = invoiceSyncRunning ? 'syncing'
+                         : (last?.status === 'success' ? 'idle' : (last?.status || 'never'));
     // Return BOTH the legacy field names the UI expects AND the new ones
     res.json({
       // Legacy fields (used by AdminPanel Books UI)
-      syncStatus:         last?.status === 'success' ? 'idle' : (last?.status || 'never'),
+      syncStatus:         liveSyncStatus,
+      syncRunning:        invoiceSyncRunning,
+      syncStartedAt:      invoiceSyncStartedAt,
       totalInvoicesInDb:  invoiceCount,
       lastIncrementalSync: last?.synced_at || null,
       lastFullSync:        last?.synced_at || null,
