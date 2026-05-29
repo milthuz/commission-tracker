@@ -1983,46 +1983,46 @@ async function autoSyncInvoices() {
       }
     }
 
-    // Fetch PAID invoices from Zoho
-    console.log(`🔗 [AUTO-SYNC] Fetching paid invoices from: ${admin.api_domain}/books/v3/invoices`);
-    const paidResponse = await axios.get(
-      `${admin.api_domain}/books/v3/invoices`,
-      {
-        params: {
-          organization_id: process.env.ZOHO_ORG_ID,
-          status: 'paid',
-          limit: 200,
-        },
-        headers: {
-          'Authorization': `Zoho-oauthtoken ${admin.access_token}`,
-        },
+    // Sync invoices only from this date onward (configurable via env var).
+    // Default Jan 1, 2026. Saves ~50K legacy invoices from being re-pulled.
+    const dateStart = process.env.INVOICES_SYNC_FROM_DATE || '2026-01-01';
+
+    // Helper: paginated fetch by status with date_start filter
+    async function fetchAllByStatus(status) {
+      const all = [];
+      let page = 1;
+      let hasMore = true;
+      while (hasMore) {
+        const r = await axios.get(`${admin.api_domain}/books/v3/invoices`, {
+          params: {
+            organization_id: process.env.ZOHO_ORG_ID,
+            status,
+            date_start: dateStart,
+            per_page: 200,
+            page,
+          },
+          headers: { 'Authorization': `Zoho-oauthtoken ${admin.access_token}` },
+          validateStatus: () => true,
+        });
+        if (r.status !== 200) {
+          console.warn(`⚠️ [AUTO-SYNC] ${status} page ${page} returned ${r.status}:`, JSON.stringify(r.data).slice(0, 200));
+          break;
+        }
+        const rows = r.data?.invoices || [];
+        all.push(...rows);
+        hasMore = r.data?.page_context?.has_more_page === true;
+        console.log(`  [AUTO-SYNC] ${status} page ${page}: +${rows.length} (total ${all.length})`);
+        page++;
       }
-    );
+      return all;
+    }
 
-    console.log(`✅ [AUTO-SYNC] Paid response status: ${paidResponse.status}`);
-    console.log(`📊 [AUTO-SYNC] Paid invoices count: ${paidResponse.data.invoices?.length || 0}`);
-
-    // Fetch OVERDUE invoices from Zoho
-    console.log(`🔗 [AUTO-SYNC] Fetching overdue invoices...`);
-    const overdueResponse = await axios.get(
-      `${admin.api_domain}/books/v3/invoices`,
-      {
-        params: {
-          organization_id: process.env.ZOHO_ORG_ID,
-          status: 'overdue',
-          limit: 200,
-        },
-        headers: {
-          'Authorization': `Zoho-oauthtoken ${admin.access_token}`,
-        },
-      }
-    );
-
-    console.log(`✅ [AUTO-SYNC] Overdue response status: ${overdueResponse.status}`);
-    console.log(`📊 [AUTO-SYNC] Overdue invoices count: ${overdueResponse.data.invoices?.length || 0}`);
-
-    const paidInvoices = (paidResponse.data.invoices || []).map(inv => ({ ...inv, status: 'paid' }));
-    const overdueInvoices = (overdueResponse.data.invoices || []).map(inv => ({ ...inv, status: 'overdue' }));
+    console.log(`🔗 [AUTO-SYNC] Fetching invoices from ${dateStart}+ paginated...`);
+    const paidInvoicesRaw = await fetchAllByStatus('paid');
+    const overdueInvoicesRaw = await fetchAllByStatus('overdue');
+    const paidInvoices = paidInvoicesRaw.map(inv => ({ ...inv, status: 'paid' }));
+    const overdueInvoices = overdueInvoicesRaw.map(inv => ({ ...inv, status: 'overdue' }));
+    console.log(`📊 [AUTO-SYNC] Total: ${paidInvoices.length} paid + ${overdueInvoices.length} overdue`);
     const allInvoices = [...paidInvoices, ...overdueInvoices];
 
     if (allInvoices.length > 0) {
@@ -3839,6 +3839,29 @@ app.get('/api/billing/probe', authenticateToken, async (req, res) => {
       tokenType: typeof token,
       tokenExpiresIn: admin.expires_at ? Math.round((parseInt(admin.expires_at) - Date.now()) / 1000) + 's' : 'unknown',
       results,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE /api/invoices/flush — wipes all invoices from our DB so the next
+// sync only pulls from INVOICES_SYNC_FROM_DATE forward (default 2026-01-01).
+// Requires ?confirm=YES to prevent accidental wipes.
+app.delete('/api/invoices/flush', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  if (req.query.confirm !== 'YES') {
+    return res.status(400).json({ error: 'Add ?confirm=YES to confirm. This deletes ALL invoices from our DB.' });
+  }
+  try {
+    const before = await pool.query('SELECT COUNT(*) AS n FROM invoices');
+    const beforeCount = parseInt(before.rows[0].n) || 0;
+    await pool.query('DELETE FROM invoices');
+    console.log(`🗑️  Invoices flush: deleted ${beforeCount} rows`);
+    res.json({
+      success: true,
+      deleted: beforeCount,
+      note: 'Next auto-sync (or manual /api/invoices/sync) will repopulate from INVOICES_SYNC_FROM_DATE.',
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
