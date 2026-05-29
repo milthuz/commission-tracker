@@ -4030,6 +4030,20 @@ app.get('/api/invoices/enrich-preview/:invoiceNumber', authenticateToken, async 
       }
     }
 
+    // DEBUG: surface every field on the invoice + first line item that could be
+    // a subscription/activation date so we can identify what Zoho actually calls it.
+    const invKeys = Object.keys(inv);
+    const dateOrSubKeys = invKeys.filter(k => /subscript|activ|start|date|recurr|period|cf_/i.test(k));
+    const debugInvFields = {};
+    for (const k of dateOrSubKeys) debugInvFields[k] = inv[k];
+    const debugCustomFields = inv.custom_fields || inv.custom_field_hash || null;
+    const firstLineKeys = inv.line_items?.[0] ? Object.keys(inv.line_items[0]) : [];
+    const firstLineDateKeys = firstLineKeys.filter(k => /subscript|activ|start|date|recurr|period|cf_/i.test(k));
+    const debugFirstLineFields = {};
+    if (inv.line_items?.[0]) {
+      for (const k of firstLineDateKeys) debugFirstLineFields[k] = inv.line_items[0][k];
+    }
+
     res.json({
       invoice_number: inv.invoice_number,
       customer_name:  inv.customer_name,
@@ -4045,6 +4059,13 @@ app.get('/api/invoices/enrich-preview/:invoiceNumber', authenticateToken, async 
       commission_payable_date: payableDate,
       commission_status: commissionStatus,
       classified_line_items: classified,
+      _debug: {
+        invoice_date_fields: debugInvFields,
+        invoice_custom_fields: debugCustomFields,
+        first_line_item_date_fields: debugFirstLineFields,
+        invoice_all_keys: invKeys,
+        first_line_item_all_keys: firstLineKeys,
+      },
     });
   } catch (error) {
     res.status(500).json({ error: error.message, body: error.response?.data });
