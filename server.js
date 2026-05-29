@@ -1543,6 +1543,29 @@ app.get('/api/zentact/merchants', authenticateToken, async (req, res) => {
   }
 });
 
+// POST /api/zentact/merchants/backfill-activation — stamp today's date on all
+// ACTIVE merchants that currently have NULL activated_at. Fixes merchants that
+// activated in Zentact but never processed payments (so statement/transaction
+// lookups returned nothing). Returns the list of merchants that got updated.
+app.post('/api/zentact/merchants/backfill-activation', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const result = await pool.query(`
+      UPDATE zentact_merchants
+      SET activated_at = CURRENT_DATE, updated_at = CURRENT_TIMESTAMP
+      WHERE status = 'ACTIVE' AND activated_at IS NULL
+      RETURNING merchant_account_id, business_name, sales_rep_name
+    `);
+    res.json({
+      success: true,
+      stamped: result.rowCount,
+      merchants: result.rows,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // PATCH /api/zentact/merchants/:merchantId/activated-at — manually set the activation date
 app.patch('/api/zentact/merchants/:merchantId/activated-at', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
@@ -2365,7 +2388,9 @@ async function syncZentactMerchants() {
     // For ACTIVE merchants, look up the real activation date. Best historical
     // proxy = earliest billing statement month (if a merchant was billed in
     // March, they were boarded by then). Fall back to first transaction date
-    // if no statements yet. Skip if we already have a date stored.
+    // if no statements yet. If neither exists (newly activated, no transactions
+    // yet) → stamp today's date so the merchant shows up in the current month
+    // instead of being invisible forever.
     let activatedAt = null;
     if (m.status === 'ACTIVE') {
       const existing = await pool.query(
@@ -2385,7 +2410,13 @@ async function syncZentactMerchants() {
         } catch (e) {
           console.warn(`⚠️ Could not fetch activation date for ${m.merchant_account_id}:`, e.message);
         }
-        // If still no date, leave NULL — merchant is approved but never billed/transacted
+        // 3. Final fallback: today's date so the merchant is visible in the
+        //    tracker. Webhook will overwrite with exact date when status
+        //    transition actually happened (future events only).
+        if (!activatedAt) {
+          activatedAt = new Date().toISOString().split('T')[0];
+          console.log(`📅 No Zentact billing/transaction history for ${m.merchant_account_id} — stamping today (${activatedAt})`);
+        }
       } else {
         activatedAt = currentDate;
       }
