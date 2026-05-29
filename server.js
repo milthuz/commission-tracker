@@ -708,15 +708,26 @@ app.get('/api/auth/crm-callback', async (req, res) => {
 
     const { access_token, refresh_token, expires_in } = tokenResponse.data;
 
-    // Store CRM tokens — find admin user to attach to
+    // Store CRM tokens. Attach to the most recently-active admin user
+    // (the one who just clicked 'Connect CRM').
+    // Updating only ONE row (by email) avoids race conditions / overwrites
+    // when there are multiple admins.
+    const adminEmailRes = await pool.query(
+      `SELECT email FROM user_tokens WHERE is_admin = true
+       ORDER BY updated_at DESC LIMIT 1`
+    );
+    const adminEmail = adminEmailRes.rows[0]?.email;
+    if (!adminEmail) {
+      return res.status(500).json({ error: 'No admin user found to attach CRM token to' });
+    }
     await pool.query(
       `UPDATE user_tokens
        SET crm_access_token = $1, crm_refresh_token = $2, crm_expires_at = $3, updated_at = CURRENT_TIMESTAMP
-       WHERE is_admin = true`,
-      [access_token, refresh_token, Date.now() + (expires_in * 1000)]
+       WHERE email = $4`,
+      [access_token, refresh_token, Date.now() + (expires_in * 1000), adminEmail]
     );
 
-    console.log('✅ CRM tokens stored successfully');
+    console.log(`✅ CRM tokens stored for ${adminEmail}, expires at ${new Date(Date.now() + expires_in * 1000).toISOString()}`);
 
     // Redirect back to admin panel
     const redirectUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/admin/sync?crm=connected`;
@@ -2484,32 +2495,32 @@ async function ensureValidToken(email) {
 
 async function ensureValidCrmToken() {
   const result = await pool.query(
-    `SELECT crm_access_token, crm_refresh_token, crm_expires_at
-     FROM user_tokens WHERE is_admin = true AND crm_access_token IS NOT NULL
+    `SELECT email, crm_access_token, crm_refresh_token, crm_expires_at
+     FROM user_tokens WHERE crm_refresh_token IS NOT NULL
      ORDER BY updated_at DESC LIMIT 1`
   );
 
   if (!result.rows.length) {
-    throw new Error('CRM not connected. Please connect Zoho CRM in the Admin Panel.');
+    // Try fallback: any admin with crm_access_token (legacy rows without refresh_token)
+    const fallback = await pool.query(
+      `SELECT email, crm_access_token, crm_refresh_token, crm_expires_at
+       FROM user_tokens WHERE is_admin = true AND crm_access_token IS NOT NULL
+       ORDER BY updated_at DESC LIMIT 1`
+    );
+    if (!fallback.rows.length) {
+      throw new Error('CRM not connected. Please connect Zoho CRM in the Admin Panel.');
+    }
+    result.rows[0] = fallback.rows[0];
   }
 
   let row = result.rows[0];
   const expiresAt = row.crm_expires_at ? parseInt(row.crm_expires_at) : null;
 
-  // Refresh if: token is expired/expiring within 5 min, OR expiry unknown
-  const needsRefresh = !expiresAt || expiresAt < Date.now() + 5 * 60 * 1000;
+  // Proactive refresh: refresh if expiring within 10 min (was 5) for safety margin
+  const needsRefresh = !expiresAt || expiresAt < Date.now() + 10 * 60 * 1000;
 
-  if (needsRefresh) {
-    if (!row.crm_refresh_token) {
-      if (!expiresAt) {
-        // No expiry info — assume token is still valid and proceed
-        console.log('⚠️ CRM token has no expiry info, proceeding with existing token');
-        return row.crm_access_token;
-      }
-      throw new Error('CRM token expired and no refresh token available. Please reconnect CRM in Admin Panel.');
-    }
-
-    console.log('🔄 Refreshing CRM token...');
+  if (needsRefresh && row.crm_refresh_token) {
+    console.log(`🔄 Refreshing CRM token (current expiry: ${expiresAt ? new Date(expiresAt).toISOString() : 'unknown'})...`);
     try {
       const refreshRes = await axios.post(
         'https://accounts.zoho.com/oauth/v2/token',
@@ -2519,37 +2530,48 @@ async function ensureValidCrmToken() {
           client_secret: process.env.ZOHO_CLIENT_SECRET,
           refresh_token: row.crm_refresh_token,
         }),
-        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, validateStatus: () => true }
       );
 
-      const newToken = refreshRes.data.access_token;
-      const newRefreshToken = refreshRes.data.refresh_token || row.crm_refresh_token;
-      const newExpiry = Date.now() + (parseInt(refreshRes.data.expires_in) || 3600) * 1000;
+      const newToken = refreshRes.data?.access_token;
+      const newRefreshToken = refreshRes.data?.refresh_token || row.crm_refresh_token;
+      const newExpiry = Date.now() + (parseInt(refreshRes.data?.expires_in) || 3600) * 1000;
 
       if (!newToken) {
-        throw new Error(`Zoho refresh returned no access_token: ${JSON.stringify(refreshRes.data)}`);
+        console.error('❌ CRM refresh returned no access_token:', JSON.stringify(refreshRes.data));
+        // Don't throw if existing token is still valid
+        if (expiresAt && expiresAt > Date.now()) {
+          console.warn('⚠️ Using existing token despite refresh failure');
+          return row.crm_access_token;
+        }
+        throw new Error(`CRM token refresh failed: ${JSON.stringify(refreshRes.data).slice(0, 200)}`);
       }
 
+      // Update the SPECIFIC row (by email) to avoid touching other admins' rows
       await pool.query(
         `UPDATE user_tokens
          SET crm_access_token = $1, crm_refresh_token = $2, crm_expires_at = $3, updated_at = CURRENT_TIMESTAMP
-         WHERE is_admin = true`,
-        [newToken, newRefreshToken, newExpiry]
+         WHERE email = $4`,
+        [newToken, newRefreshToken, newExpiry, row.email]
       );
 
-      console.log('✅ CRM token refreshed successfully');
+      console.log(`✅ CRM token refreshed (new expiry: ${new Date(newExpiry).toISOString()})`);
       return newToken;
     } catch (err) {
       console.error('❌ CRM token refresh failed:', err.response?.data || err.message);
-      // If we have a non-expired token, use it as fallback; otherwise throw
+      // If existing token is still valid, use it; never silently disconnect
       if (expiresAt && expiresAt > Date.now()) {
-        console.warn('⚠️ Using existing token despite refresh failure (still valid)');
+        console.warn('⚠️ Using existing CRM token despite refresh failure (still valid)');
         return row.crm_access_token;
       }
-      throw new Error(`CRM token expired and refresh failed: ${err.message}. Please reconnect CRM in Admin Panel.`);
+      throw new Error(`CRM token expired and refresh failed: ${err.message}`);
     }
   }
 
+  // No refresh needed or no refresh_token available — use current
+  if (!row.crm_access_token) {
+    throw new Error('CRM not connected. Please connect Zoho CRM in the Admin Panel.');
+  }
   return row.crm_access_token;
 }
 
@@ -3707,11 +3729,19 @@ app.get('/api/sync/status', authenticateToken, async (req, res) => {
       [process.env.ZOHO_ORG_ID]
     );
     const last = logResult.rows[0];
+    const invoiceCount = parseInt(countResult.rows[0].cnt) || 0;
+    // Return BOTH the legacy field names the UI expects AND the new ones
     res.json({
-      lastSyncAt:    last?.synced_at    || null,
+      // Legacy fields (used by AdminPanel Books UI)
+      syncStatus:         last?.status === 'success' ? 'idle' : (last?.status || 'never'),
+      totalInvoicesInDb:  invoiceCount,
+      lastIncrementalSync: last?.synced_at || null,
+      lastFullSync:        last?.synced_at || null,
+      // New fields
+      lastSyncAt:    last?.synced_at     || null,
       lastSyncCount: last?.invoice_count || 0,
       status:        last?.status        || 'never',
-      totalInvoices: parseInt(countResult.rows[0].cnt) || 0,
+      totalInvoices: invoiceCount,
       message:       last?.message       || null,
     });
   } catch (error) {
