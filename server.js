@@ -3954,17 +3954,22 @@ async function fetchSubActivation(subscriptionId, apiDomain, accessToken, cache)
 }
 
 // POST /api/invoices/enrich/start — runs batch enrichment in background
+// Query params:
+//   onlyMissing=true (default) — skip invoices already enriched (line_items populated)
+//   onlyMissing=false          — re-enrich everything
 app.post('/api/invoices/enrich/start', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   if (enrichJob.status === 'running') {
     return res.status(409).json({ error: 'Already running', startedAt: enrichJob.startedAt });
   }
+  const onlyMissing = req.query.onlyMissing !== 'false'; // default true
   enrichJob = {
     status: 'running', startedAt: new Date().toISOString(),
     processed: 0, total: 0, message: 'Starting...',
-    stats: { saas: 0, hardware: 0, unknown: 0, eligible: 0, pending_payment: 0, pending_saas: 0 },
+    onlyMissing,
+    stats: { saas: 0, hardware: 0, unknown: 0, eligible: 0, pending_payment: 0, pending_saas: 0, skipped: 0 },
   };
-  res.json({ success: true, message: 'Enrichment started — poll /api/invoices/enrich/status' });
+  res.json({ success: true, message: `Enrichment started (onlyMissing=${onlyMissing}) — poll /api/invoices/enrich/status` });
 
   // Background worker
   (async () => {
@@ -3987,14 +3992,18 @@ app.post('/api/invoices/enrich/start', authenticateToken, async (req, res) => {
       for (const p of plansRes.rows) { const k = normalizeName(p.name); if (k) planNames.set(k, p.plan_code); }
 
       // Get all PAID invoices from our local DB (we only enrich paid ones — others don't earn commission yet)
+      // When onlyMissing=true, skip those already enriched (line_items populated).
+      const skipFilter = enrichJob.onlyMissing
+        ? `AND (line_items IS NULL OR line_items = '[]'::jsonb)` : '';
       const invRes = await pool.query(
         `SELECT invoice_number FROM invoices
          WHERE organization_id = $1 AND status = 'paid'
+         ${skipFilter}
          ORDER BY date DESC`,
         [orgId]
       );
       enrichJob.total = invRes.rows.length;
-      enrichJob.message = `Enriching ${enrichJob.total} paid invoices...`;
+      enrichJob.message = `Enriching ${enrichJob.total} paid invoices${enrichJob.onlyMissing ? ' (missing only)' : ''}...`;
 
       // Pass 1: fetch all invoice details from Zoho, classify, gather customer → first SaaS map
       const invoiceDetails = [];   // { number, detail, type, paid_date, subActivation, customer_id, total }
