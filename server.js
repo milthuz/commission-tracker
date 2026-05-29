@@ -3845,6 +3845,234 @@ app.get('/api/billing/probe', authenticateToken, async (req, res) => {
   }
 });
 
+// ============================================================================
+// PHASE 1b — Batch invoice enrichment (classify + link + store)
+// ============================================================================
+let enrichJob = {
+  status:   'idle',  // idle | running | stopping | stopped | completed | error
+  startedAt: null,
+  processed: 0,
+  total:     0,
+  message:   '',
+  stats:     { saas: 0, hardware: 0, unknown: 0, eligible: 0, pending_payment: 0, pending_saas: 0 },
+};
+
+async function fetchSubActivation(subscriptionId, apiDomain, accessToken, cache) {
+  if (!subscriptionId) return null;
+  if (cache.has(subscriptionId)) return cache.get(subscriptionId);
+  try {
+    const r = await axios.get(
+      `${apiDomain}/billing/v1/subscriptions/${subscriptionId}`,
+      {
+        headers: {
+          Authorization: `Zoho-oauthtoken ${accessToken}`,
+          'X-com-zoho-subscriptions-organizationid': process.env.ZOHO_ORG_ID,
+        },
+        validateStatus: () => true,
+      }
+    );
+    const sub = r.data?.subscription;
+    if (!sub) { cache.set(subscriptionId, null); return null; }
+    const raw = sub.activated_at || sub.current_term_starts_at || sub.start_date;
+    if (!raw) { cache.set(subscriptionId, null); return null; }
+    let d;
+    if (typeof raw === 'number' || /^\d+$/.test(String(raw))) d = new Date(parseInt(raw) * 1000);
+    else d = new Date(raw);
+    const iso = !isNaN(d.getTime()) ? d.toISOString().slice(0, 10) : null;
+    cache.set(subscriptionId, iso);
+    return iso;
+  } catch (_e) {
+    cache.set(subscriptionId, null);
+    return null;
+  }
+}
+
+// POST /api/invoices/enrich/start — runs batch enrichment in background
+app.post('/api/invoices/enrich/start', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  if (enrichJob.status === 'running') {
+    return res.status(409).json({ error: 'Already running', startedAt: enrichJob.startedAt });
+  }
+  enrichJob = {
+    status: 'running', startedAt: new Date().toISOString(),
+    processed: 0, total: 0, message: 'Starting...',
+    stats: { saas: 0, hardware: 0, unknown: 0, eligible: 0, pending_payment: 0, pending_saas: 0 },
+  };
+  res.json({ success: true, message: 'Enrichment started — poll /api/invoices/enrich/status' });
+
+  // Background worker
+  (async () => {
+    try {
+      const adminResult = await pool.query(
+        'SELECT email, access_token, api_domain FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
+      );
+      const admin = adminResult.rows[0];
+      if (!admin) throw new Error('No admin Zoho token');
+      const tokenData = await ensureValidToken(admin.email);
+      const accessToken = typeof tokenData === 'string' ? tokenData : tokenData?.access_token;
+      const apiDomain = admin.api_domain;
+      const orgId = process.env.ZOHO_ORG_ID;
+
+      // Load plan catalog for classification
+      const plansRes = await pool.query('SELECT plan_code, name FROM zoho_plans');
+      const planCodes = new Set(plansRes.rows.map(r => (r.plan_code || '').toLowerCase().trim()));
+      const normalizeName = (s) => (s || '').toLowerCase().replace(/^\*+/, '').replace(/\s+/g, ' ').trim();
+      const planNames = new Map();
+      for (const p of plansRes.rows) { const k = normalizeName(p.name); if (k) planNames.set(k, p.plan_code); }
+
+      // Get all PAID invoices from our local DB (we only enrich paid ones — others don't earn commission yet)
+      const invRes = await pool.query(
+        `SELECT invoice_number FROM invoices
+         WHERE organization_id = $1 AND status = 'paid'
+         ORDER BY date DESC`,
+        [orgId]
+      );
+      enrichJob.total = invRes.rows.length;
+      enrichJob.message = `Enriching ${enrichJob.total} paid invoices...`;
+
+      // Pass 1: fetch all invoice details from Zoho, classify, gather customer → first SaaS map
+      const invoiceDetails = [];   // { number, detail, type, paid_date, subActivation, customer_id, total }
+      const subCache = new Map();  // subscription_id → activation iso string
+
+      for (const row of invRes.rows) {
+        if (enrichJob.status === 'stopping') break;
+
+        // Lookup invoice in Zoho Books by number
+        const searchRes = await axios.get(
+          `${apiDomain}/books/v3/invoices`,
+          {
+            params: { organization_id: orgId, invoice_number: row.invoice_number },
+            headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+            validateStatus: () => true,
+          }
+        );
+        const stub = searchRes.data?.invoices?.[0];
+        if (!stub) { enrichJob.processed++; continue; }
+
+        const detRes = await axios.get(
+          `${apiDomain}/books/v3/invoices/${stub.invoice_id}`,
+          {
+            params: { organization_id: orgId },
+            headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+            validateStatus: () => true,
+          }
+        );
+        const det = detRes.data?.invoice;
+        if (!det) { enrichJob.processed++; continue; }
+
+        // Classify line items
+        let saasLines = 0, hardwareLines = 0;
+        const classified = (det.line_items || []).map(li => {
+          const sku = (li.sku || li.item_code || '').trim();
+          const matchedBySku = sku && planCodes.has(sku.toLowerCase());
+          const matchedByName = !matchedBySku && planNames.has(normalizeName(li.name));
+          const isSaaS = matchedBySku || matchedByName;
+          if (isSaaS) saasLines++; else hardwareLines++;
+          return {
+            name: li.name, sku, quantity: li.quantity, rate: li.rate,
+            amount: parseFloat(li.item_total) || (parseFloat(li.rate) * parseInt(li.quantity)) || 0,
+            type: isSaaS ? 'saas' : 'hardware',
+            plan_code: matchedBySku ? sku : (matchedByName ? planNames.get(normalizeName(li.name)) : null),
+          };
+        });
+        const type = saasLines > hardwareLines ? 'saas'
+                   : hardwareLines > saasLines ? 'hardware'
+                   : (saasLines > 0 ? 'saas' : 'unknown');
+        const totalAmount = classified.reduce((s, l) => s + l.amount, 0);
+        const saasAmount = classified.filter(l => l.type === 'saas').reduce((s, l) => s + l.amount, 0);
+        const hardwareAmount = totalAmount - saasAmount;
+        const paidDate = det.last_payment_date || (det.status === 'paid' ? det.date : null);
+
+        // Fetch SaaS activation if this is a SaaS invoice
+        let subActivation = null;
+        if (type === 'saas' && det.recurring_invoice_id) {
+          subActivation = await fetchSubActivation(det.recurring_invoice_id, apiDomain, accessToken, subCache);
+        }
+
+        invoiceDetails.push({
+          number: det.invoice_number, invoice_id: det.invoice_id,
+          customer_id: det.customer_id, type, classified, paidDate, subActivation,
+          saasAmount, hardwareAmount, totalAmount,
+          recurring_invoice_id: det.recurring_invoice_id || null,
+        });
+        enrichJob.processed++;
+        enrichJob.stats[type] = (enrichJob.stats[type] || 0) + 1;
+        enrichJob.message = `Enriched ${enrichJob.processed} of ${enrichJob.total}`;
+      }
+
+      // Build customer → earliest paid SaaS activation map
+      const customerSaasMap = {};
+      for (const d of invoiceDetails) {
+        if (d.type !== 'saas' || !d.paidDate || !d.subActivation) continue;
+        const cur = customerSaasMap[d.customer_id];
+        if (!cur || d.subActivation < cur.activation) {
+          customerSaasMap[d.customer_id] = { activation: d.subActivation, invoice_number: d.number };
+        }
+      }
+
+      // Pass 2: compute commission_payable_date + status and write to DB
+      for (const d of invoiceDetails) {
+        let payableDate = null;
+        let status = 'calculated';
+
+        if (d.type === 'saas') {
+          if (d.subActivation && d.paidDate) {
+            payableDate = d.paidDate > d.subActivation ? d.paidDate : d.subActivation;
+            status = 'eligible';
+          } else if (!d.paidDate) status = 'pending_payment';
+          else status = 'pending_saas';
+        } else if (d.type === 'hardware') {
+          const firstSaas = customerSaasMap[d.customer_id];
+          if (firstSaas && d.paidDate) {
+            payableDate = d.paidDate > firstSaas.activation ? d.paidDate : firstSaas.activation;
+            status = 'eligible';
+          } else if (!d.paidDate) status = 'pending_payment';
+          else status = 'pending_saas';
+        }
+
+        enrichJob.stats[status] = (enrichJob.stats[status] || 0) + 1;
+
+        await pool.query(`
+          UPDATE invoices SET
+            line_items = $1::jsonb,
+            hardware_amount = $2,
+            saas_amount = $3,
+            subscription_activation_date = $4::date,
+            paid_date = $5::date,
+            commission_payable_date = $6::date,
+            commission_status = $7,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE invoice_number = $8 AND organization_id = $9
+        `, [
+          JSON.stringify(d.classified), d.hardwareAmount, d.saasAmount,
+          d.subActivation, d.paidDate, payableDate, status,
+          d.number, orgId,
+        ]);
+      }
+
+      enrichJob.status = enrichJob.status === 'stopping' ? 'stopped' : 'completed';
+      enrichJob.message = `Done — ${enrichJob.processed} invoices processed`;
+    } catch (error) {
+      enrichJob.status = 'error';
+      enrichJob.message = error.message;
+      console.error('enrich error:', error);
+    }
+  })();
+});
+
+// GET /api/invoices/enrich/status — poll progress
+app.get('/api/invoices/enrich/status', authenticateToken, (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  res.json(enrichJob);
+});
+
+// POST /api/invoices/enrich/stop — request a graceful stop
+app.post('/api/invoices/enrich/stop', authenticateToken, (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  if (enrichJob.status === 'running') enrichJob.status = 'stopping';
+  res.json({ success: true });
+});
+
 // GET /api/invoices/enrich-preview/:invoiceNumber — fetches ONE invoice from Zoho Books
 // with full line items, classifies it as hardware OR SaaS via cached plan_codes,
 // and computes commission_payable_date with customer-level linking.
