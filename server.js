@@ -3889,21 +3889,38 @@ app.get('/api/invoices/enrich-preview/:invoiceNumber', authenticateToken, async 
     const inv = detailRes.data?.invoice;
     if (!inv) return res.status(500).json({ error: 'Failed to fetch invoice details', body: detailRes.data });
 
-    // 3. Load cached plan_codes
-    const plansRes = await pool.query('SELECT plan_code FROM zoho_plans');
+    // 3. Load cached plan_codes AND plan names (for fallback when SKU is empty)
+    const plansRes = await pool.query('SELECT plan_code, name FROM zoho_plans');
     const planCodes = new Set(plansRes.rows.map(r => (r.plan_code || '').toLowerCase().trim()));
+    // Normalize plan name: lowercase, trim, strip leading "**", collapse whitespace
+    const normalizeName = (s) => (s || '')
+      .toLowerCase()
+      .replace(/^\*+/, '')   // strip leading asterisks
+      .replace(/\s+/g, ' ')
+      .trim();
+    const planNames = new Map();
+    for (const p of plansRes.rows) {
+      const key = normalizeName(p.name);
+      if (key) planNames.set(key, p.plan_code);
+    }
 
-    // 4. Classify line items (and decide invoice TYPE)
-    let totalAmount = 0;
+    // 4. Classify line items: SKU match first, then name match as fallback
+    const matchPlan = (sku, name) => {
+      const s = (sku || '').toLowerCase().trim();
+      if (s && planCodes.has(s)) return { matched: true, by: 'sku', code: sku };
+      const n = normalizeName(name);
+      if (n && planNames.has(n)) return { matched: true, by: 'name', code: planNames.get(n) };
+      return { matched: false };
+    };
+
     let saasLineCount = 0;
     let hardwareLineCount = 0;
     let earliestSubActivation = null;
     const classified = (inv.line_items || []).map(li => {
       const sku = (li.sku || li.item_code || '').trim();
-      const isSaaS = sku ? planCodes.has(sku.toLowerCase()) : false;
+      const m = matchPlan(sku, li.name);
       const amount = parseFloat(li.item_total) || (parseFloat(li.rate) * parseInt(li.quantity)) || 0;
-      totalAmount += amount;
-      if (isSaaS) saasLineCount++; else hardwareLineCount++;
+      if (m.matched) saasLineCount++; else hardwareLineCount++;
       const subDate = li.subscription_activation_date || li.start_date || null;
       if (subDate) {
         const d = new Date(subDate);
@@ -3911,8 +3928,10 @@ app.get('/api/invoices/enrich-preview/:invoiceNumber', authenticateToken, async 
       }
       return {
         name: li.name, sku, quantity: li.quantity, rate: li.rate, amount,
-        type: isSaaS ? 'saas' : 'hardware',
-        plan_matched: isSaaS,
+        type: m.matched ? 'saas' : 'hardware',
+        plan_matched: m.matched,
+        matched_by:   m.matched ? m.by   : null,
+        plan_code:    m.matched ? m.code : null,
         subscription_activation_date: subDate,
       };
     });
@@ -3963,7 +3982,9 @@ app.get('/api/invoices/enrich-preview/:invoiceNumber', authenticateToken, async 
         if (!det_inv) continue;
         const hasSaas = (det_inv.line_items || []).some(li => {
           const sku = (li.sku || li.item_code || '').toLowerCase().trim();
-          return sku && planCodes.has(sku);
+          if (sku && planCodes.has(sku)) return true;
+          const n = normalizeName(li.name);
+          return !!(n && planNames.has(n));
         });
         if (hasSaas) {
           const subDateFromLines = (det_inv.line_items || [])
