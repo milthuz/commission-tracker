@@ -4820,6 +4820,136 @@ app.post('/api/commissions/unapprove', authenticateToken, async (req, res) => {
 let recalcJob = { status: 'idle', processed: 0, total: 0, message: '' };
 
 // POST /api/commissions/recalculate
+// ============================================================================
+// PHASE 1c — Recalculate commissions using enriched data
+// ============================================================================
+// New rules (applied per eligible invoice):
+//   Hardware           → hardware_amount × rep_rate%
+//   SaaS first month   → saas_amount × 100% (one-time activation commission)
+//   SaaS renewal       → 0 (already paid on activation)
+//   Not eligible       → 0
+//
+// "First month" detection: for each customer, the EARLIEST paid SaaS invoice
+// per subscription_activation_date is the first month; all others are renewals.
+
+let recalcV2Job = {
+  status: 'idle', processed: 0, total: 0, message: '',
+  stats: { hardware: 0, saas_first: 0, saas_renewal: 0, not_eligible: 0, total_commission: 0 },
+};
+
+app.post('/api/commissions/recalc-v2/start', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  if (recalcV2Job.status === 'running') {
+    return res.status(409).json({ error: 'Already running' });
+  }
+  recalcV2Job = {
+    status: 'running', startedAt: new Date().toISOString(),
+    processed: 0, total: 0, message: 'Starting...',
+    stats: { hardware: 0, saas_first: 0, saas_renewal: 0, not_eligible: 0, total_commission: 0 },
+  };
+  res.json({ success: true, message: 'Recalc v2 started — poll /api/commissions/recalc-v2/status' });
+
+  (async () => {
+    try {
+      // Load rep rates
+      const spRes = await pool.query('SELECT name, commission_rate FROM salespeople');
+      const rateMap = {};
+      spRes.rows.forEach(r => { rateMap[r.name] = parseFloat(r.commission_rate) || 10; });
+
+      // Load all paid invoices with enriched data
+      const invRes = await pool.query(`
+        SELECT id, invoice_number, salesperson_name, customer_name, total,
+               hardware_amount, saas_amount, subscription_activation_date,
+               commission_status, status
+        FROM invoices
+        WHERE organization_id = $1 AND status = 'paid'
+        ORDER BY date ASC
+      `, [process.env.ZOHO_ORG_ID]);
+      recalcV2Job.total = invRes.rows.length;
+
+      // Build first-month map: for each (customer_name, subscription_activation_date),
+      // remember the EARLIEST invoice ID (in our table) — that's the first month.
+      const firstMonthByGroup = new Map(); // key: customer + '|' + activation_date → invoice id
+      for (const inv of invRes.rows) {
+        const isSaaS = parseFloat(inv.saas_amount) > 0;
+        if (!isSaaS || !inv.subscription_activation_date) continue;
+        const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
+        if (!firstMonthByGroup.has(key)) {
+          firstMonthByGroup.set(key, inv.id); // first encountered (sorted ASC by date)
+        }
+      }
+
+      // Now compute commission per invoice
+      for (const inv of invRes.rows) {
+        if (recalcV2Job.status === 'stopping') break;
+
+        const rate = rateMap[inv.salesperson_name] || 10;
+        const hardwareAmount = parseFloat(inv.hardware_amount) || 0;
+        const saasAmount     = parseFloat(inv.saas_amount)     || 0;
+        let commission = 0;
+        let bucket = 'not_eligible';
+
+        if (inv.commission_status === 'eligible') {
+          if (hardwareAmount > 0 && saasAmount === 0) {
+            // Pure hardware
+            commission = hardwareAmount * (rate / 100);
+            bucket = 'hardware';
+          } else if (saasAmount > 0 && hardwareAmount === 0) {
+            // Pure SaaS — check first month vs renewal
+            const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
+            const isFirstMonth = firstMonthByGroup.get(key) === inv.id;
+            if (isFirstMonth) {
+              commission = saasAmount; // 100%
+              bucket = 'saas_first';
+            } else {
+              commission = 0;
+              bucket = 'saas_renewal';
+            }
+          } else if (hardwareAmount > 0 && saasAmount > 0) {
+            // Mixed (shouldn't happen per user spec, but handle defensively):
+            // Hardware portion at rep rate, SaaS portion follows first-month rule
+            commission = hardwareAmount * (rate / 100);
+            const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
+            const isFirstMonth = firstMonthByGroup.get(key) === inv.id;
+            if (isFirstMonth) commission += saasAmount;
+            bucket = isFirstMonth ? 'saas_first' : 'saas_renewal';
+          }
+        }
+
+        recalcV2Job.stats[bucket]++;
+        recalcV2Job.stats.total_commission += commission;
+
+        await pool.query(
+          'UPDATE invoices SET commission = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+          [commission, inv.id]
+        );
+
+        recalcV2Job.processed++;
+        recalcV2Job.message = `Processed ${recalcV2Job.processed} of ${recalcV2Job.total}`;
+      }
+
+      recalcV2Job.status  = recalcV2Job.status === 'stopping' ? 'stopped' : 'completed';
+      recalcV2Job.stats.total_commission = Math.round(recalcV2Job.stats.total_commission * 100) / 100;
+      recalcV2Job.message = `Done — total commissions: $${recalcV2Job.stats.total_commission.toLocaleString()}`;
+    } catch (error) {
+      recalcV2Job.status  = 'error';
+      recalcV2Job.message = error.message;
+      console.error('recalc-v2 error:', error);
+    }
+  })();
+});
+
+app.get('/api/commissions/recalc-v2/status', authenticateToken, (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  res.json(recalcV2Job);
+});
+
+app.post('/api/commissions/recalc-v2/stop', authenticateToken, (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  if (recalcV2Job.status === 'running') recalcV2Job.status = 'stopping';
+  res.json({ success: true });
+});
+
 app.post('/api/commissions/recalculate', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   if (recalcJob.status === 'running') return res.status(409).json({ error: 'Already running' });
