@@ -4885,7 +4885,7 @@ app.post('/api/commissions/recalc-v2/start', authenticateToken, async (req, res)
   recalcV2Job = {
     status: 'running', startedAt: new Date().toISOString(),
     processed: 0, total: 0, message: 'Starting...',
-    stats: { hardware: 0, saas_first: 0, saas_renewal: 0, not_eligible: 0, total_commission: 0 },
+    stats: { hardware: 0, saas_first: 0, saas_renewal: 0, too_late: 0, pending_saas: 0, pending_payment: 0, not_eligible: 0, total_commission: 0 },
   };
   res.json({ success: true, message: 'Recalc v2 started — poll /api/commissions/recalc-v2/status' });
 
@@ -4896,30 +4896,58 @@ app.post('/api/commissions/recalc-v2/start', authenticateToken, async (req, res)
       const rateMap = {};
       spRes.rows.forEach(r => { rateMap[r.name] = parseFloat(r.commission_rate) || 10; });
 
-      // Load all paid invoices with enriched data
+      // Load all invoices (paid + not paid) with enriched data
       const invRes = await pool.query(`
         SELECT id, invoice_number, salesperson_name, customer_name, total,
                hardware_amount, saas_amount, subscription_activation_date,
-               commission_status, status
+               paid_date, commission_status, status
         FROM invoices
-        WHERE organization_id = $1 AND status = 'paid'
+        WHERE organization_id = $1
         ORDER BY date ASC
       `, [process.env.ZOHO_ORG_ID]);
       recalcV2Job.total = invRes.rows.length;
 
-      // Build first-month map: for each (customer_name, subscription_activation_date),
-      // remember the EARLIEST invoice ID (in our table) — that's the first month.
-      const firstMonthByGroup = new Map(); // key: customer + '|' + activation_date → invoice id
+      // PASS 1: Build per-customer maps
+      //   firstSaasPaidByCustomer: customer → { paidDate, invoiceId }  (trigger for hardware window)
+      //   firstMonthByGroup: (customer, sub_activation) → invoice id   (which SaaS = first month, rest = renewal)
+      const firstSaasPaidByCustomer = new Map();
+      const firstMonthByGroup = new Map();
       for (const inv of invRes.rows) {
         const isSaaS = parseFloat(inv.saas_amount) > 0;
-        if (!isSaaS || !inv.subscription_activation_date) continue;
-        const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
-        if (!firstMonthByGroup.has(key)) {
-          firstMonthByGroup.set(key, inv.id); // first encountered (sorted ASC by date)
+        if (!isSaaS) continue;
+        // Track first paid SaaS per customer (sorted by date ASC, but use paid_date for accuracy)
+        if (inv.status === 'paid' && inv.paid_date) {
+          const cur = firstSaasPaidByCustomer.get(inv.customer_name);
+          if (!cur || inv.paid_date < cur.paidDate) {
+            firstSaasPaidByCustomer.set(inv.customer_name, {
+              paidDate: inv.paid_date,
+              invoiceId: inv.id,
+            });
+          }
+        }
+        // Track first-month per subscription_activation_date group
+        if (inv.subscription_activation_date) {
+          const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
+          if (!firstMonthByGroup.has(key)) {
+            firstMonthByGroup.set(key, inv.id);
+          }
         }
       }
 
-      // Now compute commission per invoice
+      // PASS 2: Compute commission per invoice using the new rules
+      //   1. SaaS first month → 100% commission (immediately when paid)
+      //   2. SaaS renewals → 0
+      //   3. Hardware: paid before first SaaS → eligible
+      //                paid within 3 months AFTER first SaaS → eligible
+      //                paid more than 3 months AFTER → too_late
+      //   4. Not paid or no first SaaS yet → pending_payment / pending_saas
+      const THREE_MONTHS_MS = 3 * 30 * 24 * 60 * 60 * 1000; // approx 3 months
+      const addMonths = (dateStr, months) => {
+        const d = new Date(dateStr);
+        d.setMonth(d.getMonth() + months);
+        return d.toISOString().slice(0, 10);
+      };
+
       for (const inv of invRes.rows) {
         if (recalcV2Job.status === 'stopping') break;
 
@@ -4929,30 +4957,54 @@ app.post('/api/commissions/recalc-v2/start', authenticateToken, async (req, res)
         let commission = 0;
         let bucket = 'not_eligible';
 
-        if (inv.commission_status === 'eligible') {
-          if (hardwareAmount > 0 && saasAmount === 0) {
-            // Pure hardware
-            commission = hardwareAmount * (rate / 100);
-            bucket = 'hardware';
-          } else if (saasAmount > 0 && hardwareAmount === 0) {
-            // Pure SaaS — check first month vs renewal
-            const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
-            const isFirstMonth = firstMonthByGroup.get(key) === inv.id;
-            if (isFirstMonth) {
-              commission = saasAmount; // 100%
-              bucket = 'saas_first';
+        if (inv.status !== 'paid' || !inv.paid_date) {
+          bucket = 'pending_payment';
+        } else if (saasAmount > 0 && hardwareAmount === 0) {
+          // Pure SaaS — first month gets 100%, renewals get 0
+          const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
+          const isFirstMonth = firstMonthByGroup.get(key) === inv.id;
+          if (isFirstMonth) {
+            commission = saasAmount;
+            bucket = 'saas_first';
+          } else {
+            commission = 0;
+            bucket = 'saas_renewal';
+          }
+        } else if (hardwareAmount > 0 && saasAmount === 0) {
+          // Pure hardware — eligible if paid before OR within 3 months after first SaaS
+          const firstSaasPaid = firstSaasPaidByCustomer.get(inv.customer_name);
+          if (!firstSaasPaid) {
+            // Customer has no paid SaaS yet → wait
+            bucket = 'pending_saas';
+          } else {
+            const windowEnd = addMonths(firstSaasPaid.paidDate, 3);
+            if (inv.paid_date <= windowEnd) {
+              // Paid before SaaS OR within 3-month window after → eligible
+              commission = hardwareAmount * (rate / 100);
+              bucket = 'hardware';
             } else {
-              commission = 0;
-              bucket = 'saas_renewal';
+              // Paid > 3 months after first SaaS → no commission
+              bucket = 'too_late';
             }
-          } else if (hardwareAmount > 0 && saasAmount > 0) {
-            // Mixed (shouldn't happen per user spec, but handle defensively):
-            // Hardware portion at rep rate, SaaS portion follows first-month rule
-            commission = hardwareAmount * (rate / 100);
-            const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
-            const isFirstMonth = firstMonthByGroup.get(key) === inv.id;
-            if (isFirstMonth) commission += saasAmount;
-            bucket = isFirstMonth ? 'saas_first' : 'saas_renewal';
+          }
+        } else if (hardwareAmount > 0 && saasAmount > 0) {
+          // Mixed (shouldn't happen per user spec)
+          const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
+          const isFirstMonth = firstMonthByGroup.get(key) === inv.id;
+          const firstSaasPaid = firstSaasPaidByCustomer.get(inv.customer_name);
+          // SaaS portion
+          if (isFirstMonth) {
+            commission += saasAmount;
+            bucket = 'saas_first';
+          } else {
+            bucket = 'saas_renewal';
+          }
+          // Hardware portion (if window allows)
+          if (firstSaasPaid) {
+            const windowEnd = addMonths(firstSaasPaid.paidDate, 3);
+            if (inv.paid_date <= windowEnd) {
+              commission += hardwareAmount * (rate / 100);
+            }
           }
         }
 
