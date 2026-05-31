@@ -3919,6 +3919,31 @@ app.get('/api/billing/probe', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/invoices/debug-customer — full enriched data for a customer
+app.get('/api/invoices/debug-customer', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const search = (req.query.q || '').trim();
+  if (!search) return res.status(400).json({ error: 'q parameter required' });
+  try {
+    const result = await pool.query(`
+      SELECT invoice_number, customer_name, salesperson_name, status, date,
+             paid_date, total, commission, commission_status,
+             hardware_amount, saas_amount, subscription_activation_date,
+             commission_payable_date,
+             jsonb_array_length(line_items) AS line_items_count
+      FROM invoices
+      WHERE organization_id = $1 AND customer_name ILIKE $2
+      ORDER BY date ASC
+    `, [process.env.ZOHO_ORG_ID, `%${search}%`]);
+    res.json({
+      count: result.rows.length,
+      invoices: result.rows,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // DELETE /api/invoices/flush — wipes all invoices from our DB so the next
 // sync only pulls from INVOICES_SYNC_FROM_DATE forward (default 2026-01-01).
 // Requires ?confirm=YES to prevent accidental wipes.
