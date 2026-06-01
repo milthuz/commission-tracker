@@ -34,6 +34,7 @@ const PERMISSION_CATALOG = [
   { key: 'report:view_own',            label: 'View own commission report',                  category: 'Commission Report' },
   { key: 'report:view_others',         label: "View other reps' commission reports",         category: 'Commission Report' },
   { key: 'report:approve',             label: 'Approve / unapprove commissions',             category: 'Commission Report' },
+  { key: 'report:mark_paid',           label: 'Mark approved commissions as paid to rep',    category: 'Commission Report' },
 
   // Invoices
   { key: 'invoices:view_own',          label: 'View own invoices',                           category: 'Invoices' },
@@ -76,6 +77,25 @@ async function getUserPermissions(email) {
   } catch {
     return new Set();
   }
+}
+
+// Endpoint-level helper: resolve current user, check perm, respond 403 if missing.
+// Returns true if allowed (and you should proceed), false if it sent a 403 response.
+// Admins (or admins-while-impersonating) always pass.
+async function requirePerm(req, res, perm) {
+  if (req.user.isAdmin === true) return true;
+  if (req.user.realAdminEmail) return true;            // admin impersonating someone
+  const email = req.user.email;
+  if (!email) {
+    res.status(403).json({ error: `Permission required: ${perm}` });
+    return false;
+  }
+  const perms = await getUserPermissions(email);
+  if (!userHasPermission(perms, perm)) {
+    res.status(403).json({ error: `Permission required: ${perm}` });
+    return false;
+  }
+  return true;
 }
 
 // Check helper: wildcards (*) grant all
@@ -159,6 +179,25 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS commission_payable_date DATE`);
     await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS commission_status VARCHAR(50) DEFAULT 'calculated'`);
     // commission_status values: calculated | pending_payment | pending_saas | eligible | approved | paid
+
+    // Phase 2 — approval workflow columns. Separate from commission_status (which is computed
+    // from invoice data) so manager approvals are independent of the classification engine.
+    //   approval_status: 'pending' (default) | 'approved' | 'paid' | 'rejected'
+    //   approved_*  → who locked the commission for payout
+    //   payout_*    → who confirmed the commission was actually paid to the rep
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS approval_status VARCHAR(20) DEFAULT 'pending'`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS approved_by VARCHAR(255)`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS payout_paid_by VARCHAR(255)`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS payout_paid_at TIMESTAMPTZ`);
+    // One-time backfill: any invoice previously flipped to commission_paid=true counts as already paid
+    await pool.query(`
+      UPDATE invoices
+      SET approval_status = 'paid',
+          payout_paid_at = COALESCE(payout_paid_at, updated_at, CURRENT_TIMESTAMP),
+          approved_at    = COALESCE(approved_at, updated_at, CURRENT_TIMESTAMP)
+      WHERE commission_paid = true AND approval_status = 'pending'
+    `);
 
     // User preferences table
     await pool.query(`
@@ -4716,8 +4755,10 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
         COALESCE(SUM(commission), 0) AS commission,
         COALESCE(SUM(CASE WHEN commission_paid THEN commission ELSE 0 END), 0) AS paid_commission,
         COALESCE(SUM(CASE WHEN status = 'paid' THEN total ELSE 0 END), 0) AS paid_revenue,
-        COUNT(CASE WHEN commission_paid THEN 1 END) AS commission_paid_count,
-        COUNT(CASE WHEN commission > 0 AND commission_status IN ('hardware','saas_first') THEN 1 END) AS commission_qualifying_count
+        COUNT(CASE WHEN approval_status = 'paid' THEN 1 END) AS commission_paid_count,
+        COUNT(CASE WHEN approval_status = 'approved' THEN 1 END) AS commission_approved_count,
+        COUNT(CASE WHEN commission > 0 AND commission_status IN ('hardware','saas_first') THEN 1 END) AS commission_qualifying_count,
+        COALESCE(SUM(CASE WHEN approval_status = 'approved' THEN commission ELSE 0 END), 0) AS approved_commission
       FROM invoices
       WHERE salesperson_name = $1 AND organization_id = $2
         AND ${dateCol} >= $3 AND ${dateCol} <= $4
@@ -4746,8 +4787,10 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
         commission:               parseFloat(m.commission)               || 0,
         paidCommission:           parseFloat(m.paid_commission)          || 0,
         paidRevenue:              parseFloat(m.paid_revenue)             || 0,
-        commissionPaidCount:      parseInt(m.commission_paid_count)      || 0,
-        commissionQualifyingCount: parseInt(m.commission_qualifying_count) || 0,
+        commissionPaidCount:       parseInt(m.commission_paid_count)        || 0,
+        commissionApprovedCount:   parseInt(m.commission_approved_count)    || 0,
+        commissionQualifyingCount: parseInt(m.commission_qualifying_count)  || 0,
+        approvedCommission:        parseFloat(m.approved_commission)        || 0,
       };
     });
 
@@ -4838,7 +4881,8 @@ app.get('/api/commissions/invoices', authenticateToken, async (req, res) => {
     const result = await pool.query(`
       SELECT invoice_number, customer_name, date, total, commission, status,
              commission_paid, commission_status, commission_payable_date,
-             hardware_amount, saas_amount, subscription_activation_date, paid_date
+             hardware_amount, saas_amount, subscription_activation_date, paid_date,
+             approval_status, approved_by, approved_at, payout_paid_by, payout_paid_at
       FROM invoices
       WHERE salesperson_name = $1 AND organization_id = $2 AND ${whereDate}
       ORDER BY COALESCE(commission_payable_date, date) DESC, date DESC
@@ -4859,6 +4903,11 @@ app.get('/api/commissions/invoices', authenticateToken, async (req, res) => {
         saasAmount:                 parseFloat(r.saas_amount) || 0,
         subscriptionActivationDate: r.subscription_activation_date || null,
         paidDate:                   r.paid_date || null,
+        approvalStatus:             r.approval_status || 'pending',
+        approvedBy:                 r.approved_by || null,
+        approvedAt:                 r.approved_at || null,
+        payoutPaidBy:               r.payout_paid_by || null,
+        payoutPaidAt:               r.payout_paid_at || null,
       }))
     });
   } catch (error) {
@@ -4867,30 +4916,45 @@ app.get('/api/commissions/invoices', authenticateToken, async (req, res) => {
 });
 
 // POST /api/commissions/approve — supports { repName, year, month } OR { invoiceNumbers: [...] }
+// Locks a commission for payroll: sets approval_status='approved' (does NOT mark as paid).
+// Use /mark-paid afterwards to record actual rep payout.
 app.post('/api/commissions/approve', authenticateToken, async (req, res) => {
-  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  if (!(await requirePerm(req, res, 'report:approve'))) return;
   const { repName, year, month, invoiceNumbers } = req.body;
+  const approverEmail = req.user.realAdminEmail || req.user.email || 'unknown';
   try {
     let result;
     if (Array.isArray(invoiceNumbers) && invoiceNumbers.length > 0) {
       result = await pool.query(
-        `UPDATE invoices SET commission_paid = true, updated_at = CURRENT_TIMESTAMP
-         WHERE invoice_number = ANY($1) RETURNING invoice_number`,
-        [invoiceNumbers]
+        `UPDATE invoices
+         SET approval_status = 'approved',
+             approved_by    = $2,
+             approved_at    = CURRENT_TIMESTAMP,
+             updated_at     = CURRENT_TIMESTAMP
+         WHERE invoice_number = ANY($1)
+           AND commission > 0 AND commission_status IN ('hardware','saas_first')
+           AND approval_status = 'pending'
+         RETURNING invoice_number`,
+        [invoiceNumbers, approverEmail]
       );
     } else if (repName && year && month) {
       const startDate = new Date(`${year}-${String(month).padStart(2, '0')}-01`);
       const endDate   = new Date(startDate);
       endDate.setMonth(endDate.getMonth() + 1);
-      // Approve only invoices whose commission was actually EARNED (hardware or saas_first)
-      // and whose unlock month falls in the chosen month.
+      // Approve only invoices whose commission was actually EARNED (hardware or saas_first),
+      // whose unlock month falls in the chosen month, and that are still pending.
       result = await pool.query(
-        `UPDATE invoices SET commission_paid = true, updated_at = CURRENT_TIMESTAMP
+        `UPDATE invoices
+         SET approval_status = 'approved',
+             approved_by    = $5,
+             approved_at    = CURRENT_TIMESTAMP,
+             updated_at     = CURRENT_TIMESTAMP
          WHERE salesperson_name = $1 AND organization_id = $2
            AND commission_payable_date >= $3 AND commission_payable_date < $4
            AND commission > 0 AND commission_status IN ('hardware','saas_first')
+           AND approval_status = 'pending'
          RETURNING invoice_number`,
-        [repName, process.env.ZOHO_ORG_ID, startDate, endDate]
+        [repName, process.env.ZOHO_ORG_ID, startDate, endDate, approverEmail]
       );
     } else {
       return res.status(400).json({ error: 'Provide repName+year+month or invoiceNumbers' });
@@ -4901,16 +4965,23 @@ app.post('/api/commissions/approve', authenticateToken, async (req, res) => {
   }
 });
 
-// POST /api/commissions/unapprove — supports { repName, year, month } OR { invoiceNumbers: [...] }
+// POST /api/commissions/unapprove — revert approved/paid back to pending.
+// Caller needs report:approve (an approver can undo their own + mark_paid actions too).
 app.post('/api/commissions/unapprove', authenticateToken, async (req, res) => {
-  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  if (!(await requirePerm(req, res, 'report:approve'))) return;
   const { repName, year, month, invoiceNumbers } = req.body;
   try {
     let result;
     if (Array.isArray(invoiceNumbers) && invoiceNumbers.length > 0) {
       result = await pool.query(
-        `UPDATE invoices SET commission_paid = false, updated_at = CURRENT_TIMESTAMP
-         WHERE invoice_number = ANY($1) RETURNING invoice_number`,
+        `UPDATE invoices
+         SET approval_status = 'pending',
+             approved_by = NULL, approved_at = NULL,
+             payout_paid_by = NULL, payout_paid_at = NULL,
+             commission_paid = false,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE invoice_number = ANY($1)
+         RETURNING invoice_number`,
         [invoiceNumbers]
       );
     } else if (repName && year && month) {
@@ -4918,7 +4989,12 @@ app.post('/api/commissions/unapprove', authenticateToken, async (req, res) => {
       const endDate   = new Date(startDate);
       endDate.setMonth(endDate.getMonth() + 1);
       result = await pool.query(
-        `UPDATE invoices SET commission_paid = false, updated_at = CURRENT_TIMESTAMP
+        `UPDATE invoices
+         SET approval_status = 'pending',
+             approved_by = NULL, approved_at = NULL,
+             payout_paid_by = NULL, payout_paid_at = NULL,
+             commission_paid = false,
+             updated_at = CURRENT_TIMESTAMP
          WHERE salesperson_name = $1 AND organization_id = $2
            AND commission_payable_date >= $3 AND commission_payable_date < $4
          RETURNING invoice_number`,
@@ -4930,6 +5006,55 @@ app.post('/api/commissions/unapprove', authenticateToken, async (req, res) => {
     res.json({ success: true, invoicesUpdated: result.rowCount });
   } catch (error) {
     res.status(500).json({ error: 'Failed to unapprove commissions', details: error.message });
+  }
+});
+
+// POST /api/commissions/mark-paid — final step in the workflow.
+// Flips approval_status 'approved' → 'paid' and stamps payout actor + timestamp.
+// Also flips legacy commission_paid=true for backward-compatibility with any code
+// still reading that column.
+// Body: { repName, year, month } OR { invoiceNumbers: [...] }
+app.post('/api/commissions/mark-paid', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const { repName, year, month, invoiceNumbers } = req.body;
+  const payerEmail = req.user.realAdminEmail || req.user.email || 'unknown';
+  try {
+    let result;
+    if (Array.isArray(invoiceNumbers) && invoiceNumbers.length > 0) {
+      result = await pool.query(
+        `UPDATE invoices
+         SET approval_status = 'paid',
+             commission_paid = true,
+             payout_paid_by  = $2,
+             payout_paid_at  = CURRENT_TIMESTAMP,
+             updated_at      = CURRENT_TIMESTAMP
+         WHERE invoice_number = ANY($1) AND approval_status = 'approved'
+         RETURNING invoice_number`,
+        [invoiceNumbers, payerEmail]
+      );
+    } else if (repName && year && month) {
+      const startDate = new Date(`${year}-${String(month).padStart(2, '0')}-01`);
+      const endDate   = new Date(startDate);
+      endDate.setMonth(endDate.getMonth() + 1);
+      result = await pool.query(
+        `UPDATE invoices
+         SET approval_status = 'paid',
+             commission_paid = true,
+             payout_paid_by  = $5,
+             payout_paid_at  = CURRENT_TIMESTAMP,
+             updated_at      = CURRENT_TIMESTAMP
+         WHERE salesperson_name = $1 AND organization_id = $2
+           AND commission_payable_date >= $3 AND commission_payable_date < $4
+           AND approval_status = 'approved'
+         RETURNING invoice_number`,
+        [repName, process.env.ZOHO_ORG_ID, startDate, endDate, payerEmail]
+      );
+    } else {
+      return res.status(400).json({ error: 'Provide repName+year+month or invoiceNumbers' });
+    }
+    res.json({ success: true, invoicesUpdated: result.rowCount });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to mark commissions as paid', details: error.message });
   }
 });
 
