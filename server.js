@@ -3357,22 +3357,38 @@ async function getAdminBooksAuth() {
 }
 
 // Look up Zoho's internal invoice_id from our local invoice_number by asking
-// the Zoho Books API directly — avoids requiring a zoho_invoice_id column on
-// our invoices table (which may or may not exist depending on which migration
-// path the DB followed).
+// the Zoho Books API directly. Avoids requiring a zoho_invoice_id column on
+// our invoices table.
+// Tries two queries: exact match first, then a 'contains' fallback in case
+// Zoho stored the number with different casing/whitespace.
 async function resolveInvoiceIdViaZoho(invoiceNumber, accessToken, apiDomain) {
-  const r = await axios.get(`${apiDomain}/books/v3/invoices`, {
-    params: {
-      organization_id: process.env.ZOHO_ORG_ID,
-      invoice_number: invoiceNumber,
-      per_page: 1,
-    },
-    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
-    validateStatus: () => true,
-  });
-  if (r.status !== 200) return null;
-  const inv = r.data?.invoices?.[0];
-  return inv?.invoice_id || null;
+  const tryQuery = async (params) => {
+    const r = await axios.get(`${apiDomain}/books/v3/invoices`, {
+      params: { organization_id: process.env.ZOHO_ORG_ID, per_page: 25, ...params },
+      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+      validateStatus: () => true,
+    });
+    if (r.status !== 200) {
+      console.warn(`Zoho invoice search ${JSON.stringify(params)} → HTTP ${r.status}`,
+        typeof r.data === 'string' ? r.data.slice(0, 200) : JSON.stringify(r.data).slice(0, 200));
+      return { id: null, count: 0, httpStatus: r.status };
+    }
+    const invoices = r.data?.invoices || [];
+    // Prefer an exact match on invoice_number if the response has many rows
+    const exact = invoices.find(i => (i.invoice_number || '').trim() === invoiceNumber.trim());
+    return { id: (exact || invoices[0])?.invoice_id || null, count: invoices.length, httpStatus: 200 };
+  };
+
+  // 1. Exact match
+  const exact = await tryQuery({ invoice_number: invoiceNumber });
+  if (exact.id) return exact.id;
+
+  // 2. Fallback: contains (handles casing / whitespace differences)
+  const contains = await tryQuery({ invoice_number_contains: invoiceNumber });
+  if (contains.id) return contains.id;
+
+  console.warn(`Invoice ${invoiceNumber} not found in Zoho — exact: ${exact.count} rows (HTTP ${exact.httpStatus}), contains: ${contains.count} rows (HTTP ${contains.httpStatus})`);
+  return null;
 }
 
 // Fetch the rendered PDF bytes from Zoho Books for a given invoice number.
@@ -3421,10 +3437,10 @@ app.get('/api/invoices/:invoiceNumber/preview', async (req, res) => {
   try {
     const result = await fetchInvoicePdfBytes(req.params.invoiceNumber);
     if (result.error === 'not_found') {
-      return res.status(404).send(`<html><body style="font-family:sans-serif;padding:2rem"><p>Invoice ${req.params.invoiceNumber} not found in our database.</p></body></html>`);
+      return res.status(404).send(`<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>Invoice ${req.params.invoiceNumber} not found in Zoho Books</h3><p>This invoice exists in our local database but Zoho Books couldn't find it when we searched by its number. Possible causes:</p><ul><li>The invoice was deleted from Zoho Books after we synced it</li><li>The invoice number has changed in Zoho</li><li>The Zoho admin account no longer has access to this organization</li></ul></body></html>`);
     }
     if (result.error) {
-      return res.status(result.status).send(`<html><body style="font-family:sans-serif;padding:2rem"><p>Could not fetch this invoice from Zoho Books.</p><pre style="font-size:11px;color:#888">${result.body || ''}</pre></body></html>`);
+      return res.status(result.status).send(`<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>Could not fetch this invoice from Zoho Books</h3><pre style="font-size:11px;color:#888;white-space:pre-wrap">${result.body || ''}</pre></body></html>`);
     }
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `inline; filename="${req.params.invoiceNumber}.pdf"`);
