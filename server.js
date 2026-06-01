@@ -3356,20 +3356,30 @@ async function getAdminBooksAuth() {
   return { accessToken: admin.access_token, apiDomain: admin.api_domain };
 }
 
-// Look up Zoho's internal invoice_id from our local invoice_number.
-async function resolveInvoiceId(invoiceNumber) {
-  const row = (await pool.query(
-    'SELECT zoho_invoice_id FROM invoices WHERE invoice_number = $1 LIMIT 1',
-    [invoiceNumber]
-  )).rows[0];
-  return row?.zoho_invoice_id || null;
+// Look up Zoho's internal invoice_id from our local invoice_number by asking
+// the Zoho Books API directly — avoids requiring a zoho_invoice_id column on
+// our invoices table (which may or may not exist depending on which migration
+// path the DB followed).
+async function resolveInvoiceIdViaZoho(invoiceNumber, accessToken, apiDomain) {
+  const r = await axios.get(`${apiDomain}/books/v3/invoices`, {
+    params: {
+      organization_id: process.env.ZOHO_ORG_ID,
+      invoice_number: invoiceNumber,
+      per_page: 1,
+    },
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+    validateStatus: () => true,
+  });
+  if (r.status !== 200) return null;
+  const inv = r.data?.invoices?.[0];
+  return inv?.invoice_id || null;
 }
 
 // Fetch the rendered PDF bytes from Zoho Books for a given invoice number.
 async function fetchInvoicePdfBytes(invoiceNumber) {
-  const zohoId = await resolveInvoiceId(invoiceNumber);
-  if (!zohoId) return { error: 'not_found', status: 404 };
   const { accessToken, apiDomain } = await getAdminBooksAuth();
+  const zohoId = await resolveInvoiceIdViaZoho(invoiceNumber, accessToken, apiDomain);
+  if (!zohoId) return { error: 'not_found', status: 404 };
   // Zoho Books returns the PDF when the request is for /invoices/{id} with accept=pdf
   const r = await axios.get(`${apiDomain}/books/v3/invoices/${zohoId}`, {
     params: { organization_id: process.env.ZOHO_ORG_ID, accept: 'pdf' },
