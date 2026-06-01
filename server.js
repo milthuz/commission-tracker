@@ -3318,14 +3318,111 @@ app.post('/api/invoices/bulk-import', authenticateToken, async (req, res) => {
   }
 });
 
-// GET /api/invoices/:invoiceNumber/pdf
+// ============================================================================
+// Invoice PDF helpers — fetch the rendered PDF from Zoho Books.
+//   /preview: token comes in via ?token=... query string (iframe can't set headers),
+//             Content-Disposition: inline so the browser renders in-place.
+//   /pdf:     standard Authorization header (axios fetches as blob),
+//             Content-Disposition: attachment for download.
+// Both go through the most-recently-used admin token (auto-refreshed if expired).
+// ============================================================================
+
+// Returns a fresh admin access_token + api_domain. Auto-refreshes if expired.
+async function getAdminBooksAuth() {
+  const admin = (await pool.query(
+    'SELECT email, access_token, refresh_token, api_domain, expires_at FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
+  )).rows[0];
+  if (!admin) throw new Error('No admin Zoho account connected');
+  // Refresh if token expired (or within 60s of expiry)
+  if (admin.refresh_token && (!admin.expires_at || Date.now() > admin.expires_at - 60_000)) {
+    const r = await axios.post(
+      'https://accounts.zoho.com/oauth/v2/token',
+      new URLSearchParams({
+        grant_type: 'refresh_token',
+        client_id: process.env.ZOHO_CLIENT_ID,
+        client_secret: process.env.ZOHO_CLIENT_SECRET,
+        refresh_token: admin.refresh_token,
+      }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    const newToken = r.data.access_token;
+    const newExpires = Date.now() + ((parseInt(r.data.expires_in) || 3600) * 1000);
+    await pool.query(
+      `UPDATE user_tokens SET access_token = $1, expires_at = $2, updated_at = CURRENT_TIMESTAMP WHERE email = $3`,
+      [newToken, newExpires, admin.email]
+    );
+    admin.access_token = newToken;
+  }
+  return { accessToken: admin.access_token, apiDomain: admin.api_domain };
+}
+
+// Look up Zoho's internal invoice_id from our local invoice_number.
+async function resolveInvoiceId(invoiceNumber) {
+  const row = (await pool.query(
+    'SELECT zoho_invoice_id FROM invoices WHERE invoice_number = $1 LIMIT 1',
+    [invoiceNumber]
+  )).rows[0];
+  return row?.zoho_invoice_id || null;
+}
+
+// Fetch the rendered PDF bytes from Zoho Books for a given invoice number.
+async function fetchInvoicePdfBytes(invoiceNumber) {
+  const zohoId = await resolveInvoiceId(invoiceNumber);
+  if (!zohoId) return { error: 'not_found', status: 404 };
+  const { accessToken, apiDomain } = await getAdminBooksAuth();
+  // Zoho Books returns the PDF when the request is for /invoices/{id} with accept=pdf
+  const r = await axios.get(`${apiDomain}/books/v3/invoices/${zohoId}`, {
+    params: { organization_id: process.env.ZOHO_ORG_ID, accept: 'pdf' },
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+    responseType: 'arraybuffer',
+    validateStatus: () => true,
+  });
+  if (r.status !== 200) {
+    const text = Buffer.isBuffer(r.data) ? r.data.toString('utf8').slice(0, 500) : JSON.stringify(r.data).slice(0, 500);
+    return { error: 'zoho_error', status: r.status, body: text };
+  }
+  return { buffer: Buffer.from(r.data), contentType: r.headers['content-type'] || 'application/pdf' };
+}
+
+// GET /api/invoices/:invoiceNumber/pdf — download
 app.get('/api/invoices/:invoiceNumber/pdf', authenticateToken, async (req, res) => {
-  res.status(501).json({ error: 'PDF download not yet implemented' });
+  try {
+    const result = await fetchInvoicePdfBytes(req.params.invoiceNumber);
+    if (result.error) return res.status(result.status).json({ error: result.error, details: result.body });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${req.params.invoiceNumber}.pdf"`);
+    return res.send(result.buffer);
+  } catch (e) {
+    console.error('Invoice PDF error:', e.message);
+    return res.status(500).json({ error: 'Failed to fetch invoice PDF', details: e.message });
+  }
 });
 
-// GET /api/invoices/:invoiceNumber/preview
-app.get('/api/invoices/:invoiceNumber/preview', (req, res) => {
-  res.status(501).send('<html><body style="font-family:sans-serif;padding:2rem"><p>Preview not yet implemented</p></body></html>');
+// GET /api/invoices/:invoiceNumber/preview?token=... — inline render for iframe
+app.get('/api/invoices/:invoiceNumber/preview', async (req, res) => {
+  // iframes can't set Authorization headers, so we accept the JWT via query string
+  const token = req.query.token;
+  if (!token) return res.status(401).send('Missing token');
+  try {
+    jwt.verify(String(token), process.env.JWT_SECRET || 'your-secret-key');
+  } catch {
+    return res.status(401).send('Invalid token');
+  }
+  try {
+    const result = await fetchInvoicePdfBytes(req.params.invoiceNumber);
+    if (result.error === 'not_found') {
+      return res.status(404).send(`<html><body style="font-family:sans-serif;padding:2rem"><p>Invoice ${req.params.invoiceNumber} not found in our database.</p></body></html>`);
+    }
+    if (result.error) {
+      return res.status(result.status).send(`<html><body style="font-family:sans-serif;padding:2rem"><p>Could not fetch this invoice from Zoho Books.</p><pre style="font-size:11px;color:#888">${result.body || ''}</pre></body></html>`);
+    }
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${req.params.invoiceNumber}.pdf"`);
+    return res.send(result.buffer);
+  } catch (e) {
+    console.error('Invoice preview error:', e.message);
+    return res.status(500).send(`<html><body style="font-family:sans-serif;padding:2rem"><p>Error loading preview: ${e.message}</p></body></html>`);
+  }
 });
 
 // POST /api/invoices/:invoiceNumber/email
