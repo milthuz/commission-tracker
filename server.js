@@ -4700,20 +4700,40 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
     const startDate = new Date(`${targetYear}-01-01`);
     const endDate   = new Date(`${targetYear}-12-31T23:59:59.999`);
 
+    // groupBy=payable (default, new behaviour) → bucket invoices by commission_payable_date.
+    //   That's the month the rep "unlocks" the commission (paid SaaS first month / hardware
+    //   within 3-month window). Invoices with NULL payable_date are not yet earned and
+    //   are surfaced separately (see pending stats below).
+    // groupBy=invoice → legacy: bucket by invoice date.
+    const groupBy = (req.query.groupBy || 'payable').toString();
+    const dateCol = groupBy === 'invoice' ? 'date' : 'commission_payable_date';
+
     const monthlyResult = await pool.query(`
       SELECT
-        EXTRACT(MONTH FROM date) AS month_num,
+        EXTRACT(MONTH FROM ${dateCol}) AS month_num,
         COUNT(*) AS invoices,
         COALESCE(SUM(total), 0) AS revenue,
         COALESCE(SUM(commission), 0) AS commission,
         COALESCE(SUM(CASE WHEN commission_paid THEN commission ELSE 0 END), 0) AS paid_commission,
         COALESCE(SUM(CASE WHEN status = 'paid' THEN total ELSE 0 END), 0) AS paid_revenue,
         COUNT(CASE WHEN commission_paid THEN 1 END) AS commission_paid_count,
-        COUNT(CASE WHEN status = 'paid'    THEN 1 END) AS commission_qualifying_count
+        COUNT(CASE WHEN commission > 0 AND commission_status IN ('hardware','saas_first') THEN 1 END) AS commission_qualifying_count
       FROM invoices
-      WHERE salesperson_name = $1 AND organization_id = $2 AND date >= $3 AND date <= $4
-      GROUP BY EXTRACT(MONTH FROM date) ORDER BY month_num
+      WHERE salesperson_name = $1 AND organization_id = $2
+        AND ${dateCol} >= $3 AND ${dateCol} <= $4
+      GROUP BY EXTRACT(MONTH FROM ${dateCol}) ORDER BY month_num
     `, [targetRep, process.env.ZOHO_ORG_ID, startDate, endDate]);
+
+    // Pending stats — invoices with commission > 0 but no payable date yet (waiting for SaaS / payment)
+    const pendingResult = await pool.query(`
+      SELECT
+        COUNT(*) AS pending_count,
+        COALESCE(SUM(CASE WHEN hardware_amount > 0 THEN hardware_amount * ($5::numeric / 100.0) ELSE 0 END), 0) AS pending_commission
+      FROM invoices
+      WHERE salesperson_name = $1 AND organization_id = $2
+        AND date >= $3 AND date <= $4
+        AND commission_status IN ('pending_saas','pending_payment')
+    `, [targetRep, process.env.ZOHO_ORG_ID, startDate, endDate, commissionRate]);
 
     const mMap = {};
     monthlyResult.rows.forEach(r => { mMap[parseInt(r.month_num)] = r; });
@@ -4731,6 +4751,7 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
       };
     });
 
+    // Customers — only invoices with earned commission (hardware or saas_first with commission > 0)
     const customerResult = await pool.query(`
       SELECT COALESCE(customer_name, 'Unknown') AS customer_name,
              COUNT(*) AS invoices,
@@ -4738,8 +4759,9 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
              COALESCE(SUM(commission), 0) AS commission
       FROM invoices
       WHERE salesperson_name = $1 AND organization_id = $2
-        AND date >= $3 AND date <= $4 AND status = 'paid'
-      GROUP BY customer_name ORDER BY revenue DESC LIMIT 20
+        AND ${dateCol} >= $3 AND ${dateCol} <= $4
+        AND commission > 0 AND commission_status IN ('hardware','saas_first')
+      GROUP BY customer_name ORDER BY commission DESC LIMIT 50
     `, [targetRep, process.env.ZOHO_ORG_ID, startDate, endDate]);
 
     const currentMonthNum  = new Date().getMonth();  // 0-indexed
@@ -4748,10 +4770,12 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
     const ytdRevenue       = months.reduce((s, m) => s + m.revenue,    0);
     const ytdInvoices      = months.reduce((s, m) => s + m.invoices,   0);
 
+    const pendingRow = pendingResult.rows[0] || {};
     res.json({
       repName: targetRep,
       commissionRate,
       year: targetYear,
+      groupBy,
       months,
       customers: customerResult.rows.map(r => ({
         customerName: r.customer_name,
@@ -4766,6 +4790,10 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
           invoices:   currentMonthData.invoices,
         },
         ytd: { commission: ytdCommission, revenue: ytdRevenue, invoices: ytdInvoices },
+        pending: {
+          count:      parseInt(pendingRow.pending_count) || 0,
+          commission: parseFloat(pendingRow.pending_commission) || 0,
+        },
       },
     });
   } catch (error) {
@@ -4794,22 +4822,43 @@ app.get('/api/commissions/invoices', authenticateToken, async (req, res) => {
       endDate   = new Date(`${targetYear}-12-31T23:59:59.999`);
     }
 
+    // groupBy=payable (default) → group by commission_payable_date when month filter is provided
+    // groupBy=invoice → legacy mode: group by invoice date
+    const groupBy = (req.query.groupBy || 'payable').toString();
+    const dateCol = groupBy === 'invoice' ? 'date' : 'commission_payable_date';
+
+    // When grouping by payable, NULL commission_payable_date rows are not yet payable — exclude
+    // unless caller is asking for the whole year (no specific month).
+    const whereDate = (month && month !== 'all')
+      ? `${dateCol} >= $3 AND ${dateCol} < $4`
+      : (groupBy === 'payable'
+          ? `(${dateCol} IS NULL OR (${dateCol} >= $3 AND ${dateCol} <= $4))`
+          : `${dateCol} >= $3 AND ${dateCol} <= $4`);
+
     const result = await pool.query(`
-      SELECT invoice_number, customer_name, date, total, commission, status, commission_paid
+      SELECT invoice_number, customer_name, date, total, commission, status,
+             commission_paid, commission_status, commission_payable_date,
+             hardware_amount, saas_amount, subscription_activation_date, paid_date
       FROM invoices
-      WHERE salesperson_name = $1 AND organization_id = $2 AND date >= $3 AND date < $4
-      ORDER BY date DESC
+      WHERE salesperson_name = $1 AND organization_id = $2 AND ${whereDate}
+      ORDER BY COALESCE(commission_payable_date, date) DESC, date DESC
     `, [targetRep, process.env.ZOHO_ORG_ID, startDate, endDate]);
 
     res.json({
       invoices: result.rows.map(r => ({
-        invoiceNumber:  r.invoice_number,
-        customerName:   r.customer_name || 'Unknown',
-        date:           r.date,
-        total:          parseFloat(r.total),
-        commission:     parseFloat(r.commission),
-        status:         r.status,
-        commissionPaid: r.commission_paid || false,
+        invoiceNumber:              r.invoice_number,
+        customerName:               r.customer_name || 'Unknown',
+        date:                       r.date,
+        total:                      parseFloat(r.total),
+        commission:                 parseFloat(r.commission),
+        status:                     r.status,
+        commissionPaid:             r.commission_paid || false,
+        commissionStatus:           r.commission_status || null,
+        commissionPayableDate:      r.commission_payable_date || null,
+        hardwareAmount:             parseFloat(r.hardware_amount) || 0,
+        saasAmount:                 parseFloat(r.saas_amount) || 0,
+        subscriptionActivationDate: r.subscription_activation_date || null,
+        paidDate:                   r.paid_date || null,
       }))
     });
   } catch (error) {
@@ -4833,10 +4882,13 @@ app.post('/api/commissions/approve', authenticateToken, async (req, res) => {
       const startDate = new Date(`${year}-${String(month).padStart(2, '0')}-01`);
       const endDate   = new Date(startDate);
       endDate.setMonth(endDate.getMonth() + 1);
+      // Approve only invoices whose commission was actually EARNED (hardware or saas_first)
+      // and whose unlock month falls in the chosen month.
       result = await pool.query(
         `UPDATE invoices SET commission_paid = true, updated_at = CURRENT_TIMESTAMP
          WHERE salesperson_name = $1 AND organization_id = $2
-           AND date >= $3 AND date < $4 AND status = 'paid'
+           AND commission_payable_date >= $3 AND commission_payable_date < $4
+           AND commission > 0 AND commission_status IN ('hardware','saas_first')
          RETURNING invoice_number`,
         [repName, process.env.ZOHO_ORG_ID, startDate, endDate]
       );
@@ -4868,7 +4920,7 @@ app.post('/api/commissions/unapprove', authenticateToken, async (req, res) => {
       result = await pool.query(
         `UPDATE invoices SET commission_paid = false, updated_at = CURRENT_TIMESTAMP
          WHERE salesperson_name = $1 AND organization_id = $2
-           AND date >= $3 AND date < $4
+           AND commission_payable_date >= $3 AND commission_payable_date < $4
          RETURNING invoice_number`,
         [repName, process.env.ZOHO_ORG_ID, startDate, endDate]
       );
