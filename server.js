@@ -5155,6 +5155,11 @@ app.post('/api/commissions/recalc-v2/start', authenticateToken, async (req, res)
         const invPaidDate    = toDate(inv.paid_date);
         let commission = 0;
         let bucket = 'not_eligible';
+        // payableDate = when the commission "unlocks" for the rep. NULL when no commission earned.
+        // SaaS first month → invoice paid_date (rep unlocks the moment the SaaS gets paid)
+        // Hardware       → max(hardware paid_date, first SaaS paid_date) — if HW was paid
+        //                   before the SaaS, the unlock still has to wait for SaaS to be paid.
+        let payableDate = null;
 
         if (inv.status !== 'paid' || !invPaidDate) {
           bucket = 'pending_payment';
@@ -5165,6 +5170,7 @@ app.post('/api/commissions/recalc-v2/start', authenticateToken, async (req, res)
           if (isFirstMonth) {
             commission = saasAmount;
             bucket = 'saas_first';
+            payableDate = invPaidDate;
           } else {
             commission = 0;
             bucket = 'saas_renewal';
@@ -5179,6 +5185,7 @@ app.post('/api/commissions/recalc-v2/start', authenticateToken, async (req, res)
             if (invPaidDate <= windowEnd) {
               commission = hardwareAmount * (rate / 100);
               bucket = 'hardware';
+              payableDate = invPaidDate > firstSaasPaid.paidDate ? invPaidDate : firstSaasPaid.paidDate;
             } else {
               bucket = 'too_late';
             }
@@ -5191,6 +5198,7 @@ app.post('/api/commissions/recalc-v2/start', authenticateToken, async (req, res)
           if (isFirstMonth) {
             commission += saasAmount;
             bucket = 'saas_first';
+            payableDate = invPaidDate;
           } else {
             bucket = 'saas_renewal';
           }
@@ -5198,6 +5206,11 @@ app.post('/api/commissions/recalc-v2/start', authenticateToken, async (req, res)
             const windowEnd = monthsLater(firstSaasPaid.paidDate, 3);
             if (invPaidDate <= windowEnd) {
               commission += hardwareAmount * (rate / 100);
+              // If the SaaS portion didn't already set a payable date (renewal w/ HW), use the
+              // later of this invoice's paid_date and the first-SaaS paid_date.
+              if (!payableDate) {
+                payableDate = invPaidDate > firstSaasPaid.paidDate ? invPaidDate : firstSaasPaid.paidDate;
+              }
             }
           }
         }
@@ -5205,9 +5218,16 @@ app.post('/api/commissions/recalc-v2/start', authenticateToken, async (req, res)
         recalcV2Job.stats[bucket]++;
         recalcV2Job.stats.total_commission += commission;
 
+        // Persist commission_status + commission_payable_date alongside the new commission
+        // so the report endpoints can group/filter on them.
         await pool.query(
-          'UPDATE invoices SET commission = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-          [commission, inv.id]
+          `UPDATE invoices SET
+             commission = $1,
+             commission_status = $2,
+             commission_payable_date = $3::date,
+             updated_at = CURRENT_TIMESTAMP
+           WHERE id = $4`,
+          [commission, bucket, payableDate, inv.id]
         );
 
         recalcV2Job.processed++;
