@@ -3452,8 +3452,49 @@ app.get('/api/invoices/:invoiceNumber/preview', async (req, res) => {
 });
 
 // POST /api/invoices/:invoiceNumber/email
+// Body: { recipientEmail, subject?, body? }
+// Sends the invoice (with the org-default PDF attached) to the given email
+// address via Zoho Books' built-in invoice email endpoint.
 app.post('/api/invoices/:invoiceNumber/email', authenticateToken, async (req, res) => {
-  res.status(501).json({ error: 'Email sending not yet implemented' });
+  if (!(await requirePerm(req, res, 'invoices:send_email'))) return;
+  const { recipientEmail, subject, body } = req.body;
+  if (!recipientEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipientEmail)) {
+    return res.status(400).json({ error: 'Valid recipientEmail required' });
+  }
+  try {
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    const zohoId = await resolveInvoiceIdViaZoho(req.params.invoiceNumber, accessToken, apiDomain);
+    if (!zohoId) return res.status(404).json({ error: 'Invoice not found in Zoho Books' });
+
+    const r = await axios.post(
+      `${apiDomain}/books/v3/invoices/${zohoId}/email`,
+      {
+        send_from_org_email_id: true,
+        to_mail_ids: [recipientEmail],
+        subject: subject || `Invoice ${req.params.invoiceNumber}`,
+        body: body || `Hello,\n\nPlease find attached invoice ${req.params.invoiceNumber}.\n\nThank you.`,
+      },
+      {
+        params: { organization_id: process.env.ZOHO_ORG_ID },
+        headers: {
+          Authorization: `Zoho-oauthtoken ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        validateStatus: () => true,
+      }
+    );
+    if (r.status >= 200 && r.status < 300) {
+      return res.json({ success: true, sentTo: recipientEmail });
+    }
+    console.warn(`Zoho email send → HTTP ${r.status}:`, JSON.stringify(r.data).slice(0, 300));
+    return res.status(r.status).json({
+      error: 'Zoho rejected the email request',
+      details: r.data?.message || r.data,
+    });
+  } catch (e) {
+    console.error('Invoice email error:', e.message);
+    res.status(500).json({ error: 'Failed to send invoice email', details: e.message });
+  }
 });
 
 // ============================================================================
