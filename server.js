@@ -3582,6 +3582,7 @@ app.post('/api/webhooks/zoho-books/invoice', async (req, res) => {
 
   const invoiceNumber = req.body?.invoice_number || req.body?.InvoiceNumber || req.body?.invoiceNumber;
   const event = (req.body?.event || 'updated').toLowerCase();
+  const debug = req.query.debug === '1';
   if (!invoiceNumber) {
     return res.status(400).json({ error: 'missing invoice_number in payload' });
   }
@@ -3600,6 +3601,32 @@ app.post('/api/webhooks/zoho-books/invoice', async (req, res) => {
     // For any other event (created / updated / status_change / payment_made / void),
     // fetch the full invoice from Zoho Books and upsert.
     const { accessToken, apiDomain } = await getAdminBooksAuth();
+
+    // Debug mode — dump the raw Zoho search response so we can see what's happening
+    if (debug) {
+      const dbg = await axios.get(`${apiDomain}/books/v3/invoices`, {
+        params: { organization_id: process.env.ZOHO_ORG_ID, search_text: invoiceNumber, per_page: 50 },
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+        validateStatus: () => true,
+      });
+      return res.json({
+        debug: true,
+        searched_for: invoiceNumber,
+        zoho_http_status: dbg.status,
+        zoho_total_returned: dbg.data?.invoices?.length || 0,
+        zoho_invoices_preview: (dbg.data?.invoices || []).slice(0, 5).map(i => ({
+          invoice_id: i.invoice_id,
+          invoice_number: i.invoice_number,
+          customer_name: i.customer_name,
+          status: i.status,
+          date: i.date,
+        })),
+        zoho_raw_error: dbg.status !== 200 ? (typeof dbg.data === 'string' ? dbg.data.slice(0, 300) : JSON.stringify(dbg.data).slice(0, 300)) : null,
+        api_domain: apiDomain,
+        org_id_in_use: process.env.ZOHO_ORG_ID,
+      });
+    }
+
     const zohoId = await resolveInvoiceIdViaZoho(invoiceNumber, accessToken, apiDomain);
     if (!zohoId) {
       // Invoice exists in webhook but not searchable in Zoho — odd, but log & ack.
