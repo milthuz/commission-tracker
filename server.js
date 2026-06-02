@@ -3604,26 +3604,34 @@ app.post('/api/webhooks/zoho-books/invoice', async (req, res) => {
 
     // Debug mode — dump the raw Zoho search response so we can see what's happening
     if (debug) {
-      const dbg = await axios.get(`${apiDomain}/books/v3/invoices`, {
-        params: { organization_id: process.env.ZOHO_ORG_ID, search_text: invoiceNumber, per_page: 50 },
-        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
-        validateStatus: () => true,
-      });
+      // Try 3 different query shapes side-by-side to isolate the issue.
+      const calls = [
+        { label: 'autoSync-style (status=paid)', params: { organization_id: process.env.ZOHO_ORG_ID, status: 'paid', per_page: 5 } },
+        { label: 'search_text',                  params: { organization_id: process.env.ZOHO_ORG_ID, search_text: invoiceNumber, per_page: 50 } },
+        { label: 'invoice_number filter',        params: { organization_id: process.env.ZOHO_ORG_ID, invoice_number: invoiceNumber, per_page: 50 } },
+      ];
+      const results = [];
+      for (const c of calls) {
+        const dbg = await axios.get(`${apiDomain}/books/v3/invoices`, {
+          params: c.params,
+          headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+          validateStatus: () => true,
+        });
+        results.push({
+          label: c.label,
+          http: dbg.status,
+          returned: dbg.data?.invoices?.length || 0,
+          first_few_invoice_numbers: (dbg.data?.invoices || []).slice(0, 3).map(i => i.invoice_number),
+          error_body: dbg.status !== 200 ? (typeof dbg.data === 'string' ? dbg.data.slice(0, 300) : JSON.stringify(dbg.data).slice(0, 300)) : null,
+        });
+      }
       return res.json({
         debug: true,
         searched_for: invoiceNumber,
-        zoho_http_status: dbg.status,
-        zoho_total_returned: dbg.data?.invoices?.length || 0,
-        zoho_invoices_preview: (dbg.data?.invoices || []).slice(0, 5).map(i => ({
-          invoice_id: i.invoice_id,
-          invoice_number: i.invoice_number,
-          customer_name: i.customer_name,
-          status: i.status,
-          date: i.date,
-        })),
-        zoho_raw_error: dbg.status !== 200 ? (typeof dbg.data === 'string' ? dbg.data.slice(0, 300) : JSON.stringify(dbg.data).slice(0, 300)) : null,
         api_domain: apiDomain,
         org_id_in_use: process.env.ZOHO_ORG_ID,
+        access_token_tail: (accessToken || '').slice(-8),
+        results,
       });
     }
 
