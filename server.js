@@ -3433,38 +3433,34 @@ async function getAdminBooksAuth() {
 }
 
 // Look up Zoho's internal invoice_id from our local invoice_number by asking
-// the Zoho Books API directly. Avoids requiring a zoho_invoice_id column on
-// our invoices table.
-// Tries two queries: exact match first, then a 'contains' fallback in case
-// Zoho stored the number with different casing/whitespace.
+// the Zoho Books API directly.
+// Uses `search_text` — the documented general search param — and then picks the
+// row whose invoice_number matches exactly. The previously-used `invoice_number`
+// filter param isn't actually documented and is silently ignored by Zoho, which
+// caused this helper to always return the most-recent invoice regardless of the
+// query (or nothing if the response page didn't contain a match).
 async function resolveInvoiceIdViaZoho(invoiceNumber, accessToken, apiDomain) {
-  const tryQuery = async (params) => {
-    const r = await axios.get(`${apiDomain}/books/v3/invoices`, {
-      params: { organization_id: process.env.ZOHO_ORG_ID, per_page: 25, ...params },
-      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
-      validateStatus: () => true,
-    });
-    if (r.status !== 200) {
-      console.warn(`Zoho invoice search ${JSON.stringify(params)} → HTTP ${r.status}`,
-        typeof r.data === 'string' ? r.data.slice(0, 200) : JSON.stringify(r.data).slice(0, 200));
-      return { id: null, count: 0, httpStatus: r.status };
-    }
-    const invoices = r.data?.invoices || [];
-    // Prefer an exact match on invoice_number if the response has many rows
-    const exact = invoices.find(i => (i.invoice_number || '').trim() === invoiceNumber.trim());
-    return { id: (exact || invoices[0])?.invoice_id || null, count: invoices.length, httpStatus: 200 };
-  };
-
-  // 1. Exact match
-  const exact = await tryQuery({ invoice_number: invoiceNumber });
-  if (exact.id) return exact.id;
-
-  // 2. Fallback: contains (handles casing / whitespace differences)
-  const contains = await tryQuery({ invoice_number_contains: invoiceNumber });
-  if (contains.id) return contains.id;
-
-  console.warn(`Invoice ${invoiceNumber} not found in Zoho — exact: ${exact.count} rows (HTTP ${exact.httpStatus}), contains: ${contains.count} rows (HTTP ${contains.httpStatus})`);
-  return null;
+  const r = await axios.get(`${apiDomain}/books/v3/invoices`, {
+    params: {
+      organization_id: process.env.ZOHO_ORG_ID,
+      search_text: invoiceNumber,
+      per_page: 50,
+    },
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+    validateStatus: () => true,
+  });
+  if (r.status !== 200) {
+    console.warn(`Zoho invoice search for ${invoiceNumber} → HTTP ${r.status}`,
+      typeof r.data === 'string' ? r.data.slice(0, 200) : JSON.stringify(r.data).slice(0, 200));
+    return null;
+  }
+  const invoices = r.data?.invoices || [];
+  const exact = invoices.find(i => (i.invoice_number || '').trim() === invoiceNumber.trim());
+  if (!exact) {
+    console.warn(`Invoice ${invoiceNumber} not found in Zoho — search_text returned ${invoices.length} rows, none matched exactly`);
+    return null;
+  }
+  return exact.invoice_id || null;
 }
 
 // Fetch the rendered PDF bytes from Zoho Books for a given invoice number.
