@@ -2238,12 +2238,24 @@ async function autoSyncInvoices() {
 
     console.log(`✅ [AUTO-SYNC] Successfully synced ${syncedCount} invoices, ${deletedCount} deleted at ${new Date().toISOString()}`);
 
-    // Auto-trigger recalc-v2 after every successful sync. New invoices arrive
-    // with commission_status='calculated' (the default) and need to be bucketed
-    // (hardware/saas_first/etc.) for commissions to show up correctly. Running
-    // recalc here means users never have to remember to trigger it manually.
+    // Auto-pipeline after every successful sync:
+    //   Sync (just did) → Enrich (line items + paid_date + classification) → Recalc (bucket + $)
+    // Without enrich, recalc has no hardware/saas amounts to work with and lands new
+    // invoices in pending_payment instead of the correct bucket. Without recalc, new
+    // invoices stay at commission_status='calculated'. Chaining all three guarantees
+    // commissions stay current with zero manual intervention.
     // Fire-and-forget — don't block the sync result.
-    if (typeof runRecalcV2 === 'function') {
+    if (typeof runEnrichInvoices === 'function' && typeof runRecalcV2 === 'function') {
+      (async () => {
+        try {
+          await runEnrichInvoices({ onlyMissing: true, source: 'post-sync' });
+          await runRecalcV2('post-sync');
+        } catch (e) {
+          console.warn('[AUTO-SYNC] post-sync enrich+recalc failed:', e.message);
+        }
+      })();
+    } else if (typeof runRecalcV2 === 'function') {
+      // Fallback if enrich function isn't available for some reason
       runRecalcV2('post-sync').catch(e => console.warn('[AUTO-SYNC] post-sync recalc failed:', e.message));
     }
   } catch (error) {
@@ -4666,23 +4678,19 @@ async function fetchSubActivation(subscriptionId, apiDomain, accessToken, cache)
 // Query params:
 //   onlyMissing=true (default) — skip invoices already enriched (line_items populated)
 //   onlyMissing=false          — re-enrich everything
-app.post('/api/invoices/enrich/start', authenticateToken, async (req, res) => {
-  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+// Shared enrich routine — runs the background enrichment job. Used by both the
+// HTTP endpoint and the post-sync auto-trigger.
+async function runEnrichInvoices({ onlyMissing = true, source = 'manual' } = {}) {
   if (enrichJob.status === 'running') {
-    return res.status(409).json({ error: 'Already running', startedAt: enrichJob.startedAt });
+    return { skipped: true, reason: 'already_running' };
   }
-  const onlyMissing = req.query.onlyMissing !== 'false'; // default true
   enrichJob = {
     status: 'running', startedAt: new Date().toISOString(),
-    processed: 0, total: 0, message: 'Starting...',
-    onlyMissing,
+    processed: 0, total: 0, message: `Starting (${source})...`,
+    onlyMissing, source,
     stats: { saas: 0, hardware: 0, unknown: 0, eligible: 0, pending_payment: 0, pending_saas: 0, skipped: 0 },
   };
-  res.json({ success: true, message: `Enrichment started (onlyMissing=${onlyMissing}) — poll /api/invoices/enrich/status` });
-
-  // Background worker
-  (async () => {
-    try {
+  try {
       const adminResult = await pool.query(
         'SELECT email, access_token, api_domain FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
       );
@@ -4835,13 +4843,26 @@ app.post('/api/invoices/enrich/start', authenticateToken, async (req, res) => {
       }
 
       enrichJob.status = enrichJob.status === 'stopping' ? 'stopped' : 'completed';
-      enrichJob.message = `Done — ${enrichJob.processed} invoices processed`;
+      enrichJob.message = `Done (${source}) — ${enrichJob.processed} invoices processed`;
+      console.log(`[ENRICH] ${enrichJob.message}`);
+      return enrichJob;
     } catch (error) {
       enrichJob.status = 'error';
       enrichJob.message = error.message;
       console.error('enrich error:', error);
+      return enrichJob;
     }
-  })();
+}
+
+// HTTP endpoint — fire-and-forget wrapper around runEnrichInvoices
+app.post('/api/invoices/enrich/start', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  if (enrichJob.status === 'running') {
+    return res.status(409).json({ error: 'Already running', startedAt: enrichJob.startedAt });
+  }
+  const onlyMissing = req.query.onlyMissing !== 'false'; // default true
+  res.json({ success: true, message: `Enrichment started (onlyMissing=${onlyMissing}) — poll /api/invoices/enrich/status` });
+  runEnrichInvoices({ onlyMissing, source: 'manual' }).catch(e => console.error('enrich bg error:', e));
 });
 
 // GET /api/invoices/enrich/status — poll progress
