@@ -2113,14 +2113,18 @@ async function autoSyncInvoices() {
     // Fetch every status that can affect commissions / show up in the tracker.
     // 'void' is critical: an invoice that was paid then cancelled in Zoho should
     // flip to commission=0 in our DB — without syncing void we'd never see the change.
-    const paidInvoicesRaw    = await fetchAllByStatus('paid');
-    const overdueInvoicesRaw = await fetchAllByStatus('overdue');
-    const voidInvoicesRaw    = await fetchAllByStatus('void');
+    // 'partially_paid' is included so we surface payments-in-progress; recalc-v2
+    // still treats them as 'pending_payment' (commission only fires when fully paid).
+    const paidInvoicesRaw      = await fetchAllByStatus('paid');
+    const overdueInvoicesRaw   = await fetchAllByStatus('overdue');
+    const partialInvoicesRaw   = await fetchAllByStatus('partially_paid');
+    const voidInvoicesRaw      = await fetchAllByStatus('void');
     const paidInvoices    = paidInvoicesRaw.map(inv => ({ ...inv, status: 'paid' }));
     const overdueInvoices = overdueInvoicesRaw.map(inv => ({ ...inv, status: 'overdue' }));
+    const partialInvoices = partialInvoicesRaw.map(inv => ({ ...inv, status: 'partially_paid' }));
     const voidInvoices    = voidInvoicesRaw.map(inv => ({ ...inv, status: 'void' }));
-    console.log(`📊 [AUTO-SYNC] Total: ${paidInvoices.length} paid + ${overdueInvoices.length} overdue + ${voidInvoices.length} void`);
-    const allInvoices = [...paidInvoices, ...overdueInvoices, ...voidInvoices];
+    console.log(`📊 [AUTO-SYNC] Total: ${paidInvoices.length} paid + ${overdueInvoices.length} overdue + ${partialInvoices.length} partial + ${voidInvoices.length} void`);
+    const allInvoices = [...paidInvoices, ...overdueInvoices, ...partialInvoices, ...voidInvoices];
 
     if (allInvoices.length > 0) {
       console.log(`📥 [AUTO-SYNC] Sample paid invoice:`, JSON.stringify(paidInvoices[0], null, 2).slice(0, 500));
@@ -2171,7 +2175,7 @@ async function autoSyncInvoices() {
     const expected = (await pool.query(
       `SELECT COUNT(*)::int AS c FROM invoices
        WHERE organization_id = $1 AND date >= $2::date
-         AND status IN ('paid', 'overdue', 'void')`,
+         AND status IN ('paid', 'overdue', 'partially_paid', 'void')`,
       [process.env.ZOHO_ORG_ID, dateStart]
     )).rows[0]?.c || 0;
     const safe = expected === 0 || liveInvoiceNumbers.length >= Math.floor(expected * 0.5);
@@ -2184,7 +2188,7 @@ async function autoSyncInvoices() {
          SET status = 'deleted', commission = 0, updated_at = CURRENT_TIMESTAMP
          WHERE organization_id = $1
            AND date >= $2::date
-           AND status IN ('paid', 'overdue', 'void')   -- only the ones we'd expect Zoho to return
+           AND status IN ('paid', 'overdue', 'partially_paid', 'void')   -- only the ones we'd expect Zoho to return
            AND invoice_number <> ALL($3::text[])
          RETURNING invoice_number`,
         [process.env.ZOHO_ORG_ID, dateStart, liveInvoiceNumbers]
@@ -2200,7 +2204,7 @@ async function autoSyncInvoices() {
       `INSERT INTO sync_log (invoice_count, status, organization_id, message)
        VALUES ($1, 'success', $2, $3)`,
       [syncedCount, process.env.ZOHO_ORG_ID,
-       `Synced ${paidInvoices.length} paid + ${overdueInvoices.length} overdue + ${voidInvoices.length} void` +
+       `Synced ${paidInvoices.length} paid + ${overdueInvoices.length} overdue + ${partialInvoices.length} partial + ${voidInvoices.length} void` +
        (deletedCount > 0 ? `, marked ${deletedCount} as deleted` : '')]
     );
 
