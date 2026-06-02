@@ -310,6 +310,16 @@ async function initializeDatabase() {
       }
     }
 
+    // Generic key-value sync state table — used to track last delta sync timestamps,
+    // last webhook event seen, etc. Avoids creating one column per piece of state.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS sync_state (
+        key VARCHAR(100) PRIMARY KEY,
+        value TEXT,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
     // Sync log table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS sync_log (
@@ -2217,7 +2227,8 @@ async function autoSyncInvoices() {
 }
 
 // Schedule auto-sync intervals
-const AUTO_SYNC_INTERVAL         = 1 * 60 * 60 * 1000; // 1 hour   — Books invoices
+const AUTO_SYNC_INTERVAL         = 1 * 60 * 60 * 1000; // 1 hour   — Books full reconcile (handles deletions)
+const DELTA_SYNC_INTERVAL        = 5 * 60 * 1000;       // 5 min    — Books delta poll (webhook safety net)
 const ZENTACT_AUTO_SYNC_INTERVAL = 1 * 60 * 60 * 1000; // 1 hour   — Zentact merchants
 const CRM_AUTO_SYNC_INTERVAL     = 1 * 60 * 60 * 1000; // 1 hour   — CRM sold deals
 
@@ -2255,9 +2266,12 @@ async function autoSyncCrm() {
 function startAutoSync() {
   console.log('⏰ [AUTO-SYNC] Starting automatic sync scheduler (Books 4h, Zentact 1h, CRM 1h)');
 
-  // Invoices — run immediately, then every 4 hours
+  // Invoices — full reconcile run immediately, then every hour (handles deletions).
+  // Delta poll runs every 5 min as the webhook safety net.
   autoSyncInvoices();
   syncInterval = setInterval(autoSyncInvoices, AUTO_SYNC_INTERVAL);
+  setTimeout(deltaSyncInvoices, 60 * 1000); // first delta after 1 min
+  setInterval(deltaSyncInvoices, DELTA_SYNC_INTERVAL);
 
   // Zentact — first run after 5 seconds, then every 1 hour
   setTimeout(() => {
@@ -3512,6 +3526,204 @@ app.get('/api/invoices/:invoiceNumber/preview', async (req, res) => {
     return res.status(500).send(`<html><body style="font-family:sans-serif;padding:2rem"><p>Error loading preview: ${e.message}</p></body></html>`);
   }
 });
+
+// ============================================================================
+// REAL-TIME INVOICE SYNC — webhook + 5-min delta poll + 1h full reconcile
+// ============================================================================
+// Architecture:
+//   - Webhook (POST /api/webhooks/zoho-books/invoice): Zoho Books calls us on
+//     every invoice event. We fetch the full invoice and upsert immediately.
+//   - Delta poll (every 5 min): safety net — fetches invoices modified since
+//     the last delta sync. Catches anything the webhook missed.
+//   - Full sync (every 1h): re-fetches everything to handle status changes we
+//     don't get webhooks for + detects deleted invoices (reconciliation).
+// ============================================================================
+
+// Upsert a single invoice row from a Zoho payload — shared between webhook and
+// delta poll so behaviour stays identical.
+async function upsertInvoiceFromZoho(inv) {
+  const salesperson  = inv.salesperson_name || 'Unassigned';
+  const customerName = inv.customer_name || inv.contact_name || null;
+  const total        = parseFloat(inv.total) || 0;
+  const status       = inv.status || 'paid';
+  const commission   = status === 'paid' ? (total * 0.1) : 0;
+  const invDate      = new Date(inv.date || new Date());
+  await pool.query(
+    `INSERT INTO invoices
+       (invoice_number, salesperson_name, customer_name, total, status, date, commission, organization_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     ON CONFLICT (invoice_number) DO UPDATE SET
+       salesperson_name = $2,
+       customer_name    = COALESCE($3, invoices.customer_name),
+       total            = $4,
+       status           = $5,
+       date             = $6,
+       commission       = CASE WHEN $5 = 'paid' THEN $7 ELSE invoices.commission END,
+       updated_at       = CURRENT_TIMESTAMP`,
+    [inv.invoice_number, salesperson, customerName, total, status, invDate, commission, process.env.ZOHO_ORG_ID]
+  );
+}
+
+// POST /api/webhooks/zoho-books/invoice
+// Zoho Books → workflow webhook → us. Configure in Zoho Books:
+//   Settings → Automation → Workflow Rules → Create rule (entity: Invoice,
+//   trigger: Created/Edited/Deleted/Status Change) → Action: Webhook.
+//   URL: https://<our-host>/api/webhooks/zoho-books/invoice?secret=<env>
+//   Body (raw JSON):
+//     {"invoice_number": "${invoice_number}", "event": "updated"}
+// Note: we deliberately re-fetch the full invoice from Zoho rather than trust
+// the webhook body — keeps our logic robust if Zoho changes payload format.
+app.post('/api/webhooks/zoho-books/invoice', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  const expected = process.env.ZOHO_WEBHOOK_SECRET;
+  if (!expected) {
+    return res.status(503).json({ error: 'webhook not configured (ZOHO_WEBHOOK_SECRET unset)' });
+  }
+  if (provided !== expected) {
+    console.warn('🚫 Webhook rejected — bad secret', { providedLen: (provided || '').length });
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+
+  const invoiceNumber = req.body?.invoice_number || req.body?.InvoiceNumber || req.body?.invoiceNumber;
+  const event = (req.body?.event || 'updated').toLowerCase();
+  if (!invoiceNumber) {
+    return res.status(400).json({ error: 'missing invoice_number in payload' });
+  }
+
+  try {
+    if (event === 'deleted' || event === 'delete') {
+      const r = await pool.query(
+        `UPDATE invoices SET status = 'deleted', commission = 0, updated_at = CURRENT_TIMESTAMP
+         WHERE invoice_number = $1 AND organization_id = $2 RETURNING invoice_number`,
+        [invoiceNumber, process.env.ZOHO_ORG_ID]
+      );
+      console.log(`🔔 Webhook: ${invoiceNumber} deleted (${r.rowCount} row affected)`);
+      return res.json({ ok: true, action: 'deleted', invoice: invoiceNumber });
+    }
+
+    // For any other event (created / updated / status_change / payment_made / void),
+    // fetch the full invoice from Zoho Books and upsert.
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    const zohoId = await resolveInvoiceIdViaZoho(invoiceNumber, accessToken, apiDomain);
+    if (!zohoId) {
+      // Invoice exists in webhook but not searchable in Zoho — odd, but log & ack.
+      console.warn(`🔔 Webhook: ${invoiceNumber} not found in Zoho — ignoring`);
+      return res.json({ ok: true, action: 'skipped', reason: 'not_found_in_zoho' });
+    }
+    const r = await axios.get(`${apiDomain}/books/v3/invoices/${zohoId}`, {
+      params: { organization_id: process.env.ZOHO_ORG_ID },
+      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+      validateStatus: () => true,
+    });
+    if (r.status !== 200) {
+      console.warn(`🔔 Webhook fetch ${invoiceNumber} → HTTP ${r.status}`);
+      return res.status(502).json({ error: 'failed to fetch invoice from zoho', zohoStatus: r.status });
+    }
+    await upsertInvoiceFromZoho(r.data.invoice);
+    console.log(`🔔 Webhook: ${invoiceNumber} ${event} → upserted`);
+    return res.json({ ok: true, action: 'upserted', invoice: invoiceNumber });
+  } catch (e) {
+    console.error('Webhook error:', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Delta poll — fetch invoices modified since the last delta sync.
+// We rely on sorting by last_modified_time DESC and walking pages until we hit
+// invoices older than our cutoff. That works regardless of which filter param
+// Zoho's API version exposes for the timestamp.
+async function deltaSyncInvoices() {
+  try {
+    // Read last sync time. Default to now - 10 min on first run so we catch
+    // anything recent without trying to backfill the whole history.
+    const lastRow = (await pool.query(
+      `SELECT value FROM sync_state WHERE key = 'invoices_delta_last_sync'`
+    )).rows[0];
+    const cutoff = lastRow?.value
+      ? new Date(lastRow.value)
+      : new Date(Date.now() - 10 * 60 * 1000);
+
+    const adminResult = await pool.query(
+      'SELECT email, access_token, refresh_token, api_domain, expires_at FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
+    );
+    let admin = adminResult.rows[0];
+    if (!admin) return; // no admin connected → skip silently
+    // Refresh token if expired
+    if (admin.refresh_token && (!admin.expires_at || Date.now() > admin.expires_at - 60_000)) {
+      try {
+        const r = await axios.post(
+          'https://accounts.zoho.com/oauth/v2/token',
+          new URLSearchParams({
+            grant_type: 'refresh_token',
+            client_id: process.env.ZOHO_CLIENT_ID,
+            client_secret: process.env.ZOHO_CLIENT_SECRET,
+            refresh_token: admin.refresh_token,
+          }),
+          { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+        );
+        admin.access_token = r.data.access_token;
+        await pool.query(
+          `UPDATE user_tokens SET access_token = $1, expires_at = $2, updated_at = CURRENT_TIMESTAMP WHERE email = $3`,
+          [admin.access_token, Date.now() + (parseInt(r.data.expires_in) || 3600) * 1000, admin.email]
+        );
+      } catch (e) {
+        console.warn('[DELTA] token refresh failed:', e.message);
+        return;
+      }
+    }
+
+    // Walk pages sorted by last_modified_time DESC; stop as soon as a page
+    // contains an invoice older than the cutoff.
+    let page = 1;
+    let processed = 0;
+    let done = false;
+    const newest = { time: cutoff }; // track newest seen so we can update cutoff
+    while (!done && page < 10) { // hard cap pages to avoid runaway
+      const r = await axios.get(`${admin.api_domain}/books/v3/invoices`, {
+        params: {
+          organization_id: process.env.ZOHO_ORG_ID,
+          per_page: 50,
+          page,
+          sort_column: 'last_modified_time',
+          sort_order: 'D',
+        },
+        headers: { Authorization: `Zoho-oauthtoken ${admin.access_token}` },
+        validateStatus: () => true,
+      });
+      if (r.status !== 200) {
+        console.warn(`[DELTA] page ${page} → HTTP ${r.status}`);
+        break;
+      }
+      const rows = r.data?.invoices || [];
+      for (const inv of rows) {
+        const mt = new Date(inv.last_modified_time || inv.last_modified_date || 0);
+        if (mt > newest.time) newest.time = mt;
+        if (mt <= cutoff) { done = true; break; }
+        // Only sync statuses we care about — skip drafts / sent
+        if (['paid', 'overdue', 'partially_paid', 'void'].includes(inv.status)) {
+          await upsertInvoiceFromZoho(inv);
+          processed++;
+        }
+      }
+      if (rows.length < 50) break; // no more pages
+      if (!r.data?.page_context?.has_more_page) break;
+      page++;
+    }
+
+    // Persist cutoff for next run
+    await pool.query(
+      `INSERT INTO sync_state (key, value, updated_at) VALUES ('invoices_delta_last_sync', $1, CURRENT_TIMESTAMP)
+       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = CURRENT_TIMESTAMP`,
+      [newest.time.toISOString()]
+    );
+
+    if (processed > 0) {
+      console.log(`[DELTA] synced ${processed} modified invoices (cutoff: ${cutoff.toISOString()})`);
+    }
+  } catch (e) {
+    console.error('[DELTA] error:', e.message);
+  }
+}
 
 // POST /api/invoices/:invoiceNumber/email
 // Body: { recipientEmail, subject?, body? }
