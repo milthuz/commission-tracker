@@ -2110,56 +2110,101 @@ async function autoSyncInvoices() {
     }
 
     console.log(`🔗 [AUTO-SYNC] Fetching invoices from ${dateStart}+ paginated...`);
-    const paidInvoicesRaw = await fetchAllByStatus('paid');
+    // Fetch every status that can affect commissions / show up in the tracker.
+    // 'void' is critical: an invoice that was paid then cancelled in Zoho should
+    // flip to commission=0 in our DB — without syncing void we'd never see the change.
+    const paidInvoicesRaw    = await fetchAllByStatus('paid');
     const overdueInvoicesRaw = await fetchAllByStatus('overdue');
-    const paidInvoices = paidInvoicesRaw.map(inv => ({ ...inv, status: 'paid' }));
+    const voidInvoicesRaw    = await fetchAllByStatus('void');
+    const paidInvoices    = paidInvoicesRaw.map(inv => ({ ...inv, status: 'paid' }));
     const overdueInvoices = overdueInvoicesRaw.map(inv => ({ ...inv, status: 'overdue' }));
-    console.log(`📊 [AUTO-SYNC] Total: ${paidInvoices.length} paid + ${overdueInvoices.length} overdue`);
-    const allInvoices = [...paidInvoices, ...overdueInvoices];
+    const voidInvoices    = voidInvoicesRaw.map(inv => ({ ...inv, status: 'void' }));
+    console.log(`📊 [AUTO-SYNC] Total: ${paidInvoices.length} paid + ${overdueInvoices.length} overdue + ${voidInvoices.length} void`);
+    const allInvoices = [...paidInvoices, ...overdueInvoices, ...voidInvoices];
 
     if (allInvoices.length > 0) {
-      console.log(`📥 [AUTO-SYNC] Sample paid invoice:`, JSON.stringify(paidInvoices[0], null, 2));
-      if (overdueInvoices.length > 0) {
-        console.log(`📥 [AUTO-SYNC] Sample overdue invoice:`, JSON.stringify(overdueInvoices[0], null, 2));
-      }
-    } else {
-      console.log(`⚠️ [AUTO-SYNC] No invoices returned. Full paid response:`, JSON.stringify(paidResponse.data, null, 2));
-      console.log(`⚠️ [AUTO-SYNC] Full overdue response:`, JSON.stringify(overdueResponse.data, null, 2));
+      console.log(`📥 [AUTO-SYNC] Sample paid invoice:`, JSON.stringify(paidInvoices[0], null, 2).slice(0, 500));
     }
 
-    console.log(`📥 [AUTO-SYNC] Fetched ${paidInvoices.length} paid + ${overdueInvoices.length} overdue invoices`);
-
-    // Insert/Update invoices in database (both paid and overdue)
+    // Insert/Update invoices in database (paid + overdue + void)
     let syncedCount = 0;
     for (const inv of allInvoices) {
       const salesperson = inv.salesperson_name || 'Unassigned';
       const customerName = inv.customer_name || inv.contact_name || null;
       const total = parseFloat(inv.total) || 0;
-      // Commission only for PAID invoices
+      // Commission only for PAID invoices. void/overdue → 0 (will be properly
+      // recomputed by recalc-v2 anyway, this is just a sane baseline)
       const commission = inv.status === 'paid' ? (total * 0.1) : 0;
       const invDate = new Date(inv.date || new Date());
 
+      // Now UPDATEs salesperson_name and date too — previously a rep
+      // reassignment or a date change in Zoho would not sync back to us.
       await pool.query(
         `INSERT INTO invoices
          (invoice_number, salesperson_name, customer_name, total, status, date, commission, organization_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT (invoice_number) DO UPDATE SET
-         status = $5, total = $4, commission = $7, customer_name = COALESCE($3, invoices.customer_name),
-         updated_at = CURRENT_TIMESTAMP`,
+           salesperson_name = $2,
+           customer_name    = COALESCE($3, invoices.customer_name),
+           total            = $4,
+           status           = $5,
+           date             = $6,
+           commission       = CASE WHEN $5 = 'paid' THEN $7 ELSE invoices.commission END,
+           updated_at       = CURRENT_TIMESTAMP`,
         [inv.invoice_number, salesperson, customerName, total, inv.status, invDate, commission, process.env.ZOHO_ORG_ID]
       );
       syncedCount++;
+    }
+
+    // ------------------------------------------------------------------
+    // Reconcile deletions — anything in our DB with date >= sync_from_date
+    // that Zoho doesn't have any of these statuses for anymore is
+    // assumed deleted (or moved to a status we don't sync, e.g. draft).
+    // Mark them 'deleted' so recalc-v2 / commission queries can exclude
+    // them. We don't physically DELETE the row to preserve history.
+    // ------------------------------------------------------------------
+    const liveInvoiceNumbers = allInvoices.map(i => i.invoice_number).filter(Boolean);
+    let deletedCount = 0;
+    // Safety: count how many invoices we *expect* to have for this period.
+    // If Zoho returned <50% of that, something is wrong (rate limit, partial
+    // failure, etc.) — skip reconciliation rather than nuke real data.
+    const expected = (await pool.query(
+      `SELECT COUNT(*)::int AS c FROM invoices
+       WHERE organization_id = $1 AND date >= $2::date
+         AND status IN ('paid', 'overdue', 'void')`,
+      [process.env.ZOHO_ORG_ID, dateStart]
+    )).rows[0]?.c || 0;
+    const safe = expected === 0 || liveInvoiceNumbers.length >= Math.floor(expected * 0.5);
+    if (!safe) {
+      console.warn(`⚠️ [AUTO-SYNC] Skipping deletion reconcile — Zoho returned ${liveInvoiceNumbers.length} but DB has ${expected}. Possible partial fetch.`);
+    }
+    if (safe && liveInvoiceNumbers.length > 0) {
+      const deletedRes = await pool.query(
+        `UPDATE invoices
+         SET status = 'deleted', commission = 0, updated_at = CURRENT_TIMESTAMP
+         WHERE organization_id = $1
+           AND date >= $2::date
+           AND status IN ('paid', 'overdue', 'void')   -- only the ones we'd expect Zoho to return
+           AND invoice_number <> ALL($3::text[])
+         RETURNING invoice_number`,
+        [process.env.ZOHO_ORG_ID, dateStart, liveInvoiceNumbers]
+      );
+      deletedCount = deletedRes.rowCount || 0;
+      if (deletedCount > 0) {
+        console.log(`🗑️  [AUTO-SYNC] Marked ${deletedCount} invoices as deleted (no longer in Zoho)`);
+      }
     }
 
     // Log the sync
     await pool.query(
       `INSERT INTO sync_log (invoice_count, status, organization_id, message)
        VALUES ($1, 'success', $2, $3)`,
-      [syncedCount, process.env.ZOHO_ORG_ID, `Synced ${paidInvoices.length} paid + ${overdueInvoices.length} overdue`]
+      [syncedCount, process.env.ZOHO_ORG_ID,
+       `Synced ${paidInvoices.length} paid + ${overdueInvoices.length} overdue + ${voidInvoices.length} void` +
+       (deletedCount > 0 ? `, marked ${deletedCount} as deleted` : '')]
     );
 
-    console.log(`✅ [AUTO-SYNC] Successfully synced ${syncedCount} invoices at ${new Date().toISOString()}`);
-    console.log(`💰 [AUTO-SYNC] Commission calculated ONLY on paid invoices`);
+    console.log(`✅ [AUTO-SYNC] Successfully synced ${syncedCount} invoices, ${deletedCount} deleted at ${new Date().toISOString()}`);
   } catch (error) {
     console.error(`❌ [AUTO-SYNC] Sync failed: ${error.message}`);
   } finally {
@@ -2168,7 +2213,7 @@ async function autoSyncInvoices() {
 }
 
 // Schedule auto-sync intervals
-const AUTO_SYNC_INTERVAL         = 4 * 60 * 60 * 1000; // 4 hours  — Books invoices
+const AUTO_SYNC_INTERVAL         = 1 * 60 * 60 * 1000; // 1 hour   — Books invoices
 const ZENTACT_AUTO_SYNC_INTERVAL = 1 * 60 * 60 * 1000; // 1 hour   — Zentact merchants
 const CRM_AUTO_SYNC_INTERVAL     = 1 * 60 * 60 * 1000; // 1 hour   — CRM sold deals
 
@@ -5338,7 +5383,11 @@ app.post('/api/commissions/recalc-v2/start', authenticateToken, async (req, res)
         //                   before the SaaS, the unlock still has to wait for SaaS to be paid.
         let payableDate = null;
 
-        if (inv.status !== 'paid' || !invPaidDate) {
+        // Voided/deleted invoices: never eligible. Catch this BEFORE the
+        // generic 'pending_payment' branch so we don't mislabel them.
+        if (inv.status === 'void' || inv.status === 'deleted') {
+          bucket = 'not_eligible';
+        } else if (inv.status !== 'paid' || !invPaidDate) {
           bucket = 'pending_payment';
         } else if (saasAmount > 0 && hardwareAmount === 0) {
           // Pure SaaS — first month gets 100%, renewals get 0
