@@ -320,6 +320,24 @@ async function initializeDatabase() {
       );
     `);
 
+    // Webhook activity log — every call to our webhook endpoints lands a row here
+    // so we can audit/debug who fired what without needing Heroku log access.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS webhook_log (
+        id SERIAL PRIMARY KEY,
+        received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        endpoint VARCHAR(200),
+        invoice_number VARCHAR(100),
+        event VARCHAR(50),
+        action VARCHAR(50),
+        result VARCHAR(50),
+        user_agent TEXT,
+        source_ip VARCHAR(64),
+        body JSONB
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_webhook_log_received_at ON webhook_log(received_at DESC)`);
+
     // Sync log table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS sync_log (
@@ -3572,10 +3590,31 @@ async function upsertInvoiceFromZoho(inv) {
 app.post('/api/webhooks/zoho-books/invoice', async (req, res) => {
   const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
   const expected = process.env.ZOHO_WEBHOOK_SECRET;
+  // Log every call (even rejected ones) — gives us a trail of who fired what,
+  // including the User-Agent and source IP so we can tell Zoho's calls apart
+  // from curl/manual tests.
+  const userAgent = String(req.headers['user-agent'] || '').slice(0, 500);
+  const sourceIp  = String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim().slice(0, 64);
+  const logAttempt = async (action, result) => {
+    try {
+      await pool.query(
+        `INSERT INTO webhook_log (endpoint, invoice_number, event, action, result, user_agent, source_ip, body)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
+        ['/api/webhooks/zoho-books/invoice',
+          req.body?.invoice_number || req.body?.InvoiceNumber || req.body?.invoiceNumber || null,
+          req.body?.event || null,
+          action, result, userAgent, sourceIp,
+          JSON.stringify(req.body || {})]
+      );
+    } catch (_e) { /* don't fail the request just because logging failed */ }
+  };
+
   if (!expected) {
+    await logAttempt(null, 'not_configured');
     return res.status(503).json({ error: 'webhook not configured (ZOHO_WEBHOOK_SECRET unset)' });
   }
   if (provided !== expected) {
+    await logAttempt(null, 'bad_secret');
     console.warn('🚫 Webhook rejected — bad secret', { providedLen: (provided || '').length });
     return res.status(401).json({ error: 'invalid secret' });
   }
@@ -3584,6 +3623,7 @@ app.post('/api/webhooks/zoho-books/invoice', async (req, res) => {
   const event = (req.body?.event || 'updated').toLowerCase();
   const debug = req.query.debug === '1';
   if (!invoiceNumber) {
+    await logAttempt(event, 'missing_invoice_number');
     return res.status(400).json({ error: 'missing invoice_number in payload' });
   }
 
@@ -3595,6 +3635,7 @@ app.post('/api/webhooks/zoho-books/invoice', async (req, res) => {
         [invoiceNumber, process.env.ZOHO_ORG_ID]
       );
       console.log(`🔔 Webhook: ${invoiceNumber} deleted (${r.rowCount} row affected)`);
+      await logAttempt(event, 'deleted');
       return res.json({ ok: true, action: 'deleted', invoice: invoiceNumber });
     }
 
@@ -3639,6 +3680,7 @@ app.post('/api/webhooks/zoho-books/invoice', async (req, res) => {
     if (!zohoId) {
       // Invoice exists in webhook but not searchable in Zoho — odd, but log & ack.
       console.warn(`🔔 Webhook: ${invoiceNumber} not found in Zoho — ignoring`);
+      await logAttempt(event, 'skipped_not_found');
       return res.json({ ok: true, action: 'skipped', reason: 'not_found_in_zoho' });
     }
     const r = await axios.get(`${apiDomain}/books/v3/invoices/${zohoId}`, {
@@ -3652,9 +3694,40 @@ app.post('/api/webhooks/zoho-books/invoice', async (req, res) => {
     }
     await upsertInvoiceFromZoho(r.data.invoice);
     console.log(`🔔 Webhook: ${invoiceNumber} ${event} → upserted`);
+    await logAttempt(event, 'upserted');
     return res.json({ ok: true, action: 'upserted', invoice: invoiceNumber });
   } catch (e) {
     console.error('Webhook error:', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/webhooks/log?secret=<shared>&invoice=<optional>&limit=<optional>
+// Returns the last N rows of webhook_log so we can audit incoming calls without
+// needing Heroku log access. Gated by the same shared secret as the webhook.
+app.get('/api/webhooks/log', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const limit = Math.min(parseInt(req.query.limit) || 50, 500);
+  const invoice = (req.query.invoice || '').trim() || null;
+  try {
+    const rows = invoice
+      ? (await pool.query(
+          `SELECT id, received_at, invoice_number, event, action, result, user_agent, source_ip
+           FROM webhook_log WHERE invoice_number = $1
+           ORDER BY received_at DESC LIMIT $2`,
+          [invoice, limit]
+        )).rows
+      : (await pool.query(
+          `SELECT id, received_at, invoice_number, event, action, result, user_agent, source_ip
+           FROM webhook_log
+           ORDER BY received_at DESC LIMIT $1`,
+          [limit]
+        )).rows;
+    return res.json({ count: rows.length, rows });
+  } catch (e) {
     return res.status(500).json({ error: e.message });
   }
 });
