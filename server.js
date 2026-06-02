@@ -3702,6 +3702,69 @@ app.post('/api/webhooks/zoho-books/invoice', async (req, res) => {
   }
 });
 
+// GET /api/admin/db-stats?secret=<shared>
+// Returns row counts per table + invoice breakdown by status. Gated by the
+// same shared secret as the webhook so we don't need a JWT to query it.
+app.get('/api/admin/db-stats', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const counts = {};
+    const tables = [
+      'invoices', 'salespeople', 'crm_sold_deals', 'zentact_merchants',
+      'zoho_plans', 'user_tokens', 'roles', 'user_roles', 'releases',
+      'sync_log', 'webhook_log', 'sync_state',
+    ];
+    for (const t of tables) {
+      try {
+        const r = await pool.query(`SELECT COUNT(*)::int AS c FROM ${t}`);
+        counts[t] = r.rows[0].c;
+      } catch { counts[t] = 'n/a'; }
+    }
+
+    // Invoice breakdown
+    const byStatus = (await pool.query(
+      `SELECT status, COUNT(*)::int AS count, COALESCE(SUM(total), 0)::float AS total_revenue,
+              COALESCE(SUM(commission), 0)::float AS total_commission
+       FROM invoices GROUP BY status ORDER BY count DESC`
+    )).rows;
+
+    const byCommissionStatus = (await pool.query(
+      `SELECT COALESCE(commission_status, 'unknown') AS commission_status, COUNT(*)::int AS count
+       FROM invoices GROUP BY commission_status ORDER BY count DESC`
+    )).rows;
+
+    const dateRange = (await pool.query(
+      `SELECT MIN(date)::date AS oldest, MAX(date)::date AS newest FROM invoices`
+    )).rows[0];
+
+    const lastSync = (await pool.query(
+      `SELECT synced_at, invoice_count, status, message FROM sync_log
+       ORDER BY synced_at DESC LIMIT 1`
+    )).rows[0] || null;
+
+    const lastWebhook = (await pool.query(
+      `SELECT received_at, invoice_number, event, result, user_agent FROM webhook_log
+       WHERE user_agent LIKE 'ZohoBooks%' OR user_agent LIKE 'Zoho%'
+       ORDER BY received_at DESC LIMIT 1`
+    )).rows[0] || null;
+
+    res.json({
+      generated_at: new Date().toISOString(),
+      row_counts: counts,
+      invoices_by_status: byStatus,
+      invoices_by_commission_status: byCommissionStatus,
+      invoice_date_range: dateRange,
+      last_sync_log: lastSync,
+      last_zoho_webhook: lastWebhook,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/webhooks/log?secret=<shared>&invoice=<optional>&limit=<optional>
 // Returns the last N rows of webhook_log so we can audit incoming calls without
 // needing Heroku log access. Gated by the same shared secret as the webhook.
