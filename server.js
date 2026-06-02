@@ -654,14 +654,27 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
     const isAdmin = row.is_admin != null ? row.is_admin : (req.user.isAdmin || false);
     const permissions = isAdmin ? ['*'] : [...permSet];
 
+    // Is the current user actually an active salesperson? (used by Commission Report
+    // to decide whether to show 'My Report' option — admins who aren't reps shouldn't see it)
+    const displayName = row.display_name || req.user.name || req.user.email;
+    let isSalesperson = false;
+    try {
+      const sp = await pool.query(
+        'SELECT 1 FROM salespeople WHERE LOWER(name) = LOWER($1) AND is_active = true LIMIT 1',
+        [displayName]
+      );
+      isSalesperson = sp.rows.length > 0;
+    } catch { /* ignore — default false */ }
+
     res.json({
       valid: true,
       user: {
         email:   req.user.email,
-        name:    row.display_name || req.user.name || req.user.email,
+        name:    displayName,
         photo:   row.photo || req.user.photo || null,
         zoho_id: req.user.zoho_id || req.user.email,
         isAdmin,
+        isSalesperson,
         permissions,
         impersonating:   req.user.impersonating || false,
         realAdminEmail:  req.user.realAdminEmail || null,
