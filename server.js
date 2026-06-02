@@ -2237,6 +2237,15 @@ async function autoSyncInvoices() {
     );
 
     console.log(`✅ [AUTO-SYNC] Successfully synced ${syncedCount} invoices, ${deletedCount} deleted at ${new Date().toISOString()}`);
+
+    // Auto-trigger recalc-v2 after every successful sync. New invoices arrive
+    // with commission_status='calculated' (the default) and need to be bucketed
+    // (hardware/saas_first/etc.) for commissions to show up correctly. Running
+    // recalc here means users never have to remember to trigger it manually.
+    // Fire-and-forget — don't block the sync result.
+    if (typeof runRecalcV2 === 'function') {
+      runRecalcV2('post-sync').catch(e => console.warn('[AUTO-SYNC] post-sync recalc failed:', e.message));
+    }
   } catch (error) {
     console.error(`❌ [AUTO-SYNC] Sync failed: ${error.message}`);
   } finally {
@@ -5684,20 +5693,21 @@ let recalcV2Job = {
   stats: { hardware: 0, saas_first: 0, saas_renewal: 0, not_eligible: 0, total_commission: 0 },
 };
 
-app.post('/api/commissions/recalc-v2/start', authenticateToken, async (req, res) => {
-  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+// Shared recalc routine — used both by the HTTP endpoint and by post-sync auto-trigger.
+// Returns the final recalcV2Job state. Caller decides whether to await or fire-and-forget.
+async function runRecalcV2(source = 'manual') {
   if (recalcV2Job.status === 'running') {
-    return res.status(409).json({ error: 'Already running' });
+    return { skipped: true, reason: 'already_running' };
   }
   recalcV2Job = {
-    status: 'running', startedAt: new Date().toISOString(),
-    processed: 0, total: 0, message: 'Starting...',
+    status: 'running',
+    startedAt: new Date().toISOString(),
+    source,
+    processed: 0, total: 0,
+    message: `Starting (${source})...`,
     stats: { hardware: 0, saas_first: 0, saas_renewal: 0, too_late: 0, pending_saas: 0, pending_payment: 0, not_eligible: 0, total_commission: 0 },
   };
-  res.json({ success: true, message: 'Recalc v2 started — poll /api/commissions/recalc-v2/status' });
-
-  (async () => {
-    try {
+  try {
       // Load rep rates
       const spRes = await pool.query('SELECT name, commission_rate FROM salespeople');
       const rateMap = {};
@@ -5845,13 +5855,26 @@ app.post('/api/commissions/recalc-v2/start', authenticateToken, async (req, res)
 
       recalcV2Job.status  = recalcV2Job.status === 'stopping' ? 'stopped' : 'completed';
       recalcV2Job.stats.total_commission = Math.round(recalcV2Job.stats.total_commission * 100) / 100;
-      recalcV2Job.message = `Done — total commissions: $${recalcV2Job.stats.total_commission.toLocaleString()}`;
+      recalcV2Job.message = `Done (${source}) — total commissions: $${recalcV2Job.stats.total_commission.toLocaleString()}`;
+      console.log(`[RECALC] ${recalcV2Job.message} (processed ${recalcV2Job.processed})`);
+      return recalcV2Job;
     } catch (error) {
       recalcV2Job.status  = 'error';
       recalcV2Job.message = error.message;
       console.error('recalc-v2 error:', error);
+      return recalcV2Job;
     }
-  })();
+}
+
+// HTTP endpoint — fire-and-forget wrapper around runRecalcV2
+app.post('/api/commissions/recalc-v2/start', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  if (recalcV2Job.status === 'running') {
+    return res.status(409).json({ error: 'Already running' });
+  }
+  res.json({ success: true, message: 'Recalc v2 started — poll /api/commissions/recalc-v2/status' });
+  // Don't await — run in background
+  runRecalcV2('manual').catch(e => console.error('recalc bg error:', e));
 });
 
 app.get('/api/commissions/recalc-v2/status', authenticateToken, (req, res) => {
