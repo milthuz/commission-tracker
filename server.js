@@ -2278,12 +2278,20 @@ async function autoSyncInvoices() {
 
     console.log(`✅ [AUTO-SYNC] Successfully synced ${syncedCount} invoices, ${deletedCount} deleted at ${new Date().toISOString()}`);
 
-    // NOTE: previously we chained sync → enrich → recalc here, but enrich is
-    // an expensive job (1 Zoho API call per invoice, can be 1000+) and recalc
-    // loads the full invoice set into memory. Running all three in series on
-    // every sync was OOM-ing the dyno. They're scheduled separately now
-    // (recalc on its own 6h timer) or triggered manually (enrich, from the
-    // Admin Panel) — see the scheduler setup below.
+    // Auto-pipeline: sync → enrich-missing → recalc-v2
+    // This runs ONLY in the worker dyno (Procfile: ROLE=worker), so even if it
+    // OOMs, the web dyno keeps serving HTTP. Each step has a 'already running'
+    // guard so overlap is safe.
+    if (typeof runEnrichInvoices === 'function' && typeof runRecalcV2 === 'function') {
+      (async () => {
+        try {
+          await runEnrichInvoices({ onlyMissing: true, source: 'post-sync' });
+          await runRecalcV2('post-sync');
+        } catch (e) {
+          console.warn('[AUTO-SYNC] post-sync enrich+recalc failed:', e.message);
+        }
+      })();
+    }
   } catch (error) {
     console.error(`❌ [AUTO-SYNC] Sync failed: ${error.message}`);
   } finally {
@@ -6670,25 +6678,40 @@ app.get('/api/debug/photo', authenticateToken, async (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, () => {
-  console.log(`✅ Commission Tracker API running on http://localhost:${PORT}`);
-  console.log(`📚 Zoho Books Organization ID: ${process.env.ZOHO_ORG_ID}`);
-  console.log(`🔐 Frontend redirect: ${process.env.FRONTEND_URL}`);
-  console.log(`🗄️  Database connected: ${process.env.DATABASE_URL ? 'Yes' : 'No'}`);
+// ROLE-based startup so a single codebase can boot as either:
+//   - 'web'    (default): serves HTTP, no scheduled jobs
+//   - 'worker':           runs the periodic sync/recalc/enrich jobs only, no HTTP
+//   - 'all':              both (legacy single-process mode — useful for local dev)
+// Procfile: `web: ROLE=web node server.js` and `worker: ROLE=worker node server.js`
+const ROLE = (process.env.ROLE || 'all').toLowerCase();
 
-  // Wait for DB to be ready before starting auto-sync (up to 30 seconds)
-  const waitForDb = (attempts = 0) => {
-    if (dbReady) {
-      startAutoSync();
-    } else if (attempts < 30) {
-      setTimeout(() => waitForDb(attempts + 1), 1000);
-    } else {
-      console.warn('⚠️ DB not ready after 30s, starting sync anyway');
-      startAutoSync();
-    }
-  };
-  waitForDb();
-});
+// Wait for the DB schema migrations to finish, then run the given callback.
+const waitForDb = (onReady, attempts = 0) => {
+  if (dbReady) onReady();
+  else if (attempts < 30) setTimeout(() => waitForDb(onReady, attempts + 1), 1000);
+  else { console.warn('⚠️ DB not ready after 30s, proceeding anyway'); onReady(); }
+};
+
+if (ROLE === 'web' || ROLE === 'all') {
+  app.listen(PORT, () => {
+    console.log(`✅ Commission Tracker API running on http://localhost:${PORT} [role=${ROLE}]`);
+    console.log(`📚 Zoho Books Organization ID: ${process.env.ZOHO_ORG_ID}`);
+    console.log(`🔐 Frontend redirect: ${process.env.FRONTEND_URL}`);
+    console.log(`🗄️  Database connected: ${process.env.DATABASE_URL ? 'Yes' : 'No'}`);
+    // In 'all' mode the web process also runs scheduled jobs (legacy behaviour).
+    if (ROLE === 'all') waitForDb(startAutoSync);
+  });
+}
+
+if (ROLE === 'worker') {
+  // Worker has no HTTP listener — just the scheduled jobs. Wait for the
+  // schema migrations to finish (they run in initializeDatabase() at module
+  // load) before kicking off the first sync.
+  console.log(`🛠  Worker process starting [role=worker]`);
+  console.log(`📚 Zoho Books Organization ID: ${process.env.ZOHO_ORG_ID}`);
+  console.log(`🗄️  Database connected: ${process.env.DATABASE_URL ? 'Yes' : 'No'}`);
+  waitForDb(startAutoSync);
+}
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
