@@ -11,6 +11,8 @@ const axios = require('axios');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bodyParser = require('body-parser');
+const multer = require('multer');
+const xlsx = require('xlsx');
 const { Pool } = require('pg');
 const { ZohoCRMService, MONTHLY_QUOTA, MONTHLY_BONUS_TIERS, ANNUAL_BONUS_TIERS, PLAN_START_DATE } = require('./services/zohoCRMService');
 const { ZentactService } = require('./services/zentactService');
@@ -319,6 +321,44 @@ async function initializeDatabase() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
+
+    // Commission payment imports — each .xlsx import lands a summary row here,
+    // with related signup/monthly bonuses going into commission_bonuses (FK link).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS commission_payment_imports (
+        id SERIAL PRIMARY KEY,
+        filename VARCHAR(500) NOT NULL,
+        rep_name VARCHAR(255) NOT NULL,
+        paid_for_period DATE NOT NULL,
+        imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        imported_by VARCHAR(255),
+        invoices_marked INT DEFAULT 0,
+        invoices_skipped INT DEFAULT 0,
+        invoices_not_found INT DEFAULT 0,
+        signup_bonuses_count INT DEFAULT 0,
+        signup_bonuses_amount NUMERIC(12,2) DEFAULT 0,
+        monthly_bonus_amount NUMERIC(12,2) DEFAULT 0,
+        total_amount NUMERIC(12,2) DEFAULT 0,
+        raw_summary JSONB
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_cp_imports_period ON commission_payment_imports(paid_for_period DESC, rep_name)`);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS commission_bonuses (
+        id SERIAL PRIMARY KEY,
+        import_id INT REFERENCES commission_payment_imports(id) ON DELETE CASCADE,
+        rep_name VARCHAR(255) NOT NULL,
+        bonus_type VARCHAR(50) NOT NULL,
+        merchant_name VARCHAR(255),
+        matched_zentact_id VARCHAR(255),
+        amount NUMERIC(12,2) NOT NULL,
+        paid_for_period DATE,
+        report_date DATE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_cbonus_period ON commission_bonuses(paid_for_period DESC, rep_name)`);
 
     // Webhook activity log — every call to our webhook endpoints lands a row here
     // so we can audit/debug who fired what without needing Heroku log access.
@@ -3781,6 +3821,276 @@ app.get('/api/admin/db-stats', async (req, res) => {
       last_sync_log: lastSync,
       last_zoho_webhook: lastWebhook,
     });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================================
+// COMMISSION REPORT IMPORT — parse an Excel pay-report and mark invoices
+// as approval_status='paid' + record signup/monthly bonuses.
+// ============================================================================
+// File naming convention: Eligible_Invoices_for_Commission_<MonthAbbr>_<YY>_<RepFirstName>.xlsx
+//   e.g. Eligible_Invoices_for_Commission_Jan_26_Amy.xlsx
+// Structure (single sheet, no fixed row positions — we scan):
+//   - Header row contains "Invoice Number" and "Commissions Amount" cell labels
+//   - Data rows: rows where col[4] starts with "INV-"
+//   - "Payment :" marker indicates the start of the bonus section
+//   - Signup commission rows: col[6] === "Signup commission", merchant in col[8], amount in col[13]
+//   - Monthly bonus row: col[6] matches "<MONTH> BONUS", amount in col[13]
+// ============================================================================
+
+const MONTH_ABBR_TO_NUM = { jan:1, feb:2, mar:3, apr:4, may:5, jun:6, jul:7, aug:8, sep:9, oct:10, nov:11, dec:12 };
+
+// Parse the filename to extract month/year + rep first name.
+function parseImportFilename(filename) {
+  const m = filename.match(/_(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)_(\d{2})_(.+?)\.xlsx$/i);
+  if (!m) return null;
+  const month = MONTH_ABBR_TO_NUM[m[1].toLowerCase()];
+  const year = 2000 + parseInt(m[2], 10);
+  const repFirstName = m[3].replace(/_/g, ' ').trim();
+  return { month, year, repFirstName, periodDate: `${year}-${String(month).padStart(2, '0')}-01` };
+}
+
+// Read the workbook and return a structured payload — invoices, signup bonuses, monthly bonus.
+function parseCommissionReportXlsx(buffer) {
+  const wb = xlsx.read(buffer, { type: 'buffer', cellDates: true });
+  const sheetName = wb.SheetNames[0];
+  const sheet = wb.Sheets[sheetName];
+  const rows = xlsx.utils.sheet_to_json(sheet, { header: 1, blankrows: false, defval: null });
+
+  // Find header row (contains "Invoice Number" cell)
+  let headerIdx = rows.findIndex(r => r.some(c => typeof c === 'string' && c.trim() === 'Invoice Number'));
+  if (headerIdx < 0) throw new Error('Header row with "Invoice Number" not found');
+  const header = rows[headerIdx].map(c => (c == null ? '' : String(c).trim()));
+  const col = (name) => header.indexOf(name);
+
+  const idxInvoiceNumber = col('Invoice Number');
+  const idxRep           = col('Sales Person Name');
+  const idxCustomer      = col('Customer Name');
+  const idxCommission    = col('Commissions Amount');
+  const idxPaymentDate   = col('Payment Date');
+  const idxLeadSource    = col('Lead Source');
+
+  const invoices = [];
+  let i = headerIdx + 1;
+  // Eat data rows until we hit a fully-blank row (signals end of invoice block)
+  for (; i < rows.length; i++) {
+    const r = rows[i];
+    const inv = r[idxInvoiceNumber];
+    if (inv && typeof inv === 'string' && inv.startsWith('INV-')) {
+      const commission = parseFloat(r[idxCommission]) || 0;
+      invoices.push({
+        invoice_number: inv.trim(),
+        rep: r[idxRep] ? String(r[idxRep]).trim() : null,
+        customer: r[idxCustomer] ? String(r[idxCustomer]).trim() : null,
+        commission,
+        payment_date: r[idxPaymentDate] || null,
+      });
+    }
+  }
+
+  // Now scan everything below for bonus rows. The "Lead Source" column is what
+  // tags bonus types ("Signup commission" or "<MONTH> BONUS").
+  const signupBonuses = [];
+  let monthlyBonus = 0;
+  for (i = headerIdx + 1; i < rows.length; i++) {
+    const r = rows[i];
+    const tag = r[idxLeadSource] ? String(r[idxLeadSource]).trim() : '';
+    const amount = parseFloat(r[idxCommission]) || 0;
+    if (/^Signup commission$/i.test(tag) && amount > 0) {
+      signupBonuses.push({
+        merchant: r[idxCustomer] ? String(r[idxCustomer]).trim() : null,
+        amount,
+        date: r[0] || null,
+      });
+    } else if (/BONUS$/i.test(tag) && amount > 0) {
+      monthlyBonus += amount;
+    }
+  }
+
+  return { invoices, signupBonuses, monthlyBonus };
+}
+
+// Fuzzy match a merchant name against zentact_merchants — case-insensitive, ignores spaces/hyphens.
+async function findZentactMerchantId(name) {
+  if (!name) return null;
+  const norm = name.toLowerCase().replace(/[\s\-_'.,&]+/g, '');
+  const all = await pool.query(`SELECT merchant_account_id, restaurant_name FROM zentact_merchants WHERE restaurant_name IS NOT NULL`);
+  for (const row of all.rows) {
+    const candidate = (row.restaurant_name || '').toLowerCase().replace(/[\s\-_'.,&]+/g, '');
+    if (candidate === norm) return row.merchant_account_id;
+    if (candidate.includes(norm) || norm.includes(candidate)) return row.merchant_account_id;
+  }
+  return null;
+}
+
+// In-memory upload (small files, fine in RAM)
+const uploadXlsx = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB max
+});
+
+// POST /api/admin/commission-import/preview
+// Returns what WOULD happen if we committed — no DB changes.
+// POST /api/admin/commission-import/commit
+// Same parsing, but applies changes (transactional).
+async function importCommissionReport(req, res, { commit }) {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const file = req.file;
+  if (!file) return res.status(400).json({ error: 'No file uploaded (multipart field "file" expected)' });
+
+  const meta = parseImportFilename(file.originalname);
+  if (!meta) {
+    return res.status(400).json({
+      error: 'Filename does not match expected pattern',
+      expected: 'Eligible_Invoices_for_Commission_<Mon>_<YY>_<RepFirstName>.xlsx',
+    });
+  }
+
+  let parsed;
+  try {
+    parsed = parseCommissionReportXlsx(file.buffer);
+  } catch (e) {
+    return res.status(400).json({ error: 'Failed to parse spreadsheet', details: e.message });
+  }
+
+  // Use the full rep name from the data rows when available (so we get "Amy Spicer"
+  // instead of just "Amy" from the filename).
+  const repFullName = parsed.invoices.find(i => i.rep)?.rep || meta.repFirstName;
+
+  // For each invoice with commission > 0, check whether it exists in our DB and is markable.
+  const eligibleInvoices = parsed.invoices.filter(i => i.commission > 0);
+  const skipped = parsed.invoices.filter(i => i.commission === 0).map(i => i.invoice_number);
+  const matched = [];
+  const notFound = [];
+  for (const inv of eligibleInvoices) {
+    const row = (await pool.query(
+      `SELECT invoice_number, salesperson_name, total, status, approval_status
+       FROM invoices WHERE invoice_number = $1 LIMIT 1`,
+      [inv.invoice_number]
+    )).rows[0];
+    if (!row) {
+      notFound.push(inv.invoice_number);
+    } else {
+      matched.push({ ...inv, current_status: row.status, current_approval: row.approval_status });
+    }
+  }
+
+  // Match each signup bonus to a Zentact merchant
+  const bonusesWithMatch = [];
+  for (const b of parsed.signupBonuses) {
+    const zid = await findZentactMerchantId(b.merchant);
+    bonusesWithMatch.push({ ...b, matched_zentact_id: zid });
+  }
+
+  const summary = {
+    filename:               file.originalname,
+    rep_name:               repFullName,
+    paid_for_period:        meta.periodDate,
+    invoices_to_mark:       matched.length,
+    invoices_skipped_zero:  skipped.length,
+    invoices_not_found:     notFound.length,
+    signup_bonuses_count:   bonusesWithMatch.length,
+    signup_bonuses_amount:  bonusesWithMatch.reduce((s, b) => s + b.amount, 0),
+    monthly_bonus_amount:   parsed.monthlyBonus,
+    total_to_pay:           matched.reduce((s, i) => s + i.commission, 0)
+                            + bonusesWithMatch.reduce((s, b) => s + b.amount, 0)
+                            + parsed.monthlyBonus,
+  };
+
+  if (!commit) {
+    return res.json({
+      preview: true,
+      summary,
+      matched,
+      skipped_zero: skipped,
+      not_found: notFound,
+      bonuses: bonusesWithMatch,
+    });
+  }
+
+  // Commit — wrap in transaction
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+
+    // 1. Insert the import summary
+    const importRow = (await client.query(
+      `INSERT INTO commission_payment_imports
+         (filename, rep_name, paid_for_period, imported_by,
+          invoices_marked, invoices_skipped, invoices_not_found,
+          signup_bonuses_count, signup_bonuses_amount, monthly_bonus_amount,
+          total_amount, raw_summary)
+       VALUES ($1, $2, $3::date, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)
+       RETURNING id`,
+      [file.originalname, repFullName, meta.periodDate, actor,
+       summary.invoices_to_mark, summary.invoices_skipped_zero, summary.invoices_not_found,
+       summary.signup_bonuses_count, summary.signup_bonuses_amount, summary.monthly_bonus_amount,
+       summary.total_to_pay, JSON.stringify(summary)]
+    )).rows[0];
+
+    // 2. Mark each invoice as paid
+    for (const inv of matched) {
+      await client.query(
+        `UPDATE invoices SET
+           approval_status = 'paid',
+           commission_paid = true,
+           approved_by    = COALESCE(approved_by, $2),
+           approved_at    = COALESCE(approved_at, $3::date),
+           payout_paid_by = COALESCE(payout_paid_by, $4),
+           payout_paid_at = $3::date,
+           updated_at     = CURRENT_TIMESTAMP
+         WHERE invoice_number = $1`,
+        [inv.invoice_number, actor, meta.periodDate, `import:${file.originalname}`]
+      );
+    }
+
+    // 3. Insert signup bonuses
+    for (const b of bonusesWithMatch) {
+      await client.query(
+        `INSERT INTO commission_bonuses
+           (import_id, rep_name, bonus_type, merchant_name, matched_zentact_id, amount, paid_for_period, report_date)
+         VALUES ($1, $2, 'signup', $3, $4, $5, $6::date, $7::date)`,
+        [importRow.id, repFullName, b.merchant, b.matched_zentact_id, b.amount, meta.periodDate, b.date || null]
+      );
+    }
+
+    // 4. Insert monthly bonus if any
+    if (parsed.monthlyBonus > 0) {
+      await client.query(
+        `INSERT INTO commission_bonuses
+           (import_id, rep_name, bonus_type, amount, paid_for_period)
+         VALUES ($1, $2, 'monthly', $3, $4::date)`,
+        [importRow.id, repFullName, parsed.monthlyBonus, meta.periodDate]
+      );
+    }
+
+    await client.query('COMMIT');
+    return res.json({ committed: true, import_id: importRow.id, summary });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('commission import commit error:', e);
+    return res.status(500).json({ error: 'Failed to commit import', details: e.message });
+  } finally {
+    client.release();
+  }
+}
+
+app.post('/api/admin/commission-import/preview', authenticateToken, uploadXlsx.single('file'),
+  (req, res) => importCommissionReport(req, res, { commit: false }));
+app.post('/api/admin/commission-import/commit', authenticateToken, uploadXlsx.single('file'),
+  (req, res) => importCommissionReport(req, res, { commit: true }));
+
+// GET /api/admin/commission-imports — history of all imports
+app.get('/api/admin/commission-imports', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  try {
+    const r = await pool.query(
+      `SELECT * FROM commission_payment_imports ORDER BY imported_at DESC LIMIT 200`
+    );
+    res.json({ imports: r.rows });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
