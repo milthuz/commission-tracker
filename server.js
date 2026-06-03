@@ -2278,26 +2278,12 @@ async function autoSyncInvoices() {
 
     console.log(`✅ [AUTO-SYNC] Successfully synced ${syncedCount} invoices, ${deletedCount} deleted at ${new Date().toISOString()}`);
 
-    // Auto-pipeline after every successful sync:
-    //   Sync (just did) → Enrich (line items + paid_date + classification) → Recalc (bucket + $)
-    // Without enrich, recalc has no hardware/saas amounts to work with and lands new
-    // invoices in pending_payment instead of the correct bucket. Without recalc, new
-    // invoices stay at commission_status='calculated'. Chaining all three guarantees
-    // commissions stay current with zero manual intervention.
-    // Fire-and-forget — don't block the sync result.
-    if (typeof runEnrichInvoices === 'function' && typeof runRecalcV2 === 'function') {
-      (async () => {
-        try {
-          await runEnrichInvoices({ onlyMissing: true, source: 'post-sync' });
-          await runRecalcV2('post-sync');
-        } catch (e) {
-          console.warn('[AUTO-SYNC] post-sync enrich+recalc failed:', e.message);
-        }
-      })();
-    } else if (typeof runRecalcV2 === 'function') {
-      // Fallback if enrich function isn't available for some reason
-      runRecalcV2('post-sync').catch(e => console.warn('[AUTO-SYNC] post-sync recalc failed:', e.message));
-    }
+    // NOTE: previously we chained sync → enrich → recalc here, but enrich is
+    // an expensive job (1 Zoho API call per invoice, can be 1000+) and recalc
+    // loads the full invoice set into memory. Running all three in series on
+    // every sync was OOM-ing the dyno. They're scheduled separately now
+    // (recalc on its own 6h timer) or triggered manually (enrich, from the
+    // Admin Panel) — see the scheduler setup below.
   } catch (error) {
     console.error(`❌ [AUTO-SYNC] Sync failed: ${error.message}`);
   } finally {
@@ -2310,6 +2296,7 @@ const AUTO_SYNC_INTERVAL         = 1 * 60 * 60 * 1000; // 1 hour   — Books ful
 const DELTA_SYNC_INTERVAL        = 5 * 60 * 1000;       // 5 min    — Books delta poll (webhook safety net)
 const ZENTACT_AUTO_SYNC_INTERVAL = 1 * 60 * 60 * 1000; // 1 hour   — Zentact merchants
 const CRM_AUTO_SYNC_INTERVAL     = 1 * 60 * 60 * 1000; // 1 hour   — CRM sold deals
+const RECALC_INTERVAL            = 6 * 60 * 60 * 1000; // 6 hours  — periodic recalc-v2 (independent of sync to avoid OOM)
 
 let syncInterval;
 let zentactSyncIntervalHandle;
@@ -2351,6 +2338,18 @@ function startAutoSync() {
   syncInterval = setInterval(autoSyncInvoices, AUTO_SYNC_INTERVAL);
   setTimeout(deltaSyncInvoices, 60 * 1000); // first delta after 1 min
   setInterval(deltaSyncInvoices, DELTA_SYNC_INTERVAL);
+
+  // Recalc-v2 — runs on its own 6h cadence, offset 30 min from sync to avoid
+  // overlapping with the heavy sync window. Skips if already running (guard
+  // in runRecalcV2). Light job: just reads invoices + writes commission cols.
+  setTimeout(() => {
+    if (typeof runRecalcV2 === 'function') {
+      runRecalcV2('scheduled').catch(e => console.warn('[SCHEDULED-RECALC] failed:', e.message));
+      setInterval(() => {
+        runRecalcV2('scheduled').catch(e => console.warn('[SCHEDULED-RECALC] failed:', e.message));
+      }, RECALC_INTERVAL);
+    }
+  }, 30 * 60 * 1000); // first scheduled recalc 30 min after boot
 
   // Zentact — first run after 5 seconds, then every 1 hour
   setTimeout(() => {
