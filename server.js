@@ -546,10 +546,7 @@ app.use(bodyParser.json({
 // as if it came from that salesperson (isAdmin=false, name=impersonated). Useful
 // for testing what regular users see without logging out.
 const authenticateToken = async (req, res, next) => {
-  // Header is the primary source. Fall back to ?token=... for cases where the
-  // request is a browser top-level navigation (can't set custom headers) —
-  // e.g. OAuth-reconnect link from the connection-lost banner.
-  const token = req.headers['authorization']?.split(' ')[1] || req.query.token;
+  const token = req.headers['authorization']?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token provided' });
 
   try {
