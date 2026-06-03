@@ -118,10 +118,27 @@ function userHasPermission(permSet, requiredPerm) {
 // DATABASE CONNECTION
 // ============================================================================
 
+// DB is on Railway, reached over its PUBLIC TCP proxy (proxy.rlwy.net) — i.e. cross-cloud
+// from the Heroku dynos. Every round-trip pays ~30-100ms of public-internet latency, so we
+// bound connections and fail fast instead of hanging into the Heroku 30s H12 timeout.
+const isWorker = process.env.ROLE === 'worker';
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
+  max: isWorker ? 5 : 10,         // worker = batch séquentiel ; web = HTTP concurrent (Railway = 100 conn. dispo)
+  connectionTimeoutMillis: 10000, // échoue proprement en 10s si le pool est saturé, au lieu de pendre → fini le H12 muet
+  idleTimeoutMillis: 30000,
+  keepAlive: true,                // le proxy TCP Railway coupe les connexions idle — keepAlive évite les resets
+  query_timeout: 25000,           // borne client-side une requête lente sous le timeout routeur Heroku (30s)
 });
+
+// Split an array into fixed-size chunks (used to batch multi-row INSERT/UPDATE statements
+// so we issue one query per chunk instead of one per row over the cross-cloud link).
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
 
 // Initialize database tables
 async function initializeDatabase() {
@@ -2198,8 +2215,12 @@ async function autoSyncInvoices() {
       console.log(`📥 [AUTO-SYNC] Sample paid invoice:`, JSON.stringify(paidInvoices[0], null, 2).slice(0, 500));
     }
 
-    // Insert/Update invoices in database (paid + overdue + void)
-    let syncedCount = 0;
+    // Insert/Update invoices in database (paid + overdue + void).
+    // Build the rows first, de-duplicating by invoice_number (last wins — mirrors the old
+    // sequential loop) so a multi-row ON CONFLICT batch never tries to touch the same row
+    // twice (Postgres errors on that). Then upsert in chunks: one query per ~200 rows instead
+    // of one cross-cloud round-trip per invoice.
+    const upsertByNumber = new Map();
     for (const inv of allInvoices) {
       const salesperson = inv.salesperson_name || 'Unassigned';
       const customerName = inv.customer_name || inv.contact_name || null;
@@ -2208,24 +2229,36 @@ async function autoSyncInvoices() {
       // recomputed by recalc-v2 anyway, this is just a sane baseline)
       const commission = inv.status === 'paid' ? (total * 0.1) : 0;
       const invDate = new Date(inv.date || new Date());
-
-      // Now UPDATEs salesperson_name and date too — previously a rep
-      // reassignment or a date change in Zoho would not sync back to us.
+      upsertByNumber.set(inv.invoice_number, [
+        inv.invoice_number, salesperson, customerName, total, inv.status, invDate, commission, process.env.ZOHO_ORG_ID,
+      ]);
+    }
+    // Now UPDATEs salesperson_name and date too — previously a rep reassignment or a date
+    // change in Zoho would not sync back to us. EXCLUDED.* refers to the row being inserted,
+    // so the conflict-update semantics are identical to the old positional version.
+    let syncedCount = 0;
+    for (const part of chunk([...upsertByNumber.values()], 200)) {
+      const vals = [];
+      const tuples = part.map((row, k) => {
+        const b = k * 8;
+        vals.push(...row);
+        return `($${b+1}, $${b+2}, $${b+3}, $${b+4}, $${b+5}, $${b+6}, $${b+7}, $${b+8})`;
+      });
       await pool.query(
         `INSERT INTO invoices
          (invoice_number, salesperson_name, customer_name, total, status, date, commission, organization_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         VALUES ${tuples.join(', ')}
          ON CONFLICT (invoice_number) DO UPDATE SET
-           salesperson_name = $2,
-           customer_name    = COALESCE($3, invoices.customer_name),
-           total            = $4,
-           status           = $5,
-           date             = $6,
-           commission       = CASE WHEN $5 = 'paid' THEN $7 ELSE invoices.commission END,
+           salesperson_name = EXCLUDED.salesperson_name,
+           customer_name    = COALESCE(EXCLUDED.customer_name, invoices.customer_name),
+           total            = EXCLUDED.total,
+           status           = EXCLUDED.status,
+           date             = EXCLUDED.date,
+           commission       = CASE WHEN EXCLUDED.status = 'paid' THEN EXCLUDED.commission ELSE invoices.commission END,
            updated_at       = CURRENT_TIMESTAMP`,
-        [inv.invoice_number, salesperson, customerName, total, inv.status, invDate, commission, process.env.ZOHO_ORG_ID]
+        vals
       );
-      syncedCount++;
+      syncedCount += part.length;
     }
 
     // ------------------------------------------------------------------
@@ -2517,48 +2550,56 @@ async function syncZentactMerchants() {
     console.log('🔍 Zentact first merchant attributes:', JSON.stringify(attrs).slice(0, 500));
   }
 
+  // Preload lookup tables ONCE instead of issuing up to 5 queries per merchant against a
+  // cross-cloud DB (was the dominant cost / connection-hog of this sync). We match in memory
+  // below, preserving the exact resolution precedence: exact > alias > prefix > raw > email > deal.
+  const spAll = await pool.query(`SELECT name, is_active, aliases FROM salespeople`);
+  const activeExactByName = new Map(); // lower(name) -> canonical name (ACTIVE reps only)
+  const aliasToName       = new Map(); // lower(alias) -> canonical name (any rep)
+  const allRepNames       = [];        // for first-name prefix matching (any rep)
+  for (const r of spAll.rows) {
+    allRepNames.push(r.name);
+    const lname = r.name.toLowerCase();
+    if (r.is_active && !activeExactByName.has(lname)) activeExactByName.set(lname, r.name);
+    let aliases = r.aliases;
+    if (typeof aliases === 'string') { try { aliases = JSON.parse(aliases); } catch { aliases = []; } }
+    if (Array.isArray(aliases)) {
+      for (const a of aliases) {
+        if (a == null) continue;
+        const key = String(a).toLowerCase();
+        if (!aliasToName.has(key)) aliasToName.set(key, r.name);
+      }
+    }
+  }
+  const tokensRes = await pool.query(`SELECT email, display_name FROM user_tokens WHERE email IS NOT NULL`);
+  const displayNameByEmail = new Map(tokensRes.rows.map(t => [t.email.toLowerCase(), t.display_name]));
+  const dealsRes = await pool.query(`SELECT deal_id, owner_name FROM crm_sold_deals WHERE deal_id IS NOT NULL`);
+  const ownerByDealId = new Map(dealsRes.rows.map(d => [String(d.deal_id), d.owner_name]));
+  const existingZentact = await pool.query(`SELECT merchant_account_id, activated_at FROM zentact_merchants`);
+  const activatedByMerchant = new Map(existingZentact.rows.map(z => [z.merchant_account_id, z.activated_at]));
+
   for (const raw of rawMerchants) {
     const m = zentact.transformMerchant(raw);
 
-    // --- Rep name resolution ---
+    // --- Rep name resolution (all in-memory against the preloaded maps) ---
     // Zentact uses { name: 'sales_rep', value: 'FirstName' } — match against salespeople table
     let repName = null;
     if (m.sales_rep_raw) {
+      const rawLower = m.sales_rep_raw.toLowerCase();
       // 1. Exact match — only against ACTIVE salespeople so deactivated
       //    standalone first-name records (e.g. lone "Erika") never beat the
       //    canonical full-name rep that has the alias set.
-      const exactRes = await pool.query(
-        `SELECT name FROM salespeople
-         WHERE LOWER(name) = LOWER($1) AND is_active = true LIMIT 1`,
-        [m.sales_rep_raw]
-      );
-      repName = exactRes.rows[0]?.name || null;
+      repName = activeExactByName.get(rawLower) || null;
 
       // 2. Alias match — admin-configured nicknames ("Gaby" → "Gabriella Daly")
-      if (!repName) {
-        const aliasRes = await pool.query(
-          `SELECT name FROM salespeople
-           WHERE aliases @> $1::jsonb
-              OR EXISTS (
-                SELECT 1 FROM jsonb_array_elements_text(aliases) a
-                WHERE LOWER(a) = LOWER($2)
-              )
-           LIMIT 1`,
-          [JSON.stringify([m.sales_rep_raw]), m.sales_rep_raw]
-        );
-        repName = aliasRes.rows[0]?.name || null;
-      }
+      if (!repName) repName = aliasToName.get(rawLower) || null;
 
       // 3. First-name prefix match — "Dora" → "Dora Smith"
       if (!repName) {
-        const firstRes = await pool.query(
-          `SELECT name FROM salespeople
-           WHERE LOWER(name) ILIKE LOWER($1) || ' %'
-              OR LOWER(name) ILIKE '% ' || LOWER($1)
-           LIMIT 1`,
-          [m.sales_rep_raw]
-        );
-        repName = firstRes.rows[0]?.name || null;
+        repName = allRepNames.find(n => {
+          const ln = n.toLowerCase();
+          return ln.startsWith(rawLower + ' ') || ln.endsWith(' ' + rawLower);
+        }) || null;
       }
 
       // 4. Use the raw value as-is so the merchant is never "Unassigned"
@@ -2566,21 +2607,13 @@ async function syncZentactMerchants() {
       if (!repName) repName = m.sales_rep_raw;
     }
 
-    // 4. Fallback: email lookup (legacy / other orgs)
+    // 5. Fallback: email lookup (legacy / other orgs)
     if (!repName && m.sales_rep_email) {
-      const userRes = await pool.query(
-        `SELECT display_name FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1`,
-        [m.sales_rep_email]
-      );
-      repName = userRes.rows[0]?.display_name || null;
+      repName = displayNameByEmail.get(m.sales_rep_email.toLowerCase()) || null;
     }
-    // 5. Fallback: Opportunity_ID → crm_sold_deals.owner_name
+    // 6. Fallback: Opportunity_ID → crm_sold_deals.owner_name
     if (!repName && m.opportunity_id) {
-      const dealRes = await pool.query(
-        `SELECT owner_name FROM crm_sold_deals WHERE deal_id = $1 LIMIT 1`,
-        [m.opportunity_id]
-      );
-      repName = dealRes.rows[0]?.owner_name || null;
+      repName = ownerByDealId.get(String(m.opportunity_id)) || null;
     }
     // 6. Fall back to the existing rep name already in DB (don't overwrite with a worse value)
 
@@ -2594,11 +2627,7 @@ async function syncZentactMerchants() {
     // instead of being invisible forever.
     let activatedAt = null;
     if (m.status === 'ACTIVE') {
-      const existing = await pool.query(
-        `SELECT activated_at FROM zentact_merchants WHERE merchant_account_id = $1`,
-        [m.merchant_account_id]
-      );
-      const currentDate = existing.rows[0]?.activated_at;
+      const currentDate = activatedByMerchant.get(m.merchant_account_id);
 
       if (!currentDate) {
         try {
@@ -2657,10 +2686,12 @@ async function syncZentactMerchants() {
     `SELECT DISTINCT sales_rep_name FROM zentact_merchants
      WHERE sales_rep_name IS NOT NULL AND sales_rep_name <> ''`
   );
-  for (const row of activeRepsRes.rows) {
+  const repNamesToUpsert = activeRepsRes.rows.map(r => r.sales_rep_name);
+  if (repNamesToUpsert.length) {
+    const valuesSql = repNamesToUpsert.map((_, i) => `($${i + 1}, true)`).join(', ');
     await pool.query(
-      `INSERT INTO salespeople (name, is_active) VALUES ($1, true) ON CONFLICT (name) DO NOTHING`,
-      [row.sales_rep_name]
+      `INSERT INTO salespeople (name, is_active) VALUES ${valuesSql} ON CONFLICT (name) DO NOTHING`,
+      repNamesToUpsert
     );
   }
 
@@ -3919,17 +3950,24 @@ function parseCommissionReportXlsx(buffer) {
   return { invoices, signupBonuses, monthlyBonus };
 }
 
-// Fuzzy match a merchant name against zentact_merchants — case-insensitive, ignores spaces/hyphens.
-async function findZentactMerchantId(name) {
-  if (!name) return null;
-  const norm = name.toLowerCase().replace(/[\s\-_'.,&]+/g, '');
+// Load zentact_merchants ONCE and return a fuzzy matcher — case-insensitive, ignores
+// spaces/hyphens. Avoids the full-table scan per bonus that previously serialized into
+// the Heroku 30s request timeout (H12) on large reports.
+async function buildZentactMatcher() {
   const all = await pool.query(`SELECT merchant_account_id, restaurant_name FROM zentact_merchants WHERE restaurant_name IS NOT NULL`);
-  for (const row of all.rows) {
-    const candidate = (row.restaurant_name || '').toLowerCase().replace(/[\s\-_'.,&]+/g, '');
-    if (candidate === norm) return row.merchant_account_id;
-    if (candidate.includes(norm) || norm.includes(candidate)) return row.merchant_account_id;
-  }
-  return null;
+  const candidates = all.rows.map(row => ({
+    id: row.merchant_account_id,
+    norm: (row.restaurant_name || '').toLowerCase().replace(/[\s\-_'.,&]+/g, ''),
+  }));
+  return (name) => {
+    if (!name) return null;
+    const norm = name.toLowerCase().replace(/[\s\-_'.,&]+/g, '');
+    for (const c of candidates) {
+      if (c.norm === norm) return c.id;
+      if (c.norm.includes(norm) || norm.includes(c.norm)) return c.id;
+    }
+    return null;
+  };
 }
 
 // In-memory upload (small files, fine in RAM)
@@ -3967,29 +4005,35 @@ async function importCommissionReport(req, res, { commit }) {
   const repFullName = parsed.invoices.find(i => i.rep)?.rep || meta.repFirstName;
 
   // For each invoice with commission > 0, check whether it exists in our DB and is markable.
+  // Single batched lookup (was N sequential queries — root cause of the H12 timeout on big reports).
   const eligibleInvoices = parsed.invoices.filter(i => i.commission > 0);
   const skipped = parsed.invoices.filter(i => i.commission === 0).map(i => i.invoice_number);
   const matched = [];
   const notFound = [];
-  for (const inv of eligibleInvoices) {
-    const row = (await pool.query(
+  if (eligibleInvoices.length) {
+    const numbers = eligibleInvoices.map(i => i.invoice_number);
+    const rows = (await pool.query(
       `SELECT invoice_number, salesperson_name, total, status, approval_status
-       FROM invoices WHERE invoice_number = $1 LIMIT 1`,
-      [inv.invoice_number]
-    )).rows[0];
-    if (!row) {
-      notFound.push(inv.invoice_number);
-    } else {
-      matched.push({ ...inv, current_status: row.status, current_approval: row.approval_status });
+       FROM invoices WHERE invoice_number = ANY($1)`,
+      [numbers]
+    )).rows;
+    const byNumber = new Map(rows.map(r => [r.invoice_number, r]));
+    for (const inv of eligibleInvoices) {
+      const row = byNumber.get(inv.invoice_number);
+      if (!row) {
+        notFound.push(inv.invoice_number);
+      } else {
+        matched.push({ ...inv, current_status: row.status, current_approval: row.approval_status });
+      }
     }
   }
 
-  // Match each signup bonus to a Zentact merchant
-  const bonusesWithMatch = [];
-  for (const b of parsed.signupBonuses) {
-    const zid = await findZentactMerchantId(b.merchant);
-    bonusesWithMatch.push({ ...b, matched_zentact_id: zid });
-  }
+  // Match each signup bonus to a Zentact merchant (matcher loads the table once, matches in memory).
+  const matchZentact = await buildZentactMatcher();
+  const bonusesWithMatch = parsed.signupBonuses.map(b => ({
+    ...b,
+    matched_zentact_id: matchZentact(b.merchant),
+  }));
 
   const summary = {
     filename:               file.originalname,
@@ -5397,77 +5441,89 @@ app.get('/api/invoices/enrich-preview/:invoiceNumber', authenticateToken, async 
           validateStatus: () => true,
         }
       );
-      const customerInvoices = custInvRes.data?.invoices || [];
-      // Walk the customer's paid invoices and find the first one that has any
-      // SaaS line item (matches a plan_code). We need the detail call again for line items.
-      for (const ci of customerInvoices) {
-        if (ci.invoice_id === inv.invoice_id) continue; // skip self
-        const det = await axios.get(
-          `${admin.api_domain}/books/v3/invoices/${ci.invoice_id}`,
-          {
-            params: { organization_id: process.env.ZOHO_ORG_ID },
-            headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
-            validateStatus: () => true,
-          }
-        );
-        const det_inv = det.data?.invoice;
-        if (!det_inv) continue;
-        const hasSaas = (det_inv.line_items || []).some(li => {
-          const sku = (li.sku || li.item_code || '').toLowerCase().trim();
-          if (sku && planCodes.has(sku)) return true;
-          const n = normalizeName(li.name);
-          return !!(n && planNames.has(n));
-        });
-        if (hasSaas) {
-          // Get subscription activation: line items first, then recurring template start_date
-          const subDateFromLines = (det_inv.line_items || [])
-            .map(li => li.subscription_activation_date || li.start_date)
-            .filter(Boolean)
-            .map(d => new Date(d))
-            .sort((a, b) => a - b)[0];
-          let activationDate = subDateFromLines
-            ? subDateFromLines.toISOString().slice(0, 10)
-            : (det_inv.cf_subscription_activation_date || null);
-
-          // Fall back to the Billing subscription's activated_at (or Books recurring invoice)
-          if (!activationDate && det_inv.recurring_invoice_id) {
-            try {
-              const subRes = await axios.get(
-                `${admin.api_domain}/billing/v1/subscriptions/${det_inv.recurring_invoice_id}`,
-                {
-                  headers: {
-                    Authorization: `Zoho-oauthtoken ${accessToken}`,
-                    'X-com-zoho-subscriptions-organizationid': process.env.ZOHO_ORG_ID,
-                  },
-                  validateStatus: () => true,
-                }
-              );
-              const sub = subRes.data?.subscription;
-              if (sub) {
-                const activatedRaw = sub.activated_at || sub.current_term_starts_at || sub.start_date;
-                if (activatedRaw) {
-                  let d = null;
-                  if (typeof activatedRaw === 'number' || /^\d+$/.test(activatedRaw)) {
-                    d = new Date(parseInt(activatedRaw) * 1000);
-                  } else {
-                    d = new Date(activatedRaw);
-                  }
-                  if (d && !isNaN(d.getTime())) activationDate = d.toISOString().slice(0, 10);
-                }
-              }
-            } catch (_e) { /* keep null */ }
-          }
-
-          firstSaasInvoice = {
-            invoice_number: det_inv.invoice_number,
-            invoice_id: det_inv.invoice_id,
-            date: det_inv.date,
-            last_payment_date: det_inv.last_payment_date,
-            recurring_invoice_id: det_inv.recurring_invoice_id || null,
-            subscription_activation_date: activationDate,
-          };
-          break;
+      const customerInvoices = (custInvRes.data?.invoices || [])
+        .filter(ci => ci.invoice_id !== inv.invoice_id); // skip self
+      // Walk the customer's paid invoices (already sorted ascending by date) and find the
+      // FIRST one that has any SaaS line item. Detail calls go out in bounded-concurrency
+      // batches instead of one sequential Zoho round-trip per invoice (the old loop could
+      // blow past Heroku's 30s H12 timeout for customers with many paid invoices). We stop
+      // launching batches as soon as an earlier batch yields a match, so we never over-call
+      // Zoho — and picking the first match *in original order* preserves "earliest SaaS".
+      let firstSaasDet = null;
+      const DETAIL_CONCURRENCY = 6;
+      for (let start = 0; start < customerInvoices.length && !firstSaasDet; start += DETAIL_CONCURRENCY) {
+        const batch = customerInvoices.slice(start, start + DETAIL_CONCURRENCY);
+        const dets = await Promise.all(batch.map(ci =>
+          axios.get(
+            `${admin.api_domain}/books/v3/invoices/${ci.invoice_id}`,
+            {
+              params: { organization_id: process.env.ZOHO_ORG_ID },
+              headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+              validateStatus: () => true,
+            }
+          ).then(r => r.data?.invoice || null).catch(() => null)
+        ));
+        for (const det_inv of dets) {
+          if (!det_inv) continue;
+          const hasSaas = (det_inv.line_items || []).some(li => {
+            const sku = (li.sku || li.item_code || '').toLowerCase().trim();
+            if (sku && planCodes.has(sku)) return true;
+            const n = normalizeName(li.name);
+            return !!(n && planNames.has(n));
+          });
+          if (hasSaas) { firstSaasDet = det_inv; break; }
         }
+      }
+
+      if (firstSaasDet) {
+        const det_inv = firstSaasDet;
+        // Get subscription activation: line items first, then recurring template start_date
+        const subDateFromLines = (det_inv.line_items || [])
+          .map(li => li.subscription_activation_date || li.start_date)
+          .filter(Boolean)
+          .map(d => new Date(d))
+          .sort((a, b) => a - b)[0];
+        let activationDate = subDateFromLines
+          ? subDateFromLines.toISOString().slice(0, 10)
+          : (det_inv.cf_subscription_activation_date || null);
+
+        // Fall back to the Billing subscription's activated_at (or Books recurring invoice)
+        if (!activationDate && det_inv.recurring_invoice_id) {
+          try {
+            const subRes = await axios.get(
+              `${admin.api_domain}/billing/v1/subscriptions/${det_inv.recurring_invoice_id}`,
+              {
+                headers: {
+                  Authorization: `Zoho-oauthtoken ${accessToken}`,
+                  'X-com-zoho-subscriptions-organizationid': process.env.ZOHO_ORG_ID,
+                },
+                validateStatus: () => true,
+              }
+            );
+            const sub = subRes.data?.subscription;
+            if (sub) {
+              const activatedRaw = sub.activated_at || sub.current_term_starts_at || sub.start_date;
+              if (activatedRaw) {
+                let d = null;
+                if (typeof activatedRaw === 'number' || /^\d+$/.test(activatedRaw)) {
+                  d = new Date(parseInt(activatedRaw) * 1000);
+                } else {
+                  d = new Date(activatedRaw);
+                }
+                if (d && !isNaN(d.getTime())) activationDate = d.toISOString().slice(0, 10);
+              }
+            }
+          } catch (_e) { /* keep null */ }
+        }
+
+        firstSaasInvoice = {
+          invoice_number: det_inv.invoice_number,
+          invoice_id: det_inv.invoice_id,
+          date: det_inv.date,
+          last_payment_date: det_inv.last_payment_date,
+          recurring_invoice_id: det_inv.recurring_invoice_id || null,
+          subscription_activation_date: activationDate,
+        };
       }
     }
 
@@ -6098,6 +6154,33 @@ async function runRecalcV2(source = 'manual') {
         }
       }
 
+      // Batched persistence for PASS 2: buffer the per-invoice writes and flush them in
+      // chunks (one UPDATE ... FROM (VALUES ...) per ~500 rows) instead of one cross-cloud
+      // round-trip per invoice. Flushing per chunk keeps progress + stoppability intact.
+      const recalcUpdates = [];
+      const RECALC_UPDATE_CHUNK = 500;
+      const flushRecalcUpdates = async () => {
+        for (const part of chunk(recalcUpdates, RECALC_UPDATE_CHUNK)) {
+          const vals = [];
+          const tuples = part.map((u, k) => {
+            const b = k * 4;
+            vals.push(u.id, u.commission, u.bucket, u.payableDate);
+            return `($${b+1}::int, $${b+2}::numeric, $${b+3}::text, $${b+4}::date)`;
+          });
+          await pool.query(
+            `UPDATE invoices AS i SET
+               commission = v.commission,
+               commission_status = v.bucket,
+               commission_payable_date = v.payable_date,
+               updated_at = CURRENT_TIMESTAMP
+             FROM (VALUES ${tuples.join(', ')}) AS v(id, commission, bucket, payable_date)
+             WHERE i.id = v.id`,
+            vals
+          );
+        }
+        recalcUpdates.length = 0;
+      };
+
       // PASS 2: Compute commission per invoice using the new rules
       for (const inv of invRes.rows) {
         if (recalcV2Job.status === 'stopping') break;
@@ -6175,21 +6258,14 @@ async function runRecalcV2(source = 'manual') {
         recalcV2Job.stats[bucket]++;
         recalcV2Job.stats.total_commission += commission;
 
-        // Persist commission_status + commission_payable_date alongside the new commission
-        // so the report endpoints can group/filter on them.
-        await pool.query(
-          `UPDATE invoices SET
-             commission = $1,
-             commission_status = $2,
-             commission_payable_date = $3::date,
-             updated_at = CURRENT_TIMESTAMP
-           WHERE id = $4`,
-          [commission, bucket, payableDate, inv.id]
-        );
-
+        // Buffer the write (commission + commission_status + commission_payable_date);
+        // flushed in chunks below so report endpoints still get the same persisted values.
+        recalcUpdates.push({ id: inv.id, commission, bucket, payableDate });
         recalcV2Job.processed++;
         recalcV2Job.message = `Processed ${recalcV2Job.processed} of ${recalcV2Job.total}`;
+        if (recalcUpdates.length >= RECALC_UPDATE_CHUNK) await flushRecalcUpdates();
       }
+      await flushRecalcUpdates();
 
       recalcV2Job.status  = recalcV2Job.status === 'stopping' ? 'stopped' : 'completed';
       recalcV2Job.stats.total_commission = Math.round(recalcV2Job.stats.total_commission * 100) / 100;
