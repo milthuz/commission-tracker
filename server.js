@@ -3954,10 +3954,10 @@ function parseCommissionReportXlsx(buffer) {
 // spaces/hyphens. Avoids the full-table scan per bonus that previously serialized into
 // the Heroku 30s request timeout (H12) on large reports.
 async function buildZentactMatcher() {
-  const all = await pool.query(`SELECT merchant_account_id, restaurant_name FROM zentact_merchants WHERE restaurant_name IS NOT NULL`);
+  const all = await pool.query(`SELECT merchant_account_id, business_name FROM zentact_merchants WHERE business_name IS NOT NULL AND business_name <> ''`);
   const candidates = all.rows.map(row => ({
     id: row.merchant_account_id,
-    norm: (row.restaurant_name || '').toLowerCase().replace(/[\s\-_'.,&]+/g, ''),
+    norm: (row.business_name || '').toLowerCase().replace(/[\s\-_'.,&]+/g, ''),
   }));
   return (name) => {
     if (!name) return null;
