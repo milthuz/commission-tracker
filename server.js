@@ -662,7 +662,12 @@ app.get('/api/auth/callback', async (req, res) => {
         `INSERT INTO user_tokens (email, access_token, refresh_token, api_domain, expires_at, photo, display_name)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (email) DO UPDATE SET
-         access_token = $2, refresh_token = $3, api_domain = $4, expires_at = $5,
+         access_token = $2,
+         -- NEVER wipe an existing refresh_token: Zoho only returns one on consent, so a
+         -- normal login (no refresh_token in the response) must preserve what we already have.
+         -- Overwriting with NULL here is exactly what broke the admin's Books sync.
+         refresh_token = COALESCE(NULLIF($3, ''), user_tokens.refresh_token),
+         api_domain = $4, expires_at = $5,
          photo = $6, display_name = $7, updated_at = CURRENT_TIMESTAMP`,
         [userEmail, access_token, refresh_token, api_domain, Date.now() + expires_in * 1000, userPhoto, userName]
       );
