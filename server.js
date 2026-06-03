@@ -100,6 +100,46 @@ async function requirePerm(req, res, perm) {
   return true;
 }
 
+// Detect "permanent" auth failures from Zoho's token endpoint. These mean the
+// refresh_token is dead and only a fresh OAuth grant will fix it — auto-retry
+// is wasteful. Marking the service as 'disconnected' on the user_tokens row
+// stops the polling jobs from spamming, and the UI can surface a banner.
+function isPermanentZohoAuthFailure(payload) {
+  if (!payload) return false;
+  const text = typeof payload === 'string' ? payload : JSON.stringify(payload);
+  return /invalid_grant|invalid_code|invalid_client/i.test(text);
+}
+
+async function markServiceDisconnected(service, email, reason) {
+  const safe = String(reason || 'unknown').slice(0, 500);
+  const col_status = service === 'books' ? 'books_connection_status' : 'crm_connection_status';
+  const col_reason = service === 'books' ? 'books_disconnect_reason' : 'crm_disconnect_reason';
+  const col_at     = service === 'books' ? 'books_disconnected_at'   : 'crm_disconnected_at';
+  try {
+    await pool.query(
+      `UPDATE user_tokens SET ${col_status} = 'disconnected', ${col_reason} = $1, ${col_at} = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+       WHERE email = $2`,
+      [safe, email]
+    );
+    console.warn(`🔌 Marked ${service} connection as disconnected for ${email}: ${safe.slice(0, 200)}`);
+  } catch (e) {
+    console.warn(`Failed to mark ${service} disconnected:`, e.message);
+  }
+}
+
+async function markServiceConnected(service, email) {
+  const col_status = service === 'books' ? 'books_connection_status' : 'crm_connection_status';
+  const col_reason = service === 'books' ? 'books_disconnect_reason' : 'crm_disconnect_reason';
+  const col_at     = service === 'books' ? 'books_disconnected_at'   : 'crm_disconnected_at';
+  try {
+    await pool.query(
+      `UPDATE user_tokens SET ${col_status} = 'active', ${col_reason} = NULL, ${col_at} = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE email = $1`,
+      [email]
+    );
+  } catch { /* ignore */ }
+}
+
 // Check helper: wildcards (*) grant all
 function userHasPermission(permSet, requiredPerm) {
   if (!permSet) return false;
@@ -152,6 +192,15 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT false`);
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS photo TEXT`);
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS display_name VARCHAR(255)`);
+    // Connection health flags — flipped to 'disconnected' when the refresh_token
+    // gets revoked / expires (Zoho returns invalid_grant / invalid_code), so we
+    // stop hammering the API every hour and the UI can surface a reconnect banner.
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS books_connection_status VARCHAR(20) DEFAULT 'active'`);
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS books_disconnect_reason TEXT`);
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS books_disconnected_at TIMESTAMPTZ`);
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_connection_status VARCHAR(20) DEFAULT 'active'`);
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_disconnect_reason TEXT`);
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_disconnected_at TIMESTAMPTZ`);
 
     // Invoices table
     await pool.query(`
@@ -700,6 +749,45 @@ app.get('/api/auth/token', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Token retrieval error:', error);
     res.status(500).json({ error: 'Failed to retrieve token' });
+  }
+});
+
+// GET /api/auth/connections-status — Books + CRM connection health for the UI banner.
+// Returns the disconnect reason + when it happened so the user knows what broke.
+app.get('/api/auth/connections-status', authenticateToken, async (req, res) => {
+  try {
+    // Aggregate per service across all admins — connected if any admin still works.
+    const r = await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE is_admin = true AND COALESCE(books_connection_status,'active') = 'active' AND refresh_token IS NOT NULL) AS books_ok,
+         COUNT(*) FILTER (WHERE is_admin = true AND books_connection_status = 'disconnected') AS books_dc,
+         COUNT(*) FILTER (WHERE is_admin = true AND COALESCE(crm_connection_status,'active') = 'active' AND crm_refresh_token IS NOT NULL) AS crm_ok,
+         COUNT(*) FILTER (WHERE is_admin = true AND crm_connection_status = 'disconnected') AS crm_dc,
+         (SELECT books_disconnect_reason FROM user_tokens WHERE books_connection_status = 'disconnected' ORDER BY books_disconnected_at DESC LIMIT 1) AS books_reason,
+         (SELECT books_disconnected_at FROM user_tokens WHERE books_connection_status = 'disconnected' ORDER BY books_disconnected_at DESC LIMIT 1) AS books_at,
+         (SELECT crm_disconnect_reason FROM user_tokens WHERE crm_connection_status = 'disconnected' ORDER BY crm_disconnected_at DESC LIMIT 1) AS crm_reason,
+         (SELECT crm_disconnected_at FROM user_tokens WHERE crm_connection_status = 'disconnected' ORDER BY crm_disconnected_at DESC LIMIT 1) AS crm_at
+       FROM user_tokens`
+    );
+    const row = r.rows[0] || {};
+    res.json({
+      books: {
+        connected:      parseInt(row.books_ok) > 0,
+        disconnected:   parseInt(row.books_dc) > 0 && parseInt(row.books_ok) === 0,
+        reason:         row.books_reason || null,
+        disconnectedAt: row.books_at || null,
+        reconnectUrl:   '/api/auth/zoho',           // existing OAuth endpoint
+      },
+      crm: {
+        connected:      parseInt(row.crm_ok) > 0,
+        disconnected:   parseInt(row.crm_dc) > 0 && parseInt(row.crm_ok) === 0,
+        reason:         row.crm_reason || null,
+        disconnectedAt: row.crm_at || null,
+        reconnectUrl:   '/api/auth/zoho-crm',       // existing OAuth endpoint
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -2328,6 +2416,18 @@ async function autoSyncZentact() {
 
 async function autoSyncCrm() {
   try {
+    // Skip silently if all admin CRM connections are flagged as disconnected —
+    // the UI banner already prompts the user to reconnect, no need to spam logs.
+    const dc = (await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE is_admin = true AND COALESCE(crm_connection_status,'active') = 'active' AND crm_refresh_token IS NOT NULL) AS ok
+       FROM user_tokens`
+    )).rows[0];
+    if (parseInt(dc?.ok) === 0) {
+      console.log('⏭️  [AUTO-SYNC] CRM disconnected — skipping (reconnect via Admin Panel)');
+      return;
+    }
+
     console.log('🔄 [AUTO-SYNC] Starting automatic CRM sold-deals sync...');
     const crmToken = await ensureValidCrmToken();
     if (!crmToken) {
@@ -2772,13 +2872,21 @@ async function ensureValidCrmToken() {
 
       if (!newToken) {
         console.error('❌ CRM refresh returned no access_token:', JSON.stringify(refreshRes.data));
-        // Don't throw if existing token is still valid
+        // Permanent failure (invalid_grant / invalid_code) → mark disconnected so we stop retrying
+        if (isPermanentZohoAuthFailure(refreshRes.data)) {
+          await markServiceDisconnected('crm', row.email, JSON.stringify(refreshRes.data));
+          throw new Error(`CRM connection revoked — needs re-auth. Reason: ${JSON.stringify(refreshRes.data).slice(0, 200)}`);
+        }
+        // Transient — don't throw if existing token is still valid
         if (expiresAt && expiresAt > Date.now()) {
           console.warn('⚠️ Using existing token despite refresh failure');
           return row.crm_access_token;
         }
         throw new Error(`CRM token refresh failed: ${JSON.stringify(refreshRes.data).slice(0, 200)}`);
       }
+
+      // Refresh succeeded — clear any stale "disconnected" flag
+      await markServiceConnected('crm', row.email);
 
       // Update the SPECIFIC row (by email) to avoid touching other admins' rows
       await pool.query(
@@ -3484,10 +3592,22 @@ app.post('/api/invoices/bulk-import', authenticateToken, async (req, res) => {
 
 // Returns a fresh admin access_token + api_domain. Auto-refreshes if expired.
 async function getAdminBooksAuth() {
-  const admin = (await pool.query(
-    'SELECT email, access_token, refresh_token, api_domain, expires_at FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
+  // Prefer admins whose Books connection is still active. Only fall back to
+  // ones flagged 'disconnected' if there's truly nothing else.
+  let admin = (await pool.query(
+    `SELECT email, access_token, refresh_token, api_domain, expires_at, books_connection_status
+     FROM user_tokens
+     WHERE is_admin = true AND COALESCE(books_connection_status, 'active') = 'active'
+     ORDER BY updated_at DESC LIMIT 1`
   )).rows[0];
+  if (!admin) {
+    admin = (await pool.query(
+      `SELECT email, access_token, refresh_token, api_domain, expires_at, books_connection_status
+       FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1`
+    )).rows[0];
+  }
   if (!admin) throw new Error('No admin Zoho account connected');
+
   // Refresh if token expired (or within 60s of expiry)
   if (admin.refresh_token && (!admin.expires_at || Date.now() > admin.expires_at - 60_000)) {
     const r = await axios.post(
@@ -3498,15 +3618,24 @@ async function getAdminBooksAuth() {
         client_secret: process.env.ZOHO_CLIENT_SECRET,
         refresh_token: admin.refresh_token,
       }),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, validateStatus: () => true }
     );
-    const newToken = r.data.access_token;
+    const newToken = r.data?.access_token;
+    if (!newToken) {
+      if (isPermanentZohoAuthFailure(r.data)) {
+        await markServiceDisconnected('books', admin.email, JSON.stringify(r.data));
+        throw new Error(`Books connection revoked — needs re-auth. Reason: ${JSON.stringify(r.data).slice(0, 200)}`);
+      }
+      throw new Error(`Books token refresh failed: ${JSON.stringify(r.data).slice(0, 200)}`);
+    }
     const newExpires = Date.now() + ((parseInt(r.data.expires_in) || 3600) * 1000);
     await pool.query(
       `UPDATE user_tokens SET access_token = $1, expires_at = $2, updated_at = CURRENT_TIMESTAMP WHERE email = $3`,
       [newToken, newExpires, admin.email]
     );
     admin.access_token = newToken;
+    // Clear any stale 'disconnected' flag now that refresh succeeded
+    await markServiceConnected('books', admin.email);
   }
   return { accessToken: admin.access_token, apiDomain: admin.api_domain };
 }
