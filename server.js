@@ -567,7 +567,12 @@ app.get('/api/auth/zoho', (req, res) => {
     `&response_type=code` +
     `&redirect_uri=${ZOHO_CONFIG.redirect_uri}` +
     `&state=${state}` +
-    `&access_type=offline`;
+    `&access_type=offline` +
+    // Force the consent screen so Zoho re-issues a refresh_token on EVERY authorization.
+    // Without this, reconnecting Books returns only an access_token (Zoho only sends a
+    // refresh_token on first consent) — which is how the admin token ended up with no
+    // refresh_token and every sync started failing with 401.
+    `&prompt=consent`;
 
   res.json({ authUrl, state });
 });
