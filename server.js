@@ -6713,10 +6713,60 @@ if (ROLE === 'worker') {
   waitForDb(startAutoSync);
 }
 
+// ============================================================================
+// GLOBAL CRASH HANDLERS
+// ============================================================================
+// Modern Node crashes the process on unhandled promise rejections by default.
+// In our app, that means a single bad request or background job kills the dyno
+// and forces a 30-60 sec reboot — repeated crashes look like a memory issue
+// but are really one async path nobody caught. Logging them and continuing keeps
+// the process alive and tells us EXACTLY what's wrong via Heroku logs.
+
+process.on('unhandledRejection', (reason, promise) => {
+  const msg = reason instanceof Error ? `${reason.message}\n${reason.stack}` : String(reason);
+  console.error('🔥 UNHANDLED PROMISE REJECTION:', msg);
+  console.error('   Promise:', promise);
+  // Stay alive — log and move on.
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('🔥 UNCAUGHT EXCEPTION:', err.message);
+  console.error('   Stack:', err.stack);
+  // Stay alive — log and move on.
+});
+
+// Periodic memory snapshot for visibility (every 5 min). Heroku tier limits:
+//   Standard-1X = 512 MB,  Standard-2X = 1 GB,  Perf-M = 2.5 GB.
+// If RSS climbs past 80% of the limit, we'll see it here BEFORE the OOM kill.
+setInterval(() => {
+  const m = process.memoryUsage();
+  const fmt = (b) => `${(b / 1024 / 1024).toFixed(0)}MB`;
+  console.log(`📊 [${ROLE}] mem rss=${fmt(m.rss)} heap=${fmt(m.heapUsed)}/${fmt(m.heapTotal)} ext=${fmt(m.external)}`);
+}, 5 * 60 * 1000);
+
+// Lightweight health check that touches nothing (no DB, no Zoho) — for Heroku's
+// load balancer + uptime checks. Always returns 200 if the process is alive.
+app.get('/api/_health', (req, res) => {
+  const m = process.memoryUsage();
+  res.json({
+    ok:        true,
+    role:      ROLE,
+    uptime_s:  Math.round(process.uptime()),
+    pid:       process.pid,
+    memory_mb: { rss: Math.round(m.rss / 1024 / 1024), heap_used: Math.round(m.heapUsed / 1024 / 1024) },
+  });
+});
+
 // Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('Shutting down gracefully...');
-  stopAutoSync();
+  if (typeof stopAutoSync === 'function') stopAutoSync();
+  await pool.end();
+  process.exit(0);
+});
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down...');
+  if (typeof stopAutoSync === 'function') stopAutoSync();
   await pool.end();
   process.exit(0);
 });
