@@ -4139,9 +4139,7 @@ const importHandler = (commit) => async (req, res) => {
     await importCommissionReport(req, res, { commit });
   } catch (e) {
     console.error(`commission-import ${commit ? 'commit' : 'preview'} error:`, e);
-    // Surface the real cause in `error` (the field the UI renders) — not just `details` —
-    // so we can see it without DevTools. TODO: revert to a generic message once diagnosed.
-    if (!res.headersSent) res.status(500).json({ error: `Import failed: ${e.message}`, details: e.message, stack: e.stack });
+    if (!res.headersSent) res.status(500).json({ error: 'Import failed', details: e.message });
   }
 };
 app.post('/api/admin/commission-import/preview', authenticateToken, uploadXlsx.single('file'), importHandler(false));
