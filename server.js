@@ -4129,10 +4129,21 @@ async function importCommissionReport(req, res, { commit }) {
   }
 }
 
-app.post('/api/admin/commission-import/preview', authenticateToken, uploadXlsx.single('file'),
-  (req, res) => importCommissionReport(req, res, { commit: false }));
-app.post('/api/admin/commission-import/commit', authenticateToken, uploadXlsx.single('file'),
-  (req, res) => importCommissionReport(req, res, { commit: true }));
+// importCommissionReport is async and the preview path isn't fully wrapped in try/catch, so
+// any rejection (DB error, query_timeout, pool connect timeout, ...) would otherwise escape as
+// an unhandledRejection — which our global handler only LOGS, leaving the HTTP request hanging
+// forever → the frontend shows "Network Error". This wrapper guarantees a response is always
+// sent and surfaces the real error message instead of a silent hang.
+const importHandler = (commit) => async (req, res) => {
+  try {
+    await importCommissionReport(req, res, { commit });
+  } catch (e) {
+    console.error(`commission-import ${commit ? 'commit' : 'preview'} error:`, e);
+    if (!res.headersSent) res.status(500).json({ error: 'Import failed', details: e.message });
+  }
+};
+app.post('/api/admin/commission-import/preview', authenticateToken, uploadXlsx.single('file'), importHandler(false));
+app.post('/api/admin/commission-import/commit', authenticateToken, uploadXlsx.single('file'), importHandler(true));
 
 // GET /api/admin/commission-imports — history of all imports
 app.get('/api/admin/commission-imports', authenticateToken, async (req, res) => {
