@@ -696,8 +696,6 @@ app.get('/api/auth/callback', async (req, res) => {
          photo = $6, display_name = $7, updated_at = CURRENT_TIMESTAMP`,
         [userEmail, access_token, refresh_token, api_domain, Date.now() + expires_in * 1000, userPhoto, userName]
       );
-      // Clear the 'disconnected' flag now that we have a fresh refresh_token
-      await markServiceConnected('books', userEmail);
       console.log('✅ Tokens stored in database for:', userEmail);
     } catch (dbError) {
       console.error('❌ Database error:', dbError.message);
@@ -939,9 +937,6 @@ app.get('/api/auth/crm-callback', async (req, res) => {
        WHERE email = $4`,
       [access_token, refresh_token, Date.now() + (expires_in * 1000), adminEmail]
     );
-
-    // Clear the 'disconnected' flag now that we have a fresh refresh_token
-    await markServiceConnected('crm', adminEmail);
 
     console.log(`✅ CRM tokens stored for ${adminEmail}, expires at ${new Date(Date.now() + expires_in * 1000).toISOString()}`);
 
