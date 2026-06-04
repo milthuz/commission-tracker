@@ -413,6 +413,21 @@ async function initializeDatabase() {
       ON CONFLICT (feature_id) DO NOTHING
     `);
 
+    // POS license activations — submissions from the resellers' Zoho order form (via webhook).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS reseller_pos_activations (
+        id            SERIAL PRIMARY KEY,
+        reseller_name VARCHAR(255),
+        license_type  VARCHAR(255),
+        quantity      INT DEFAULT 1,
+        customer_name VARCHAR(255),
+        submitted_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        raw           JSONB,
+        created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_pos_activations_reseller ON reseller_pos_activations(reseller_name)`);
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS commission_bonuses (
         id SERIAL PRIMARY KEY,
@@ -4297,11 +4312,62 @@ app.get('/api/resellers', authenticateToken, async (req, res) => {
   }
 });
 
+// POST /api/webhooks/zoho-form/license-order — receives a reseller's license-order form
+// submission from Zoho Forms (Integrations → Webhooks). Secret-gated via ?secret=.
+// Configure the form's webhook to send JSON mapping fields → keys:
+//   reseller_name (required, link key), license_type, quantity, customer_name, submitted_at
+app.post('/api/webhooks/zoho-form/license-order',
+  bodyParser.urlencoded({ extended: true }), // also accept form-encoded payloads
+  async (req, res) => {
+    const expected = process.env.ZOHO_FORM_WEBHOOK_SECRET || process.env.ZOHO_WEBHOOK_SECRET;
+    if (!expected || req.query.secret !== expected) {
+      return res.status(401).json({ error: 'Invalid webhook secret' });
+    }
+    try {
+      const b = req.body || {};
+      const resellerName = (b.reseller_name || b.resellerName || b.reseller || '').toString().trim() || null;
+      const licenseType  = (b.license_type || b.licenseType || b.license || '').toString().trim() || null;
+      const quantity     = parseInt(b.quantity || b.qty || 1) || 1;
+      const customerName = (b.customer_name || b.customerName || b.customer || '').toString().trim() || null;
+      const submittedAt  = b.submitted_at || b.submittedAt || new Date().toISOString();
+
+      await pool.query(
+        `INSERT INTO reseller_pos_activations (reseller_name, license_type, quantity, customer_name, submitted_at, raw)
+         VALUES ($1, $2, $3, $4, $5::timestamp, $6::jsonb)`,
+        [resellerName, licenseType, quantity, customerName, submittedAt, JSON.stringify(b)]
+      );
+      // Auto-register the reseller (by name) so it appears in the resellers list.
+      if (resellerName) {
+        await pool.query(
+          `INSERT INTO resellers (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`,
+          [resellerName]
+        );
+      }
+      console.log(`🔔 POS activation: ${resellerName || '(no reseller)'} — ${licenseType || '?'} x${quantity}`);
+      res.json({ success: true });
+    } catch (e) {
+      console.error('zoho-form webhook error:', e.message);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
 // GET /api/resellers/pos-activations — POS license activations from the Zoho order form.
-// Phase 2 will populate this from Zoho Forms submissions; for now returns an unconnected stub.
 app.get('/api/resellers/pos-activations', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'reseller:view'))) return;
-  res.json({ connected: false, source: 'zoho_forms', activations: [] });
+  try {
+    const rows = (await pool.query(
+      `SELECT id, reseller_name, license_type, quantity, customer_name, submitted_at
+       FROM reseller_pos_activations ORDER BY submitted_at DESC LIMIT 1000`
+    )).rows;
+    const byReseller = (await pool.query(
+      `SELECT COALESCE(reseller_name,'(unknown)') AS reseller_name,
+              COUNT(*)::int AS submissions, COALESCE(SUM(quantity),0)::int AS licenses
+       FROM reseller_pos_activations GROUP BY 1 ORDER BY licenses DESC`
+    )).rows;
+    res.json({ connected: true, source: 'zoho_forms', activations: rows, byReseller });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // GET /api/resellers/residuals — residual payments per reseller (from Zentact statements).
