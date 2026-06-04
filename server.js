@@ -372,6 +372,19 @@ async function initializeDatabase() {
       );
     `);
 
+    // Resellers — third-party companies that resell licenses. POS activations come from a
+    // Zoho Form; residual payments come from Zentact. Linked by reseller name for now.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS resellers (
+        id         SERIAL PRIMARY KEY,
+        name       VARCHAR(255) UNIQUE NOT NULL,
+        email      VARCHAR(255),
+        active     BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS commission_bonuses (
         id SERIAL PRIMARY KEY,
@@ -4199,6 +4212,36 @@ app.post('/api/features/seen', authenticateToken, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ============================================================================
+// RESELLERS — third-party license resellers. POS activations (Zoho Form) + residual
+// payments (Zentact). Phase 1 = scaffolding; data sources wired in later phases.
+// ============================================================================
+
+// GET /api/resellers — list resellers
+app.get('/api/resellers', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:*'))) return;
+  try {
+    const r = await pool.query('SELECT id, name, email, active FROM resellers ORDER BY name');
+    res.json({ resellers: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/resellers/pos-activations — POS license activations from the Zoho order form.
+// Phase 2 will populate this from Zoho Forms submissions; for now returns an unconnected stub.
+app.get('/api/resellers/pos-activations', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:*'))) return;
+  res.json({ connected: false, source: 'zoho_forms', activations: [] });
+});
+
+// GET /api/resellers/residuals — residual payments per reseller (from Zentact statements).
+// Phase 3 will populate this from the Zentact API; for now returns an unconnected stub.
+app.get('/api/resellers/residuals', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:*'))) return;
+  res.json({ connected: false, source: 'zentact', residuals: [] });
 });
 
 // GET /api/admin/commission-imports — history of all imports
