@@ -5175,8 +5175,7 @@ async function runEnrichInvoices({ onlyMissing = true, source = 'manual' } = {})
       enrichJob.message = `Enriching ${enrichJob.total} paid invoices${enrichJob.onlyMissing ? ' (missing only)' : ''}...`;
 
       // Pass 1: fetch all invoice details from Zoho, classify, gather customer → first SaaS map
-      const invoiceDetails = [];   // { number, detail, type, paid_date, subActivation, customer_id, total }
-      const subCache = new Map();  // subscription_id → activation iso string
+      const subCache = new Map();  // subscription_id → activation iso string (reused across invoices)
       let enrichZohoErrors = 0;    // Zoho calls that came back non-200 (rate limit / auth / etc.)
       let enrichErrLogged = false; // log the first error verbatim so we can see WHY (then suppress spam)
 
@@ -5251,49 +5250,10 @@ async function runEnrichInvoices({ onlyMissing = true, source = 'manual' } = {})
           subActivation = await fetchSubActivation(det.recurring_invoice_id, apiDomain, accessToken, subCache);
         }
 
-        invoiceDetails.push({
-          number: det.invoice_number, invoice_id: det.invoice_id,
-          customer_id: det.customer_id, type, classified, paidDate, subActivation,
-          saasAmount, hardwareAmount, totalAmount,
-          recurring_invoice_id: det.recurring_invoice_id || null,
-        });
-        enrichJob.processed++;
-        enrichJob.stats[type] = (enrichJob.stats[type] || 0) + 1;
-        enrichJob.message = `Enriched ${enrichJob.processed} of ${enrichJob.total}`;
-      }
-
-      // Build customer → earliest paid SaaS activation map
-      const customerSaasMap = {};
-      for (const d of invoiceDetails) {
-        if (d.type !== 'saas' || !d.paidDate || !d.subActivation) continue;
-        const cur = customerSaasMap[d.customer_id];
-        if (!cur || d.subActivation < cur.activation) {
-          customerSaasMap[d.customer_id] = { activation: d.subActivation, invoice_number: d.number };
-        }
-      }
-
-      // Pass 2: compute commission_payable_date + status and write to DB
-      for (const d of invoiceDetails) {
-        let payableDate = null;
-        let status = 'calculated';
-
-        if (d.type === 'saas') {
-          if (d.subActivation && d.paidDate) {
-            payableDate = d.paidDate > d.subActivation ? d.paidDate : d.subActivation;
-            status = 'eligible';
-          } else if (!d.paidDate) status = 'pending_payment';
-          else status = 'pending_saas';
-        } else if (d.type === 'hardware') {
-          const firstSaas = customerSaasMap[d.customer_id];
-          if (firstSaas && d.paidDate) {
-            payableDate = d.paidDate > firstSaas.activation ? d.paidDate : firstSaas.activation;
-            status = 'eligible';
-          } else if (!d.paidDate) status = 'pending_payment';
-          else status = 'pending_saas';
-        }
-
-        enrichJob.stats[status] = (enrichJob.stats[status] || 0) + 1;
-
+        // Write this invoice's enriched facts IMMEDIATELY — incremental so progress is saved
+        // continuously (resumable across restarts/OOM, no big in-memory accumulation, and the
+        // count climbs visibly). commission_status / commission_payable_date are owned by
+        // recalc-v2, which runs right after enrich (post-sync chain) and on schedule.
         await pool.query(`
           UPDATE invoices SET
             line_items = $1::jsonb,
@@ -5301,15 +5261,13 @@ async function runEnrichInvoices({ onlyMissing = true, source = 'manual' } = {})
             saas_amount = $3,
             subscription_activation_date = $4::date,
             paid_date = $5::date,
-            commission_payable_date = $6::date,
-            commission_status = $7,
             updated_at = CURRENT_TIMESTAMP
-          WHERE invoice_number = $8 AND organization_id = $9
-        `, [
-          JSON.stringify(d.classified), d.hardwareAmount, d.saasAmount,
-          d.subActivation, d.paidDate, payableDate, status,
-          d.number, orgId,
-        ]);
+          WHERE invoice_number = $6 AND organization_id = $7
+        `, [JSON.stringify(classified), hardwareAmount, saasAmount, subActivation, paidDate, det.invoice_number, orgId]);
+
+        enrichJob.processed++;
+        enrichJob.stats[type] = (enrichJob.stats[type] || 0) + 1;
+        enrichJob.message = `Enriched ${enrichJob.processed} of ${enrichJob.total}`;
       }
 
       enrichJob.status = enrichJob.status === 'stopping' ? 'stopped' : 'completed';
