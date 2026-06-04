@@ -388,6 +388,31 @@ async function initializeDatabase() {
       );
     `);
 
+    // "What's New" catalog — backend-driven so admins choose what's new when publishing a
+    // release (no code deploy). The per-user "seen" state lives in user_seen_features (by feature_id).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS new_features (
+        id          SERIAL PRIMARY KEY,
+        feature_id  VARCHAR(255) UNIQUE NOT NULL,
+        path        VARCHAR(255) NOT NULL,
+        title       TEXT,
+        description TEXT,
+        since       DATE DEFAULT CURRENT_DATE,
+        days        INT  DEFAULT 7,
+        release_id  INT,
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    // Migrate the one entry that used to live in the frontend registry (keeps its dot/seen state).
+    await pool.query(`
+      INSERT INTO new_features (feature_id, path, title, description, since, days)
+      VALUES ('admin-data-tools-2026-06', '/admin/sync',
+              'Invoice Enrichment & Recalculation',
+              'New tools to enrich invoices (classify hardware/SaaS) and recalculate commissions.',
+              '2026-06-04', 7)
+      ON CONFLICT (feature_id) DO NOTHING
+    `);
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS commission_bonuses (
         id SERIAL PRIMARY KEY,
@@ -4217,6 +4242,45 @@ app.post('/api/features/seen', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/features/new — active "new feature" announcements (within their since+days window).
+// Drives the sidebar dot/badge + on-page banner. Authed (any user); per-user seen state is
+// tracked separately via /api/features/seen.
+app.get('/api/features/new', authenticateToken, async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT feature_id AS id, path, title, description, since, days
+      FROM new_features
+      WHERE CURRENT_DATE <= since + (days * INTERVAL '1 day')
+      ORDER BY since DESC
+    `);
+    res.json({ features: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Admin: list ALL new-feature entries (active or expired) — for management in the Releases panel.
+app.get('/api/admin/new-features', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:releases'))) return;
+  try {
+    const r = await pool.query(`SELECT id, feature_id, path, title, description, since, days, release_id FROM new_features ORDER BY since DESC`);
+    res.json({ features: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Admin: remove a new-feature tag early.
+app.delete('/api/admin/new-features/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:releases'))) return;
+  try {
+    await pool.query('DELETE FROM new_features WHERE id = $1', [parseInt(req.params.id)]);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ============================================================================
 // RESELLERS — third-party license resellers. POS activations (Zoho Form) + residual
 // payments (Zentact). Phase 1 = scaffolding; data sources wired in later phases.
@@ -6664,7 +6728,7 @@ app.get('/api/releases/workflow-status', authenticateToken, async (req, res) => 
 // frontend uses the stored URL, which now points to the actual GitHub release.
 app.post('/api/releases/create', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
-  const { version, releaseNotes } = req.body;
+  const { version, releaseNotes, newFeatures } = req.body;
   if (!version) return res.status(400).json({ error: 'Version required' });
 
   const token   = process.env.GITHUB_TOKEN;
@@ -6718,11 +6782,28 @@ app.post('/api/releases/create', authenticateToken, async (req, res) => {
   }
 
   try {
-    await pool.query(
+    const rel = await pool.query(
       `INSERT INTO releases (version, name, notes, url, date)
-       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)`,
+       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP) RETURNING id`,
       [tagName, tagName, releaseNotes || '', releaseUrl]
     );
+    const releaseId = rel.rows[0].id;
+
+    // "What's New" menu tags chosen at publish time → drive the sidebar dot/badge + banner.
+    if (Array.isArray(newFeatures)) {
+      for (const f of newFeatures) {
+        if (!f || !f.path) continue;
+        const featureId = `${tagName}:${f.path}`;
+        await pool.query(
+          `INSERT INTO new_features (feature_id, path, title, description, since, days, release_id)
+           VALUES ($1, $2, $3, $4, CURRENT_DATE, $5, $6)
+           ON CONFLICT (feature_id) DO UPDATE SET
+             title = EXCLUDED.title, description = EXCLUDED.description,
+             since = CURRENT_DATE, days = EXCLUDED.days, release_id = EXCLUDED.release_id`,
+          [featureId, f.path, f.title || null, f.description || null, parseInt(f.days) || 7, releaseId]
+        );
+      }
+    }
     res.json({ success: true, version: tagName, url: releaseUrl, warning });
   } catch (error) {
     res.status(500).json({ error: 'Failed to save release record', details: error.message });
