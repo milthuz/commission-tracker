@@ -61,6 +61,7 @@ const PERMISSION_CATALOG = [
 
   // Reseller
   { key: 'reseller:view',              label: 'View the Reseller section (POS activations + residual payments)', category: 'Reseller' },
+  { key: 'reseller:manage',           label: 'Manage resellers (names, emails, Zentact key, active)',           category: 'Reseller' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -387,6 +388,11 @@ async function initializeDatabase() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    // Reseller identity resolution: associated form emails + a Zentact key (residuals).
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS emails JSONB DEFAULT '[]'::jsonb`);
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS zentact_key VARCHAR(255)`);
+    await pool.query(`UPDATE resellers SET emails = jsonb_build_array(LOWER(email))
+                      WHERE (emails IS NULL OR emails = '[]'::jsonb) AND email IS NOT NULL AND email <> ''`);
 
     // "What's New" catalog — backend-driven so admins choose what's new when publishing a
     // release (no code deploy). The per-user "seen" state lives in user_seen_features (by feature_id).
@@ -4303,12 +4309,99 @@ app.delete('/api/admin/new-features/:id', authenticateToken, async (req, res) =>
 // payments (Zentact). Phase 1 = scaffolding; data sources wired in later phases.
 // ============================================================================
 
-// GET /api/resellers — list resellers
+// GET /api/resellers — list resellers with resolved activation stats (locations + licenses)
 app.get('/api/resellers', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'reseller:view'))) return;
   try {
-    const r = await pool.query('SELECT id, name, email, active FROM resellers ORDER BY name');
+    const r = await pool.query(`
+      SELECT rs.id, rs.name, rs.active, rs.zentact_key,
+             COALESCE(rs.emails, '[]'::jsonb) AS emails,
+             COALESCE(a.locations, 0) AS locations,
+             COALESCE(a.licenses, 0) AS licenses
+      FROM resellers rs
+      LEFT JOIN LATERAL (
+        SELECT COUNT(DISTINCT customer_name)::int AS locations, COALESCE(SUM(quantity),0)::int AS licenses
+        FROM reseller_pos_activations a
+        WHERE rs.emails @> to_jsonb(LOWER(a.reseller_email))
+      ) a ON true
+      ORDER BY rs.name
+    `);
     res.json({ resellers: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/resellers — create a reseller
+app.post('/api/resellers', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'reseller:manage'))) return;
+  const name = (req.body?.name || '').toString().trim();
+  if (!name) return res.status(400).json({ error: 'name required' });
+  try {
+    const r = await pool.query(
+      `INSERT INTO resellers (name) VALUES ($1) ON CONFLICT (name) DO NOTHING RETURNING id`,
+      [name]
+    );
+    res.json({ success: true, id: r.rows[0]?.id || null });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/resellers/:id — update name / active / emails / zentact_key
+app.put('/api/resellers/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'reseller:manage'))) return;
+  const { name, active, emails, zentact_key } = req.body || {};
+  // Normalize emails to a lowercased, de-duped array.
+  const cleanEmails = Array.isArray(emails)
+    ? [...new Set(emails.map(e => (e || '').toString().trim().toLowerCase()).filter(Boolean))]
+    : null;
+  try {
+    await pool.query(
+      `UPDATE resellers SET
+         name        = COALESCE($2, name),
+         active      = COALESCE($3, active),
+         emails      = COALESCE($4::jsonb, emails),
+         zentact_key = $5,
+         updated_at  = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [parseInt(req.params.id),
+       name != null ? String(name).trim() : null,
+       typeof active === 'boolean' ? active : null,
+       cleanEmails ? JSON.stringify(cleanEmails) : null,
+       zentact_key != null ? String(zentact_key).trim() || null : null]
+    );
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/resellers/:id
+app.delete('/api/resellers/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'reseller:manage'))) return;
+  try {
+    await pool.query('DELETE FROM resellers WHERE id = $1', [parseInt(req.params.id)]);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/resellers/unassigned-emails — reseller emails seen in activations but not mapped to any reseller
+app.get('/api/resellers/unassigned-emails', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'reseller:view'))) return;
+  try {
+    const r = await pool.query(`
+      SELECT LOWER(a.reseller_email) AS email,
+             COUNT(DISTINCT a.customer_name)::int AS locations,
+             COALESCE(SUM(a.quantity),0)::int AS licenses
+      FROM reseller_pos_activations a
+      WHERE a.reseller_email IS NOT NULL AND a.reseller_email <> ''
+        AND NOT EXISTS (SELECT 1 FROM resellers rs WHERE rs.emails @> to_jsonb(LOWER(a.reseller_email)))
+      GROUP BY 1 ORDER BY licenses DESC
+    `);
+    res.json({ emails: r.rows });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -4363,18 +4456,24 @@ app.post('/api/webhooks/zoho-form/license-order',
 app.get('/api/resellers/pos-activations', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'reseller:view'))) return;
   try {
+    // Resolve each activation's reseller_email to a managed reseller (by emails mapping);
+    // unassigned emails fall back to showing the raw email.
     const rows = (await pool.query(
-      `SELECT id,
-              COALESCE(NULLIF(reseller_name,''), reseller_email, '(unknown)') AS reseller_name,
-              reseller_email, quantity, customer_name, submitted_at
-       FROM reseller_pos_activations ORDER BY submitted_at DESC LIMIT 2000`
+      `SELECT a.id,
+              COALESCE(rs.name, a.reseller_email, '(unassigned)') AS reseller_name,
+              a.reseller_email, a.quantity, a.customer_name, a.submitted_at
+       FROM reseller_pos_activations a
+       LEFT JOIN resellers rs ON rs.emails @> to_jsonb(LOWER(a.reseller_email))
+       ORDER BY a.submitted_at DESC LIMIT 2000`
     )).rows;
     const byReseller = (await pool.query(
-      `SELECT COALESCE(NULLIF(reseller_name,''), reseller_email, '(unknown)') AS reseller_name,
-              COUNT(DISTINCT customer_name)::int AS locations,
-              COALESCE(SUM(quantity),0)::int AS licenses,
+      `SELECT COALESCE(rs.name, a.reseller_email, '(unassigned)') AS reseller_name,
+              COUNT(DISTINCT a.customer_name)::int AS locations,
+              COALESCE(SUM(a.quantity),0)::int AS licenses,
               COUNT(*)::int AS submissions
-       FROM reseller_pos_activations GROUP BY 1 ORDER BY licenses DESC`
+       FROM reseller_pos_activations a
+       LEFT JOIN resellers rs ON rs.emails @> to_jsonb(LOWER(a.reseller_email))
+       GROUP BY 1 ORDER BY licenses DESC`
     )).rows;
     res.json({ connected: true, source: 'zoho_forms', activations: rows, byReseller });
   } catch (e) {
