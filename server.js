@@ -4361,7 +4361,9 @@ app.get('/api/resellers/pos-activations', authenticateToken, async (req, res) =>
     )).rows;
     const byReseller = (await pool.query(
       `SELECT COALESCE(reseller_name,'(unknown)') AS reseller_name,
-              COUNT(*)::int AS submissions, COALESCE(SUM(quantity),0)::int AS licenses
+              COUNT(DISTINCT customer_name)::int AS locations,
+              COALESCE(SUM(quantity),0)::int AS licenses,
+              COUNT(*)::int AS submissions
        FROM reseller_pos_activations GROUP BY 1 ORDER BY licenses DESC`
     )).rows;
     res.json({ connected: true, source: 'zoho_forms', activations: rows, byReseller });
