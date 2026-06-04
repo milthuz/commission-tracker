@@ -5020,6 +5020,27 @@ app.delete('/api/invoices/flush', authenticateToken, async (req, res) => {
 // ============================================================================
 // PHASE 1b — Batch invoice enrichment (classify + link + store)
 // ============================================================================
+
+// Normalize a line-item / plan name for matching: lowercase, strip leading '*', collapse spaces.
+function normalizePlanName(s) {
+  return (s || '').toLowerCase().replace(/^\*+/, '').replace(/\s+/g, ' ').trim();
+}
+
+// Classify a single line item → 'saas' | 'hardware' | 'noncommission'. Business rules:
+//   - Residuals / referral payouts earn nothing.
+//   - Matches a Zoho plan (sku or name) OR is an "...Integration" add-on (Datacandy, MEV-WEB,
+//     Payment Processing Integration, ...) → SaaS (first month 100%, renewals 0%).
+//   - Everything else (POS, printers, installation/labor services, ...) → hardware (10%).
+// noncommission amounts are excluded from BOTH saas_amount and hardware_amount, so they pay $0.
+function classifyLineType(name, sku, planCodes, planNames) {
+  const n = normalizePlanName(name);
+  if (/residual|referral/.test(n)) return 'noncommission';
+  if (sku && planCodes.has(String(sku).toLowerCase().trim())) return 'saas';
+  if (n && planNames.has(n)) return 'saas';
+  if (/integration/.test(n)) return 'saas';
+  return 'hardware';
+}
+
 let enrichJob = {
   status:   'idle',  // idle | running | stopping | stopped | completed | error
   startedAt: null,
@@ -5137,27 +5158,27 @@ async function runEnrichInvoices({ onlyMissing = true, source = 'manual' } = {})
         const det = detRes.data?.invoice;
         if (!det) { enrichJob.processed++; continue; }
 
-        // Classify line items
+        // Classify line items (3-way: saas / hardware / noncommission)
         let saasLines = 0, hardwareLines = 0;
         const classified = (det.line_items || []).map(li => {
           const sku = (li.sku || li.item_code || '').trim();
+          const lineType = classifyLineType(li.name, sku, planCodes, planNames);
+          if (lineType === 'saas') saasLines++; else if (lineType === 'hardware') hardwareLines++;
           const matchedBySku = sku && planCodes.has(sku.toLowerCase());
-          const matchedByName = !matchedBySku && planNames.has(normalizeName(li.name));
-          const isSaaS = matchedBySku || matchedByName;
-          if (isSaaS) saasLines++; else hardwareLines++;
           return {
             name: li.name, sku, quantity: li.quantity, rate: li.rate,
             amount: parseFloat(li.item_total) || (parseFloat(li.rate) * parseInt(li.quantity)) || 0,
-            type: isSaaS ? 'saas' : 'hardware',
-            plan_code: matchedBySku ? sku : (matchedByName ? planNames.get(normalizeName(li.name)) : null),
+            type: lineType,
+            plan_code: matchedBySku ? sku : (planNames.get(normalizeName(li.name)) || null),
           };
         });
         const type = saasLines > hardwareLines ? 'saas'
                    : hardwareLines > saasLines ? 'hardware'
                    : (saasLines > 0 ? 'saas' : 'unknown');
-        const totalAmount = classified.reduce((s, l) => s + l.amount, 0);
+        // hardware_amount = hardware lines ONLY (noncommission lines excluded from both → pay $0)
         const saasAmount = classified.filter(l => l.type === 'saas').reduce((s, l) => s + l.amount, 0);
-        const hardwareAmount = totalAmount - saasAmount;
+        const hardwareAmount = classified.filter(l => l.type === 'hardware').reduce((s, l) => s + l.amount, 0);
+        const totalAmount = saasAmount + hardwareAmount;
         const paidDate = det.last_payment_date || (det.status === 'paid' ? det.date : null);
 
         // Fetch SaaS activation if this is a SaaS invoice
