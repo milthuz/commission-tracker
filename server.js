@@ -58,6 +58,9 @@ const PERMISSION_CATALOG = [
   { key: 'sync:crm',                   label: 'Trigger Zoho CRM sync manually',              category: 'Syncs' },
   { key: 'sync:zentact',               label: 'Trigger Zentact merchant sync manually',      category: 'Syncs' },
   { key: 'sync:recalc',                label: 'Recalculate all commissions',                 category: 'Syncs' },
+
+  // Reseller
+  { key: 'reseller:view',              label: 'View the Reseller section (POS activations + residual payments)', category: 'Reseller' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -4221,7 +4224,7 @@ app.post('/api/features/seen', authenticateToken, async (req, res) => {
 
 // GET /api/resellers — list resellers
 app.get('/api/resellers', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'admin:*'))) return;
+  if (!(await requirePerm(req, res, 'reseller:view'))) return;
   try {
     const r = await pool.query('SELECT id, name, email, active FROM resellers ORDER BY name');
     res.json({ resellers: r.rows });
@@ -4233,14 +4236,14 @@ app.get('/api/resellers', authenticateToken, async (req, res) => {
 // GET /api/resellers/pos-activations — POS license activations from the Zoho order form.
 // Phase 2 will populate this from Zoho Forms submissions; for now returns an unconnected stub.
 app.get('/api/resellers/pos-activations', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'admin:*'))) return;
+  if (!(await requirePerm(req, res, 'reseller:view'))) return;
   res.json({ connected: false, source: 'zoho_forms', activations: [] });
 });
 
 // GET /api/resellers/residuals — residual payments per reseller (from Zentact statements).
 // Phase 3 will populate this from the Zentact API; for now returns an unconnected stub.
 app.get('/api/resellers/residuals', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'admin:*'))) return;
+  if (!(await requirePerm(req, res, 'reseller:view'))) return;
   res.json({ connected: false, source: 'zentact', residuals: [] });
 });
 
