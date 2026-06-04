@@ -4329,12 +4329,16 @@ app.post('/api/webhooks/zoho-form/license-order',
       const licenseType  = (b.license_type || b.licenseType || b.license || '').toString().trim() || null;
       const quantity     = parseInt(b.quantity || b.qty || 1) || 1;
       const customerName = (b.customer_name || b.customerName || b.customer || '').toString().trim() || null;
-      const submittedAt  = b.submitted_at || b.submittedAt || new Date().toISOString();
+      // Submission date: use the mapped form value if it parses, else now (the webhook fires
+      // at submit time, so "now" is the submission moment). Parsed in JS to tolerate any format.
+      let submittedDate = new Date();
+      const rawDate = b.submitted_at || b.submittedAt || b.date || b.added_time || b['Added Time'];
+      if (rawDate) { const d = new Date(rawDate); if (!isNaN(d.getTime())) submittedDate = d; }
 
       await pool.query(
         `INSERT INTO reseller_pos_activations (reseller_name, license_type, quantity, customer_name, submitted_at, raw)
-         VALUES ($1, $2, $3, $4, $5::timestamp, $6::jsonb)`,
-        [resellerName, licenseType, quantity, customerName, submittedAt, JSON.stringify(b)]
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+        [resellerName, licenseType, quantity, customerName, submittedDate, JSON.stringify(b)]
       );
       // Auto-register the reseller (by name) so it appears in the resellers list.
       if (resellerName) {
