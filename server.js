@@ -5077,10 +5077,13 @@ function normalizePlanName(s) {
 // noncommission amounts are excluded from BOTH saas_amount and hardware_amount, so they pay $0.
 function classifyLineType(name, sku, planCodes, planNames) {
   const n = normalizePlanName(name);
-  if (/residual|referral/.test(n)) return 'noncommission';
+  // Non-commissionable: residuals, referral payouts, and fees earn nothing.
+  if (/\b(residual|referral|fee|frais)/.test(n)) return 'noncommission';
+  // SaaS: matches a Zoho plan, OR a recurring software product/add-on by keyword.
   if (sku && planCodes.has(String(sku).toLowerCase().trim())) return 'saas';
   if (n && planNames.has(n)) return 'saas';
-  if (/integration/.test(n)) return 'saas';
+  if (/integration|online ordering|qr table|delivery|bundle|cluster os|add-?on/.test(n)) return 'saas';
+  // Everything else (POS, printers, terminals, installation/labor/shipping services) → hardware.
   return 'hardware';
 }
 
