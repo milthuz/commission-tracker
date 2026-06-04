@@ -5177,6 +5177,8 @@ async function runEnrichInvoices({ onlyMissing = true, source = 'manual' } = {})
       // Pass 1: fetch all invoice details from Zoho, classify, gather customer → first SaaS map
       const invoiceDetails = [];   // { number, detail, type, paid_date, subActivation, customer_id, total }
       const subCache = new Map();  // subscription_id → activation iso string
+      let enrichZohoErrors = 0;    // Zoho calls that came back non-200 (rate limit / auth / etc.)
+      let enrichErrLogged = false; // log the first error verbatim so we can see WHY (then suppress spam)
 
       for (const row of invRes.rows) {
         if (enrichJob.status === 'stopping') break;
@@ -5190,6 +5192,14 @@ async function runEnrichInvoices({ onlyMissing = true, source = 'manual' } = {})
             validateStatus: () => true,
           }
         );
+        if (searchRes.status !== 200) {
+          enrichZohoErrors++;
+          if (!enrichErrLogged) {
+            console.warn(`⚠️ [ENRICH] Zoho search ${row.invoice_number} → HTTP ${searchRes.status}: ${JSON.stringify(searchRes.data).slice(0, 300)}`);
+            enrichErrLogged = true;
+          }
+          enrichJob.processed++; continue;
+        }
         const stub = searchRes.data?.invoices?.[0];
         if (!stub) { enrichJob.processed++; continue; }
 
@@ -5201,6 +5211,14 @@ async function runEnrichInvoices({ onlyMissing = true, source = 'manual' } = {})
             validateStatus: () => true,
           }
         );
+        if (detRes.status !== 200) {
+          enrichZohoErrors++;
+          if (!enrichErrLogged) {
+            console.warn(`⚠️ [ENRICH] Zoho detail ${row.invoice_number} → HTTP ${detRes.status}: ${JSON.stringify(detRes.data).slice(0, 300)}`);
+            enrichErrLogged = true;
+          }
+          enrichJob.processed++; continue;
+        }
         const det = detRes.data?.invoice;
         if (!det) { enrichJob.processed++; continue; }
 
@@ -5295,7 +5313,9 @@ async function runEnrichInvoices({ onlyMissing = true, source = 'manual' } = {})
       }
 
       enrichJob.status = enrichJob.status === 'stopping' ? 'stopped' : 'completed';
-      enrichJob.message = `Done (${source}) — ${enrichJob.processed} invoices processed`;
+      enrichJob.zohoErrors = enrichZohoErrors;
+      enrichJob.message = `Done (${source}) — ${enrichJob.processed} invoices processed`
+        + (enrichZohoErrors ? ` — ⚠️ ${enrichZohoErrors} Zoho errors (rate limit / auth?)` : '');
       console.log(`[ENRICH] ${enrichJob.message}`);
       return enrichJob;
     } catch (error) {
