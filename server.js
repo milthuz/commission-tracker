@@ -427,6 +427,8 @@ async function initializeDatabase() {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_pos_activations_reseller ON reseller_pos_activations(reseller_name)`);
+    // Resellers are identified by EMAIL (the form's reseller-name field is often blank).
+    await pool.query(`ALTER TABLE reseller_pos_activations ADD COLUMN IF NOT EXISTS reseller_email VARCHAR(255)`);
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS commission_bonuses (
@@ -4325,7 +4327,8 @@ app.post('/api/webhooks/zoho-form/license-order',
     }
     try {
       const b = req.body || {};
-      const resellerName = (b.reseller_name || b.resellerName || b.reseller || '').toString().trim() || null;
+      const resellerName  = (b.reseller_name || b.resellerName || b.reseller || '').toString().trim() || null;
+      const resellerEmail = (b.reseller_email || b.resellerEmail || b.email || '').toString().trim().toLowerCase() || null;
       const licenseType  = (b.license_type || b.licenseType || b.license || '').toString().trim() || null;
       const quantity     = parseInt(b.quantity || b.qty || 1) || 1;
       const customerName = (b.customer_name || b.customerName || b.customer || '').toString().trim() || null;
@@ -4336,18 +4339,19 @@ app.post('/api/webhooks/zoho-form/license-order',
       if (rawDate) { const d = new Date(rawDate); if (!isNaN(d.getTime())) submittedDate = d; }
 
       await pool.query(
-        `INSERT INTO reseller_pos_activations (reseller_name, license_type, quantity, customer_name, submitted_at, raw)
-         VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
-        [resellerName, licenseType, quantity, customerName, submittedDate, JSON.stringify(b)]
+        `INSERT INTO reseller_pos_activations (reseller_name, reseller_email, license_type, quantity, customer_name, submitted_at, raw)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+        [resellerName, resellerEmail, licenseType, quantity, customerName, submittedDate, JSON.stringify(b)]
       );
-      // Auto-register the reseller (by name) so it appears in the resellers list.
-      if (resellerName) {
+      // Auto-register the reseller (keyed by name when present, else email) so it appears in the list.
+      const resellerKey = resellerName || resellerEmail;
+      if (resellerKey) {
         await pool.query(
-          `INSERT INTO resellers (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`,
-          [resellerName]
+          `INSERT INTO resellers (name, email) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING`,
+          [resellerKey, resellerEmail]
         );
       }
-      console.log(`🔔 POS activation: ${resellerName || '(no reseller)'} — ${licenseType || '?'} x${quantity}`);
+      console.log(`🔔 POS activation: ${resellerKey || '(no reseller)'} — ${customerName || '?'} x${quantity}`);
       res.json({ success: true });
     } catch (e) {
       console.error('zoho-form webhook error:', e.message);
@@ -4360,11 +4364,13 @@ app.get('/api/resellers/pos-activations', authenticateToken, async (req, res) =>
   if (!(await requirePerm(req, res, 'reseller:view'))) return;
   try {
     const rows = (await pool.query(
-      `SELECT id, reseller_name, license_type, quantity, customer_name, submitted_at
-       FROM reseller_pos_activations ORDER BY submitted_at DESC LIMIT 1000`
+      `SELECT id,
+              COALESCE(NULLIF(reseller_name,''), reseller_email, '(unknown)') AS reseller_name,
+              reseller_email, quantity, customer_name, submitted_at
+       FROM reseller_pos_activations ORDER BY submitted_at DESC LIMIT 2000`
     )).rows;
     const byReseller = (await pool.query(
-      `SELECT COALESCE(reseller_name,'(unknown)') AS reseller_name,
+      `SELECT COALESCE(NULLIF(reseller_name,''), reseller_email, '(unknown)') AS reseller_name,
               COUNT(DISTINCT customer_name)::int AS locations,
               COALESCE(SUM(quantity),0)::int AS licenses,
               COUNT(*)::int AS submissions
