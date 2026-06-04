@@ -2235,9 +2235,10 @@ async function autoSyncInvoices() {
       const salesperson = inv.salesperson_name || 'Unassigned';
       const customerName = inv.customer_name || inv.contact_name || null;
       const total = parseFloat(inv.total) || 0;
-      // Commission only for PAID invoices. void/overdue → 0 (will be properly
-      // recomputed by recalc-v2 anyway, this is just a sane baseline)
-      const commission = inv.status === 'paid' ? (total * 0.1) : 0;
+      // recalc-v2 is the SOLE authority on `commission` — do NOT write a flat 10% baseline
+      // here. It used to clobber recalc-v2's per-model values on every sync. New rows start
+      // at 0; the post-sync recalc-v2 fills the real value.
+      const commission = 0;
       const invDate = new Date(inv.date || new Date());
       upsertByNumber.set(inv.invoice_number, [
         inv.invoice_number, salesperson, customerName, total, inv.status, invDate, commission, process.env.ZOHO_ORG_ID,
@@ -2264,7 +2265,6 @@ async function autoSyncInvoices() {
            total            = EXCLUDED.total,
            status           = EXCLUDED.status,
            date             = EXCLUDED.date,
-           commission       = CASE WHEN EXCLUDED.status = 'paid' THEN EXCLUDED.commission ELSE invoices.commission END,
            updated_at       = CURRENT_TIMESTAMP`,
         vals
       );
@@ -2920,7 +2920,8 @@ app.post('/api/sync/invoices', authenticateToken, async (req, res) => {
       const salesperson = inv.salesperson_name || 'Unassigned';
       const customerName = inv.customer_name || inv.contact_name || null;
       const total = parseFloat(inv.total) || 0;
-      const commission = inv.status === 'paid' ? (total * 0.1) : 0;
+      // recalc-v2 owns `commission` — never overwrite it from a sync (was a flat 10% clobber).
+      const commission = 0;
       const invDate = new Date(inv.date || new Date());
 
       await pool.query(
@@ -2928,7 +2929,7 @@ app.post('/api/sync/invoices', authenticateToken, async (req, res) => {
          (invoice_number, salesperson_name, customer_name, total, status, date, commission, organization_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT (invoice_number) DO UPDATE SET
-         status = $5, total = $4, commission = $7, customer_name = COALESCE($3, invoices.customer_name),
+         status = $5, total = $4, customer_name = COALESCE($3, invoices.customer_name),
          updated_at = CURRENT_TIMESTAMP`,
         [inv.invoice_number, salesperson, customerName, total, inv.status, invDate, commission, process.env.ZOHO_ORG_ID]
       );
@@ -3669,7 +3670,10 @@ async function upsertInvoiceFromZoho(inv) {
   const customerName = inv.customer_name || inv.contact_name || null;
   const total        = parseFloat(inv.total) || 0;
   const status       = inv.status || 'paid';
-  const commission   = status === 'paid' ? (total * 0.1) : 0;
+  // recalc-v2 is the SOLE authority on `commission`. Sync must NOT write a flat 10% here —
+  // doing so clobbered recalc-v2's per-model values (first-month 100%, renewals 0%, etc.)
+  // on every 5-min delta poll / webhook. New rows start at 0; recalc-v2 fills the real value.
+  const commission   = 0;
   const invDate      = new Date(inv.date || new Date());
   await pool.query(
     `INSERT INTO invoices
@@ -3681,7 +3685,6 @@ async function upsertInvoiceFromZoho(inv) {
        total            = $4,
        status           = $5,
        date             = $6,
-       commission       = CASE WHEN $5 = 'paid' THEN $7 ELSE invoices.commission END,
        updated_at       = CURRENT_TIMESTAMP`,
     [inv.invoice_number, salesperson, customerName, total, status, invDate, commission, process.env.ZOHO_ORG_ID]
   );
