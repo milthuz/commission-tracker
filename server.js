@@ -361,6 +361,17 @@ async function initializeDatabase() {
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_cp_imports_period ON commission_payment_imports(paid_for_period DESC, rep_name)`);
 
+    // Tracks which "new feature" announcements each user has seen (per-user, cross-device).
+    // The feature catalog itself lives in the frontend; we just store seen feature_ids here.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_seen_features (
+        user_key   VARCHAR(255) NOT NULL,
+        feature_id VARCHAR(255) NOT NULL,
+        seen_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (user_key, feature_id)
+      );
+    `);
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS commission_bonuses (
         id SERIAL PRIMARY KEY,
@@ -4157,6 +4168,38 @@ const importHandler = (commit) => async (req, res) => {
 };
 app.post('/api/admin/commission-import/preview', authenticateToken, uploadXlsx.single('file'), importHandler(false));
 app.post('/api/admin/commission-import/commit', authenticateToken, uploadXlsx.single('file'), importHandler(true));
+
+// ============================================================================
+// "What's New" — per-user tracking of which new-feature announcements were seen.
+// The feature catalog lives in the frontend; here we just persist seen ids per user.
+// ============================================================================
+const seenFeatureKey = (req) => req.user.email || req.user.realAdminEmail || req.user.name || 'unknown';
+
+// GET /api/features/seen — list feature ids the current user has already seen
+app.get('/api/features/seen', authenticateToken, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT feature_id FROM user_seen_features WHERE user_key = $1', [seenFeatureKey(req)]);
+    res.json({ seen: r.rows.map(x => x.feature_id) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/features/seen — mark a feature id as seen for the current user
+app.post('/api/features/seen', authenticateToken, async (req, res) => {
+  const featureId = (req.body?.featureId || '').toString().trim();
+  if (!featureId) return res.status(400).json({ error: 'featureId required' });
+  try {
+    await pool.query(
+      `INSERT INTO user_seen_features (user_key, feature_id) VALUES ($1, $2)
+       ON CONFLICT (user_key, feature_id) DO NOTHING`,
+      [seenFeatureKey(req), featureId]
+    );
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // GET /api/admin/commission-imports — history of all imports
 app.get('/api/admin/commission-imports', authenticateToken, async (req, res) => {
