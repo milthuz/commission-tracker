@@ -254,6 +254,9 @@ async function initializeDatabase() {
     `);
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS invoice_count INT DEFAULT 0`);
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS aliases JSONB DEFAULT '[]'::jsonb`);
+    // Per-salesperson signup-bonus config (amount per Zentact activation + on/off toggle).
+    await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS signup_bonus_amount DECIMAL(10,2) DEFAULT 100`);
+    await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS signup_bonus_enabled BOOLEAN DEFAULT true`);
 
     // ROLES & PERMISSIONS — RBAC system
     await pool.query(`
@@ -1164,10 +1167,19 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       });
     }
 
+    // Per-salesperson signup-bonus config (amount per activation + on/off). Default $100, on.
+    const spCfgRows = (await pool.query(`SELECT name, signup_bonus_amount, signup_bonus_enabled FROM salespeople`)).rows;
+    const signupByRep = new Map(spCfgRows.map(s => [String(s.name).toLowerCase(), {
+      amount: s.signup_bonus_amount == null ? 100 : parseFloat(s.signup_bonus_amount),
+      enabled: s.signup_bonus_enabled !== false,
+    }]));
+    const signupFor = (name) => signupByRep.get(String(name || '').toLowerCase()) || { amount: 100, enabled: true };
+
     let summary = Object.values(repMap).map(rep => {
       const zentactMerchants = rep.zentactMerchants || [];
       const zentactPoints = zentactMerchants.reduce((s, m) => s + (m.points || 1), 0);
-      const zentactBonus  = zentactMerchants.reduce((s, m) => s + (m.bonus_amount || 100), 0);
+      const cfg = signupFor(rep.repName);
+      const zentactBonus  = cfg.enabled ? zentactMerchants.length * cfg.amount : 0;
       const quotaMet = rep.totalPoints >= MONTHLY_QUOTA;
       const monthlyBonus = ZohoCRMService.calculateMonthlyBonus(rep.totalPoints);
       return {
@@ -1226,12 +1238,13 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       const crmAnnual     = annualByRep[rep.repName]         || 0;
       const zentactAnnual = annualZentactByRep[rep.repName]  || { points: 0, activations: 0, bonus: 0 };
       const totalAnnual   = crmAnnual + zentactAnnual.points;
+      const cfg           = signupFor(rep.repName);
       return {
         ...rep,
         annualPoints:             totalAnnual,
         annualBonus:              ZohoCRMService.calculateAnnualBonus(totalAnnual),
         annualZentactActivations: zentactAnnual.activations,
-        annualZentactBonus:       zentactAnnual.bonus,
+        annualZentactBonus:       cfg.enabled ? zentactAnnual.activations * cfg.amount : 0,
       };
     });
 
@@ -5065,17 +5078,20 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
     `, [process.env.ZOHO_ORG_ID]);
 
     const result = await pool.query(
-      `SELECT name, is_active, commission_rate, base_salary, invoice_count, aliases
+      `SELECT name, is_active, commission_rate, base_salary, invoice_count, aliases,
+              signup_bonus_amount, signup_bonus_enabled
        FROM salespeople ORDER BY name`
     );
     res.json({
       salespeople: result.rows.map(r => ({
-        name:           r.name,
-        isActive:       r.is_active,
-        commissionRate: parseFloat(r.commission_rate) || 10,
-        baseSalary:     parseFloat(r.base_salary)     || 0,
-        invoiceCount:   parseInt(r.invoice_count)     || 0,
-        aliases:        Array.isArray(r.aliases) ? r.aliases : [],
+        name:               r.name,
+        isActive:           r.is_active,
+        commissionRate:     parseFloat(r.commission_rate) || 10,
+        baseSalary:         parseFloat(r.base_salary)     || 0,
+        invoiceCount:       parseInt(r.invoice_count)     || 0,
+        aliases:            Array.isArray(r.aliases) ? r.aliases : [],
+        signupBonusAmount:  r.signup_bonus_amount == null ? 100 : parseFloat(r.signup_bonus_amount),
+        signupBonusEnabled: r.signup_bonus_enabled !== false,
       }))
     });
   } catch (error) {
@@ -5128,6 +5144,25 @@ app.put('/api/salespeople/:name/base-salary', authenticateToken, async (req, res
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update base salary', details: error.message });
+  }
+});
+
+// PUT /api/salespeople/:name/signup-bonus — set the per-activation signup-bonus amount
+// + on/off toggle for this rep. Drives the Zentact signup bonus in the Commission Tracker.
+app.put('/api/salespeople/:name/signup-bonus', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const { amount, enabled } = req.body;
+  const amt = amount == null ? 100 : Math.max(0, parseFloat(amount) || 0);
+  const en = enabled !== false;
+  try {
+    await pool.query(
+      `INSERT INTO salespeople (name, signup_bonus_amount, signup_bonus_enabled) VALUES ($1, $2, $3)
+       ON CONFLICT (name) DO UPDATE SET signup_bonus_amount = $2, signup_bonus_enabled = $3, updated_at = CURRENT_TIMESTAMP`,
+      [req.params.name, amt, en]
+    );
+    res.json({ success: true, signupBonusAmount: amt, signupBonusEnabled: en });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update signup bonus', details: error.message });
   }
 });
 
