@@ -1180,6 +1180,8 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       const zentactPoints = zentactMerchants.reduce((s, m) => s + (m.points || 1), 0);
       const cfg = signupFor(rep.repName);
       const zentactBonus  = cfg.enabled ? zentactMerchants.length * cfg.amount : 0;
+      // Reflect the rep's signup config on each merchant row too (0 when disabled).
+      const zentactMerchantsOut = zentactMerchants.map(m => ({ ...m, bonus_amount: cfg.enabled ? cfg.amount : 0 }));
       const quotaMet = rep.totalPoints >= MONTHLY_QUOTA;
       const monthlyBonus = ZohoCRMService.calculateMonthlyBonus(rep.totalPoints);
       return {
@@ -1197,7 +1199,7 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
         nextBonusTier: MONTHLY_BONUS_TIERS.slice().reverse().find(t => rep.totalPoints < t.points) || null,
         dealsCount:          rep.deals.length,  // survives privacy stripping
         deals:               rep.deals,
-        zentactMerchants,
+        zentactMerchants:    zentactMerchantsOut,
       };
     }).sort((a, b) => b.totalPoints - a.totalPoints);
 
