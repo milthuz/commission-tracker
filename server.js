@@ -3985,17 +3985,15 @@ app.get('/api/admin/zentact-revenue-probe', async (req, res) => {
   const merchantId = req.query.merchantId || m.merchant_account_id;
   const organizationId = req.query.organizationId || m.organization_id;
   const psp = req.query.psp || 'ClusterPOS_POS';
-  const today = new Date();
-  const noMs = (d) => d.toISOString().replace(/\.\d{3}Z$/, 'Z'); // YYYY-MM-DDTHH:mm:ssZ
-  const fromDate = '2026-01-01T00:00:00Z';
-  const toDate = noMs(today);
-  const common = { pspMerchantAccountName: psp, organizationId, fromDate, toDate, type: 'merchants' };
+  // transaction-profitability requires a window of at most 31 days → use one month.
+  const fromDate = '2026-04-01T00:00:00Z';
+  const toDate = '2026-04-30T23:59:59Z';
+  const common = { pspMerchantAccountName: psp, organizationId, fromDate, toDate };
 
   const tries = [
-    ['transaction-profitability (merchant)', `${base}/reports/transaction-profitability`, { ...common, merchantAccountId: merchantId }],
-    ['transaction-profitability (all merchants)', `${base}/reports/transaction-profitability`, { ...common }],
-    ['payment-summary (merchant)', `${base}/reports/payment-summary`, { ...common, merchantAccountId: merchantId }],
-    ['payment-volume (merchant)', `${base}/reports/payment-volume`, { ...common, merchantAccountId: merchantId }],
+    ['profitability (merchants, all)', `${base}/reports/transaction-profitability`, { ...common, type: 'merchants' }],
+    ['profitability (merchant)', `${base}/reports/transaction-profitability`, { ...common, type: 'merchants', merchantAccountId: merchantId }],
+    ['profitability (organizations)', `${base}/reports/transaction-profitability`, { ...common, type: 'organizations' }],
   ];
   const out = [];
   for (const [name, url, params] of tries) {
