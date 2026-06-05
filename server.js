@@ -2510,16 +2510,38 @@ function rangePeriods(fromY, fromM, toY, toM) {
   return out;
 }
 
-async function syncZentactRevenue(periods) {
+// opts.resume = skip (org, month) pairs already imported, so a re-trigger after a
+// deploy/restart continues where it left off instead of redoing everything. The
+// worker's recent-month refresh passes resume=false (recent statements get restated).
+async function syncZentactRevenue(periods, opts = {}) {
+  const resume = !!opts.resume;
   if (!process.env.ZENTACT_API_KEY) return { skipped: true };
   if (!periods || periods.length === 0) return { skipped: true, reason: 'no periods' };
   const zentact = new ZentactService(process.env.ZENTACT_API_KEY);
-  const orgs = (await pool.query(
-    `SELECT DISTINCT organization_id FROM zentact_merchants WHERE organization_id IS NOT NULL AND organization_id <> ''`
-  )).rows.map((r) => r.organization_id);
+  // org → its merchant ids (one report call per org returns all its merchants).
+  const orgToMerchants = new Map();
+  for (const r of (await pool.query(
+    `SELECT merchant_account_id, organization_id FROM zentact_merchants WHERE organization_id IS NOT NULL AND organization_id <> ''`
+  )).rows) {
+    if (!orgToMerchants.has(r.organization_id)) orgToMerchants.set(r.organization_id, []);
+    orgToMerchants.get(r.organization_id).push(r.merchant_account_id);
+  }
+  const orgs = [...orgToMerchants.keys()];
 
-  revenueSyncJob = { running: true, startedAt: new Date().toISOString(), periods: periods.length, orgs: orgs.length, calls: 0, upserts: 0, errors: 0, doneAt: null };
-  console.log(`💰 [REVENUE] Sync start: ${periods.length} month(s) × ${orgs.length} org(s)`);
+  // For resume: which (merchant, year, month) rows already exist in the requested window.
+  const done = new Set();
+  if (resume) {
+    const yms = periods.map((p) => p.year * 100 + p.month);
+    for (const r of (await pool.query(
+      `SELECT merchant_account_id, year, month FROM zentact_merchant_revenue WHERE (year*100+month) = ANY($1)`,
+      [yms]
+    )).rows) {
+      done.add(`${r.merchant_account_id}|${r.year}|${r.month}`);
+    }
+  }
+
+  revenueSyncJob = { running: true, resume, startedAt: new Date().toISOString(), periods: periods.length, orgs: orgs.length, calls: 0, upserts: 0, skipped: 0, errors: 0, doneAt: null };
+  console.log(`💰 [REVENUE] Sync start: ${periods.length} month(s) × ${orgs.length} org(s)${resume ? ' (resume)' : ''}`);
 
   for (const p of periods) {
     const mm = String(p.month).padStart(2, '0');
@@ -2527,6 +2549,11 @@ async function syncZentactRevenue(periods) {
     const fromDate = `${p.year}-${mm}-01T00:00:00Z`;
     const toDate = `${p.year}-${mm}-${String(lastDay).padStart(2, '0')}T23:59:59Z`;
     for (const org of orgs) {
+      // Resume: skip this org+month if we already have data for any of its merchants.
+      if (resume && (orgToMerchants.get(org) || []).some((mid) => done.has(`${mid}|${p.year}|${p.month}`))) {
+        revenueSyncJob.skipped++;
+        continue;
+      }
       let rows = [];
       try {
         rows = await zentact.getTransactionProfitability({ organizationId: org, pspMerchantAccountName: PSP_NAME, fromDate, toDate });
@@ -4159,17 +4186,19 @@ app.get('/api/admin/zentact-revenue-sync', async (req, res) => {
     return res.status(401).json({ error: 'invalid secret' });
   }
   if (revenueSyncJob.running) return res.json({ alreadyRunning: true, job: revenueSyncJob });
-  let periods;
+  let periods, resume;
   if (req.query.from && req.query.to) {
     const [fy, fm] = String(req.query.from).split('-').map(Number);
     const [ty, tm] = String(req.query.to).split('-').map(Number);
     periods = rangePeriods(fy, fm, ty, tm);
+    resume = req.query.force !== '1'; // backfill resumes by default; &force=1 re-does everything
   } else {
     periods = recentPeriods(parseInt(req.query.monthsBack) || 2);
+    resume = false; // recent months get restated → always refresh
   }
   // Fire-and-forget — don't await (avoids H12; progress visible via summary).
-  syncZentactRevenue(periods).catch((e) => console.error('❌ [REVENUE] sync error:', e.message));
-  res.json({ started: true, periods: periods.length, first: periods[0], last: periods[periods.length - 1] });
+  syncZentactRevenue(periods, { resume }).catch((e) => console.error('❌ [REVENUE] sync error:', e.message));
+  res.json({ started: true, resume, periods: periods.length, first: periods[0], last: periods[periods.length - 1] });
 });
 
 // Revenue summary — row counts + totals (cents) by salesperson and by reseller.
