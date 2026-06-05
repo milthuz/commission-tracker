@@ -4214,13 +4214,26 @@ app.get('/api/admin/zentact-revenue-summary', async (req, res) => {
 
 const MONTH_ABBR_TO_NUM = { jan:1, feb:2, mar:3, apr:4, may:5, jun:6, jul:7, aug:8, sep:9, oct:10, nov:11, dec:12 };
 
-// Parse the filename to extract month/year + rep first name.
+// Parse the filename to extract month/year + rep name. Tolerant of token ORDER
+// (Mon_YY_Rep or Rep_Mon_YYYY) and 2- or 4-digit years — we just locate a month
+// token and a year token anywhere, and treat the remainder as the rep name.
+//   Eligible_Invoices_for_Commission_Feb_26_Amy.xlsx   ✓
+//   Eligible_Invoices_for_Commission_Amy_Feb_2026.xlsx ✓
 function parseImportFilename(filename) {
-  const m = filename.match(/_(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)_(\d{2})_(.+?)\.xlsx$/i);
-  if (!m) return null;
-  const month = MONTH_ABBR_TO_NUM[m[1].toLowerCase()];
-  const year = 2000 + parseInt(m[2], 10);
-  const repFirstName = m[3].replace(/_/g, ' ').trim();
+  if (!/\.xlsx$/i.test(filename)) return null;
+  const norm = filename.replace(/\.xlsx$/i, '').replace(/_/g, ' ');
+  const mMatch = norm.match(/\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b/i);
+  const yMatch = norm.match(/\b(20\d{2}|\d{2})\b/);
+  if (!mMatch || !yMatch) return null;
+  const month = MONTH_ABBR_TO_NUM[mMatch[1].toLowerCase()];
+  let year = parseInt(yMatch[1], 10);
+  if (year < 100) year += 2000;
+  const repFirstName = norm
+    .replace(/Eligible Invoices for Commission/i, '')
+    .replace(mMatch[0], ' ')
+    .replace(yMatch[0], ' ')
+    .replace(/\s+/g, ' ')
+    .trim() || null;
   return { month, year, repFirstName, periodDate: `${year}-${String(month).padStart(2, '0')}-01` };
 }
 
