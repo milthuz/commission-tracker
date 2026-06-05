@@ -3986,8 +3986,9 @@ app.get('/api/admin/zentact-revenue-probe', async (req, res) => {
   const organizationId = req.query.organizationId || m.organization_id;
   const psp = req.query.psp || 'ClusterPOS_POS';
   const today = new Date();
-  const fromDate = '2026-01-01T00:00:00.000Z';
-  const toDate = today.toISOString();
+  const noMs = (d) => d.toISOString().replace(/\.\d{3}Z$/, 'Z'); // YYYY-MM-DDTHH:mm:ssZ
+  const fromDate = '2026-01-01T00:00:00Z';
+  const toDate = noMs(today);
   const common = { pspMerchantAccountName: psp, organizationId, fromDate, toDate, type: 'merchants' };
 
   const tries = [
