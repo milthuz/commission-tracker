@@ -62,6 +62,9 @@ const PERMISSION_CATALOG = [
   // Reseller
   { key: 'reseller:view',              label: 'View the Reseller section (POS activations + residual payments)', category: 'Reseller' },
   { key: 'reseller:manage',           label: 'Manage resellers (names, emails, Zentact key, active)',           category: 'Reseller' },
+
+  // Revenue (Zentact transaction profit)
+  { key: 'revenue:view',               label: 'View merchant revenue (Transaction Profit by rep / reseller)',    category: 'Revenue' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -4751,12 +4754,17 @@ app.get('/api/resellers/residuals', authenticateToken, async (req, res) => {
     // before an admin sets its zentact_key.
     const resellers = (await pool.query(`SELECT name, zentact_key FROM resellers`)).rows;
     const merchants = (await pool.query(
-      `SELECT business_name, status, activated_at,
-              LOWER(sales_rep_name)     AS rep,
-              LOWER(reseller_attribute) AS reseller_attr
-       FROM zentact_merchants
-       WHERE (sales_rep_name IS NOT NULL AND sales_rep_name <> '')
-          OR (reseller_attribute IS NOT NULL AND reseller_attribute <> '')`
+      `SELECT zm.business_name, zm.status, zm.activated_at,
+              LOWER(zm.sales_rep_name)     AS rep,
+              LOWER(zm.reseller_attribute) AS reseller_attr,
+              COALESCE(rev.profit_cents, 0) AS profit_cents
+       FROM zentact_merchants zm
+       LEFT JOIN (
+         SELECT merchant_account_id, SUM(transaction_profit_cents) AS profit_cents
+         FROM zentact_merchant_revenue GROUP BY merchant_account_id
+       ) rev ON rev.merchant_account_id = zm.merchant_account_id
+       WHERE (zm.sales_rep_name IS NOT NULL AND zm.sales_rep_name <> '')
+          OR (zm.reseller_attribute IS NOT NULL AND zm.reseller_attribute <> '')`
     )).rows;
 
     // Build key(lowercased) → reseller name map. A reseller is identified in Zentact
@@ -4772,21 +4780,67 @@ app.get('/api/resellers/residuals', authenticateToken, async (req, res) => {
     }
 
     const detail = [];
-    const agg = new Map(); // reseller → { merchants, active }
+    const agg = new Map(); // reseller → { merchants, active, profit_cents }
     for (const m of merchants) {
       // Match by sales_rep_name first, then by the Reseller custom attribute.
       const reseller = keyToReseller.get(m.rep) || keyToReseller.get(m.reseller_attr);
       if (!reseller) continue; // not linked to a managed reseller (internal vendor / unmapped)
-      detail.push({ reseller_name: reseller, business_name: m.business_name, status: m.status, activated_at: m.activated_at });
-      const a = agg.get(reseller) || { merchants: 0, active: 0 };
-      a.merchants++; if (m.status === 'ACTIVE') a.active++;
+      const profit = Number(m.profit_cents) / 100;
+      detail.push({ reseller_name: reseller, business_name: m.business_name, status: m.status, activated_at: m.activated_at, transaction_profit: profit });
+      const a = agg.get(reseller) || { merchants: 0, active: 0, profit_cents: 0 };
+      a.merchants++; if (m.status === 'ACTIVE') a.active++; a.profit_cents += Number(m.profit_cents) || 0;
       agg.set(reseller, a);
     }
-    const byReseller = [...agg.entries()].map(([reseller_name, v]) => ({ reseller_name, ...v }))
-      .sort((a, b) => b.merchants - a.merchants);
+    const byReseller = [...agg.entries()].map(([reseller_name, v]) => ({
+      reseller_name, merchants: v.merchants, active: v.active, transaction_profit: v.profit_cents / 100,
+    })).sort((a, b) => b.merchants - a.merchants);
     detail.sort((a, b) => new Date(b.activated_at || 0) - new Date(a.activated_at || 0));
 
     res.json({ connected: true, source: 'zentact', byReseller, sales: detail.slice(0, 2000), linkedResellers: resellers.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/zentact/revenue?year=YYYY — per-merchant monthly Transaction Profit for a
+// year, with the salesperson and resolved reseller attached. Feeds the Revenus page
+// (client filters by month + aggregates by rep / reseller).
+app.get('/api/zentact/revenue', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'revenue:view'))) return;
+  try {
+    const year = parseInt(req.query.year) || new Date().getFullYear();
+    // Reseller resolution map (same rules as /api/resellers/residuals).
+    const resellers = (await pool.query(`SELECT name, zentact_key FROM resellers`)).rows;
+    const keyToReseller = new Map();
+    for (const rs of resellers) {
+      for (const k of String(rs.zentact_key || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)) {
+        keyToReseller.set(k, rs.name);
+      }
+      const nk = String(rs.name || '').trim().toLowerCase();
+      if (nk && !keyToReseller.has(nk)) keyToReseller.set(nk, rs.name);
+    }
+    const rows = (await pool.query(
+      `SELECT r.merchant_account_id, r.month, r.transaction_profit_cents, r.total_volume_cents,
+              r.payments_count, r.currency, zm.business_name, zm.sales_rep_name,
+              LOWER(zm.sales_rep_name) AS rep_l, LOWER(zm.reseller_attribute) AS reseller_attr_l
+       FROM zentact_merchant_revenue r
+       LEFT JOIN zentact_merchants zm ON zm.merchant_account_id = r.merchant_account_id
+       WHERE r.year = $1`,
+      [year]
+    )).rows;
+    const out = rows.map((r) => ({
+      merchant_account_id: r.merchant_account_id,
+      business_name: r.business_name || r.merchant_account_id,
+      sales_rep_name: r.sales_rep_name || null,
+      reseller_name: keyToReseller.get(r.rep_l) || keyToReseller.get(r.reseller_attr_l) || null,
+      month: r.month,
+      transaction_profit: Number(r.transaction_profit_cents) / 100,
+      volume: Number(r.total_volume_cents) / 100,
+      payments_count: r.payments_count,
+      currency: r.currency,
+    }));
+    const years = (await pool.query(`SELECT DISTINCT year FROM zentact_merchant_revenue ORDER BY year DESC`)).rows.map((x) => x.year);
+    res.json({ year, years, rows: out });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
