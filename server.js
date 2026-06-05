@@ -6474,8 +6474,9 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
     const myName    = tokenResult.rows[0]?.display_name || jwtName || email;
     const targetRep = isAdmin ? (repName || myName) : myName;
 
-    const spResult = await pool.query('SELECT commission_rate FROM salespeople WHERE name = $1', [targetRep]);
+    const spResult = await pool.query('SELECT commission_rate, base_salary FROM salespeople WHERE name = $1', [targetRep]);
     const commissionRate = parseFloat(spResult.rows[0]?.commission_rate) || 10;
+    const baseSalary = parseFloat(spResult.rows[0]?.base_salary) || 0; // annual base salary
 
     const startDate = new Date(`${targetYear}-01-01`);
     const endDate   = new Date(`${targetYear}-12-31T23:59:59.999`);
@@ -6558,6 +6559,7 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
     res.json({
       repName: targetRep,
       commissionRate,
+      baseSalary,
       year: targetYear,
       groupBy,
       months,
