@@ -4481,11 +4481,62 @@ app.get('/api/resellers/pos-activations', authenticateToken, async (req, res) =>
   }
 });
 
-// GET /api/resellers/residuals — residual payments per reseller (from Zentact statements).
-// Phase 3 will populate this from the Zentact API; for now returns an unconnected stub.
+// GET /api/resellers/residuals — a reseller's Zentact SALES (merchants they activated),
+// matched by the reseller's zentact_key against zentact_merchants.sales_rep_name
+// (comma-separated, case-insensitive). Resellers don't get bonuses — this is their sales.
 app.get('/api/resellers/residuals', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'reseller:view'))) return;
-  res.json({ connected: false, source: 'zentact', residuals: [] });
+  try {
+    const resellers = (await pool.query(
+      `SELECT name, zentact_key FROM resellers WHERE zentact_key IS NOT NULL AND zentact_key <> ''`
+    )).rows;
+    const merchants = (await pool.query(
+      `SELECT business_name, status, activated_at, LOWER(sales_rep_name) AS rep
+       FROM zentact_merchants WHERE sales_rep_name IS NOT NULL AND sales_rep_name <> ''`
+    )).rows;
+
+    // Build rep(lowercased) → reseller name map from each reseller's comma-separated zentact_key.
+    const repToReseller = new Map();
+    for (const rs of resellers) {
+      for (const k of String(rs.zentact_key).split(',').map(s => s.trim().toLowerCase()).filter(Boolean)) {
+        repToReseller.set(k, rs.name);
+      }
+    }
+
+    const detail = [];
+    const agg = new Map(); // reseller → { merchants, active }
+    for (const m of merchants) {
+      const reseller = repToReseller.get(m.rep);
+      if (!reseller) continue; // not linked to a managed reseller (internal vendor / unmapped)
+      detail.push({ reseller_name: reseller, business_name: m.business_name, status: m.status, activated_at: m.activated_at });
+      const a = agg.get(reseller) || { merchants: 0, active: 0 };
+      a.merchants++; if (m.status === 'ACTIVE') a.active++;
+      agg.set(reseller, a);
+    }
+    const byReseller = [...agg.entries()].map(([reseller_name, v]) => ({ reseller_name, ...v }))
+      .sort((a, b) => b.merchants - a.merchants);
+    detail.sort((a, b) => new Date(b.activated_at || 0) - new Date(a.activated_at || 0));
+
+    res.json({ connected: true, source: 'zentact', byReseller, sales: detail.slice(0, 2000), linkedResellers: resellers.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/resellers/zentact-names — distinct Zentact sales_rep_names (+ merchant counts) to
+// help the admin pick a reseller's zentact_key in the management tool.
+app.get('/api/resellers/zentact-names', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'reseller:view'))) return;
+  try {
+    const r = await pool.query(
+      `SELECT sales_rep_name AS name, COUNT(*)::int AS merchants
+       FROM zentact_merchants WHERE sales_rep_name IS NOT NULL AND sales_rep_name <> ''
+       GROUP BY 1 ORDER BY merchants DESC`
+    );
+    res.json({ names: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // GET /api/admin/commission-imports — history of all imports
