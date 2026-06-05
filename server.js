@@ -90,10 +90,10 @@ async function getUserPermissions(email) {
 
 // Endpoint-level helper: resolve current user, check perm, respond 403 if missing.
 // Returns true if allowed (and you should proceed), false if it sent a 403 response.
-// Admins (or admins-while-impersonating) always pass.
+// Admins always pass. While impersonating, the request is evaluated as the
+// impersonated user (their own permissions) — the admin's powers do NOT carry over.
 async function requirePerm(req, res, perm) {
   if (req.user.isAdmin === true) return true;
-  if (req.user.realAdminEmail) return true;            // admin impersonating someone
   const email = req.user.email;
   if (!email) {
     res.status(403).json({ error: `Permission required: ${perm}` });
@@ -640,10 +640,16 @@ const authenticateToken = async (req, res, next) => {
       if (result.rows.length > 0) {
         req.user.realAdminEmail = user.email;
         req.user.realAdminName  = user.name;
-        req.user.email          = null;  // skip display_name lookup → use impersonated name directly
         req.user.name           = result.rows[0].name; // canonical casing from DB
-        req.user.isAdmin        = false;
+        req.user.isAdmin        = false;               // never admin while impersonating
         req.user.impersonating  = true;
+        // True "view as": adopt the impersonated salesperson's OWN login account
+        // (so their real permissions apply). A rep with no login → no perms at all.
+        const acct = await pool.query(
+          'SELECT email FROM user_tokens WHERE LOWER(display_name) = LOWER($1) LIMIT 1',
+          [result.rows[0].name]
+        );
+        req.user.email = acct.rows[0]?.email || null;
       }
     }
     next();
@@ -851,10 +857,10 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
           [req.user.email]
         )).rows[0] || {};
 
-    // Load effective permissions for this user (impersonation lookup uses
-    // realAdminEmail since user_roles is keyed by email)
-    const permLookupEmail = req.user.impersonating ? null : req.user.email;
-    const permSet = await getUserPermissions(permLookupEmail);
+    // Effective permissions = those of the current identity. While impersonating,
+    // req.user.email is the impersonated user's own account (or null → no perms),
+    // so this returns exactly what that user would see — never the admin's perms.
+    const permSet = await getUserPermissions(req.user.email);
     // Super-admins always get the full set (wildcard)
     const isAdmin = row.is_admin != null ? row.is_admin : (req.user.isAdmin || false);
     const permissions = isAdmin ? ['*'] : [...permSet];
