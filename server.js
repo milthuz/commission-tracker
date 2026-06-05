@@ -549,6 +549,31 @@ async function initializeDatabase() {
     // ensure it exists on the live table too (CREATE TABLE IF NOT EXISTS is a no-op there).
     await pool.query(`ALTER TABLE zentact_merchants ADD COLUMN IF NOT EXISTS reseller_attribute VARCHAR(255)`);
 
+    // Per-merchant monthly revenue from Zentact's transaction-profitability report.
+    // All monetary fields are in MINOR UNITS (cents). transaction_profit_cents = the
+    // report's `totalRevenue` (collectedFees - processingCost) = Cluster's margin.
+    // other_revenue_cents (recurring/fixed fees) is reserved for Phase 2 (PDF parsing).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS zentact_merchant_revenue (
+        id                       SERIAL PRIMARY KEY,
+        merchant_account_id      VARCHAR(255) NOT NULL,
+        year                     INT NOT NULL,
+        month                    INT NOT NULL,
+        currency                 VARCHAR(8),
+        total_volume_cents       BIGINT DEFAULT 0,
+        payments_count           INT    DEFAULT 0,
+        processing_cost_cents    BIGINT DEFAULT 0,
+        collected_fees_cents     BIGINT DEFAULT 0,
+        gateway_fee_cents        BIGINT DEFAULT 0,
+        transaction_profit_cents BIGINT DEFAULT 0,
+        other_revenue_cents      BIGINT,
+        raw                      JSONB,
+        synced_at                TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (merchant_account_id, year, month)
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_merch_revenue_period ON zentact_merchant_revenue(year, month)`);
+
     console.log('✅ Database tables initialized');
   } catch (error) {
     console.error('Database initialization error:', error);
@@ -2445,9 +2470,105 @@ async function autoSyncZentact() {
     console.log('🔄 [AUTO-SYNC] Starting automatic Zentact merchant sync...');
     const result = await syncZentactMerchants();
     console.log(`✅ [AUTO-SYNC] Zentact done: ${result.total} total, ${result.active} active, ${result.newCount} new`);
+    // Chain a revenue refresh for the most recent 2 months (statements get restated).
+    await syncZentactRevenue(recentPeriods(2));
   } catch (err) {
     console.error('❌ [AUTO-SYNC] Zentact sync error:', err.message);
   }
+}
+
+// ============================================================================
+// ZENTACT REVENUE — per-merchant monthly Transaction Profit (totalRevenue) from
+// the transaction-profitability report. Synced per ORGANIZATION (one call returns
+// all the org's merchants) × MONTH (the report window is capped at 31 days).
+// ============================================================================
+const PSP_NAME = process.env.ZENTACT_PSP_NAME || 'ClusterPOS_POS';
+let revenueSyncJob = { running: false, startedAt: null, periods: 0, orgs: 0, calls: 0, upserts: 0, errors: 0, doneAt: null };
+
+// Build [{year, month}] for the last N calendar months (incl. current), most recent first.
+function recentPeriods(n) {
+  const out = [];
+  const d = new Date();
+  for (let i = 0; i < n; i++) {
+    out.push({ year: d.getFullYear(), month: d.getMonth() + 1 });
+    d.setMonth(d.getMonth() - 1);
+  }
+  return out;
+}
+
+// Build [{year, month}] spanning from {fromY,fromM} to {toY,toM} inclusive.
+function rangePeriods(fromY, fromM, toY, toM) {
+  const out = [];
+  let y = fromY, m = fromM;
+  while (y < toY || (y === toY && m <= toM)) {
+    out.push({ year: y, month: m });
+    m++; if (m > 12) { m = 1; y++; }
+  }
+  return out;
+}
+
+async function syncZentactRevenue(periods) {
+  if (!process.env.ZENTACT_API_KEY) return { skipped: true };
+  if (!periods || periods.length === 0) return { skipped: true, reason: 'no periods' };
+  const zentact = new ZentactService(process.env.ZENTACT_API_KEY);
+  const orgs = (await pool.query(
+    `SELECT DISTINCT organization_id FROM zentact_merchants WHERE organization_id IS NOT NULL AND organization_id <> ''`
+  )).rows.map((r) => r.organization_id);
+
+  revenueSyncJob = { running: true, startedAt: new Date().toISOString(), periods: periods.length, orgs: orgs.length, calls: 0, upserts: 0, errors: 0, doneAt: null };
+  console.log(`💰 [REVENUE] Sync start: ${periods.length} month(s) × ${orgs.length} org(s)`);
+
+  for (const p of periods) {
+    const mm = String(p.month).padStart(2, '0');
+    const lastDay = new Date(p.year, p.month, 0).getDate();
+    const fromDate = `${p.year}-${mm}-01T00:00:00Z`;
+    const toDate = `${p.year}-${mm}-${String(lastDay).padStart(2, '0')}T23:59:59Z`;
+    for (const org of orgs) {
+      let rows = [];
+      try {
+        rows = await zentact.getTransactionProfitability({ organizationId: org, pspMerchantAccountName: PSP_NAME, fromDate, toDate });
+        revenueSyncJob.calls++;
+      } catch (e) {
+        revenueSyncJob.errors++;
+        continue;
+      }
+      for (const row of rows) {
+        if (!row.merchantAccountId) continue;
+        try {
+          await pool.query(
+            `INSERT INTO zentact_merchant_revenue
+               (merchant_account_id, year, month, currency, total_volume_cents, payments_count,
+                processing_cost_cents, collected_fees_cents, gateway_fee_cents, transaction_profit_cents, raw, synced_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb, CURRENT_TIMESTAMP)
+             ON CONFLICT (merchant_account_id, year, month) DO UPDATE SET
+               currency                 = EXCLUDED.currency,
+               total_volume_cents       = EXCLUDED.total_volume_cents,
+               payments_count           = EXCLUDED.payments_count,
+               processing_cost_cents    = EXCLUDED.processing_cost_cents,
+               collected_fees_cents     = EXCLUDED.collected_fees_cents,
+               gateway_fee_cents        = EXCLUDED.gateway_fee_cents,
+               transaction_profit_cents = EXCLUDED.transaction_profit_cents,
+               raw                      = EXCLUDED.raw,
+               synced_at                = CURRENT_TIMESTAMP`,
+            [
+              row.merchantAccountId, p.year, p.month, row.currency || null,
+              Math.round(row.totalVolume || 0), Math.round(row.totalPaymentsCount || 0),
+              Math.round(row.processingCost || 0), Math.round(row.collectedFees || 0),
+              Math.round(row.gatewayFee || 0), Math.round(row.totalRevenue || 0),
+              JSON.stringify(row),
+            ]
+          );
+          revenueSyncJob.upserts++;
+        } catch (e) {
+          revenueSyncJob.errors++;
+        }
+      }
+    }
+  }
+  revenueSyncJob.running = false;
+  revenueSyncJob.doneAt = new Date().toISOString();
+  console.log(`✅ [REVENUE] Sync done: ${revenueSyncJob.calls} calls, ${revenueSyncJob.upserts} upserts, ${revenueSyncJob.errors} errors`);
+  return revenueSyncJob;
 }
 
 async function autoSyncCrm() {
@@ -4023,6 +4144,58 @@ app.get('/api/admin/zentact-revenue-probe', async (req, res) => {
     }
   }
   res.json({ baseUsed: base, merchantId, organizationId, psp, year, month, fromDate, toDate, tries: out });
+});
+
+// Trigger a revenue sync/backfill. Secret-gated so it can run without a session
+// (and from a cron). Fire-and-forget (the job can take minutes); poll the summary.
+//   ?from=YYYY-MM&to=YYYY-MM  → backfill a range
+//   ?monthsBack=N             → last N months (default 2)
+app.get('/api/admin/zentact-revenue-sync', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  if (revenueSyncJob.running) return res.json({ alreadyRunning: true, job: revenueSyncJob });
+  let periods;
+  if (req.query.from && req.query.to) {
+    const [fy, fm] = String(req.query.from).split('-').map(Number);
+    const [ty, tm] = String(req.query.to).split('-').map(Number);
+    periods = rangePeriods(fy, fm, ty, tm);
+  } else {
+    periods = recentPeriods(parseInt(req.query.monthsBack) || 2);
+  }
+  // Fire-and-forget — don't await (avoids H12; progress visible via summary).
+  syncZentactRevenue(periods).catch((e) => console.error('❌ [REVENUE] sync error:', e.message));
+  res.json({ started: true, periods: periods.length, first: periods[0], last: periods[periods.length - 1] });
+});
+
+// Revenue summary — row counts + totals (cents) by salesperson and by reseller.
+// Used to verify the import and to feed the eventual UI.
+app.get('/api/admin/zentact-revenue-summary', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const totals = (await pool.query(
+      `SELECT COUNT(*)::int AS rows, COUNT(DISTINCT merchant_account_id)::int AS merchants,
+              MIN(year*100+month) AS first_period, MAX(year*100+month) AS last_period,
+              ROUND(SUM(transaction_profit_cents)/100.0, 2) AS transaction_profit,
+              ROUND(SUM(total_volume_cents)/100.0, 2) AS volume
+       FROM zentact_merchant_revenue`
+    )).rows[0];
+    const byRep = (await pool.query(
+      `SELECT COALESCE(zm.sales_rep_name, '(unassigned)') AS rep,
+              ROUND(SUM(r.transaction_profit_cents)/100.0, 2) AS transaction_profit,
+              COUNT(DISTINCT r.merchant_account_id)::int AS merchants
+       FROM zentact_merchant_revenue r
+       LEFT JOIN zentact_merchants zm ON zm.merchant_account_id = r.merchant_account_id
+       GROUP BY 1 ORDER BY transaction_profit DESC NULLS LAST LIMIT 100`
+    )).rows;
+    res.json({ job: revenueSyncJob, totals, byRep });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ============================================================================

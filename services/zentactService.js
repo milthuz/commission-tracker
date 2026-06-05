@@ -287,6 +287,23 @@ class ZentactService {
   }
 
   // ============================================================
+  // TRANSACTION PROFITABILITY — per-merchant revenue for a date window.
+  // Zentact requires type, organizationId, pspMerchantAccountName, and a
+  // window of at most 31 days, with full ISO-8601 'Z' dates (no millis).
+  // Returns the raw rows; monetary fields are in MINOR UNITS (cents).
+  // ============================================================
+  async getTransactionProfitability({ organizationId, pspMerchantAccountName, fromDate, toDate }) {
+    const r = await axios.get(`${ZENTACT_BASE_URL}/reports/transaction-profitability`, {
+      headers: this.headers,
+      params: { type: 'merchants', organizationId, pspMerchantAccountName, fromDate, toDate },
+      timeout: 30000,
+    });
+    const data = r.data;
+    const inner = data?.data && typeof data.data === 'object' && !Array.isArray(data.data) ? data.data : null;
+    return (inner?.rows) || (Array.isArray(data?.data) ? data.data : []) || [];
+  }
+
+  // ============================================================
   // CONNECTION TEST
   // ============================================================
   async testConnection() {
