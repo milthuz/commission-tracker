@@ -146,6 +146,12 @@ class ZentactService {
     const opportunityId = ZentactService.getAttribute(attrs, 'Opportunity_ID')
                        || ZentactService.getAttribute(attrs, 'opportunity_id')
                        || null;
+    // Custom attribute "Reseller" — set in Zentact on merchants boarded by a
+    // third-party reseller (e.g. "Lirette"). getAttribute is case-insensitive,
+    // so 'Reseller' also matches 'reseller'. Try a couple of likely key names.
+    const resellerAttr  = ZentactService.getAttribute(attrs, 'Reseller')
+                       || ZentactService.getAttribute(attrs, 'reseller_name')
+                       || null;
 
     return {
       merchant_account_id: merchant.merchantAccountId,
@@ -156,6 +162,7 @@ class ZentactService {
       sales_rep_raw:       salesRepRaw,   // raw value from Zentact (e.g. "Dora", "Jay")
       sales_rep_email:     null,          // not used by this org — kept for schema compat
       opportunity_id:      opportunityId,
+      reseller_attribute:  resellerAttr,  // Zentact "Reseller" custom attribute, if present
       raw_attributes:      JSON.stringify(attrs),
     };
   }

@@ -536,6 +536,7 @@ async function initializeDatabase() {
         sales_rep_email     VARCHAR(255),
         sales_rep_name      VARCHAR(255),
         opportunity_id      VARCHAR(255),
+        reseller_attribute  VARCHAR(255),
         activated_at        DATE,
         points              INT          DEFAULT 1,
         bonus_amount        DECIMAL(10,2) DEFAULT 100.00,
@@ -544,6 +545,9 @@ async function initializeDatabase() {
         updated_at          TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    // Zentact "Reseller" custom attribute — added after the table shipped, so
+    // ensure it exists on the live table too (CREATE TABLE IF NOT EXISTS is a no-op there).
+    await pool.query(`ALTER TABLE zentact_merchants ADD COLUMN IF NOT EXISTS reseller_attribute VARCHAR(255)`);
 
     console.log('✅ Database tables initialized');
   } catch (error) {
@@ -1111,6 +1115,9 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
           sales_rep_name IN (SELECT name FROM salespeople WHERE is_active = true)
           OR sales_rep_name IS NULL
         )
+        -- Reseller-boarded merchants are NOT internal-vendor activations: they
+        -- earn no $100 signup bonus and belong in Reseller → Payments instead.
+        AND (reseller_attribute IS NULL OR reseller_attribute = '')
     `, [startDate, endDate]);
 
     for (const merchant of zentactResult.rows) {
@@ -1746,6 +1753,10 @@ app.get('/api/zentact/merchants', authenticateToken, async (req, res) => {
     const where = [];
     if (req.query.unassigned === 'true') {
       where.push(`(sales_rep_name IS NULL OR sales_rep_name = '')`);
+      // Reseller-boarded merchants aren't "unassigned internal vendors" — they
+      // belong to a reseller (see Reseller → Payments), so keep them out of the
+      // rep-assignment tool.
+      where.push(`(reseller_attribute IS NULL OR reseller_attribute = '')`);
     }
     if (req.query.active === 'true') {
       where.push(`status = 'ACTIVE'`);
@@ -1753,7 +1764,7 @@ app.get('/api/zentact/merchants', authenticateToken, async (req, res) => {
     const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
     const result = await pool.query(`
       SELECT merchant_account_id, business_name, status, sales_rep_email,
-             sales_rep_name, opportunity_id, activated_at, bonus_amount, points,
+             sales_rep_name, opportunity_id, reseller_attribute, activated_at, bonus_amount, points,
              raw_attributes, updated_at
       FROM zentact_merchants
       ${whereSql}
@@ -2740,14 +2751,15 @@ async function syncZentactMerchants() {
     const result = await pool.query(`
       INSERT INTO zentact_merchants
         (merchant_account_id, organization_id, business_name, invitee_email, status,
-         sales_rep_email, sales_rep_name, opportunity_id, activated_at, raw_attributes)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+         sales_rep_email, sales_rep_name, opportunity_id, reseller_attribute, activated_at, raw_attributes)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
       ON CONFLICT (merchant_account_id) DO UPDATE SET
-        status          = EXCLUDED.status,
-        business_name   = EXCLUDED.business_name,
-        sales_rep_email = COALESCE(EXCLUDED.sales_rep_email, zentact_merchants.sales_rep_email),
-        sales_rep_name  = COALESCE($7, zentact_merchants.sales_rep_name),
-        opportunity_id  = COALESCE(EXCLUDED.opportunity_id,  zentact_merchants.opportunity_id),
+        status            = EXCLUDED.status,
+        business_name     = EXCLUDED.business_name,
+        sales_rep_email   = COALESCE(EXCLUDED.sales_rep_email, zentact_merchants.sales_rep_email),
+        sales_rep_name    = COALESCE($7, zentact_merchants.sales_rep_name),
+        opportunity_id    = COALESCE(EXCLUDED.opportunity_id,  zentact_merchants.opportunity_id),
+        reseller_attribute = COALESCE(EXCLUDED.reseller_attribute, zentact_merchants.reseller_attribute),
         activated_at    = CASE
           -- Keep any existing date (never overwrite a real stamp)
           WHEN zentact_merchants.activated_at IS NOT NULL
@@ -2761,7 +2773,7 @@ async function syncZentactMerchants() {
         updated_at      = CURRENT_TIMESTAMP
       RETURNING (xmax = 0) AS inserted
     `, [m.merchant_account_id, m.organization_id, m.business_name, m.invitee_email,
-        m.status, m.sales_rep_email, repName, m.opportunity_id, activatedAt, m.raw_attributes]);
+        m.status, m.sales_rep_email, repName, m.opportunity_id, m.reseller_attribute, activatedAt, m.raw_attributes]);
 
     if (result.rows[0]?.inserted) newCount++;
   }
@@ -4487,26 +4499,36 @@ app.get('/api/resellers/pos-activations', authenticateToken, async (req, res) =>
 app.get('/api/resellers/residuals', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'reseller:view'))) return;
   try {
-    const resellers = (await pool.query(
-      `SELECT name, zentact_key FROM resellers WHERE zentact_key IS NOT NULL AND zentact_key <> ''`
-    )).rows;
+    // All resellers: matched by their zentact_key (sales_rep_name) AND/OR by name
+    // against the Zentact "Reseller" custom attribute, so a reseller links even
+    // before an admin sets its zentact_key.
+    const resellers = (await pool.query(`SELECT name, zentact_key FROM resellers`)).rows;
     const merchants = (await pool.query(
-      `SELECT business_name, status, activated_at, LOWER(sales_rep_name) AS rep
-       FROM zentact_merchants WHERE sales_rep_name IS NOT NULL AND sales_rep_name <> ''`
+      `SELECT business_name, status, activated_at,
+              LOWER(sales_rep_name)     AS rep,
+              LOWER(reseller_attribute) AS reseller_attr
+       FROM zentact_merchants
+       WHERE (sales_rep_name IS NOT NULL AND sales_rep_name <> '')
+          OR (reseller_attribute IS NOT NULL AND reseller_attribute <> '')`
     )).rows;
 
-    // Build rep(lowercased) → reseller name map from each reseller's comma-separated zentact_key.
-    const repToReseller = new Map();
+    // Build key(lowercased) → reseller name map. A reseller is identified in Zentact
+    // EITHER by a sales_rep_name OR by the "Reseller" custom attribute — both are matched
+    // against the same comma-separated zentact_key, plus the reseller's own name as a fallback.
+    const keyToReseller = new Map();
     for (const rs of resellers) {
       for (const k of String(rs.zentact_key).split(',').map(s => s.trim().toLowerCase()).filter(Boolean)) {
-        repToReseller.set(k, rs.name);
+        keyToReseller.set(k, rs.name);
       }
+      const nameKey = String(rs.name || '').trim().toLowerCase();
+      if (nameKey && !keyToReseller.has(nameKey)) keyToReseller.set(nameKey, rs.name);
     }
 
     const detail = [];
     const agg = new Map(); // reseller → { merchants, active }
     for (const m of merchants) {
-      const reseller = repToReseller.get(m.rep);
+      // Match by sales_rep_name first, then by the Reseller custom attribute.
+      const reseller = keyToReseller.get(m.rep) || keyToReseller.get(m.reseller_attr);
       if (!reseller) continue; // not linked to a managed reseller (internal vendor / unmapped)
       detail.push({ reseller_name: reseller, business_name: m.business_name, status: m.status, activated_at: m.activated_at });
       const a = agg.get(reseller) || { merchants: 0, active: 0 };
