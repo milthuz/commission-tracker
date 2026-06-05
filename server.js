@@ -3979,48 +3979,40 @@ app.get('/api/admin/zentact-revenue-probe', async (req, res) => {
   const baseRoot = base.replace(/\/api\/v1\/?$/, '/api');
   const headers = { 'X-API-Key': apiKey, 'Content-Type': 'application/json' };
 
-  let merchantId = req.query.merchantId;
-  if (!merchantId) {
-    const r = await pool.query(
-      `SELECT merchant_account_id FROM zentact_merchants WHERE status='ACTIVE' ORDER BY activated_at DESC NULLS LAST LIMIT 1`
-    );
-    merchantId = r.rows[0]?.merchant_account_id;
-  }
+  // An older ACTIVE merchant is most likely to have monthly statements.
+  const oldR = await pool.query(
+    `SELECT merchant_account_id FROM zentact_merchants WHERE status='ACTIVE' AND activated_at IS NOT NULL ORDER BY activated_at ASC LIMIT 1`
+  );
+  const oldMerchant = req.query.merchantId || oldR.rows[0]?.merchant_account_id;
   const today = new Date();
-  const startY = new Date(); startY.setFullYear(today.getFullYear() - 1);
+  const startM = new Date(); startM.setMonth(today.getMonth() - 1);
   const fmt = (d) => d.toISOString().split('T')[0];
-  const range = { startDate: fmt(startY), endDate: fmt(today) };
 
   const tries = [
-    ['merchant-accounts (base check)', `${base}/merchant-accounts`, { pageSize: 1, pageIndex: 0 }],
-    ['merchant detail', `${base}/merchant-accounts/${merchantId}`, {}],
-    ['transactions', `${base}/transactions`, { merchantAccountId: merchantId, ...range, pageSize: 2, pageIndex: 0 }],
-    ['merchant transactions', `${base}/merchant-accounts/${merchantId}/transactions`, { ...range, pageSize: 2 }],
-    ['v1 statements', `${base}/statements`, { merchantAccountId: merchantId, pageSize: 2 }],
-    ['v1 reports/statements', `${base}/reports/statements`, { merchantAccountId: merchantId, pageSize: 2 }],
-    ['v2 reports/statements', `${baseV2}/reports/statements`, { merchantAccountId: merchantId, pageSize: 2 }],
-    ['v2 statements', `${baseV2}/statements`, { merchantAccountId: merchantId, pageSize: 2 }],
-    ['v2 reports/revenue', `${baseV2}/reports/revenue`, { merchantAccountId: merchantId, ...range }],
-    ['root reports/statements', `${baseRoot}/reports/statements`, { merchantAccountId: merchantId, pageSize: 2 }],
-    ['reports index', `${base}/reports`, {}],
-    ['merchant revenue', `${base}/merchant-accounts/${merchantId}/revenue`, {}],
-    ['merchant statements', `${base}/merchant-accounts/${merchantId}/statements`, {}],
+    // KEY: statements with no merchant filter → reveals the row schema across all merchants
+    ['statements (all, recent)', `${base}/statements`, { pageSize: 3, pageIndex: 0 }],
+    ['statements (old merchant)', `${base}/statements`, { merchantAccountId: oldMerchant, pageSize: 3 }],
+    ['transactions (1, 1mo)', `${base}/transactions`, { merchantAccountId: oldMerchant, startDate: fmt(startM), endDate: fmt(today), pageSize: 1, pageIndex: 0 }],
+    ['payouts', `${base}/payouts`, { pageSize: 2 }],
+    ['settlements', `${base}/settlements`, { pageSize: 2 }],
+    ['fees', `${base}/fees`, { pageSize: 2 }],
+    ['revenue', `${base}/revenue`, { pageSize: 2 }],
   ];
   const out = [];
   for (const [name, url, params] of tries) {
     try {
-      const r = await axios.get(url, { headers, params, timeout: 8000, validateStatus: () => true });
+      const r = await axios.get(url, { headers, params, timeout: 20000, validateStatus: () => true });
       const isHtml = typeof r.data === 'string' && r.data.includes('<html');
       out.push({
         name,
         status: r.status,
-        sample: isHtml ? '(html 404)' : typeof r.data === 'object' ? JSON.stringify(r.data).slice(0, 2000) : String(r.data).slice(0, 300),
+        sample: isHtml ? '(html 404)' : typeof r.data === 'object' ? JSON.stringify(r.data).slice(0, 2500) : String(r.data).slice(0, 300),
       });
     } catch (e) {
       out.push({ name, error: e.message });
     }
   }
-  res.json({ baseUsed: base, merchantId, tries: out });
+  res.json({ baseUsed: base, oldMerchant, tries: out });
 });
 
 // ============================================================================
