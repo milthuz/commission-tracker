@@ -3979,24 +3979,23 @@ app.get('/api/admin/zentact-revenue-probe', async (req, res) => {
   const baseRoot = base.replace(/\/api\/v1\/?$/, '/api');
   const headers = { 'X-API-Key': apiKey, 'Content-Type': 'application/json' };
 
-  // An older ACTIVE merchant is most likely to have monthly statements.
-  const oldR = await pool.query(
-    `SELECT merchant_account_id FROM zentact_merchants WHERE status='ACTIVE' AND activated_at IS NOT NULL ORDER BY activated_at ASC LIMIT 1`
-  );
-  const oldMerchant = req.query.merchantId || oldR.rows[0]?.merchant_account_id;
+  const m = (await pool.query(
+    `SELECT merchant_account_id, organization_id FROM zentact_merchants WHERE status='ACTIVE' AND organization_id IS NOT NULL ORDER BY activated_at ASC LIMIT 1`
+  )).rows[0] || {};
+  const merchantId = req.query.merchantId || m.merchant_account_id;
+  const organizationId = req.query.organizationId || m.organization_id;
+  const psp = req.query.psp || 'ClusterPOS_POS';
   const today = new Date();
-  const startM = new Date(); startM.setMonth(today.getMonth() - 1);
   const fmt = (d) => d.toISOString().split('T')[0];
+  const fromDate = '2026-01-01';
+  const toDate = fmt(today);
+  const common = { pspMerchantAccountName: psp, organizationId, fromDate, toDate };
 
   const tries = [
-    // KEY: statements with no merchant filter → reveals the row schema across all merchants
-    ['statements (all, recent)', `${base}/statements`, { pageSize: 3, pageIndex: 0 }],
-    ['statements (old merchant)', `${base}/statements`, { merchantAccountId: oldMerchant, pageSize: 3 }],
-    ['transactions (1, 1mo)', `${base}/transactions`, { merchantAccountId: oldMerchant, startDate: fmt(startM), endDate: fmt(today), pageSize: 1, pageIndex: 0 }],
-    ['payouts', `${base}/payouts`, { pageSize: 2 }],
-    ['settlements', `${base}/settlements`, { pageSize: 2 }],
-    ['fees', `${base}/fees`, { pageSize: 2 }],
-    ['revenue', `${base}/revenue`, { pageSize: 2 }],
+    ['transaction-profitability (merchant)', `${base}/reports/transaction-profitability`, { ...common, merchantAccountId: merchantId }],
+    ['transaction-profitability (type=merchants)', `${base}/reports/transaction-profitability`, { ...common, type: 'merchants' }],
+    ['payment-summary (merchant)', `${base}/reports/payment-summary`, { ...common, merchantAccountId: merchantId }],
+    ['payment-volume (merchant)', `${base}/reports/payment-volume`, { ...common, merchantAccountId: merchantId }],
   ];
   const out = [];
   for (const [name, url, params] of tries) {
@@ -4012,7 +4011,7 @@ app.get('/api/admin/zentact-revenue-probe', async (req, res) => {
       out.push({ name, error: e.message });
     }
   }
-  res.json({ baseUsed: base, oldMerchant, tries: out });
+  res.json({ baseUsed: base, merchantId, organizationId, psp, fromDate, toDate, tries: out });
 });
 
 // ============================================================================
