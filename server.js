@@ -4115,67 +4115,6 @@ app.get('/api/admin/db-stats', async (req, res) => {
   }
 });
 
-// TEMP DIAGNOSTIC — inspect the real field shape of Zentact revenue reports so we
-// can map "Transaction Profit" / "Other Revenue" to actual API fields. Read-only,
-// gated by the shared secret. Remove once the revenue importer is built.
-app.get('/api/admin/zentact-revenue-probe', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
-  const apiKey = process.env.ZENTACT_API_KEY;
-  if (!apiKey) return res.status(400).json({ error: 'ZENTACT_API_KEY not set' });
-  const base = process.env.ZENTACT_API_URL || 'https://api.zentact.com/api/v1';
-  const baseV2 = base.replace('/v1', '/v2');
-  const baseRoot = base.replace(/\/api\/v1\/?$/, '/api');
-  const headers = { 'X-API-Key': apiKey, 'Content-Type': 'application/json' };
-
-  let merchantId = req.query.merchantId;
-  let organizationId = req.query.organizationId;
-  if (merchantId && !organizationId) {
-    const r = await pool.query(`SELECT organization_id FROM zentact_merchants WHERE merchant_account_id=$1`, [merchantId]);
-    organizationId = r.rows[0]?.organization_id;
-  }
-  if (!merchantId) {
-    const r = (await pool.query(
-      `SELECT merchant_account_id, organization_id FROM zentact_merchants WHERE status='ACTIVE' AND organization_id IS NOT NULL ORDER BY activated_at ASC LIMIT 1`
-    )).rows[0] || {};
-    merchantId = r.merchant_account_id; organizationId = r.organization_id;
-  }
-  const psp = req.query.psp || 'ClusterPOS_POS';
-  // Query-overridable so we can sweep any merchant/month without redeploying.
-  // transaction-profitability requires a window of at most 31 days → one month.
-  const year = req.query.year || '2026';
-  const month = req.query.month || '3'; // 1-12
-  const mm = String(month).padStart(2, '0');
-  const lastDay = new Date(Number(year), Number(month), 0).getDate();
-  const fromDate = req.query.from || `${year}-${mm}-01T00:00:00Z`;
-  const toDate = req.query.to || `${year}-${mm}-${lastDay}T23:59:59Z`;
-  const common = { pspMerchantAccountName: psp, organizationId, fromDate, toDate };
-
-  const tries = [
-    ['statements list (merchant)', `${base}/statements`, { merchantAccountId: merchantId, pageSize: 6, pageIndex: 0 }],
-    ['profitability (merchant)', `${base}/reports/transaction-profitability`, { ...common, type: 'merchants', merchantAccountId: merchantId }],
-    ['profitability (org, all merchants)', `${base}/reports/transaction-profitability`, { ...common, type: 'merchants' }],
-    ['statement file url', `${base}/statements/file-download-url`, { pspMerchantAccountName: psp, merchantAccountId: merchantId, month, year }],
-  ];
-  const out = [];
-  for (const [name, url, params] of tries) {
-    try {
-      const r = await axios.get(url, { headers, params, timeout: 20000, validateStatus: () => true });
-      const isHtml = typeof r.data === 'string' && r.data.includes('<html');
-      out.push({
-        name,
-        status: r.status,
-        sample: isHtml ? '(html 404)' : typeof r.data === 'object' ? JSON.stringify(r.data).slice(0, 2500) : String(r.data).slice(0, 300),
-      });
-    } catch (e) {
-      out.push({ name, error: e.message });
-    }
-  }
-  res.json({ baseUsed: base, merchantId, organizationId, psp, year, month, fromDate, toDate, tries: out });
-});
-
 // Trigger a revenue sync/backfill. Secret-gated so it can run without a session
 // (and from a cron). Fire-and-forget (the job can take minutes); poll the summary.
 //   ?from=YYYY-MM&to=YYYY-MM  → backfill a range
