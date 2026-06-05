@@ -3975,6 +3975,8 @@ app.get('/api/admin/zentact-revenue-probe', async (req, res) => {
   const apiKey = process.env.ZENTACT_API_KEY;
   if (!apiKey) return res.status(400).json({ error: 'ZENTACT_API_KEY not set' });
   const base = process.env.ZENTACT_API_URL || 'https://api.zentact.com/api/v1';
+  const baseV2 = base.replace('/v1', '/v2');
+  const baseRoot = base.replace(/\/api\/v1\/?$/, '/api');
   const headers = { 'X-API-Key': apiKey, 'Content-Type': 'application/json' };
 
   let merchantId = req.query.merchantId;
@@ -3984,29 +3986,41 @@ app.get('/api/admin/zentact-revenue-probe', async (req, res) => {
     );
     merchantId = r.rows[0]?.merchant_account_id;
   }
+  const today = new Date();
+  const startY = new Date(); startY.setFullYear(today.getFullYear() - 1);
+  const fmt = (d) => d.toISOString().split('T')[0];
+  const range = { startDate: fmt(startY), endDate: fmt(today) };
 
   const tries = [
-    ['statements', `${base}/reports/statements`, { merchantAccountId: merchantId, pageSize: 3, pageIndex: 0 }],
-    ['revenue', `${base}/reports/revenue`, { merchantAccountId: merchantId }],
-    ['residuals', `${base}/reports/residuals`, { merchantAccountId: merchantId }],
-    ['profitability', `${base}/reports/profitability`, { merchantAccountId: merchantId }],
-    ['merchant-revenue', `${base}/merchant-accounts/${merchantId}/revenue`, {}],
-    ['merchant-statements', `${base}/merchant-accounts/${merchantId}/statements`, {}],
+    ['merchant-accounts (base check)', `${base}/merchant-accounts`, { pageSize: 1, pageIndex: 0 }],
+    ['merchant detail', `${base}/merchant-accounts/${merchantId}`, {}],
+    ['transactions', `${base}/transactions`, { merchantAccountId: merchantId, ...range, pageSize: 2, pageIndex: 0 }],
+    ['merchant transactions', `${base}/merchant-accounts/${merchantId}/transactions`, { ...range, pageSize: 2 }],
+    ['v1 statements', `${base}/statements`, { merchantAccountId: merchantId, pageSize: 2 }],
+    ['v1 reports/statements', `${base}/reports/statements`, { merchantAccountId: merchantId, pageSize: 2 }],
+    ['v2 reports/statements', `${baseV2}/reports/statements`, { merchantAccountId: merchantId, pageSize: 2 }],
+    ['v2 statements', `${baseV2}/statements`, { merchantAccountId: merchantId, pageSize: 2 }],
+    ['v2 reports/revenue', `${baseV2}/reports/revenue`, { merchantAccountId: merchantId, ...range }],
+    ['root reports/statements', `${baseRoot}/reports/statements`, { merchantAccountId: merchantId, pageSize: 2 }],
+    ['reports index', `${base}/reports`, {}],
+    ['merchant revenue', `${base}/merchant-accounts/${merchantId}/revenue`, {}],
+    ['merchant statements', `${base}/merchant-accounts/${merchantId}/statements`, {}],
   ];
   const out = [];
   for (const [name, url, params] of tries) {
     try {
       const r = await axios.get(url, { headers, params, timeout: 8000, validateStatus: () => true });
+      const isHtml = typeof r.data === 'string' && r.data.includes('<html');
       out.push({
         name,
         status: r.status,
-        sample: typeof r.data === 'object' ? JSON.stringify(r.data).slice(0, 1800) : String(r.data).slice(0, 400),
+        sample: isHtml ? '(html 404)' : typeof r.data === 'object' ? JSON.stringify(r.data).slice(0, 2000) : String(r.data).slice(0, 300),
       });
     } catch (e) {
       out.push({ name, error: e.message });
     }
   }
-  res.json({ merchantId, tries: out });
+  res.json({ baseUsed: base, merchantId, tries: out });
 });
 
 // ============================================================================
