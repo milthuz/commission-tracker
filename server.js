@@ -3964,6 +3964,51 @@ app.get('/api/admin/db-stats', async (req, res) => {
   }
 });
 
+// TEMP DIAGNOSTIC — inspect the real field shape of Zentact revenue reports so we
+// can map "Transaction Profit" / "Other Revenue" to actual API fields. Read-only,
+// gated by the shared secret. Remove once the revenue importer is built.
+app.get('/api/admin/zentact-revenue-probe', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const apiKey = process.env.ZENTACT_API_KEY;
+  if (!apiKey) return res.status(400).json({ error: 'ZENTACT_API_KEY not set' });
+  const base = process.env.ZENTACT_API_URL || 'https://api.zentact.com/api/v1';
+  const headers = { 'X-API-Key': apiKey, 'Content-Type': 'application/json' };
+
+  let merchantId = req.query.merchantId;
+  if (!merchantId) {
+    const r = await pool.query(
+      `SELECT merchant_account_id FROM zentact_merchants WHERE status='ACTIVE' ORDER BY activated_at DESC NULLS LAST LIMIT 1`
+    );
+    merchantId = r.rows[0]?.merchant_account_id;
+  }
+
+  const tries = [
+    ['statements', `${base}/reports/statements`, { merchantAccountId: merchantId, pageSize: 3, pageIndex: 0 }],
+    ['revenue', `${base}/reports/revenue`, { merchantAccountId: merchantId }],
+    ['residuals', `${base}/reports/residuals`, { merchantAccountId: merchantId }],
+    ['profitability', `${base}/reports/profitability`, { merchantAccountId: merchantId }],
+    ['merchant-revenue', `${base}/merchant-accounts/${merchantId}/revenue`, {}],
+    ['merchant-statements', `${base}/merchant-accounts/${merchantId}/statements`, {}],
+  ];
+  const out = [];
+  for (const [name, url, params] of tries) {
+    try {
+      const r = await axios.get(url, { headers, params, timeout: 8000, validateStatus: () => true });
+      out.push({
+        name,
+        status: r.status,
+        sample: typeof r.data === 'object' ? JSON.stringify(r.data).slice(0, 1800) : String(r.data).slice(0, 400),
+      });
+    } catch (e) {
+      out.push({ name, error: e.message });
+    }
+  }
+  res.json({ merchantId, tries: out });
+});
+
 // ============================================================================
 // COMMISSION REPORT IMPORT — parse an Excel pay-report and mark invoices
 // as approval_status='paid' + record signup/monthly bonuses.
