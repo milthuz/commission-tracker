@@ -4338,7 +4338,9 @@ const MONTH_ABBR_TO_NUM = { jan:1, feb:2, mar:3, apr:4, may:5, jun:6, jul:7, aug
 function parseImportFilename(filename) {
   if (!/\.xlsx$/i.test(filename)) return null;
   const norm = filename.replace(/\.xlsx$/i, '').replace(/_/g, ' ');
-  const mMatch = norm.match(/\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b/i);
+  // Accept both abbreviated ("Mar") and full ("March") month names. The capture group
+  // keeps the 3-letter prefix so MONTH_ABBR_TO_NUM still resolves it; [a-z]* eats the rest.
+  const mMatch = norm.match(/\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\b/i);
   const yMatch = norm.match(/\b(20\d{2}|\d{2})\b/);
   if (!mMatch || !yMatch) return null;
   const month = MONTH_ABBR_TO_NUM[mMatch[1].toLowerCase()];
