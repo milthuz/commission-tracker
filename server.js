@@ -4208,6 +4208,33 @@ app.get('/api/admin/db-stats', async (req, res) => {
        LIMIT 200`
     )).rows;
 
+    // Inverse drift: commission earned (commission > 0) but NOT yet paid out to the rep
+    // (approval_status is not 'paid'). The "overdue" subset has a commission_payable_date
+    // in the past — those are earned commissions that arguably should already be paid.
+    const earnedUnpaidBreakdown = (await pool.query(
+      `SELECT COALESCE(approval_status, 'none') AS approval_status,
+              COALESCE(commission_status, 'unknown') AS commission_status,
+              COUNT(*)::int AS count,
+              COALESCE(SUM(commission), 0)::float AS commission
+       FROM invoices
+       WHERE commission > 0 AND (approval_status IS NULL OR approval_status <> 'paid')
+       GROUP BY approval_status, commission_status
+       ORDER BY commission DESC`
+    )).rows;
+
+    const earnedUnpaidRows = (await pool.query(
+      `SELECT invoice_number, salesperson_name, status,
+              COALESCE(approval_status, 'none') AS approval_status,
+              COALESCE(commission_status, 'unknown') AS commission_status,
+              commission::float AS commission, date::date AS date,
+              commission_payable_date::date AS payable_date,
+              (commission_payable_date IS NOT NULL AND commission_payable_date < CURRENT_DATE) AS overdue
+       FROM invoices
+       WHERE commission > 0 AND (approval_status IS NULL OR approval_status <> 'paid')
+       ORDER BY commission_payable_date NULLS LAST, salesperson_name
+       LIMIT 300`
+    )).rows;
+
     const dateRange = (await pool.query(
       `SELECT MIN(date)::date AS oldest, MAX(date)::date AS newest FROM invoices`
     )).rows[0];
@@ -4229,6 +4256,7 @@ app.get('/api/admin/db-stats', async (req, res) => {
       invoices_by_status: byStatus,
       invoices_by_commission_status: byCommissionStatus,
       paid_approved_drift: { breakdown: driftBreakdown, rows: driftRows },
+      earned_unpaid: { breakdown: earnedUnpaidBreakdown, rows: earnedUnpaidRows },
       invoice_date_range: dateRange,
       last_sync_log: lastSync,
       last_zoho_webhook: lastWebhook,
