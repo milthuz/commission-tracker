@@ -4423,21 +4423,53 @@ function parseImportFilename(filename) {
     .replace(/Eligible Invoices for Commission/i, '')
     .replace(mMatch[0], ' ')
     .replace(yMatch[0], ' ')
+    .replace(/add[\s_-]?ons?/i, ' ')   // drop the "Addon" tag from e.g. "Nov_2025_Liz_Addon"
     .replace(/\s+/g, ' ')
     .trim() || null;
   return { month, year, repFirstName, periodDate: `${year}-${String(month).padStart(2, '0')}-01` };
 }
 
+// Parse a money cell tolerant of "$7,298.30" (US) and "638,90" (EU comma-decimal).
+function parseMoneyCell(v) {
+  if (v == null) return 0;
+  if (typeof v === 'number') return v;
+  let s = String(v).replace(/[^0-9.,\-]/g, '');      // strip $, spaces, letters
+  if (s.includes(',') && !s.includes('.')) s = s.replace(',', '.');  // EU decimal comma
+  else s = s.replace(/,/g, '');                       // commas are thousands separators
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+
 // Read the workbook and return a structured payload — invoices, signup bonuses, monthly bonus.
+// Supports two layouts:
+//   • Standard "Eligible Invoices for Commission" report — header row has an exact
+//     "Invoice Number" cell, plus "Commissions Amount" / "Lead Source" (bonuses).
+//   • "Addon" report — header row (not necessarily at the top) has "INVOICE" + "COMMISSION"
+//     columns, plus TYPE / STATUS / OWED NOW / COMING SOON. Tracks partial payouts; we treat
+//     a listed invoice as fully settled (mark paid) UNLESS it still carries a COMING SOON amount.
 function parseCommissionReportXlsx(buffer) {
   const wb = xlsx.read(buffer, { type: 'buffer', cellDates: true });
   const sheetName = wb.SheetNames[0];
   const sheet = wb.Sheets[sheetName];
   const rows = xlsx.utils.sheet_to_json(sheet, { header: 1, blankrows: false, defval: null });
 
-  // Find header row (contains "Invoice Number" cell)
-  let headerIdx = rows.findIndex(r => r.some(c => typeof c === 'string' && c.trim() === 'Invoice Number'));
-  if (headerIdx < 0) throw new Error('Header row with "Invoice Number" not found');
+  // Standard report: exact "Invoice Number" header cell.
+  const stdHeaderIdx = rows.findIndex(r => r.some(c => typeof c === 'string' && c.trim() === 'Invoice Number'));
+  if (stdHeaderIdx >= 0) return parseStandardReport(rows, stdHeaderIdx);
+
+  // Addon report: a header row carrying both "INVOICE" and "COMMISSION" (case/space tolerant).
+  const normHdr = (c) => (c == null ? '' : String(c).replace(/\s+/g, ' ').trim().toUpperCase());
+  const addonHeaderIdx = rows.findIndex(r => {
+    const cells = r.map(normHdr);
+    return cells.includes('INVOICE') && cells.includes('COMMISSION');
+  });
+  if (addonHeaderIdx >= 0) return parseAddonReport(rows, addonHeaderIdx);
+
+  throw new Error("Unrecognized layout — expected an 'Invoice Number' header (standard report) or 'INVOICE'/'COMMISSION' headers (Addon report)");
+}
+
+// Standard "Eligible Invoices for Commission" layout.
+function parseStandardReport(rows, headerIdx) {
   const header = rows[headerIdx].map(c => (c == null ? '' : String(c).trim()));
   const col = (name) => header.indexOf(name);
 
@@ -4486,6 +4518,39 @@ function parseCommissionReportXlsx(buffer) {
   }
 
   return { invoices, signupBonuses, monthlyBonus };
+}
+
+// "Addon" layout: columns [account/customer], INVOICE, SUB-TOTAL, COMMISSION, TYPE, STATUS,
+// OWED NOW, COMING SOON. No bonus rows. Rep comes from the filename, not the sheet.
+function parseAddonReport(rows, headerIdx) {
+  const normHdr = (c) => (c == null ? '' : String(c).replace(/\s+/g, ' ').trim().toUpperCase());
+  const header = rows[headerIdx].map(normHdr);
+  const col = (name) => header.indexOf(name);
+
+  const idxInvoice    = col('INVOICE');
+  const idxCommission = col('COMMISSION');
+  const idxComingSoon = col('COMING SOON');
+  const idxCustomer   = 0; // first column holds the account/customer name
+
+  const invoices = [];
+  for (let i = headerIdx + 1; i < rows.length; i++) {
+    const r = rows[i];
+    const invRaw = r[idxInvoice];
+    // Skip the totals row and any non-invoice rows.
+    if (!invRaw || typeof invRaw !== 'string' || !/^INV-/i.test(invRaw.trim())) continue;
+    // Defensive: a non-empty COMING SOON means part of this commission is still deferred —
+    // don't mark it fully paid. Skip so it surfaces as "not imported" rather than over-paid.
+    if (idxComingSoon >= 0 && parseMoneyCell(r[idxComingSoon]) > 0) continue;
+    invoices.push({
+      invoice_number: invRaw.trim(),
+      rep: null, // filename supplies the rep for this format
+      customer: r[idxCustomer] ? String(r[idxCustomer]).trim() : null,
+      commission: parseMoneyCell(r[idxCommission]),
+      payment_date: null,
+    });
+  }
+
+  return { invoices, signupBonuses: [], monthlyBonus: 0 };
 }
 
 // Load zentact_merchants ONCE and return a fuzzy matcher — case-insensitive, ignores
