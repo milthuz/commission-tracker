@@ -7371,6 +7371,30 @@ app.get('/api/releases/generate-notes', authenticateToken, async (req, res) => {
       }
     }
 
+    // AUTO "What's New": which menu sections got a NEW feature (feat) this release?
+    // Map conventional-commit scopes → sidebar paths. Only feat(<scope>) earns a badge
+    // (fixes/chores/ui don't). The admin can still tweak the pre-filled list.
+    const SCOPE_TO_PATH = {
+      reseller:             { path: '/reseller',            title: 'Resellers' },
+      revenue:              { path: '/revenue',             title: 'Processing Revenue' },
+      'commission-tracker': { path: '/commission-tracker',  title: 'Commission Tracker' },
+      tracker:              { path: '/commission-tracker',  title: 'Commission Tracker' },
+      'commission-report':  { path: '/commission-report',   title: 'Commission Report' },
+      report:               { path: '/commission-report',   title: 'Commission Report' },
+      salespeople:          { path: '/admin/salespeople',   title: 'Salespeople' },
+      roles:                { path: '/admin/roles',         title: 'Roles & Permissions' },
+    };
+    const suggestedMap = new Map();
+    for (const c of filtered) {
+      const m = c.message.match(/^feat\(([^)]+)\)\s*:/i); // feat(scope): subject
+      if (!m) continue;
+      const target = SCOPE_TO_PATH[m[1].toLowerCase().trim()];
+      if (!target || suggestedMap.has(target.path)) continue;
+      const subject = c.message.replace(/^feat\([^)]+\)\s*:\s*/i, '').trim();
+      suggestedMap.set(target.path, { path: target.path, title: target.title, description: subject, days: 7 });
+    }
+    const suggestedFeatures = [...suggestedMap.values()];
+
     // Build markdown notes
     const formatCommit = (c) => `- ${c.message}`;
     const sections = [];
@@ -7388,6 +7412,7 @@ app.get('/api/releases/generate-notes', authenticateToken, async (req, res) => {
       notes,
       commitCount: filtered.length,
       sinceTag,
+      suggestedFeatures,
       categories: {
         features:     categories.features.length,
         ui:           categories.ui.length,
