@@ -2622,6 +2622,70 @@ async function syncZentactRevenue(periods, opts = {}) {
   return revenueSyncJob;
 }
 
+// ============================================================================
+// ZENTACT OTHER REVENUE — recurring + terminal fees (pre-tax), parsed from each
+// merchant's monthly statement PDF (the only source). Per MERCHANT × month, so
+// heavier than the profit sync. Resumable: skips merchant-months already parsed.
+// ============================================================================
+let otherRevJob = { running: false, startedAt: null, periods: 0, merchants: 0, fetched: 0, statements: 0, upserts: 0, skipped: 0, errors: 0, doneAt: null };
+
+async function syncZentactOtherRevenue(periods, opts = {}) {
+  const resume = !!opts.resume;
+  if (!process.env.ZENTACT_API_KEY) return { skipped: true };
+  if (!periods || periods.length === 0) return { skipped: true, reason: 'no periods' };
+  const zentact = new ZentactService(process.env.ZENTACT_API_KEY);
+  const merchants = (await pool.query(
+    `SELECT merchant_account_id FROM zentact_merchants WHERE merchant_account_id IS NOT NULL`
+  )).rows.map((r) => r.merchant_account_id);
+
+  const done = new Set();
+  if (resume) {
+    const yms = periods.map((p) => p.year * 100 + p.month);
+    for (const r of (await pool.query(
+      `SELECT merchant_account_id, year, month FROM zentact_merchant_revenue
+       WHERE other_revenue_cents IS NOT NULL AND (year*100+month) = ANY($1)`,
+      [yms]
+    )).rows) {
+      done.add(`${r.merchant_account_id}|${r.year}|${r.month}`);
+    }
+  }
+
+  otherRevJob = { running: true, resume, startedAt: new Date().toISOString(), periods: periods.length, merchants: merchants.length, fetched: 0, statements: 0, upserts: 0, skipped: 0, errors: 0, doneAt: null };
+  console.log(`🧾 [OTHER-REV] Sync start: ${periods.length} month(s) × ${merchants.length} merchant(s)${resume ? ' (resume)' : ''}`);
+
+  for (const p of periods) {
+    for (const mid of merchants) {
+      if (resume && done.has(`${mid}|${p.year}|${p.month}`)) { otherRevJob.skipped++; continue; }
+      let res;
+      try {
+        res = await zentact.getStatementOtherRevenue({ merchantAccountId: mid, calMonth: p.month, year: p.year, pspMerchantAccountName: PSP_NAME });
+        otherRevJob.fetched++;
+      } catch (e) {
+        otherRevJob.errors++;
+        continue;
+      }
+      if (!res) continue; // no statement for this merchant/month
+      otherRevJob.statements++;
+      try {
+        await pool.query(
+          `INSERT INTO zentact_merchant_revenue (merchant_account_id, year, month, other_revenue_cents, synced_at)
+           VALUES ($1,$2,$3,$4,CURRENT_TIMESTAMP)
+           ON CONFLICT (merchant_account_id, year, month) DO UPDATE SET
+             other_revenue_cents = EXCLUDED.other_revenue_cents, synced_at = CURRENT_TIMESTAMP`,
+          [mid, res.year, res.month, res.otherRevenueCents]
+        );
+        otherRevJob.upserts++;
+      } catch (e) {
+        otherRevJob.errors++;
+      }
+    }
+  }
+  otherRevJob.running = false;
+  otherRevJob.doneAt = new Date().toISOString();
+  console.log(`✅ [OTHER-REV] Sync done: ${otherRevJob.fetched} fetched, ${otherRevJob.statements} statements, ${otherRevJob.upserts} upserts, ${otherRevJob.errors} errors`);
+  return otherRevJob;
+}
+
 async function autoSyncCrm() {
   try {
     console.log('🔄 [AUTO-SYNC] Starting automatic CRM sold-deals sync...');
@@ -4184,6 +4248,48 @@ app.get('/api/admin/zentact-revenue-sync', async (req, res) => {
   // Fire-and-forget — don't await (avoids H12; progress visible via summary).
   syncZentactRevenue(periods, { resume }).catch((e) => console.error('❌ [REVENUE] sync error:', e.message));
   res.json({ started: true, resume, periods: periods.length, first: periods[0], last: periods[periods.length - 1] });
+});
+
+// Trigger the OTHER-REVENUE backfill (statement PDFs → recurring/terminal fees).
+//   ?from=YYYY-MM&to=YYYY-MM (resumes by default; &force=1 re-does) | ?monthsBack=N
+app.get('/api/admin/zentact-otherrev-sync', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  if (otherRevJob.running) return res.json({ alreadyRunning: true, job: otherRevJob });
+  let periods, resume;
+  if (req.query.from && req.query.to) {
+    const [fy, fm] = String(req.query.from).split('-').map(Number);
+    const [ty, tm] = String(req.query.to).split('-').map(Number);
+    periods = rangePeriods(fy, fm, ty, tm);
+    resume = req.query.force !== '1';
+  } else {
+    periods = recentPeriods(parseInt(req.query.monthsBack) || 2);
+    resume = req.query.force !== '1';
+  }
+  syncZentactOtherRevenue(periods, { resume }).catch((e) => console.error('❌ [OTHER-REV] sync error:', e.message));
+  res.json({ started: true, resume, periods: periods.length, first: periods[0], last: periods[periods.length - 1] });
+});
+
+// Other-revenue progress + totals.
+app.get('/api/admin/zentact-otherrev-summary', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const t = (await pool.query(
+      `SELECT COUNT(*) FILTER (WHERE other_revenue_cents IS NOT NULL)::int AS rows_with_other,
+              ROUND(COALESCE(SUM(other_revenue_cents),0)/100.0, 2) AS other_revenue,
+              MIN(year*100+month) FILTER (WHERE other_revenue_cents IS NOT NULL) AS first_period,
+              MAX(year*100+month) FILTER (WHERE other_revenue_cents IS NOT NULL) AS last_period
+       FROM zentact_merchant_revenue`
+    )).rows[0];
+    res.json({ job: otherRevJob, totals: t });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Revenue summary — row counts + totals (cents) by salesperson and by reseller.

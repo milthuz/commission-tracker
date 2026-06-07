@@ -1,5 +1,8 @@
 // services/zentactService.js
 const axios = require('axios');
+const pdfParse = require('pdf-parse');
+
+const STMT_MONTHS = { january: 1, february: 2, march: 3, april: 4, may: 5, june: 6, july: 7, august: 8, september: 9, october: 10, november: 11, december: 12 };
 
 // Base URL is configurable via env var — swap to production by setting ZENTACT_API_URL
 const ZENTACT_BASE_URL = process.env.ZENTACT_API_URL || 'https://api.zentact.com/api/v1';
@@ -304,6 +307,68 @@ class ZentactService {
     const data = r.data;
     const inner = data?.data && typeof data.data === 'object' && !Array.isArray(data.data) ? data.data : null;
     return (inner?.rows) || (Array.isArray(data?.data) ? data.data : []) || [];
+  }
+
+  // ============================================================
+  // STATEMENT PDF — "Other Revenue" (recurring + terminal fees, PRE-TAX).
+  // These figures live only in the monthly statement PDF (no JSON report).
+  // ============================================================
+
+  // Statement billing period from the PDF header (e.g. "May 01 – May 31, 2026").
+  static parseStatementPeriod(text) {
+    const m = text.match(/\b(January|February|March|April|May|June|July|August|September|October|November|December)\b[^\n]*?\b(20\d{2})\b/i);
+    if (!m) return null;
+    return { month: STMT_MONTHS[m[1].toLowerCase()], year: parseInt(m[2], 10) };
+  }
+
+  // Sum of pre-tax fee amounts from the Recurring Fees + Terminal Fees tables.
+  // Each fee row's pre-tax = Total − Tax (Tax may be "N/A" = 0). Returns cents.
+  static parseStatementOtherRevenueCents(text) {
+    let lines = text.split('\n').map((l) => l.trim()).filter((l) => l && !/^\(GST/i.test(l));
+    // Merge money-only lines (the Total often lands on its own line) into the previous row.
+    const merged = [];
+    for (const l of lines) {
+      if (/^CA\$[\d,]+\.\d{2}$/.test(l) && merged.length) merged[merged.length - 1] += l;
+      else merged.push(l);
+    }
+    const start = merged.findIndex((l) => /^Recurring Fees$/i.test(l));
+    if (start < 0) return 0; // no fee section → nothing billed
+    const num = (s) => (s === 'N/A' ? 0 : parseFloat(s.replace(/[^\d.]/g, '')) || 0);
+    let cents = 0;
+    for (let i = start; i < merged.length; i++) {
+      if (!/^\d{2}\/\d{4}/.test(merged[i])) continue; // only fee data rows (billing month MM/YYYY)
+      const toks = merged[i].match(/CA\$[\d,]+\.\d{2}|N\/A/g);
+      if (!toks || toks.length < 2) continue;
+      const total = num(toks[toks.length - 1]);
+      const tax = num(toks[toks.length - 2]);
+      cents += Math.round((total - tax) * 100);
+    }
+    return cents;
+  }
+
+  // Download a statement PDF (signed URL → bytes). monthParam is the API's month
+  // index (calendar month − 1). Returns a Buffer, or null if no statement exists.
+  async getStatementPdf({ merchantAccountId, monthParam, year, pspMerchantAccountName }) {
+    const urlResp = await axios.get(`${ZENTACT_BASE_URL}/statements/file-download-url`, {
+      headers: this.headers,
+      params: { pspMerchantAccountName, merchantAccountId, month: monthParam, year },
+      timeout: 15000,
+      validateStatus: () => true,
+    });
+    const url = urlResp.data?.data?.url;
+    if (!url) return null;
+    const pdfResp = await axios.get(url, { responseType: 'arraybuffer', timeout: 30000, validateStatus: () => true });
+    if (pdfResp.status < 200 || pdfResp.status >= 300) return null;
+    return Buffer.from(pdfResp.data);
+  }
+
+  // Fetch + parse one merchant/month statement → { month, year, otherRevenueCents } or null.
+  async getStatementOtherRevenue({ merchantAccountId, calMonth, year, pspMerchantAccountName }) {
+    const buf = await this.getStatementPdf({ merchantAccountId, monthParam: calMonth - 1, year, pspMerchantAccountName });
+    if (!buf) return null;
+    const { text } = await pdfParse(buf);
+    const period = ZentactService.parseStatementPeriod(text) || { month: calMonth, year };
+    return { month: period.month, year: period.year, otherRevenueCents: ZentactService.parseStatementOtherRevenueCents(text) };
   }
 
   // ============================================================
