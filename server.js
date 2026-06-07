@@ -4182,6 +4182,32 @@ app.get('/api/admin/db-stats', async (req, res) => {
        FROM invoices GROUP BY commission_status ORDER BY count DESC`
     )).rows;
 
+    // Drift diagnostic: invoices marked paid/approved (approval_status) that are no longer
+    // commission-qualifying (commission_status NOT IN hardware/saas_first). This is what makes
+    // the report's STATUS pill show e.g. "0/0/15" — paid count > qualifying count.
+    const driftBreakdown = (await pool.query(
+      `SELECT approval_status,
+              COALESCE(commission_status, 'unknown') AS commission_status,
+              COUNT(*)::int AS count,
+              COALESCE(SUM(commission), 0)::float AS commission
+       FROM invoices
+       WHERE approval_status IN ('paid','approved')
+       GROUP BY approval_status, commission_status
+       ORDER BY approval_status, count DESC`
+    )).rows;
+
+    const driftRows = (await pool.query(
+      `SELECT invoice_number, salesperson_name, status, approval_status,
+              COALESCE(commission_status, 'unknown') AS commission_status,
+              commission::float AS commission, date::date AS date,
+              commission_payable_date::date AS payable_date
+       FROM invoices
+       WHERE approval_status IN ('paid','approved')
+         AND (commission_status IS NULL OR commission_status NOT IN ('hardware','saas_first'))
+       ORDER BY salesperson_name, date
+       LIMIT 200`
+    )).rows;
+
     const dateRange = (await pool.query(
       `SELECT MIN(date)::date AS oldest, MAX(date)::date AS newest FROM invoices`
     )).rows[0];
@@ -4202,6 +4228,7 @@ app.get('/api/admin/db-stats', async (req, res) => {
       row_counts: counts,
       invoices_by_status: byStatus,
       invoices_by_commission_status: byCommissionStatus,
+      paid_approved_drift: { breakdown: driftBreakdown, rows: driftRows },
       invoice_date_range: dateRange,
       last_sync_log: lastSync,
       last_zoho_webhook: lastWebhook,
