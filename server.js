@@ -4235,6 +4235,24 @@ app.get('/api/admin/db-stats', async (req, res) => {
        LIMIT 300`
     )).rows;
 
+    // Accurate (uncapped) totals for the earned-but-unpaid pool, split by overdue vs not-yet-due.
+    const earnedUnpaidTotals = (await pool.query(
+      `SELECT
+         COUNT(*)::int AS total_count,
+         COALESCE(SUM(commission), 0)::float AS total_commission,
+         COUNT(*) FILTER (WHERE commission_payable_date IS NOT NULL AND commission_payable_date < CURRENT_DATE)::int AS overdue_count,
+         COALESCE(SUM(commission) FILTER (WHERE commission_payable_date IS NOT NULL AND commission_payable_date < CURRENT_DATE), 0)::float AS overdue_commission,
+         MIN(commission_payable_date) FILTER (WHERE commission_payable_date IS NOT NULL AND commission_payable_date < CURRENT_DATE)::date AS oldest_overdue
+       FROM invoices
+       WHERE commission > 0 AND (approval_status IS NULL OR approval_status <> 'paid')`
+    )).rows[0];
+
+    // For comparison: how many invoices have EVER been marked paid (approval workflow usage).
+    const everPaid = (await pool.query(
+      `SELECT COUNT(*)::int AS count, COALESCE(SUM(commission),0)::float AS commission
+       FROM invoices WHERE approval_status = 'paid'`
+    )).rows[0];
+
     const dateRange = (await pool.query(
       `SELECT MIN(date)::date AS oldest, MAX(date)::date AS newest FROM invoices`
     )).rows[0];
@@ -4256,7 +4274,7 @@ app.get('/api/admin/db-stats', async (req, res) => {
       invoices_by_status: byStatus,
       invoices_by_commission_status: byCommissionStatus,
       paid_approved_drift: { breakdown: driftBreakdown, rows: driftRows },
-      earned_unpaid: { breakdown: earnedUnpaidBreakdown, rows: earnedUnpaidRows },
+      earned_unpaid: { totals: earnedUnpaidTotals, ever_paid: everPaid, breakdown: earnedUnpaidBreakdown, rows: earnedUnpaidRows },
       invoice_date_range: dateRange,
       last_sync_log: lastSync,
       last_zoho_webhook: lastWebhook,
