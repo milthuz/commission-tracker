@@ -4138,6 +4138,31 @@ app.get('/api/admin/db-stats', async (req, res) => {
 
 // Trigger a revenue sync/backfill. Secret-gated so it can run without a session
 // (and from a cron). Fire-and-forget (the job can take minutes); poll the summary.
+// TEMP (Phase 2 discovery) — return a Zentact statement PDF download URL for a
+// merchant/month, so we can inspect the PDF structure for "Other Revenue".
+app.get('/api/admin/zentact-statement-url', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const apiKey = process.env.ZENTACT_API_KEY;
+  if (!apiKey) return res.status(400).json({ error: 'ZENTACT_API_KEY not set' });
+  const base = process.env.ZENTACT_API_URL || 'https://api.zentact.com/api/v1';
+  const psp = req.query.psp || 'ClusterPOS_POS';
+  const merchantId = req.query.merchantId;
+  const month = req.query.month, year = req.query.year;
+  try {
+    const r = await axios.get(`${base}/statements/file-download-url`, {
+      headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
+      params: { pspMerchantAccountName: psp, merchantAccountId: merchantId, month, year },
+      timeout: 15000, validateStatus: () => true,
+    });
+    res.json({ status: r.status, data: r.data });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 //   ?from=YYYY-MM&to=YYYY-MM  → backfill a range
 //   ?monthsBack=N             → last N months (default 2)
 app.get('/api/admin/zentact-revenue-sync', async (req, res) => {
