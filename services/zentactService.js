@@ -34,7 +34,10 @@ class ZentactService {
       const attrKey = a.name ?? a.key ?? '';
       return attrKey === key || attrKey.toLowerCase() === key.toLowerCase();
     });
-    return attr?.value || null;
+    // Trim — Zentact values sometimes carry stray whitespace (e.g. "Yannick "),
+    // which breaks exact name/alias matching and creates duplicate reps.
+    const v = attr?.value;
+    return (v == null ? null : String(v).trim()) || null;
   }
 
   // ============================================================
