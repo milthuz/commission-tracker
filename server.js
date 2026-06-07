@@ -4941,7 +4941,7 @@ app.get('/api/zentact/revenue', authenticateToken, async (req, res) => {
     }
     const rows = (await pool.query(
       `SELECT r.merchant_account_id, r.month, r.transaction_profit_cents, r.total_volume_cents,
-              r.payments_count, r.currency, zm.business_name, zm.sales_rep_name,
+              r.other_revenue_cents, r.payments_count, r.currency, zm.business_name, zm.sales_rep_name,
               LOWER(zm.sales_rep_name) AS rep_l, LOWER(zm.reseller_attribute) AS reseller_attr_l
        FROM zentact_merchant_revenue r
        LEFT JOIN zentact_merchants zm ON zm.merchant_account_id = r.merchant_account_id
@@ -4955,6 +4955,7 @@ app.get('/api/zentact/revenue', authenticateToken, async (req, res) => {
       reseller_name: keyToReseller.get(r.rep_l) || keyToReseller.get(r.reseller_attr_l) || null,
       month: r.month,
       transaction_profit: Number(r.transaction_profit_cents) / 100,
+      other_revenue: r.other_revenue_cents == null ? 0 : Number(r.other_revenue_cents) / 100,
       volume: Number(r.total_volume_cents) / 100,
       payments_count: r.payments_count,
       currency: r.currency,
