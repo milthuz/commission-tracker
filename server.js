@@ -282,6 +282,15 @@ async function initializeDatabase() {
     // Manual override of a deal's lead source group. Sync only writes lead_source_group, so this
     // override survives re-syncs. Effective source = COALESCE(override, lead_source_group).
     await pool.query(`ALTER TABLE crm_sold_deals ADD COLUMN IF NOT EXISTS lead_source_group_override VARCHAR(255)`);
+    // Configurable points per deal type (lead source group). When a deal's effective source has a
+    // mapping here, its point value comes from this table; otherwise the synced deal points stand.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS deal_source_points (
+        source_group VARCHAR(255) PRIMARY KEY,
+        points INT NOT NULL DEFAULT 1,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
 
     // ROLES & PERMISSIONS — RBAC system
     await pool.query(`
@@ -1151,19 +1160,31 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     const dealsResult = await pool.query(dealsQuery, dealsParams);
     const deals = dealsResult.rows;
 
+    // Configurable points per deal type (effective lead source group). Overrides the synced
+    // deal points when a mapping exists for that source group.
+    const dealSourcePoints = new Map(
+      (await pool.query(`SELECT source_group, points FROM deal_source_points`)).rows
+        .map(r => [String(r.source_group).toLowerCase(), parseInt(r.points)])
+    );
+    const pointsForDeal = (deal) => {
+      const mapped = dealSourcePoints.get(String(deal.lead_source_group || '').toLowerCase());
+      return mapped == null ? (parseInt(deal.points) || 0) : mapped;
+    };
+
     // Build per-rep summary from CRM deals
     const repMap = {};
     for (const deal of deals) {
       const rep = deal.owner_name || 'Unassigned';
       if (!repMap[rep]) repMap[rep] = { repName: rep, totalPoints: 0, crmPoints: 0, deals: [], zentactMerchants: [] };
-      repMap[rep].totalPoints += deal.points;
-      repMap[rep].crmPoints   += deal.points;
+      const pts = pointsForDeal(deal);
+      repMap[rep].totalPoints += pts;
+      repMap[rep].crmPoints   += pts;
       repMap[rep].deals.push({
         crm_deal_id:       deal.deal_id,
         deal_name:         deal.deal_name,
         account_name:      deal.account_name,
         lead_source_group: deal.lead_source_group,
-        points:            deal.points,
+        points:            pts,
         close_date:        deal.sold_date,
       });
     }
@@ -5740,6 +5761,57 @@ app.delete('/api/teams/:id', authenticateToken, async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete team', details: error.message });
+  }
+});
+
+// ============================================================================
+// DEAL SOURCE POINTS — configurable point value per deal type (lead source group)
+// ============================================================================
+// GET /api/deal-source-points — configured mappings + all source groups present in the data
+app.get('/api/deal-source-points', authenticateToken, async (req, res) => {
+  try {
+    const mappings = (await pool.query(`SELECT source_group, points FROM deal_source_points ORDER BY source_group`)).rows
+      .map(r => ({ sourceGroup: r.source_group, points: parseInt(r.points) }));
+    const allGroups = (await pool.query(`
+      SELECT DISTINCT COALESCE(lead_source_group_override, lead_source_group) AS g
+      FROM crm_sold_deals
+      WHERE COALESCE(lead_source_group_override, lead_source_group) IS NOT NULL
+        AND COALESCE(lead_source_group_override, lead_source_group) <> ''
+      ORDER BY g
+    `)).rows.map(r => r.g);
+    res.json({ mappings, allGroups });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch deal source points', details: error.message });
+  }
+});
+
+// PUT /api/deal-source-points — upsert a source group's point value
+app.put('/api/deal-source-points', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const sourceGroup = (req.body.sourceGroup || '').trim();
+  const points = parseInt(req.body.points);
+  if (!sourceGroup) return res.status(400).json({ error: 'sourceGroup required' });
+  if (isNaN(points)) return res.status(400).json({ error: 'points must be a number' });
+  try {
+    await pool.query(
+      `INSERT INTO deal_source_points (source_group, points) VALUES ($1, $2)
+       ON CONFLICT (source_group) DO UPDATE SET points = $2, updated_at = CURRENT_TIMESTAMP`,
+      [sourceGroup, points]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to save deal source points', details: error.message });
+  }
+});
+
+// DELETE /api/deal-source-points/:sourceGroup — remove a mapping (deals revert to synced points)
+app.delete('/api/deal-source-points/:sourceGroup', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    await pool.query(`DELETE FROM deal_source_points WHERE source_group = $1`, [req.params.sourceGroup]);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete deal source points', details: error.message });
   }
 });
 
