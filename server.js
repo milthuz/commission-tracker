@@ -6799,9 +6799,15 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
         COALESCE(SUM(commission), 0) AS commission,
         COALESCE(SUM(CASE WHEN commission_paid THEN commission ELSE 0 END), 0) AS paid_commission,
         COALESCE(SUM(CASE WHEN status = 'paid' THEN total ELSE 0 END), 0) AS paid_revenue,
-        COUNT(CASE WHEN approval_status = 'paid' THEN 1 END) AS commission_paid_count,
-        COUNT(CASE WHEN approval_status = 'approved' THEN 1 END) AS commission_approved_count,
-        COUNT(CASE WHEN commission > 0 AND commission_status IN ('hardware','saas_first') THEN 1 END) AS commission_qualifying_count,
+        -- All three counts share the same base: invoices that actually EARN commission
+        -- (commission > 0). Previously paid/approved counted ANY approval_status (incl. $0
+        -- too_late invoices) while qualifying required commission_status IN (hardware,saas_first)
+        -- — which missed mixed invoices bucketed 'saas_renewal' that still carry hardware
+        -- commission. That mismatch let paid/approved exceed qualifying → the misleading
+        -- "0/0/15" orange pill. Aligning on commission > 0 guarantees paid,approved ⊆ qualifying.
+        COUNT(CASE WHEN commission > 0 AND approval_status = 'paid' THEN 1 END) AS commission_paid_count,
+        COUNT(CASE WHEN commission > 0 AND approval_status = 'approved' THEN 1 END) AS commission_approved_count,
+        COUNT(CASE WHEN commission > 0 THEN 1 END) AS commission_qualifying_count,
         COALESCE(SUM(CASE WHEN approval_status = 'approved' THEN commission ELSE 0 END), 0) AS approved_commission
       FROM invoices
       WHERE salesperson_name = $1 AND organization_id = $2
