@@ -1307,48 +1307,58 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       } catch { /* ignore */ }
     }
 
+    // Team membership + meta from DB (ACTIVE members per team). Drives the auto quota target so a
+    // team's target reflects ALL its members, not only those who happened to sell this month.
+    let teamMetaRows = (await pool.query(`
+      SELECT t.id, t.name, t.monthly_quota_override AS override, t.counts_toward_quota AS counts,
+             COUNT(s.id) FILTER (WHERE s.is_active) AS member_count
+      FROM teams t LEFT JOIN salespeople s ON s.team_id = t.id
+      GROUP BY t.id
+    `)).rows;
+
+    // PRIVACY: a non-admin sees ONLY their own team — both the rep rows AND the team cards.
+    // (Enforced server-side so other teams' data never leaves the API.) Within their team they
+    // see teammates' totals but not line-item details (deals/merchants stripped on non-own rows).
     if (!isAdmin) {
-      summary = summary.map(rep => {
-        const isOwnRow = rep.repName.trim().toLowerCase() === viewerName;
-        if (isOwnRow) return rep;
-        return {
-          ...rep,
-          deals: [],
-          zentactMerchants: [],
-          restricted: true, // flag for the frontend
-        };
-      });
+      const myTeam = teamFor(viewerName);
+      const myTeamId = myTeam ? myTeam.id : null;
+      summary = summary
+        .filter(rep => {
+          const rt = teamFor(rep.repName);
+          if (myTeamId) return !!rt && rt.id === myTeamId;
+          return rep.repName.trim().toLowerCase() === viewerName; // no team → only self
+        })
+        .map(rep => {
+          const isOwnRow = rep.repName.trim().toLowerCase() === viewerName;
+          return isOwnRow ? rep : { ...rep, deals: [], zentactMerchants: [], restricted: true };
+        });
+      teamMetaRows = myTeamId ? teamMetaRows.filter(tr => tr.id === myTeamId) : [];
     }
 
-    // Team aggregates. Target = override when set, else MONTHLY_QUOTA × member count.
-    // Reps with no team are grouped under a synthetic "No team" bucket (counts toward quota).
-    const teamAgg = new Map();
+    // Points + reps-met-quota per team from this month's summary.
+    const pointsByTeam = new Map();
     for (const rep of summary) {
       const tm = teamFor(rep.repName);
-      const key = tm ? `id:${tm.id}` : 'none';
-      if (!teamAgg.has(key)) {
-        teamAgg.set(key, {
-          teamId:            tm ? tm.id : null,
-          name:              tm ? tm.name : 'No team',
-          countsTowardQuota: tm ? tm.countsTowardQuota : true,
-          override:          tm ? tm.override : null,
-          totalPoints:       0,
-          memberCount:       0,
-          repNames:          [],
-        });
-      }
-      const a = teamAgg.get(key);
-      a.totalPoints += rep.totalPoints;
-      a.memberCount += 1;
-      a.repNames.push(rep.repName);
+      if (!tm) continue;
+      if (!pointsByTeam.has(tm.id)) pointsByTeam.set(tm.id, { points: 0, met: 0 });
+      const p = pointsByTeam.get(tm.id);
+      p.points += rep.totalPoints;
+      if (rep.quotaMet) p.met += 1;
     }
-    const teams = [...teamAgg.values()].map(a => {
-      const quotaTarget = a.override != null ? a.override : MONTHLY_QUOTA * a.memberCount;
-      return { ...a, quotaTarget, quotaMet: a.totalPoints >= quotaTarget };
-    }).sort((x, y) => y.totalPoints - x.totalPoints);
+    const teams = teamMetaRows.map(tr => {
+      const pm = pointsByTeam.get(tr.id) || { points: 0, met: 0 };
+      const memberCount = parseInt(tr.member_count) || 0;
+      const override = tr.override == null ? null : parseInt(tr.override);
+      const quotaTarget = override != null ? override : MONTHLY_QUOTA * memberCount;
+      return {
+        teamId: tr.id, name: tr.name, countsTowardQuota: tr.counts !== false,
+        memberCount, membersMet: pm.met, totalPoints: pm.points,
+        quotaTarget, quotaMet: pm.points >= quotaTarget,
+      };
+    }).sort((a, b) => b.totalPoints - a.totalPoints);
 
-    // Company totals exclude teams flagged counts_toward_quota=false (tracked but not counted).
-    const countingTeams = teams.filter(t => t.countsTowardQuota);
+    // Company totals: admins exclude non-counting teams; a non-admin just sees their own team.
+    const countingTeams = isAdmin ? teams.filter(t => t.countsTowardQuota) : teams;
     const companyPoints = countingTeams.reduce((s, t) => s + t.totalPoints, 0);
     const companyTarget = countingTeams.reduce((s, t) => s + t.quotaTarget, 0);
 
