@@ -5770,16 +5770,30 @@ app.delete('/api/teams/:id', authenticateToken, async (req, res) => {
 // GET /api/deal-source-points — configured mappings + all source groups present in the data
 app.get('/api/deal-source-points', authenticateToken, async (req, res) => {
   try {
-    const mappings = (await pool.query(`SELECT source_group, points FROM deal_source_points ORDER BY source_group`)).rows
-      .map(r => ({ sourceGroup: r.source_group, points: parseInt(r.points) }));
-    const allGroups = (await pool.query(`
-      SELECT DISTINCT COALESCE(lead_source_group_override, lead_source_group) AS g
+    const configured = new Map(
+      (await pool.query(`SELECT source_group, points FROM deal_source_points`)).rows
+        .map(r => [r.source_group, parseInt(r.points)])
+    );
+    // Representative synced value per source group = its most frequent deal points value.
+    const rows = (await pool.query(`
+      SELECT COALESCE(lead_source_group_override, lead_source_group) AS g, points, COUNT(*)::int AS c
       FROM crm_sold_deals
       WHERE COALESCE(lead_source_group_override, lead_source_group) IS NOT NULL
         AND COALESCE(lead_source_group_override, lead_source_group) <> ''
-      ORDER BY g
-    `)).rows.map(r => r.g);
-    res.json({ mappings, allGroups });
+      GROUP BY g, points
+    `)).rows;
+    const rep = new Map();
+    for (const r of rows) {
+      const cur = rep.get(r.g);
+      if (!cur || r.c > cur.c) rep.set(r.g, { points: parseInt(r.points) || 0, c: r.c });
+    }
+    const groupNames = new Set([...rep.keys(), ...configured.keys()]);
+    const groups = [...groupNames].sort().map(g => ({
+      sourceGroup: g,
+      points: configured.has(g) ? configured.get(g) : (rep.get(g)?.points ?? 0),
+      isCustom: configured.has(g),
+    }));
+    res.json({ groups });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch deal source points', details: error.message });
   }
