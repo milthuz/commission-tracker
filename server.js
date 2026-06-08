@@ -275,6 +275,8 @@ async function initializeDatabase() {
     // Per-team: which point sources count toward the team quota (default both, = current behaviour).
     await pool.query(`ALTER TABLE teams ADD COLUMN IF NOT EXISTS include_deals BOOLEAN DEFAULT true`);
     await pool.query(`ALTER TABLE teams ADD COLUMN IF NOT EXISTS include_payments BOOLEAN DEFAULT true`);
+    // Manual display order (drives ordering in admin + the commission tracker).
+    await pool.query(`ALTER TABLE teams ADD COLUMN IF NOT EXISTS sort_order INT DEFAULT 0`);
     // Per-salesperson monthly quota override (NULL = use the default MONTHLY_QUOTA).
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS monthly_quota INT`);
     // Manual override of a deal's lead source group. Sync only writes lead_source_group, so this
@@ -1325,11 +1327,12 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     // team's target reflects ALL its members, not only those who happened to sell this month.
     let teamMetaRows = (await pool.query(`
       SELECT t.id, t.name, t.monthly_quota_override AS override, t.counts_toward_quota AS counts,
-             t.include_deals, t.include_payments,
+             t.include_deals, t.include_payments, t.sort_order,
              COUNT(s.id) FILTER (WHERE s.is_active) AS member_count,
              COALESCE(SUM(COALESCE(s.monthly_quota, ${MONTHLY_QUOTA})) FILTER (WHERE s.is_active), 0) AS members_quota_sum
       FROM teams t LEFT JOIN salespeople s ON s.team_id = t.id
       GROUP BY t.id
+      ORDER BY t.sort_order, t.name
     `)).rows;
 
     // PRIVACY: a non-admin sees ONLY their own team — both the rep rows AND the team cards.
@@ -1373,7 +1376,7 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
         memberCount, membersMet, totalPoints,
         quotaTarget, quotaMet: totalPoints >= quotaTarget,
       };
-    }).sort((a, b) => b.totalPoints - a.totalPoints);
+    }); // order preserved from teamMetaRows (manual sort_order)
 
     // Company totals: admins exclude non-counting teams; a non-admin just sees their own team.
     const countingTeams = isAdmin ? teams.filter(t => t.countsTowardQuota) : teams;
@@ -5640,7 +5643,7 @@ app.get('/api/teams', authenticateToken, async (req, res) => {
              t.include_deals, t.include_payments,
              COUNT(s.id)::int AS member_count
       FROM teams t LEFT JOIN salespeople s ON s.team_id = t.id
-      GROUP BY t.id ORDER BY t.name
+      GROUP BY t.id ORDER BY t.sort_order, t.name
     `);
     res.json({
       teams: r.rows.map(t => ({
@@ -5655,6 +5658,27 @@ app.get('/api/teams', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch teams', details: error.message });
+  }
+});
+
+// PUT /api/teams/reorder — set display order from an ordered list of team ids
+app.put('/api/teams/reorder', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const ids = Array.isArray(req.body.orderedIds) ? req.body.orderedIds.map(Number).filter(n => !isNaN(n)) : [];
+  if (!ids.length) return res.status(400).json({ error: 'orderedIds required' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (let i = 0; i < ids.length; i++) {
+      await client.query(`UPDATE teams SET sort_order = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, [i, ids[i]]);
+    }
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: 'Failed to reorder teams', details: error.message });
+  } finally {
+    client.release();
   }
 });
 
