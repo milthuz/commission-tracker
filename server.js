@@ -1160,15 +1160,33 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     const dealsResult = await pool.query(dealsQuery, dealsParams);
     const deals = dealsResult.rows;
 
-    // Configurable points per deal type (effective lead source group). Overrides the synced
-    // deal points when a mapping exists for that source group.
+    // Points per deal are driven by the deal's TYPE (effective lead source group), so every deal
+    // of a type is worth the same — matching the "Points by deal type" admin card exactly:
+    //   1) custom configured value for the type, else
+    //   2) the type's representative synced value (most frequent points among that type's deals),
+    //   3) finally the deal's own synced points (only if the type has no deals at all — shouldn't happen).
     const dealSourcePoints = new Map(
       (await pool.query(`SELECT source_group, points FROM deal_source_points`)).rows
         .map(r => [String(r.source_group).toLowerCase(), parseInt(r.points)])
     );
+    const repByGroup = new Map();
+    for (const r of (await pool.query(`
+      SELECT COALESCE(lead_source_group_override, lead_source_group) AS g, points, COUNT(*)::int AS c
+      FROM crm_sold_deals
+      WHERE COALESCE(lead_source_group_override, lead_source_group) IS NOT NULL
+        AND COALESCE(lead_source_group_override, lead_source_group) <> ''
+      GROUP BY g, points
+    `)).rows) {
+      const cur = repByGroup.get(r.g);
+      if (!cur || r.c > cur.c) repByGroup.set(r.g, { points: parseInt(r.points) || 0, c: r.c });
+    }
     const pointsForDeal = (deal) => {
-      const mapped = dealSourcePoints.get(String(deal.lead_source_group || '').toLowerCase());
-      return mapped == null ? (parseInt(deal.points) || 0) : mapped;
+      const g = String(deal.lead_source_group || '');
+      const mapped = dealSourcePoints.get(g.toLowerCase());
+      if (mapped != null) return mapped;
+      const rep = repByGroup.get(g);
+      if (rep != null) return rep.points;
+      return parseInt(deal.points) || 0;
     };
 
     // Build per-rep summary from CRM deals
