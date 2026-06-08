@@ -4451,6 +4451,12 @@ function parseMoneyCell(v) {
 // (e.g. a cell that displays "COMMIS↵SION" but should match "COMMISSION").
 function tightHdr(c) { return c == null ? '' : String(c).replace(/\s+/g, '').toUpperCase(); }
 
+// Header matchers — different reports label the same column differently:
+//   "Invoice #", "Invoice Number", "INVOICE", "Inv #"  → invoice column
+//   "Commission", "Commissions Amount"                  → commission column
+function isInvoiceHdr(t)    { return /^INV(OICE)?(#|NO\.?|NUMBER|NUM)?$/.test(t); }
+function isCommissionHdr(t) { return /^COMMISSIONS?(AMOUNT)?$/.test(t); }
+
 function parseCommissionReportXlsx(buffer) {
   const wb = xlsx.read(buffer, { type: 'buffer', cellDates: true });
 
@@ -4461,14 +4467,16 @@ function parseCommissionReportXlsx(buffer) {
     const rows = xlsx.utils.sheet_to_json(sheet, { header: 1, blankrows: false, defval: null });
     if (!rows.length) continue;
 
-    // Standard report: a cell that tightens to "INVOICENUMBER".
+    // Standard report: identified by an exact "Invoice Number" header (it carries Lead Source
+    // bonus rows). Checked FIRST so bonus-bearing reports route here, not to the Addon parser.
     const stdHeaderIdx = rows.findIndex(r => r.some(c => tightHdr(c) === 'INVOICENUMBER'));
     if (stdHeaderIdx >= 0) return parseStandardReport(rows, stdHeaderIdx);
 
-    // Addon report: a header row carrying both "INVOICE" and "COMMISSION".
+    // Addon-style report: any header row carrying both an invoice column and a commission column,
+    // however they're labelled ("Invoice #"/"INVOICE"/..., "Commission"/"Commissions Amount").
     const addonHeaderIdx = rows.findIndex(r => {
       const cells = r.map(tightHdr);
-      return cells.includes('INVOICE') && cells.includes('COMMISSION');
+      return cells.some(isInvoiceHdr) && cells.some(isCommissionHdr);
     });
     if (addonHeaderIdx >= 0) return parseAddonReport(rows, addonHeaderIdx);
   }
@@ -4534,9 +4542,9 @@ function parseAddonReport(rows, headerIdx) {
   const header = rows[headerIdx].map(tightHdr);
   const col = (name) => header.indexOf(tightHdr(name));
 
-  const idxInvoice    = col('INVOICE');
-  const idxCommission = col('COMMISSION');
-  const idxComingSoon = col('COMING SOON');
+  const idxInvoice    = header.findIndex(isInvoiceHdr);
+  const idxCommission = header.findIndex(isCommissionHdr);
+  const idxComingSoon = col('COMING SOON'); // -1 when absent (simpler layouts) → guard skipped
   const idxCustomer   = 0; // first column holds the account/customer name
 
   const invoices = [];
