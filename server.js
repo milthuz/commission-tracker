@@ -275,6 +275,11 @@ async function initializeDatabase() {
     // Per-team: which point sources count toward the team quota (default both, = current behaviour).
     await pool.query(`ALTER TABLE teams ADD COLUMN IF NOT EXISTS include_deals BOOLEAN DEFAULT true`);
     await pool.query(`ALTER TABLE teams ADD COLUMN IF NOT EXISTS include_payments BOOLEAN DEFAULT true`);
+    // Per-salesperson monthly quota override (NULL = use the default MONTHLY_QUOTA).
+    await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS monthly_quota INT`);
+    // Manual override of a deal's lead source group. Sync only writes lead_source_group, so this
+    // override survives re-syncs. Effective source = COALESCE(override, lead_source_group).
+    await pool.query(`ALTER TABLE crm_sold_deals ADD COLUMN IF NOT EXISTS lead_source_group_override VARCHAR(255)`);
 
     // ROLES & PERMISSIONS — RBAC system
     await pool.query(`
@@ -1123,7 +1128,9 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     const endDate   = new Date(year, month, 0); // last day of month
 
     let dealsQuery = `
-      SELECT c.deal_id, c.deal_name, c.account_name, c.owner_name, c.lead_source_group, c.points, c.sold_date
+      SELECT c.deal_id, c.deal_name, c.account_name, c.owner_name,
+             COALESCE(c.lead_source_group_override, c.lead_source_group) AS lead_source_group,
+             c.points, c.sold_date
       FROM crm_sold_deals c
       WHERE c.sold_date >= $1 AND c.sold_date <= $2
         AND (
@@ -1192,12 +1199,15 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     }
 
     // Per-salesperson signup-bonus config (amount per activation + on/off). Default $100, on.
-    const spCfgRows = (await pool.query(`SELECT name, signup_bonus_amount, signup_bonus_enabled FROM salespeople`)).rows;
+    const spCfgRows = (await pool.query(`SELECT name, signup_bonus_amount, signup_bonus_enabled, monthly_quota FROM salespeople`)).rows;
     const signupByRep = new Map(spCfgRows.map(s => [String(s.name).toLowerCase(), {
       amount: s.signup_bonus_amount == null ? 100 : parseFloat(s.signup_bonus_amount),
       enabled: s.signup_bonus_enabled !== false,
     }]));
     const signupFor = (name) => signupByRep.get(String(name || '').toLowerCase()) || { amount: 100, enabled: true };
+    // Per-rep monthly quota (override or default).
+    const quotaByRep = new Map(spCfgRows.map(s => [String(s.name).toLowerCase(), s.monthly_quota == null ? MONTHLY_QUOTA : parseInt(s.monthly_quota)]));
+    const quotaFor = (name) => quotaByRep.get(String(name || '').toLowerCase()) || MONTHLY_QUOTA;
 
     // Team assignment per rep (for quota grouping). rep name → team or null.
     const teamRows = (await pool.query(`
@@ -1219,7 +1229,8 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       const zentactBonus  = cfg.enabled ? zentactMerchants.length * cfg.amount : 0;
       // Reflect the rep's signup config on each merchant row too (0 when disabled).
       const zentactMerchantsOut = zentactMerchants.map(m => ({ ...m, bonus_amount: cfg.enabled ? cfg.amount : 0 }));
-      const quotaMet = rep.totalPoints >= MONTHLY_QUOTA;
+      const repQuota = quotaFor(rep.repName);
+      const quotaMet = rep.totalPoints >= repQuota;
       const monthlyBonus = ZohoCRMService.calculateMonthlyBonus(rep.totalPoints);
       const team = teamFor(rep.repName);
       return {
@@ -1231,9 +1242,9 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
         zentactPoints,
         zentactActivations:  zentactMerchants.length,
         zentactBonus,
-        quota:               MONTHLY_QUOTA,
+        quota:               repQuota,
         quotaMet,
-        pointsToQuota:       Math.max(0, MONTHLY_QUOTA - rep.totalPoints),
+        pointsToQuota:       Math.max(0, repQuota - rep.totalPoints),
         monthlyBonus,
         bonusTier:     MONTHLY_BONUS_TIERS.find(t => rep.totalPoints >= t.points) || null,
         nextBonusTier: MONTHLY_BONUS_TIERS.slice().reverse().find(t => rep.totalPoints < t.points) || null,
@@ -1315,7 +1326,8 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     let teamMetaRows = (await pool.query(`
       SELECT t.id, t.name, t.monthly_quota_override AS override, t.counts_toward_quota AS counts,
              t.include_deals, t.include_payments,
-             COUNT(s.id) FILTER (WHERE s.is_active) AS member_count
+             COUNT(s.id) FILTER (WHERE s.is_active) AS member_count,
+             COALESCE(SUM(COALESCE(s.monthly_quota, ${MONTHLY_QUOTA})) FILTER (WHERE s.is_active), 0) AS members_quota_sum
       FROM teams t LEFT JOIN salespeople s ON s.team_id = t.id
       GROUP BY t.id
     `)).rows;
@@ -1353,7 +1365,8 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       }
       const memberCount = parseInt(tr.member_count) || 0;
       const override = tr.override == null ? null : parseInt(tr.override);
-      const quotaTarget = override != null ? override : MONTHLY_QUOTA * memberCount;
+      // Auto target = sum of members' individual quotas (each defaults to MONTHLY_QUOTA).
+      const quotaTarget = override != null ? override : (parseInt(tr.members_quota_sum) || 0);
       return {
         teamId: tr.id, name: tr.name, countsTowardQuota: tr.counts !== false,
         includeDeals, includePayments,
@@ -1366,6 +1379,15 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     const countingTeams = isAdmin ? teams.filter(t => t.countsTowardQuota) : teams;
     const companyPoints = countingTeams.reduce((s, t) => s + t.totalPoints, 0);
     const companyTarget = countingTeams.reduce((s, t) => s + t.quotaTarget, 0);
+
+    // Distinct lead-source groups (effective) — drives the deal source-override dropdown.
+    const leadSourceGroups = (await pool.query(`
+      SELECT DISTINCT COALESCE(lead_source_group_override, lead_source_group) AS g
+      FROM crm_sold_deals
+      WHERE COALESCE(lead_source_group_override, lead_source_group) IS NOT NULL
+        AND COALESCE(lead_source_group_override, lead_source_group) <> ''
+      ORDER BY g
+    `)).rows.map(r => r.g);
 
     res.json({
       year,
@@ -1381,10 +1403,28 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       companyPoints,
       companyTarget,
       companyQuotaMet:         companyTarget > 0 && companyPoints >= companyTarget,
+      leadSourceGroups,
     });
   } catch (error) {
     console.error('CRM points error:', error.response?.data || error.message);
     res.status(500).json({ error: 'Failed to calculate points', details: error.message });
+  }
+});
+
+// PUT /api/crm/deals/:dealId/source — manually override a deal's lead source group.
+// Empty/null clears the override (reverts to the CRM-synced value). Survives re-syncs.
+app.put('/api/crm/deals/:dealId/source', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const src = (req.body.source == null ? '' : String(req.body.source)).trim();
+  try {
+    const r = await pool.query(
+      `UPDATE crm_sold_deals SET lead_source_group_override = $1 WHERE deal_id = $2 RETURNING deal_id`,
+      [src === '' ? null : src, req.params.dealId]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Deal not found' });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to override deal source', details: error.message });
   }
 });
 
@@ -5517,7 +5557,7 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
 
     const result = await pool.query(
       `SELECT s.name, s.is_active, s.commission_rate, s.base_salary, s.invoice_count, s.aliases,
-              s.signup_bonus_amount, s.signup_bonus_enabled, s.team_id, t.name AS team_name
+              s.signup_bonus_amount, s.signup_bonus_enabled, s.monthly_quota, s.team_id, t.name AS team_name
        FROM salespeople s LEFT JOIN teams t ON t.id = s.team_id
        ORDER BY s.name`
     );
@@ -5531,6 +5571,7 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
         aliases:            Array.isArray(r.aliases) ? r.aliases : [],
         signupBonusAmount:  r.signup_bonus_amount == null ? 100 : parseFloat(r.signup_bonus_amount),
         signupBonusEnabled: r.signup_bonus_enabled !== false,
+        monthlyQuota:       r.monthly_quota == null ? null : parseInt(r.monthly_quota),
         teamId:             r.team_id || null,
         teamName:           r.team_name || null,
       }))
@@ -5553,6 +5594,22 @@ app.put('/api/salespeople/:name/status', authenticateToken, async (req, res) => 
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update status', details: error.message });
+  }
+});
+
+// PUT /api/salespeople/:name/quota — set a per-rep monthly quota (null/empty = use default)
+app.put('/api/salespeople/:name/quota', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const q = req.body.quota == null || req.body.quota === '' ? null : parseInt(req.body.quota);
+  try {
+    const r = await pool.query(
+      `UPDATE salespeople SET monthly_quota = $1, updated_at = CURRENT_TIMESTAMP WHERE name = $2 RETURNING name`,
+      [q, req.params.name]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Salesperson not found' });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update quota', details: error.message });
   }
 });
 
