@@ -258,6 +258,21 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS signup_bonus_amount DECIMAL(10,2) DEFAULT 100`);
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS signup_bonus_enabled BOOLEAN DEFAULT true`);
 
+    // Teams — group salespeople. Quota target = monthly_quota_override when set, else
+    // MONTHLY_QUOTA × number of counting members. counts_toward_quota=false → the team's reps
+    // are still tracked but excluded from team/company quota aggregates.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS teams (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) UNIQUE NOT NULL,
+        monthly_quota_override INT,
+        counts_toward_quota BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS team_id INT REFERENCES teams(id) ON DELETE SET NULL`);
+
     // ROLES & PERMISSIONS — RBAC system
     await pool.query(`
       CREATE TABLE IF NOT EXISTS roles (
@@ -1181,6 +1196,19 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     }]));
     const signupFor = (name) => signupByRep.get(String(name || '').toLowerCase()) || { amount: 100, enabled: true };
 
+    // Team assignment per rep (for quota grouping). rep name → team or null.
+    const teamRows = (await pool.query(`
+      SELECT s.name AS rep, t.id AS team_id, t.name AS team_name,
+             t.monthly_quota_override AS override, t.counts_toward_quota AS counts
+      FROM salespeople s LEFT JOIN teams t ON t.id = s.team_id
+    `)).rows;
+    const teamByRep = new Map(teamRows.map(r => [String(r.rep).toLowerCase(), r.team_id ? {
+      id: r.team_id, name: r.team_name,
+      override: r.override == null ? null : parseInt(r.override),
+      countsTowardQuota: r.counts !== false,
+    } : null]));
+    const teamFor = (name) => teamByRep.get(String(name || '').toLowerCase()) || null;
+
     let summary = Object.values(repMap).map(rep => {
       const zentactMerchants = rep.zentactMerchants || [];
       const zentactPoints = zentactMerchants.reduce((s, m) => s + (m.points || 1), 0);
@@ -1190,8 +1218,11 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       const zentactMerchantsOut = zentactMerchants.map(m => ({ ...m, bonus_amount: cfg.enabled ? cfg.amount : 0 }));
       const quotaMet = rep.totalPoints >= MONTHLY_QUOTA;
       const monthlyBonus = ZohoCRMService.calculateMonthlyBonus(rep.totalPoints);
+      const team = teamFor(rep.repName);
       return {
         repName:             rep.repName,
+        team:                team ? { id: team.id, name: team.name } : null,
+        countsTowardQuota:   team ? team.countsTowardQuota : true,
         totalPoints:         rep.totalPoints,   // CRM + Zentact combined
         crmPoints:           rep.crmPoints || 0,
         zentactPoints,
@@ -1289,6 +1320,38 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       });
     }
 
+    // Team aggregates. Target = override when set, else MONTHLY_QUOTA × member count.
+    // Reps with no team are grouped under a synthetic "No team" bucket (counts toward quota).
+    const teamAgg = new Map();
+    for (const rep of summary) {
+      const tm = teamFor(rep.repName);
+      const key = tm ? `id:${tm.id}` : 'none';
+      if (!teamAgg.has(key)) {
+        teamAgg.set(key, {
+          teamId:            tm ? tm.id : null,
+          name:              tm ? tm.name : 'No team',
+          countsTowardQuota: tm ? tm.countsTowardQuota : true,
+          override:          tm ? tm.override : null,
+          totalPoints:       0,
+          memberCount:       0,
+          repNames:          [],
+        });
+      }
+      const a = teamAgg.get(key);
+      a.totalPoints += rep.totalPoints;
+      a.memberCount += 1;
+      a.repNames.push(rep.repName);
+    }
+    const teams = [...teamAgg.values()].map(a => {
+      const quotaTarget = a.override != null ? a.override : MONTHLY_QUOTA * a.memberCount;
+      return { ...a, quotaTarget, quotaMet: a.totalPoints >= quotaTarget };
+    }).sort((x, y) => y.totalPoints - x.totalPoints);
+
+    // Company totals exclude teams flagged counts_toward_quota=false (tracked but not counted).
+    const countingTeams = teams.filter(t => t.countsTowardQuota);
+    const companyPoints = countingTeams.reduce((s, t) => s + t.totalPoints, 0);
+    const companyTarget = countingTeams.reduce((s, t) => s + t.quotaTarget, 0);
+
     res.json({
       year,
       month,
@@ -1299,6 +1362,10 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       isAdmin,
       viewerName,
       reps:                    summary,
+      teams,
+      companyPoints,
+      companyTarget,
+      companyQuotaMet:         companyTarget > 0 && companyPoints >= companyTarget,
     });
   } catch (error) {
     console.error('CRM points error:', error.response?.data || error.message);
@@ -5434,9 +5501,10 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
     `, [process.env.ZOHO_ORG_ID]);
 
     const result = await pool.query(
-      `SELECT name, is_active, commission_rate, base_salary, invoice_count, aliases,
-              signup_bonus_amount, signup_bonus_enabled
-       FROM salespeople ORDER BY name`
+      `SELECT s.name, s.is_active, s.commission_rate, s.base_salary, s.invoice_count, s.aliases,
+              s.signup_bonus_amount, s.signup_bonus_enabled, s.team_id, t.name AS team_name
+       FROM salespeople s LEFT JOIN teams t ON t.id = s.team_id
+       ORDER BY s.name`
     );
     res.json({
       salespeople: result.rows.map(r => ({
@@ -5448,6 +5516,8 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
         aliases:            Array.isArray(r.aliases) ? r.aliases : [],
         signupBonusAmount:  r.signup_bonus_amount == null ? 100 : parseFloat(r.signup_bonus_amount),
         signupBonusEnabled: r.signup_bonus_enabled !== false,
+        teamId:             r.team_id || null,
+        teamName:           r.team_name || null,
       }))
     });
   } catch (error) {
@@ -5468,6 +5538,104 @@ app.put('/api/salespeople/:name/status', authenticateToken, async (req, res) => 
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update status', details: error.message });
+  }
+});
+
+// PUT /api/salespeople/:name/team — assign a rep to a team (teamId null = remove from team)
+app.put('/api/salespeople/:name/team', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const teamId = req.body.teamId == null ? null : parseInt(req.body.teamId);
+  try {
+    const r = await pool.query(
+      `UPDATE salespeople SET team_id = $1, updated_at = CURRENT_TIMESTAMP WHERE name = $2 RETURNING name`,
+      [teamId, req.params.name]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Salesperson not found' });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to assign team', details: error.message });
+  }
+});
+
+// ============================================================================
+// TEAMS — group salespeople for quota tracking
+// ============================================================================
+// GET /api/teams — list teams with member counts
+app.get('/api/teams', authenticateToken, async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT t.id, t.name, t.monthly_quota_override, t.counts_toward_quota,
+             COUNT(s.id)::int AS member_count
+      FROM teams t LEFT JOIN salespeople s ON s.team_id = t.id
+      GROUP BY t.id ORDER BY t.name
+    `);
+    res.json({
+      teams: r.rows.map(t => ({
+        id:                  t.id,
+        name:                t.name,
+        monthlyQuotaOverride: t.monthly_quota_override == null ? null : parseInt(t.monthly_quota_override),
+        countsTowardQuota:   t.counts_toward_quota !== false,
+        memberCount:         t.member_count,
+      })),
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch teams', details: error.message });
+  }
+});
+
+// POST /api/teams — create a team
+app.post('/api/teams', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const name = (req.body.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'Team name required' });
+  const override = req.body.monthlyQuotaOverride == null || req.body.monthlyQuotaOverride === ''
+    ? null : parseInt(req.body.monthlyQuotaOverride);
+  const counts = req.body.countsTowardQuota !== false;
+  try {
+    const r = await pool.query(
+      `INSERT INTO teams (name, monthly_quota_override, counts_toward_quota)
+       VALUES ($1, $2, $3) RETURNING id`,
+      [name, override, counts]
+    );
+    res.json({ success: true, id: r.rows[0].id });
+  } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ error: 'A team with that name already exists' });
+    res.status(500).json({ error: 'Failed to create team', details: error.message });
+  }
+});
+
+// PUT /api/teams/:id — update name / quota override / counts toward quota
+app.put('/api/teams/:id', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const id = parseInt(req.params.id);
+  const name = (req.body.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'Team name required' });
+  const override = req.body.monthlyQuotaOverride == null || req.body.monthlyQuotaOverride === ''
+    ? null : parseInt(req.body.monthlyQuotaOverride);
+  const counts = req.body.countsTowardQuota !== false;
+  try {
+    const r = await pool.query(
+      `UPDATE teams SET name = $1, monthly_quota_override = $2, counts_toward_quota = $3,
+              updated_at = CURRENT_TIMESTAMP WHERE id = $4 RETURNING id`,
+      [name, override, counts, id]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Team not found' });
+    res.json({ success: true });
+  } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ error: 'A team with that name already exists' });
+    res.status(500).json({ error: 'Failed to update team', details: error.message });
+  }
+});
+
+// DELETE /api/teams/:id — delete a team (members' team_id set to NULL via FK)
+app.delete('/api/teams/:id', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const r = await pool.query(`DELETE FROM teams WHERE id = $1 RETURNING id`, [parseInt(req.params.id)]);
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Team not found' });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete team', details: error.message });
   }
 });
 
