@@ -4253,6 +4253,20 @@ app.get('/api/admin/db-stats', async (req, res) => {
        FROM invoices WHERE approval_status = 'paid'`
     )).rows[0];
 
+    // Per-rep: earned-unpaid vs paid. Reveals whether the remaining pending pool is reps with
+    // NO reports imported (paid=0) vs reps whose reports don't cover all app-eligible invoices.
+    const earnedUnpaidByRep = (await pool.query(
+      `SELECT COALESCE(salesperson_name, '(none)') AS rep,
+              COUNT(*) FILTER (WHERE commission > 0 AND (approval_status IS NULL OR approval_status <> 'paid'))::int AS unpaid_count,
+              COALESCE(SUM(commission) FILTER (WHERE commission > 0 AND (approval_status IS NULL OR approval_status <> 'paid')), 0)::float AS unpaid_commission,
+              COUNT(*) FILTER (WHERE commission > 0 AND approval_status = 'paid')::int AS paid_count,
+              COALESCE(SUM(commission) FILTER (WHERE commission > 0 AND approval_status = 'paid'), 0)::float AS paid_commission
+       FROM invoices
+       GROUP BY salesperson_name
+       HAVING COUNT(*) FILTER (WHERE commission > 0 AND (approval_status IS NULL OR approval_status <> 'paid')) > 0
+       ORDER BY unpaid_commission DESC`
+    )).rows;
+
     const dateRange = (await pool.query(
       `SELECT MIN(date)::date AS oldest, MAX(date)::date AS newest FROM invoices`
     )).rows[0];
@@ -4274,7 +4288,7 @@ app.get('/api/admin/db-stats', async (req, res) => {
       invoices_by_status: byStatus,
       invoices_by_commission_status: byCommissionStatus,
       paid_approved_drift: { breakdown: driftBreakdown, rows: driftRows },
-      earned_unpaid: { totals: earnedUnpaidTotals, ever_paid: everPaid, breakdown: earnedUnpaidBreakdown, rows: earnedUnpaidRows },
+      earned_unpaid: { totals: earnedUnpaidTotals, ever_paid: everPaid, by_rep: earnedUnpaidByRep, breakdown: earnedUnpaidBreakdown, rows: earnedUnpaidRows },
       invoice_date_range: dateRange,
       last_sync_log: lastSync,
       last_zoho_webhook: lastWebhook,
