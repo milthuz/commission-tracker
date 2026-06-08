@@ -4287,6 +4287,38 @@ app.get('/api/admin/db-stats', async (req, res) => {
        FROM invoices WHERE salesperson_name = 'Unassigned' AND commission > 0`
     )).rows[0];
 
+    // How many "Unassigned" customers could be auto-attributed by matching their name to a
+    // zentact_merchants row that HAS a sales_rep_name? Same normalization as buildZentactMatcher
+    // (lowercase, strip non-alphanumerics). EXACT-normalized match only — a conservative lower bound
+    // (the runtime matcher also does substring includes, which would catch a few more).
+    const UN_CTE = `
+      WITH un AS (
+        SELECT customer_name,
+               regexp_replace(lower(customer_name), '[^a-z0-9]', '', 'g') AS norm,
+               COUNT(*)::int AS cnt, SUM(commission)::float AS commission
+        FROM invoices
+        WHERE salesperson_name = 'Unassigned' AND commission > 0 AND customer_name IS NOT NULL
+        GROUP BY customer_name
+      ),
+      zm AS (
+        SELECT regexp_replace(lower(business_name), '[^a-z0-9]', '', 'g') AS norm,
+               MIN(sales_rep_name) AS rep
+        FROM zentact_merchants
+        WHERE business_name IS NOT NULL AND business_name <> ''
+          AND sales_rep_name IS NOT NULL AND sales_rep_name <> ''
+        GROUP BY 1
+      )`;
+    const unassignedMatch = (await pool.query(`${UN_CTE}
+      SELECT COUNT(*)::int AS total_customers,
+             COALESCE(SUM(un.commission), 0)::float AS total_commission,
+             COUNT(zm.rep)::int AS matched_customers,
+             COALESCE(SUM(un.commission) FILTER (WHERE zm.rep IS NOT NULL), 0)::float AS matched_commission
+      FROM un LEFT JOIN zm ON zm.norm = un.norm`)).rows[0];
+    const unassignedMatchByRep = (await pool.query(`${UN_CTE}
+      SELECT zm.rep, COUNT(*)::int AS customers, COALESCE(SUM(un.commission), 0)::float AS commission
+      FROM un JOIN zm ON zm.norm = un.norm
+      GROUP BY zm.rep ORDER BY commission DESC LIMIT 50`)).rows;
+
     const dateRange = (await pool.query(
       `SELECT MIN(date)::date AS oldest, MAX(date)::date AS newest FROM invoices`
     )).rows[0];
@@ -4309,7 +4341,8 @@ app.get('/api/admin/db-stats', async (req, res) => {
       invoices_by_commission_status: byCommissionStatus,
       paid_approved_drift: { breakdown: driftBreakdown, rows: driftRows },
       earned_unpaid: { totals: earnedUnpaidTotals, ever_paid: everPaid, by_rep: earnedUnpaidByRep, breakdown: earnedUnpaidBreakdown, rows: earnedUnpaidRows },
-      unassigned: { total: unassignedTotal, by_customer: unassignedByCustomer },
+      unassigned: { total: unassignedTotal, by_customer: unassignedByCustomer,
+                    auto_match: unassignedMatch, auto_match_by_rep: unassignedMatchByRep },
       invoice_date_range: dateRange,
       last_sync_log: lastSync,
       last_zoho_webhook: lastWebhook,
