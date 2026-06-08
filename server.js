@@ -4447,31 +4447,39 @@ function parseMoneyCell(v) {
 //   • "Addon" report — header row (not necessarily at the top) has "INVOICE" + "COMMISSION"
 //     columns, plus TYPE / STATUS / OWED NOW / COMING SOON. Tracks partial payouts; we treat
 //     a listed invoice as fully settled (mark paid) UNLESS it still carries a COMING SOON amount.
+// Header text with ALL whitespace removed + uppercased. Tolerates in-cell line breaks
+// (e.g. a cell that displays "COMMIS↵SION" but should match "COMMISSION").
+function tightHdr(c) { return c == null ? '' : String(c).replace(/\s+/g, '').toUpperCase(); }
+
 function parseCommissionReportXlsx(buffer) {
   const wb = xlsx.read(buffer, { type: 'buffer', cellDates: true });
-  const sheetName = wb.SheetNames[0];
-  const sheet = wb.Sheets[sheetName];
-  const rows = xlsx.utils.sheet_to_json(sheet, { header: 1, blankrows: false, defval: null });
 
-  // Standard report: exact "Invoice Number" header cell.
-  const stdHeaderIdx = rows.findIndex(r => r.some(c => typeof c === 'string' && c.trim() === 'Invoice Number'));
-  if (stdHeaderIdx >= 0) return parseStandardReport(rows, stdHeaderIdx);
+  // The table isn't always on the first sheet — scan every sheet and use the first that
+  // carries a recognizable header.
+  for (const sheetName of wb.SheetNames) {
+    const sheet = wb.Sheets[sheetName];
+    const rows = xlsx.utils.sheet_to_json(sheet, { header: 1, blankrows: false, defval: null });
+    if (!rows.length) continue;
 
-  // Addon report: a header row carrying both "INVOICE" and "COMMISSION" (case/space tolerant).
-  const normHdr = (c) => (c == null ? '' : String(c).replace(/\s+/g, ' ').trim().toUpperCase());
-  const addonHeaderIdx = rows.findIndex(r => {
-    const cells = r.map(normHdr);
-    return cells.includes('INVOICE') && cells.includes('COMMISSION');
-  });
-  if (addonHeaderIdx >= 0) return parseAddonReport(rows, addonHeaderIdx);
+    // Standard report: a cell that tightens to "INVOICENUMBER".
+    const stdHeaderIdx = rows.findIndex(r => r.some(c => tightHdr(c) === 'INVOICENUMBER'));
+    if (stdHeaderIdx >= 0) return parseStandardReport(rows, stdHeaderIdx);
 
-  throw new Error("Unrecognized layout — expected an 'Invoice Number' header (standard report) or 'INVOICE'/'COMMISSION' headers (Addon report)");
+    // Addon report: a header row carrying both "INVOICE" and "COMMISSION".
+    const addonHeaderIdx = rows.findIndex(r => {
+      const cells = r.map(tightHdr);
+      return cells.includes('INVOICE') && cells.includes('COMMISSION');
+    });
+    if (addonHeaderIdx >= 0) return parseAddonReport(rows, addonHeaderIdx);
+  }
+
+  throw new Error("Unrecognized layout — no 'Invoice Number' header (standard report) or 'INVOICE'/'COMMISSION' headers (Addon report) found on any sheet");
 }
 
 // Standard "Eligible Invoices for Commission" layout.
 function parseStandardReport(rows, headerIdx) {
-  const header = rows[headerIdx].map(c => (c == null ? '' : String(c).trim()));
-  const col = (name) => header.indexOf(name);
+  const header = rows[headerIdx].map(tightHdr);
+  const col = (name) => header.indexOf(tightHdr(name));
 
   const idxInvoiceNumber = col('Invoice Number');
   const idxRep           = col('Sales Person Name');
@@ -4523,9 +4531,8 @@ function parseStandardReport(rows, headerIdx) {
 // "Addon" layout: columns [account/customer], INVOICE, SUB-TOTAL, COMMISSION, TYPE, STATUS,
 // OWED NOW, COMING SOON. No bonus rows. Rep comes from the filename, not the sheet.
 function parseAddonReport(rows, headerIdx) {
-  const normHdr = (c) => (c == null ? '' : String(c).replace(/\s+/g, ' ').trim().toUpperCase());
-  const header = rows[headerIdx].map(normHdr);
-  const col = (name) => header.indexOf(name);
+  const header = rows[headerIdx].map(tightHdr);
+  const col = (name) => header.indexOf(tightHdr(name));
 
   const idxInvoice    = col('INVOICE');
   const idxCommission = col('COMMISSION');
