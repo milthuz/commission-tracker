@@ -4267,6 +4267,26 @@ app.get('/api/admin/db-stats', async (req, res) => {
        ORDER BY unpaid_commission DESC`
     )).rows;
 
+    // "Unassigned" (no salesperson on the Zoho invoice) earned-commission invoices, grouped by
+    // customer — reveals whether the pool is concentrated on a few accounts that are easy to reattribute.
+    const unassignedByCustomer = (await pool.query(
+      `SELECT COALESCE(customer_name, '(none)') AS customer,
+              COUNT(*)::int AS count,
+              COALESCE(SUM(commission), 0)::float AS commission,
+              MIN(date)::date AS first_invoice,
+              MAX(date)::date AS last_invoice
+       FROM invoices
+       WHERE salesperson_name = 'Unassigned' AND commission > 0
+       GROUP BY customer_name
+       ORDER BY commission DESC
+       LIMIT 100`
+    )).rows;
+    const unassignedTotal = (await pool.query(
+      `SELECT COUNT(*)::int AS count, COUNT(DISTINCT customer_name)::int AS customers,
+              COALESCE(SUM(commission), 0)::float AS commission
+       FROM invoices WHERE salesperson_name = 'Unassigned' AND commission > 0`
+    )).rows[0];
+
     const dateRange = (await pool.query(
       `SELECT MIN(date)::date AS oldest, MAX(date)::date AS newest FROM invoices`
     )).rows[0];
@@ -4289,6 +4309,7 @@ app.get('/api/admin/db-stats', async (req, res) => {
       invoices_by_commission_status: byCommissionStatus,
       paid_approved_drift: { breakdown: driftBreakdown, rows: driftRows },
       earned_unpaid: { totals: earnedUnpaidTotals, ever_paid: everPaid, by_rep: earnedUnpaidByRep, breakdown: earnedUnpaidBreakdown, rows: earnedUnpaidRows },
+      unassigned: { total: unassignedTotal, by_customer: unassignedByCustomer },
       invoice_date_range: dateRange,
       last_sync_log: lastSync,
       last_zoho_webhook: lastWebhook,
