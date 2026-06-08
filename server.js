@@ -272,6 +272,9 @@ async function initializeDatabase() {
       );
     `);
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS team_id INT REFERENCES teams(id) ON DELETE SET NULL`);
+    // Per-team: which point sources count toward the team quota (default both, = current behaviour).
+    await pool.query(`ALTER TABLE teams ADD COLUMN IF NOT EXISTS include_deals BOOLEAN DEFAULT true`);
+    await pool.query(`ALTER TABLE teams ADD COLUMN IF NOT EXISTS include_payments BOOLEAN DEFAULT true`);
 
     // ROLES & PERMISSIONS — RBAC system
     await pool.query(`
@@ -1311,6 +1314,7 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     // team's target reflects ALL its members, not only those who happened to sell this month.
     let teamMetaRows = (await pool.query(`
       SELECT t.id, t.name, t.monthly_quota_override AS override, t.counts_toward_quota AS counts,
+             t.include_deals, t.include_payments,
              COUNT(s.id) FILTER (WHERE s.is_active) AS member_count
       FROM teams t LEFT JOIN salespeople s ON s.team_id = t.id
       GROUP BY t.id
@@ -1335,25 +1339,26 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       teamMetaRows = myTeamId ? teamMetaRows.filter(tr => tr.id === myTeamId) : [];
     }
 
-    // Points + reps-met-quota per team from this month's summary.
-    const pointsByTeam = new Map();
-    for (const rep of summary) {
-      const tm = teamFor(rep.repName);
-      if (!tm) continue;
-      if (!pointsByTeam.has(tm.id)) pointsByTeam.set(tm.id, { points: 0, met: 0 });
-      const p = pointsByTeam.get(tm.id);
-      p.points += rep.totalPoints;
-      if (rep.quotaMet) p.met += 1;
-    }
+    // Per-team points respect each team's configured sources: include CRM deal points and/or
+    // Zentact payment-activation points (both on by default = previous behaviour).
     const teams = teamMetaRows.map(tr => {
-      const pm = pointsByTeam.get(tr.id) || { points: 0, met: 0 };
+      const includeDeals = tr.include_deals !== false;
+      const includePayments = tr.include_payments !== false;
+      let totalPoints = 0, membersMet = 0;
+      for (const rep of summary) {
+        const tm = teamFor(rep.repName);
+        if (!tm || tm.id !== tr.id) continue;
+        totalPoints += (includeDeals ? (rep.crmPoints || 0) : 0) + (includePayments ? (rep.zentactPoints || 0) : 0);
+        if (rep.quotaMet) membersMet += 1;
+      }
       const memberCount = parseInt(tr.member_count) || 0;
       const override = tr.override == null ? null : parseInt(tr.override);
       const quotaTarget = override != null ? override : MONTHLY_QUOTA * memberCount;
       return {
         teamId: tr.id, name: tr.name, countsTowardQuota: tr.counts !== false,
-        memberCount, membersMet: pm.met, totalPoints: pm.points,
-        quotaTarget, quotaMet: pm.points >= quotaTarget,
+        includeDeals, includePayments,
+        memberCount, membersMet, totalPoints,
+        quotaTarget, quotaMet: totalPoints >= quotaTarget,
       };
     }).sort((a, b) => b.totalPoints - a.totalPoints);
 
@@ -5575,6 +5580,7 @@ app.get('/api/teams', authenticateToken, async (req, res) => {
   try {
     const r = await pool.query(`
       SELECT t.id, t.name, t.monthly_quota_override, t.counts_toward_quota,
+             t.include_deals, t.include_payments,
              COUNT(s.id)::int AS member_count
       FROM teams t LEFT JOIN salespeople s ON s.team_id = t.id
       GROUP BY t.id ORDER BY t.name
@@ -5585,6 +5591,8 @@ app.get('/api/teams', authenticateToken, async (req, res) => {
         name:                t.name,
         monthlyQuotaOverride: t.monthly_quota_override == null ? null : parseInt(t.monthly_quota_override),
         countsTowardQuota:   t.counts_toward_quota !== false,
+        includeDeals:        t.include_deals !== false,
+        includePayments:     t.include_payments !== false,
         memberCount:         t.member_count,
       })),
     });
@@ -5601,11 +5609,13 @@ app.post('/api/teams', authenticateToken, async (req, res) => {
   const override = req.body.monthlyQuotaOverride == null || req.body.monthlyQuotaOverride === ''
     ? null : parseInt(req.body.monthlyQuotaOverride);
   const counts = req.body.countsTowardQuota !== false;
+  const includeDeals = req.body.includeDeals !== false;
+  const includePayments = req.body.includePayments !== false;
   try {
     const r = await pool.query(
-      `INSERT INTO teams (name, monthly_quota_override, counts_toward_quota)
-       VALUES ($1, $2, $3) RETURNING id`,
-      [name, override, counts]
+      `INSERT INTO teams (name, monthly_quota_override, counts_toward_quota, include_deals, include_payments)
+       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      [name, override, counts, includeDeals, includePayments]
     );
     res.json({ success: true, id: r.rows[0].id });
   } catch (error) {
@@ -5623,11 +5633,14 @@ app.put('/api/teams/:id', authenticateToken, async (req, res) => {
   const override = req.body.monthlyQuotaOverride == null || req.body.monthlyQuotaOverride === ''
     ? null : parseInt(req.body.monthlyQuotaOverride);
   const counts = req.body.countsTowardQuota !== false;
+  const includeDeals = req.body.includeDeals !== false;
+  const includePayments = req.body.includePayments !== false;
   try {
     const r = await pool.query(
       `UPDATE teams SET name = $1, monthly_quota_override = $2, counts_toward_quota = $3,
-              updated_at = CURRENT_TIMESTAMP WHERE id = $4 RETURNING id`,
-      [name, override, counts, id]
+              include_deals = $4, include_payments = $5, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $6 RETURNING id`,
+      [name, override, counts, includeDeals, includePayments, id]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'Team not found' });
     res.json({ success: true });
