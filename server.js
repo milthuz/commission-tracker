@@ -37,6 +37,7 @@ const PERMISSION_CATALOG = [
   { key: 'report:view_others',         label: "View other reps' commission reports",         category: 'Commission Report' },
   { key: 'report:approve',             label: 'Approve / unapprove commissions',             category: 'Commission Report' },
   { key: 'report:mark_paid',           label: 'Mark approved commissions as paid to rep',    category: 'Commission Report' },
+  { key: 'report:view_paystub',        label: 'View pay stubs (own + per role)',             category: 'Commission Report' },
 
   // Invoices
   { key: 'invoices:view_own',          label: 'View own invoices',                           category: 'Invoices' },
@@ -7615,6 +7616,232 @@ app.post('/api/commissions/mark-paid', authenticateToken, async (req, res) => {
     res.json({ success: true, invoicesUpdated: result.rowCount });
   } catch (error) {
     res.status(500).json({ error: 'Failed to mark commissions as paid', details: error.message });
+  }
+});
+
+// GET /api/commissions/pay-stub?repName=&year=&month=
+// A unified pay stub for one rep + one month. Two sources, picked automatically:
+//   - 'imported': a commission_payment_imports row exists for (rep, period) → the historical
+//     pay file is the source of truth (faithful paid amounts + bonuses + total). If that import
+//     predates per-line storage (2026-06-09) its lines table is empty → linesStored=false and we
+//     attach APP-GENERATED lines as a fallback so the stub is never blank (the file total stays
+//     authoritative).
+//   - 'generated': no import for that period (the app's own model) → invoice commissions whose
+//     Unlock Month (commission_payable_date) falls in the period + signup bonuses from Zentact
+//     activations in the period.
+// Access: admins see any rep; non-admins need report:view_paystub and (by rep resolution) only
+// ever see their OWN stub. Read-only — no DB writes here.
+app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
+  const { email, isAdmin, name: jwtName } = req.user;
+  const { repName, year, month } = req.query;
+  if (!year || !month || month === 'all') {
+    return res.status(400).json({ error: 'year and a specific month are required' });
+  }
+  try {
+    // Non-admins must hold the dedicated permission; rep resolution below pins them to self.
+    if (!isAdmin) {
+      const perms = await getUserPermissions(email);
+      if (!userHasPermission(perms, 'report:view_paystub')) {
+        return res.status(403).json({ error: 'Permission required: report:view_paystub' });
+      }
+    }
+    const tokenResult = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
+    const myName    = tokenResult.rows[0]?.display_name || jwtName || email;
+    const targetRep = isAdmin ? (repName || myName) : myName;
+
+    const mm          = String(month).padStart(2, '0');
+    const periodStart = new Date(`${year}-${mm}-01`);
+    const periodEnd   = new Date(periodStart); periodEnd.setMonth(periodEnd.getMonth() + 1);
+
+    // App-generated invoice lines: commissions that UNLOCKED in this period.
+    const genLines = async () => {
+      const rows = (await pool.query(
+        `SELECT invoice_number, customer_name, commission::float AS commission
+         FROM invoices
+         WHERE salesperson_name = $1 AND organization_id = $2
+           AND commission_payable_date >= $3 AND commission_payable_date < $4
+           AND commission > 0 AND commission_status IN ('hardware','saas_first')
+         ORDER BY commission DESC`,
+        [targetRep, process.env.ZOHO_ORG_ID, periodStart, periodEnd]
+      )).rows;
+      return rows.map(r => ({
+        invoice_number: r.invoice_number,
+        customer:       r.customer_name || null,
+        paid_amount:    r.commission || 0,
+        app_commission: r.commission || 0,
+      }));
+    };
+    // App-generated signup bonuses: Zentact merchants this rep activated in the period.
+    const genBonuses = async () => {
+      const rows = (await pool.query(
+        `SELECT business_name AS merchant_name, bonus_amount::float AS bonus_amount, activated_at::date AS activated_at
+         FROM zentact_merchants
+         WHERE LOWER(sales_rep_name) = LOWER($1) AND status = 'ACTIVE'
+           AND activated_at >= $2 AND activated_at < $3`,
+        [targetRep, periodStart, periodEnd]
+      )).rows;
+      return rows.map(r => ({
+        bonus_type:    'signup',
+        merchant_name: r.merchant_name || null,
+        amount:        r.bonus_amount || 0,
+        report_date:   r.activated_at || null,
+      }));
+    };
+
+    // Prefer a historical import for this rep+period when one exists.
+    const imp = (await pool.query(
+      `SELECT * FROM commission_payment_imports
+       WHERE rep_name = $1 AND paid_for_period >= $2::date AND paid_for_period < $3::date
+       ORDER BY imported_at DESC LIMIT 1`,
+      [targetRep, periodStart, periodEnd]
+    )).rows[0];
+
+    if (imp) {
+      const lines = (await pool.query(
+        `SELECT invoice_number, customer, paid_amount::float AS paid_amount, app_commission::float AS app_commission
+         FROM commission_payment_lines WHERE import_id = $1 ORDER BY paid_amount DESC`,
+        [imp.id]
+      )).rows;
+      const bonuses = (await pool.query(
+        `SELECT bonus_type, merchant_name, amount::float AS amount, report_date::date AS report_date
+         FROM commission_bonuses WHERE import_id = $1 ORDER BY bonus_type, amount DESC`,
+        [imp.id]
+      )).rows;
+      const linesStored = lines.length > 0;
+      return res.json({
+        source:      'imported',
+        linesStored,
+        repName:     targetRep,
+        period:      `${year}-${mm}`,
+        importId:    imp.id,
+        filename:    imp.filename,
+        lines:       linesStored ? lines : await genLines(),
+        bonuses,
+        total:       parseFloat(imp.total_amount) || 0,
+      });
+    }
+
+    // No import → app generates the stub from its own model.
+    const lines   = await genLines();
+    const bonuses = await genBonuses();
+    const total   = lines.reduce((a, l) => a + l.paid_amount, 0) + bonuses.reduce((a, b) => a + b.amount, 0);
+    return res.json({
+      source:      'generated',
+      linesStored: true,
+      repName:     targetRep,
+      period:      `${year}-${mm}`,
+      lines,
+      bonuses,
+      total,
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to build pay stub', details: e.message });
+  }
+});
+
+// POST /api/commissions/pay-stub/commit — Étape 3 "commit": pay a period's APP-GENERATED stub.
+// Marks the period's unlocked-but-unpaid commissions (Unlock Month in period, hardware/saas_first,
+// not already paid) as paid, AND records the stub as an 'app-generated' import so it appears in
+// history and re-opens as an imported stub. Refuses if a real imported pay file already covers the
+// period (those are the source of truth pre-May-2026 — don't double-pay/clobber). Idempotent: a
+// prior app-generated stub for the same rep+period is replaced. Admin / report:mark_paid only.
+app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const { repName, year, month } = req.body;
+  if (!repName || !year || !month) return res.status(400).json({ error: 'repName, year, month required' });
+  const actor       = req.user.realAdminEmail || req.user.email || 'unknown';
+  const mm          = String(month).padStart(2, '0');
+  const periodStart = new Date(`${year}-${mm}-01`);
+  const periodEnd   = new Date(periodStart); periodEnd.setMonth(periodEnd.getMonth() + 1);
+  const periodDate  = `${year}-${mm}-01`;
+  const client = await pool.connect();
+  try {
+    // Guard: a real imported pay file for this period wins — refuse to generate over it.
+    const existing = (await client.query(
+      `SELECT filename FROM commission_payment_imports
+       WHERE rep_name = $1 AND paid_for_period >= $2::date AND paid_for_period < $3::date
+         AND filename NOT LIKE 'app-generated%' LIMIT 1`,
+      [repName, periodStart, periodEnd]
+    )).rows[0];
+    if (existing) {
+      return res.status(409).json({ error: 'An imported pay file already covers this period', filename: existing.filename });
+    }
+
+    await client.query('BEGIN');
+
+    const invRows = (await client.query(
+      `SELECT invoice_number, customer_name, commission::float AS commission
+       FROM invoices
+       WHERE salesperson_name = $1 AND organization_id = $2
+         AND commission_payable_date >= $3 AND commission_payable_date < $4
+         AND commission > 0 AND commission_status IN ('hardware','saas_first')
+         AND approval_status <> 'paid'
+       ORDER BY commission DESC`,
+      [repName, process.env.ZOHO_ORG_ID, periodStart, periodEnd]
+    )).rows;
+    const bonusRows = (await client.query(
+      `SELECT merchant_account_id, business_name, bonus_amount::float AS bonus_amount, activated_at::date AS activated_at
+       FROM zentact_merchants
+       WHERE LOWER(sales_rep_name) = LOWER($1) AND status = 'ACTIVE'
+         AND activated_at >= $2 AND activated_at < $3`,
+      [repName, periodStart, periodEnd]
+    )).rows;
+
+    const bonusTotal = bonusRows.reduce((a, r) => a + (r.bonus_amount || 0), 0);
+    const total      = invRows.reduce((a, r) => a + (r.commission || 0), 0) + bonusTotal;
+
+    // Idempotent re-commit: drop any prior app-generated stub for this rep+period (cascades).
+    await client.query(
+      `DELETE FROM commission_payment_imports
+       WHERE rep_name = $1 AND paid_for_period = $2::date AND filename LIKE 'app-generated%'`,
+      [repName, periodDate]
+    );
+
+    const filename = `app-generated:${repName}:${year}-${mm}`;
+    const imp = (await client.query(
+      `INSERT INTO commission_payment_imports
+         (filename, rep_name, paid_for_period, imported_by, invoices_marked, invoices_skipped,
+          invoices_not_found, signup_bonuses_count, signup_bonuses_amount, monthly_bonus_amount,
+          total_amount, raw_summary)
+       VALUES ($1, $2, $3::date, $4, $5, 0, 0, $6, $7, 0, $8, $9::jsonb)
+       RETURNING id`,
+      [filename, repName, periodDate, actor, invRows.length, bonusRows.length, bonusTotal, total,
+       JSON.stringify({ source: 'app-generated', period: `${year}-${mm}` })]
+    )).rows[0];
+
+    for (const r of invRows) {
+      await client.query(
+        `UPDATE invoices SET
+           approval_status = 'paid', commission_paid = true,
+           approved_by    = COALESCE(approved_by, $2),
+           approved_at    = COALESCE(approved_at, $3::date),
+           payout_paid_by = $4, payout_paid_at = $3::date,
+           updated_at     = CURRENT_TIMESTAMP
+         WHERE invoice_number = $1`,
+        [r.invoice_number, actor, periodDate, `paystub:${filename}`]
+      );
+      await client.query(
+        `INSERT INTO commission_payment_lines (import_id, invoice_number, customer, paid_amount, app_commission)
+         VALUES ($1, $2, $3, $4, $4)`,
+        [imp.id, r.invoice_number, r.customer_name || null, r.commission || 0]
+      );
+    }
+    for (const b of bonusRows) {
+      await client.query(
+        `INSERT INTO commission_bonuses
+           (import_id, rep_name, bonus_type, merchant_name, matched_zentact_id, amount, paid_for_period, report_date)
+         VALUES ($1, $2, 'signup', $3, $4, $5, $6::date, $7::date)`,
+        [imp.id, repName, b.business_name || null, b.merchant_account_id || null, b.bonus_amount || 0, periodDate, b.activated_at || null]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ success: true, invoicesMarked: invRows.length, bonuses: bonusRows.length, total });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ error: 'Failed to commit pay stub', details: e.message });
+  } finally {
+    client.release();
   }
 });
 
