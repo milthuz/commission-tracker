@@ -634,7 +634,8 @@ app.use(cors({
       process.env.FRONTEND_URL,
       'http://localhost:3000',
       'http://localhost:3001',
-      'https://sparkly-kulfi-c7641a.netlify.app', // Netlify
+      'https://sparkly-kulfi-c7641a.netlify.app', // Netlify (default)
+      'https://saleshub.clusterpos.com', // custom domain
       'https://commission-tracker-frontend-git-main-david-s-projects-dbd14131.vercel.app', // Vercel (old)
     ].filter(Boolean);
     
