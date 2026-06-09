@@ -4316,6 +4316,32 @@ app.post('/api/webhooks/zoho-books/invoice', async (req, res) => {
 // GET /api/admin/db-stats?secret=<shared>
 // Returns row counts per table + invoice breakdown by status. Gated by the
 // same shared secret as the webhook so we don't need a JWT to query it.
+// GET /api/admin/invoice-lookup?secret=<shared>&numbers=INV-1,INV-2
+// Debug helper: full commission-relevant state for specific invoices.
+app.get('/api/admin/invoice-lookup', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const numbers = String(req.query.numbers || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (!numbers.length) return res.status(400).json({ error: 'numbers required (comma-separated)' });
+  try {
+    const rows = (await pool.query(
+      `SELECT invoice_number, salesperson_name, date::date AS date, paid_date::date AS paid_date,
+              status, approval_status, commission::float AS commission, commission_status,
+              commission_payable_date::date AS commission_payable_date,
+              total::float AS total, saas_amount::float AS saas_amount, hardware_amount::float AS hardware_amount,
+              subscription_activation_date::date AS subscription_activation_date
+       FROM invoices WHERE invoice_number = ANY($1)`,
+      [numbers]
+    )).rows;
+    const found = new Set(rows.map(r => r.invoice_number));
+    res.json({ rows, not_in_db: numbers.filter(n => !found.has(n)) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/admin/db-stats', async (req, res) => {
   const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
   if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
