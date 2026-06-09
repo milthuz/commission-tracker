@@ -5432,6 +5432,29 @@ app.get('/api/admin/commission-imports', authenticateToken, async (req, res) => 
   }
 });
 
+// GET /api/admin/commission-imports/:id — full pay-stub detail (invoice lines + bonuses).
+app.get('/api/admin/commission-imports/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const id = parseInt(req.params.id);
+  try {
+    const imp = (await pool.query(`SELECT * FROM commission_payment_imports WHERE id = $1`, [id])).rows[0];
+    if (!imp) return res.status(404).json({ error: 'Import not found' });
+    const lines = (await pool.query(
+      `SELECT invoice_number, customer, paid_amount::float AS paid_amount, app_commission::float AS app_commission
+       FROM commission_payment_lines WHERE import_id = $1 ORDER BY paid_amount DESC`,
+      [id]
+    )).rows;
+    const bonuses = (await pool.query(
+      `SELECT bonus_type, merchant_name, amount::float AS amount, report_date::date AS report_date
+       FROM commission_bonuses WHERE import_id = $1 ORDER BY bonus_type, amount DESC`,
+      [id]
+    )).rows;
+    res.json({ import: imp, lines, bonuses });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/webhooks/log?secret=<shared>&invoice=<optional>&limit=<optional>
 // Returns the last N rows of webhook_log so we can audit incoming calls without
 // needing Heroku log access. Gated by the same shared secret as the webhook.
