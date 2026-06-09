@@ -728,7 +728,15 @@ const ZOHO_CONFIG = {
 // 1. Initiate Zoho OAuth
 app.get('/api/auth/zoho', (req, res) => {
   const state = Math.random().toString(36).substring(7);
-  
+
+  // Only force the Zoho consent screen when explicitly RECONNECTING (?reconsent=1).
+  // Zoho re-issues a refresh_token on consent; a normal login doesn't need a new one
+  // (the callback preserves the stored refresh_token via COALESCE), so forcing consent
+  // on every login just made every user re-approve each time. Omitting prompt lets Zoho
+  // silently redirect returning users who already granted access. First-time users (and
+  // an explicit reconnect to repair a broken refresh_token) still get the consent screen.
+  const forceConsent = req.query.reconsent === '1' || req.query.prompt === 'consent';
+
   const authUrl = `${ZOHO_CONFIG.accounts_url}/oauth/v2/auth?` +
     `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE,ZohoSubscriptions.plans.READ,ZohoSubscriptions.products.READ,ZohoSubscriptions.subscriptions.READ,AaaServer.profile.READ` +
     `&client_id=${ZOHO_CONFIG.client_id}` +
@@ -736,11 +744,7 @@ app.get('/api/auth/zoho', (req, res) => {
     `&redirect_uri=${ZOHO_CONFIG.redirect_uri}` +
     `&state=${state}` +
     `&access_type=offline` +
-    // Force the consent screen so Zoho re-issues a refresh_token on EVERY authorization.
-    // Without this, reconnecting Books returns only an access_token (Zoho only sends a
-    // refresh_token on first consent) — which is how the admin token ended up with no
-    // refresh_token and every sync started failing with 401.
-    `&prompt=consent`;
+    (forceConsent ? `&prompt=consent` : ``);
 
   res.json({ authUrl, state });
 });
