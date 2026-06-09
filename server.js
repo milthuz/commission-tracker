@@ -492,6 +492,22 @@ async function initializeDatabase() {
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_cbonus_period ON commission_bonuses(paid_for_period DESC, rep_name)`);
 
+    // Per-invoice payment lines for each import (a pay stub's detail). paid_amount = the amount
+    // FROM the imported file (faithful to what was actually paid); app_commission = the app's
+    // computed value at import time (for app-vs-file discrepancy auditing).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS commission_payment_lines (
+        id SERIAL PRIMARY KEY,
+        import_id INT REFERENCES commission_payment_imports(id) ON DELETE CASCADE,
+        invoice_number VARCHAR(255) NOT NULL,
+        customer VARCHAR(255),
+        paid_amount NUMERIC(12,2) NOT NULL,
+        app_commission NUMERIC(12,2),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_cplines_import ON commission_payment_lines(import_id)`);
+
     // Webhook activity log — every call to our webhook endpoints lands a row here
     // so we can audit/debug who fired what without needing Heroku log access.
     await pool.query(`
@@ -4890,7 +4906,7 @@ async function importCommissionReport(req, res, { commit }) {
   if (eligibleInvoices.length) {
     const numbers = eligibleInvoices.map(i => i.invoice_number);
     const rows = (await pool.query(
-      `SELECT invoice_number, salesperson_name, total, status, approval_status
+      `SELECT invoice_number, salesperson_name, total, status, approval_status, commission
        FROM invoices WHERE invoice_number = ANY($1)`,
       [numbers]
     )).rows;
@@ -4900,7 +4916,7 @@ async function importCommissionReport(req, res, { commit }) {
       if (!row) {
         notFound.push(inv.invoice_number);
       } else {
-        matched.push({ ...inv, current_status: row.status, current_approval: row.approval_status });
+        matched.push({ ...inv, current_status: row.status, current_approval: row.approval_status, app_commission: parseFloat(row.commission) || 0 });
       }
     }
   }
@@ -4944,6 +4960,13 @@ async function importCommissionReport(req, res, { commit }) {
     await client.query('BEGIN');
     const actor = req.user.realAdminEmail || req.user.email || 'unknown';
 
+    // 0. Idempotent re-import: drop any prior import for the same file/rep/period
+    //    (cascades to its payment_lines + bonuses) so re-uploading replaces instead of duplicating.
+    await client.query(
+      `DELETE FROM commission_payment_imports WHERE filename = $1 AND rep_name = $2 AND paid_for_period = $3::date`,
+      [file.originalname, repFullName, meta.periodDate]
+    );
+
     // 1. Insert the import summary
     const importRow = (await client.query(
       `INSERT INTO commission_payment_imports
@@ -4959,7 +4982,8 @@ async function importCommissionReport(req, res, { commit }) {
        summary.total_to_pay, JSON.stringify(summary)]
     )).rows[0];
 
-    // 2. Mark each invoice as paid
+    // 2. Mark each invoice as paid + record the pay-stub line (faithful to the file amount,
+    //    plus the app-computed value for discrepancy auditing).
     for (const inv of matched) {
       await client.query(
         `UPDATE invoices SET
@@ -4972,6 +4996,11 @@ async function importCommissionReport(req, res, { commit }) {
            updated_at     = CURRENT_TIMESTAMP
          WHERE invoice_number = $1`,
         [inv.invoice_number, actor, meta.periodDate, `import:${file.originalname}`]
+      );
+      await client.query(
+        `INSERT INTO commission_payment_lines (import_id, invoice_number, customer, paid_amount, app_commission)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [importRow.id, inv.invoice_number, inv.customer || null, inv.commission, inv.app_commission ?? null]
       );
     }
 
