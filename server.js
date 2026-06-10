@@ -14,6 +14,11 @@ const bodyParser = require('body-parser');
 const multer = require('multer');
 const xlsx = require('xlsx');
 const { Pool } = require('pg');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+const { authenticator } = require('otplib');
+const nodemailer = require('nodemailer');
+const QRCode = require('qrcode');
 const { ZohoCRMService, MONTHLY_QUOTA, MONTHLY_BONUS_TIERS, ANNUAL_BONUS_TIERS, PLAN_START_DATE } = require('./services/zohoCRMService');
 const { ZentactService } = require('./services/zentactService');
 const { ZohoBillingService } = require('./services/zohoBillingService');
@@ -414,6 +419,29 @@ async function initializeDatabase() {
         feature_id VARCHAR(255) NOT NULL,
         seen_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (user_key, feature_id)
+      );
+    `);
+
+    // External (non-Zoho) users: invited by an admin, log in with email+password and
+    // MANDATORY TOTP 2FA. Tokens (invite/reset) are stored as sha256 hashes, single-use,
+    // expiring. Permissions come from the existing roles system (user_roles by email).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS local_users (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        display_name VARCHAR(255),
+        password_hash VARCHAR(255),
+        totp_secret VARCHAR(64),
+        totp_enabled BOOLEAN DEFAULT false,
+        status VARCHAR(20) DEFAULT 'invited',
+        invite_token_hash VARCHAR(64),
+        invite_expires_at TIMESTAMP,
+        reset_token_hash VARCHAR(64),
+        reset_expires_at TIMESTAMP,
+        invited_by VARCHAR(255),
+        last_login_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
 
@@ -962,6 +990,335 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
         isAdmin: req.user.isAdmin || false,
       }
     });
+  }
+});
+
+// ============================================================================
+// LOCAL (EXTERNAL) USERS — email+password login, MANDATORY TOTP 2FA, invitations
+// ============================================================================
+// Flow: admin invites (email sent or link copied) → user sets password → scans the
+// TOTP QR and confirms a code → account active. Login = password + 6-digit code.
+// Permissions come from the existing roles system (assign roles to their email in
+// Admin → Roles). JWTs are signed with isAdmin:false — never admin by default.
+
+const sha256hex = (s) => crypto.createHash('sha256').update(s).digest('hex');
+const newRawToken = () => crypto.randomBytes(32).toString('hex');
+authenticator.options = { window: 1 }; // tolerate ±30s clock drift
+
+// SMTP mailer — Heroku config vars: SMTP_HOST, SMTP_PORT (465=TLS), SMTP_USER,
+// SMTP_PASS, SMTP_FROM. Unconfigured → emails are skipped and the API returns the
+// link so the admin can send it manually.
+function getMailer() {
+  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) return null;
+  const port = parseInt(process.env.SMTP_PORT) || 465;
+  return nodemailer.createTransport({
+    host: process.env.SMTP_HOST, port, secure: port === 465,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+  });
+}
+async function sendMail(to, subject, html) {
+  const t = getMailer();
+  if (!t) return { sent: false, reason: 'smtp_not_configured' };
+  try {
+    await t.sendMail({ from: process.env.SMTP_FROM || process.env.SMTP_USER, to, subject, html });
+    return { sent: true };
+  } catch (e) {
+    console.warn('[MAIL] send failed:', e.message);
+    return { sent: false, reason: e.message };
+  }
+}
+function mailShell(title, intro, ctaLabel, ctaUrl) {
+  return `<!doctype html><html><body style="margin:0;padding:0;background:#f4f6fa;font-family:Arial,Helvetica,sans-serif">
+  <table width="100%" cellpadding="0" cellspacing="0" style="padding:32px 12px"><tr><td align="center">
+    <table width="560" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:10px;overflow:hidden">
+      <tr><td style="background:#1c2434;padding:22px 32px"><span style="color:#ffffff;font-size:20px;font-weight:bold">Sales Hub</span>
+        <span style="color:#8a99af;font-size:12px;margin-left:8px">by Cluster Systems</span></td></tr>
+      <tr><td style="padding:32px">
+        <h2 style="margin:0 0 12px;color:#1c2434;font-size:19px">${title}</h2>
+        <p style="margin:0 0 22px;color:#475569;font-size:14px;line-height:1.6">${intro}</p>
+        <table cellpadding="0" cellspacing="0"><tr><td style="border-radius:8px;background:#3c50e0">
+          <a href="${ctaUrl}" style="display:inline-block;padding:12px 28px;color:#ffffff;font-size:14px;font-weight:bold;text-decoration:none">${ctaLabel}</a>
+        </td></tr></table>
+        <p style="margin:22px 0 0;color:#94a3b8;font-size:12px;line-height:1.6">Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :<br>
+        If the button doesn't work, copy this link into your browser:<br>
+        <a href="${ctaUrl}" style="color:#3c50e0;word-break:break-all">${ctaUrl}</a></p>
+      </td></tr>
+      <tr><td style="padding:16px 32px;background:#f8fafc;color:#94a3b8;font-size:11px">© Cluster Systems — saleshub.clusterpos.com</td></tr>
+    </table>
+  </td></tr></table></body></html>`;
+}
+
+// Simple in-memory rate limiter for credential endpoints (per dyno — good enough).
+const authAttempts = new Map();
+function rateLimited(key, max = 8, windowMs = 15 * 60 * 1000) {
+  const now = Date.now();
+  const e = authAttempts.get(key);
+  if (!e || now > e.resetAt) { authAttempts.set(key, { count: 1, resetAt: now + windowMs }); return false; }
+  e.count++;
+  return e.count > max;
+}
+
+const signLocalJwt = (u) => jwt.sign(
+  { email: u.email, name: u.display_name || u.email, isAdmin: false, userType: 'local' },
+  process.env.JWT_SECRET || 'your-secret-key', { expiresIn: '7d' }
+);
+const signMfaJwt = (email, purpose) => jwt.sign(
+  { email, purpose }, process.env.JWT_SECRET || 'your-secret-key', { expiresIn: '15m' }
+);
+function verifyMfaJwt(token, purpose) {
+  try {
+    const p = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    return p.purpose === purpose ? p : null;
+  } catch { return null; }
+}
+
+// --- Admin: invitations & external-user management (gate: admin:users) ---
+
+// POST /api/admin/local-users/invite { email, name } → creates/refreshes the invite + emails it
+app.post('/api/admin/local-users/invite', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:users'))) return;
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const name  = String(req.body.name || '').trim();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'Invalid email' });
+  try {
+    const raw = newRawToken();
+    const expires = new Date(Date.now() + 7 * 24 * 3600 * 1000);
+    const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+    const existing = (await pool.query(`SELECT id, status FROM local_users WHERE email = $1`, [email])).rows[0];
+    if (existing && existing.status === 'active') {
+      return res.status(409).json({ error: 'User already active' });
+    }
+    await pool.query(
+      `INSERT INTO local_users (email, display_name, status, invite_token_hash, invite_expires_at, invited_by)
+       VALUES ($1, $2, 'invited', $3, $4, $5)
+       ON CONFLICT (email) DO UPDATE SET
+         display_name = $2, status = 'invited', invite_token_hash = $3,
+         invite_expires_at = $4, invited_by = $5, updated_at = CURRENT_TIMESTAMP`,
+      [email, name || null, sha256hex(raw), expires, actor]
+    );
+    const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+    const inviteUrl = `${base}/accept-invite?token=${raw}`;
+    const mail = await sendMail(
+      email,
+      'Invitation — Sales Hub / You are invited to Sales Hub',
+      mailShell(
+        'Vous êtes invité à Sales Hub · You are invited to Sales Hub',
+        `${name ? name + ', ' : ''}un compte vous a été préparé sur Sales Hub (suivi des ventes et commissions de Cluster Systems). Cliquez ci-dessous pour choisir votre mot de passe et activer la vérification en deux étapes. Le lien expire dans 7 jours.<br><br>An account has been prepared for you on Sales Hub (Cluster Systems' sales & commission portal). Click below to set your password and enable two-step verification. The link expires in 7 days.`,
+        'Activer mon compte / Activate my account',
+        inviteUrl
+      )
+    );
+    res.json({ success: true, inviteUrl, emailSent: mail.sent, emailError: mail.sent ? null : mail.reason });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/local-users — list external users (no secrets)
+app.get('/api/admin/local-users', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:users'))) return;
+  try {
+    const rows = (await pool.query(
+      `SELECT id, email, display_name, status, totp_enabled,
+              invite_expires_at, invited_by, last_login_at, created_at
+       FROM local_users ORDER BY created_at DESC`
+    )).rows;
+    res.json({ users: rows, smtpConfigured: !!getMailer() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/admin/local-users/:id/status { status: 'active' | 'disabled' }
+app.put('/api/admin/local-users/:id/status', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:users'))) return;
+  const status = req.body.status === 'disabled' ? 'disabled' : 'active';
+  try {
+    const r = await pool.query(
+      `UPDATE local_users SET status = $2, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND password_hash IS NOT NULL RETURNING email`,
+      [parseInt(req.params.id), status]
+    );
+    if (!r.rowCount) return res.status(404).json({ error: 'User not found (or invite not yet accepted)' });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/admin/local-users/:id — remove an external user / pending invite
+app.delete('/api/admin/local-users/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:users'))) return;
+  try {
+    const r = await pool.query(`DELETE FROM local_users WHERE id = $1 RETURNING email`, [parseInt(req.params.id)]);
+    if (!r.rowCount) return res.status(404).json({ error: 'User not found' });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Public: invite acceptance + 2FA enrollment ---
+
+// GET /api/auth/invite-info?token= — validate an invite link before showing the form
+app.get('/api/auth/invite-info', async (req, res) => {
+  const raw = String(req.query.token || '');
+  if (!raw) return res.status(400).json({ error: 'Missing token' });
+  try {
+    const u = (await pool.query(
+      `SELECT email, display_name, invite_expires_at, status FROM local_users WHERE invite_token_hash = $1`,
+      [sha256hex(raw)]
+    )).rows[0];
+    if (!u || u.status !== 'invited') return res.status(404).json({ error: 'Invalid invitation' });
+    if (new Date(u.invite_expires_at) < new Date()) return res.status(410).json({ error: 'Invitation expired' });
+    res.json({ valid: true, email: u.email, name: u.display_name });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/auth/invite/accept { token, password } → stores the password, returns the
+// TOTP enrollment payload (QR + secret) and a short-lived setup token.
+app.post('/api/auth/invite/accept', async (req, res) => {
+  const raw = String(req.body.token || '');
+  const password = String(req.body.password || '');
+  if (rateLimited(`accept:${req.ip}`)) return res.status(429).json({ error: 'Too many attempts — try again later' });
+  if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  try {
+    const u = (await pool.query(
+      `SELECT id, email, display_name, invite_expires_at, status FROM local_users WHERE invite_token_hash = $1`,
+      [sha256hex(raw)]
+    )).rows[0];
+    if (!u || u.status !== 'invited') return res.status(404).json({ error: 'Invalid invitation' });
+    if (new Date(u.invite_expires_at) < new Date()) return res.status(410).json({ error: 'Invitation expired' });
+
+    const secret = authenticator.generateSecret();
+    await pool.query(
+      `UPDATE local_users SET password_hash = $2, totp_secret = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [u.id, await bcrypt.hash(password, 10), secret]
+    );
+    const otpauth = authenticator.keyuri(u.email, 'Sales Hub', secret);
+    const qrDataUrl = await QRCode.toDataURL(otpauth, { margin: 1, width: 220 });
+    res.json({ success: true, qrDataUrl, secret, setupToken: signMfaJwt(u.email, '2fa-setup') });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/auth/invite/verify-2fa { setupToken, code } → activates the account, logs in
+app.post('/api/auth/invite/verify-2fa', async (req, res) => {
+  const p = verifyMfaJwt(String(req.body.setupToken || ''), '2fa-setup');
+  if (!p) return res.status(401).json({ error: 'Setup session expired — restart from the invite link' });
+  if (rateLimited(`setup2fa:${p.email}`)) return res.status(429).json({ error: 'Too many attempts — try again later' });
+  try {
+    const u = (await pool.query(`SELECT * FROM local_users WHERE email = $1`, [p.email])).rows[0];
+    if (!u || !u.totp_secret) return res.status(404).json({ error: 'Invalid state' });
+    if (!authenticator.check(String(req.body.code || ''), u.totp_secret)) {
+      return res.status(401).json({ error: 'Invalid code' });
+    }
+    await pool.query(
+      `UPDATE local_users SET totp_enabled = true, status = 'active', invite_token_hash = NULL,
+              invite_expires_at = NULL, last_login_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1`, [u.id]
+    );
+    res.json({ success: true, token: signLocalJwt(u) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Public: email+password login (step 1) + TOTP (step 2) ---
+
+app.post('/api/auth/login', async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+  if (rateLimited(`login:${email}`) || rateLimited(`loginip:${req.ip}`, 20)) {
+    return res.status(429).json({ error: 'Too many attempts — try again later' });
+  }
+  try {
+    const u = (await pool.query(`SELECT * FROM local_users WHERE email = $1`, [email])).rows[0];
+    // Uniform error → no user enumeration
+    const fail = () => res.status(401).json({ error: 'Invalid email or password' });
+    if (!u || !u.password_hash || u.status === 'disabled') return fail();
+    if (!(await bcrypt.compare(password, u.password_hash))) return fail();
+    if (u.status !== 'active' || !u.totp_enabled) {
+      return res.status(403).json({ error: 'Account setup incomplete — use your invitation link' });
+    }
+    res.json({ mfaRequired: true, mfaToken: signMfaJwt(u.email, '2fa-login') });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/auth/login/verify-2fa', async (req, res) => {
+  const p = verifyMfaJwt(String(req.body.mfaToken || ''), '2fa-login');
+  if (!p) return res.status(401).json({ error: 'Session expired — log in again' });
+  if (rateLimited(`2fa:${p.email}`)) return res.status(429).json({ error: 'Too many attempts — try again later' });
+  try {
+    const u = (await pool.query(`SELECT * FROM local_users WHERE email = $1 AND status = 'active'`, [p.email])).rows[0];
+    if (!u) return res.status(401).json({ error: 'Invalid state' });
+    if (!authenticator.check(String(req.body.code || ''), u.totp_secret)) {
+      return res.status(401).json({ error: 'Invalid code' });
+    }
+    await pool.query(`UPDATE local_users SET last_login_at = CURRENT_TIMESTAMP WHERE id = $1`, [u.id]);
+    res.json({ success: true, token: signLocalJwt(u) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Public: password reset ---
+
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  if (rateLimited(`forgot:${req.ip}`)) return res.status(429).json({ error: 'Too many attempts — try again later' });
+  try {
+    const u = (await pool.query(
+      `SELECT id, display_name FROM local_users WHERE email = $1 AND status = 'active'`, [email]
+    )).rows[0];
+    if (u) {
+      const raw = newRawToken();
+      await pool.query(
+        `UPDATE local_users SET reset_token_hash = $2, reset_expires_at = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [u.id, sha256hex(raw), new Date(Date.now() + 3600 * 1000)]
+      );
+      const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+      await sendMail(
+        email,
+        'Réinitialisation du mot de passe — Sales Hub / Password reset',
+        mailShell(
+          'Réinitialiser votre mot de passe · Reset your password',
+          `Une réinitialisation du mot de passe a été demandée pour votre compte Sales Hub. Le lien expire dans 1 heure. Si vous n'êtes pas à l'origine de cette demande, ignorez ce courriel.<br><br>A password reset was requested for your Sales Hub account. The link expires in 1 hour. If you didn't request this, you can ignore this email.`,
+          'Réinitialiser / Reset password',
+          `${base}/reset-password?token=${raw}`
+        )
+      );
+    }
+    // Always OK → no user enumeration
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  const raw = String(req.body.token || '');
+  const password = String(req.body.password || '');
+  if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  try {
+    const u = (await pool.query(
+      `SELECT id, reset_expires_at FROM local_users WHERE reset_token_hash = $1`, [sha256hex(raw)]
+    )).rows[0];
+    if (!u) return res.status(404).json({ error: 'Invalid link' });
+    if (new Date(u.reset_expires_at) < new Date()) return res.status(410).json({ error: 'Link expired' });
+    await pool.query(
+      `UPDATE local_users SET password_hash = $2, reset_token_hash = NULL, reset_expires_at = NULL,
+              updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [u.id, await bcrypt.hash(password, 10)]
+    );
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
