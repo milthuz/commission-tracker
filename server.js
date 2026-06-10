@@ -5460,6 +5460,88 @@ app.get('/api/admin/commission-imports/:id', authenticateToken, async (req, res)
   }
 });
 
+// GET /api/admin/commission-imports/coverage/matrix — rep × month reconciliation grid.
+// For every month since Jan 2025: what was paid via imports (file or app-generated commit)
+// and how much earned commission is still UNPAID per the app's model. Lets the user spot
+// at a glance which pay files are missing (report era ≤ Apr 2026) and which platform
+// periods (May 2026+) haven't been committed yet.
+app.get('/api/admin/commission-imports/coverage/matrix', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  try {
+    // Months from 2025-01 through the current month
+    const months = [];
+    const now = new Date();
+    for (let d = new Date('2025-01-01T00:00:00Z'); d <= now; d.setUTCMonth(d.getUTCMonth() + 1)) {
+      months.push(d.toISOString().slice(0, 7));
+    }
+
+    const [repsRes, importsRes, unpaidRes] = await Promise.all([
+      pool.query(
+        `SELECT DISTINCT name FROM (
+           SELECT name FROM salespeople WHERE is_active = true
+           UNION SELECT DISTINCT rep_name FROM commission_payment_imports
+         ) t ORDER BY name`
+      ),
+      pool.query(
+        `SELECT rep_name, to_char(paid_for_period, 'YYYY-MM') AS ym,
+                SUM(total_amount)::float AS total,
+                SUM(invoices_marked)::int AS invoices,
+                BOOL_OR(filename NOT LIKE 'app-generated%') AS has_file,
+                BOOL_OR(filename LIKE 'app-generated%')     AS has_app
+         FROM commission_payment_imports GROUP BY 1, 2`
+      ),
+      pool.query(
+        `SELECT salesperson_name AS rep, to_char(commission_payable_date, 'YYYY-MM') AS ym,
+                COUNT(*)::int AS cnt, COALESCE(SUM(commission), 0)::float AS amt
+         FROM invoices
+         WHERE organization_id = $1 AND commission > 0
+           AND commission_status IN ('hardware','saas_first')
+           AND approval_status <> 'paid'
+           AND commission_payable_date >= '2025-01-01'::date
+         GROUP BY 1, 2`,
+        [process.env.ZOHO_ORG_ID]
+      ),
+    ]);
+
+    const impMap = new Map(importsRes.rows.map(r => [`${r.rep_name}|${r.ym}`, r]));
+    const unpMap = new Map(unpaidRes.rows.map(r => [`${r.rep}|${r.ym}`, r]));
+
+    const rows = [];
+    for (const { name } of repsRes.rows) {
+      const cells = {};
+      let totalPaid = 0, totalUnpaid = 0, hasAny = false;
+      for (const ym of months) {
+        const imp = impMap.get(`${name}|${ym}`);
+        const unp = unpMap.get(`${name}|${ym}`);
+        const cell = {
+          importTotal: imp ? imp.total : null,
+          source:      imp ? (imp.has_file && imp.has_app ? 'both' : (imp.has_app ? 'app' : 'file')) : null,
+          unpaid:      unp ? unp.amt : 0,
+          unpaidCount: unp ? unp.cnt : 0,
+        };
+        if (imp || (unp && unp.amt > 0)) hasAny = true;
+        totalPaid   += imp ? imp.total : 0;
+        totalUnpaid += unp ? unp.amt : 0;
+        cells[ym] = cell;
+      }
+      // Skip all-empty rows (active reps with no imports and nothing earned-unpaid)
+      if (!hasAny) continue;
+      rows.push({
+        rep: name,
+        cells,
+        totalPaid:   Math.round(totalPaid * 100) / 100,
+        totalUnpaid: Math.round(totalUnpaid * 100) / 100,
+      });
+    }
+    // Biggest reconciliation gaps first
+    rows.sort((a, b) => b.totalUnpaid - a.totalUnpaid);
+
+    res.json({ months, rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/webhooks/log?secret=<shared>&invoice=<optional>&limit=<optional>
 // Returns the last N rows of webhook_log so we can audit incoming calls without
 // needing Heroku log access. Gated by the same shared secret as the webhook.
