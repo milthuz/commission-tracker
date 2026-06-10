@@ -4340,6 +4340,44 @@ app.post('/api/webhooks/zoho-books/invoice', async (req, res) => {
 // GET /api/admin/db-stats?secret=<shared>
 // Returns row counts per table + invoice breakdown by status. Gated by the
 // same shared secret as the webhook so we don't need a JWT to query it.
+// GET /api/admin/unassigned-invoices?secret=<shared>
+// Full dump of every "Unassigned" earned-commission invoice (no salesperson on the Zoho
+// invoice), with a SUGGESTED rep where the customer name matches a Zentact merchant that
+// has one. Working list for fixing attribution IN ZOHO (sync overwrites local edits).
+app.get('/api/admin/unassigned-invoices', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const rows = (await pool.query(
+      `SELECT i.invoice_number,
+              i.date::date AS invoice_date,
+              i.customer_name,
+              i.total::float AS total,
+              i.commission::float AS commission,
+              i.commission_status,
+              i.status,
+              i.approval_status,
+              zm.rep AS suggested_rep
+       FROM invoices i
+       LEFT JOIN (
+         SELECT regexp_replace(lower(business_name), '[^a-z0-9]', '', 'g') AS norm,
+                MIN(sales_rep_name) AS rep
+         FROM zentact_merchants
+         WHERE business_name IS NOT NULL AND business_name <> ''
+           AND sales_rep_name IS NOT NULL AND sales_rep_name <> ''
+         GROUP BY 1
+       ) zm ON zm.norm = regexp_replace(lower(i.customer_name), '[^a-z0-9]', '', 'g')
+       WHERE i.salesperson_name = 'Unassigned' AND i.commission > 0
+       ORDER BY i.commission DESC`
+    )).rows;
+    res.json({ count: rows.length, total_commission: rows.reduce((a, r) => a + (r.commission || 0), 0), rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/admin/invoice-lookup?secret=<shared>&numbers=INV-1,INV-2
 // Debug helper: full commission-relevant state for specific invoices.
 app.get('/api/admin/invoice-lookup', async (req, res) => {
