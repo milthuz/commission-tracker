@@ -1114,6 +1114,25 @@ app.post('/api/admin/local-users/invite', authenticateToken, async (req, res) =>
   }
 });
 
+// POST /api/admin/local-users/test-email — send a test message to the calling admin
+// so SMTP config (Google Workspace app password etc.) can be verified in one click.
+app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:users'))) return;
+  const to = req.user.realAdminEmail || req.user.email;
+  if (!to) return res.status(400).json({ error: 'No email on the current session' });
+  const mail = await sendMail(
+    to,
+    'Test — Sales Hub email configuration',
+    mailShell(
+      'Configuration courriel OK · Email configuration works',
+      `Ce message confirme que l'envoi de courriels de Sales Hub fonctionne (SMTP ${process.env.SMTP_HOST || '?'}).<br><br>This message confirms Sales Hub outbound email is working.`,
+      'Ouvrir Sales Hub / Open Sales Hub',
+      process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com'
+    )
+  );
+  res.json({ sent: mail.sent, to, error: mail.sent ? null : mail.reason });
+});
+
 // GET /api/admin/local-users — list external users (no secrets)
 app.get('/api/admin/local-users', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'admin:users'))) return;
