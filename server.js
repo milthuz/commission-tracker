@@ -508,6 +508,9 @@ async function initializeDatabase() {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_cplines_import ON commission_payment_lines(import_id)`);
+    // Lines paid per the file but whose invoice is NOT in our DB (pre-2025, out of sync scope).
+    // Stored anyway so the pay stub reflects the FULL real payout; flagged for display.
+    await pool.query(`ALTER TABLE commission_payment_lines ADD COLUMN IF NOT EXISTS not_in_db BOOLEAN DEFAULT false`);
 
     // Webhook activity log — every call to our webhook endpoints lands a row here
     // so we can audit/debug who fired what without needing Heroku log access.
@@ -4907,7 +4910,7 @@ async function importCommissionReport(req, res, { commit }) {
   const eligibleInvoices = parsed.invoices.filter(i => i.commission > 0);
   const skipped = parsed.invoices.filter(i => i.commission === 0).map(i => i.invoice_number);
   const matched = [];
-  const notFound = [];
+  const notFoundRows = [];   // full file rows (number, customer, commission) — paid for real, just not in our DB
   if (eligibleInvoices.length) {
     const numbers = eligibleInvoices.map(i => i.invoice_number);
     const rows = (await pool.query(
@@ -4919,12 +4922,14 @@ async function importCommissionReport(req, res, { commit }) {
     for (const inv of eligibleInvoices) {
       const row = byNumber.get(inv.invoice_number);
       if (!row) {
-        notFound.push(inv.invoice_number);
+        notFoundRows.push(inv);
       } else {
         matched.push({ ...inv, current_status: row.status, current_approval: row.approval_status, app_commission: parseFloat(row.commission) || 0 });
       }
     }
   }
+  const notFound = notFoundRows.map(i => i.invoice_number);
+  const notFoundAmount = notFoundRows.reduce((s, i) => s + i.commission, 0);
 
   // Match each signup bonus to a Zentact merchant (matcher loads the table once, matches in memory).
   const matchZentact = await buildZentactMatcher();
@@ -4940,10 +4945,14 @@ async function importCommissionReport(req, res, { commit }) {
     invoices_to_mark:       matched.length,
     invoices_skipped_zero:  skipped.length,
     invoices_not_found:     notFound.length,
+    not_found_amount:       Math.round(notFoundAmount * 100) / 100,
     signup_bonuses_count:   bonusesWithMatch.length,
     signup_bonuses_amount:  bonusesWithMatch.reduce((s, b) => s + b.amount, 0),
     monthly_bonus_amount:   parsed.monthlyBonus,
+    // The FULL amount the file paid out — including invoices not in our DB (pre-2025).
+    // The user's pay reports are the source of truth; the stub total must match the file.
     total_to_pay:           matched.reduce((s, i) => s + i.commission, 0)
+                            + notFoundAmount
                             + bonusesWithMatch.reduce((s, b) => s + b.amount, 0)
                             + parsed.monthlyBonus,
   };
@@ -5006,6 +5015,16 @@ async function importCommissionReport(req, res, { commit }) {
         `INSERT INTO commission_payment_lines (import_id, invoice_number, customer, paid_amount, app_commission)
          VALUES ($1, $2, $3, $4, $5)`,
         [importRow.id, inv.invoice_number, inv.customer || null, inv.commission, inv.app_commission ?? null]
+      );
+    }
+
+    // 2b. Record the file's not-in-DB lines too (pre-2025 invoices): no invoice row to mark,
+    //     but they WERE paid — the stub must show the full payout. app_commission stays NULL.
+    for (const inv of notFoundRows) {
+      await client.query(
+        `INSERT INTO commission_payment_lines (import_id, invoice_number, customer, paid_amount, app_commission, not_in_db)
+         VALUES ($1, $2, $3, $4, NULL, true)`,
+        [importRow.id, inv.invoice_number, inv.customer || null, inv.commission]
       );
     }
 
@@ -5445,8 +5464,8 @@ app.get('/api/admin/commission-imports/:id', authenticateToken, async (req, res)
     const imp = (await pool.query(`SELECT * FROM commission_payment_imports WHERE id = $1`, [id])).rows[0];
     if (!imp) return res.status(404).json({ error: 'Import not found' });
     const lines = (await pool.query(
-      `SELECT invoice_number, customer, paid_amount::float AS paid_amount, app_commission::float AS app_commission
-       FROM commission_payment_lines WHERE import_id = $1 ORDER BY paid_amount DESC`,
+      `SELECT invoice_number, customer, paid_amount::float AS paid_amount, app_commission::float AS app_commission, not_in_db
+       FROM commission_payment_lines WHERE import_id = $1 ORDER BY not_in_db ASC, paid_amount DESC`,
       [id]
     )).rows;
     const bonuses = (await pool.query(
@@ -7786,8 +7805,8 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
 
     if (imp) {
       const lines = (await pool.query(
-        `SELECT invoice_number, customer, paid_amount::float AS paid_amount, app_commission::float AS app_commission
-         FROM commission_payment_lines WHERE import_id = $1 ORDER BY paid_amount DESC`,
+        `SELECT invoice_number, customer, paid_amount::float AS paid_amount, app_commission::float AS app_commission, not_in_db
+         FROM commission_payment_lines WHERE import_id = $1 ORDER BY not_in_db ASC, paid_amount DESC`,
         [imp.id]
       )).rows;
       const bonuses = (await pool.query(
