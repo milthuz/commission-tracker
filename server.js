@@ -19,6 +19,7 @@ const bcrypt = require('bcryptjs');
 const { authenticator } = require('otplib');
 const nodemailer = require('nodemailer');
 const QRCode = require('qrcode');
+const Anthropic = require('@anthropic-ai/sdk');
 const { ZohoCRMService, MONTHLY_QUOTA, MONTHLY_BONUS_TIERS, ANNUAL_BONUS_TIERS, PLAN_START_DATE } = require('./services/zohoCRMService');
 const { ZentactService } = require('./services/zentactService');
 const { ZohoBillingService } = require('./services/zohoBillingService');
@@ -1338,6 +1339,91 @@ app.post('/api/auth/reset-password', async (req, res) => {
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================================
+// AI ASSISTANT — in-app help chatbot (Claude API)
+// ============================================================================
+// POST /api/assistant/chat — authenticated users only. The frontend sends the
+// conversation history; we answer from a system prompt describing the app.
+// Requires Heroku config var ANTHROPIC_API_KEY; returns 503 when unset.
+
+let _anthropic = null;
+function getAnthropic() {
+  if (!process.env.ANTHROPIC_API_KEY) return null;
+  if (!_anthropic) _anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  return _anthropic;
+}
+
+const ASSISTANT_SYSTEM = `You are the in-app assistant for "Sales Hub", the sales & commission portal of Cluster Systems (a restaurant POS company). Your job: help users understand and navigate the app, in a friendly, concise way.
+
+LANGUAGE: Always reply in the user's language (most users speak Québec French; others use English).
+
+THE APP'S SECTIONS (left sidebar):
+- Dashboard: overview KPIs (revenue, commissions) with a year selector.
+- Commission Tracker: monthly sales points per rep. Points come from CRM sold deals and Zentact merchant activations. Each rep has a monthly quota (default 15 points, can be customized). Reps are grouped into Teams, each with a progress bar; non-admins only see their own team. Points per deal type are configurable by admins.
+- Commission Report: a rep's commissions month by month for a year. Months show EARNED commission grouped by "Unlock Month" (when the commission becomes payable). Admins can Approve a month, then Mark Paid. The "Pay stub / Bulletin de paie" button shows the pay stub for the selected rep+month: invoices paid, bonuses, total — plus an "Earned this period but NOT paid" radar section listing unlocked commissions not covered by any payment. A "Total Compensation" banner shows base salary + YTD commission + annual bonus + signup payments.
+- Reseller Activation: POS activations attributed to external resellers.
+- Processing Revenue (Revenus de paiements): monthly payment-processing revenue per rep/reseller (transaction profit + other revenue).
+- Admin Panel (admins only): Integrations (Zoho Books/CRM/Zentact syncs), Salespeople (commission %, base salary, signup payment, team, quota, active toggle), Teams, Customers, Releases, Manage users (admin access, impersonation, External users), Roles & permissions (RBAC), Import Commissions (import historical pay report Excel files; includes the Coverage & Reconciliation matrix: one cell per rep per month showing what was paid vs what is still unpaid; cells open the pay stub), Resellers.
+
+THE COMMISSION MODEL:
+- SaaS (subscription) first month: 100% of the SaaS amount, with a floor at the plan's monthly price (so a prorated first invoice still pays the full plan value). Renewals: 0% (the activation already paid it).
+- Hardware: 10% of the hardware amount, only if paid within 3 months of the customer's first paid SaaS.
+- Commission base amounts are PRE-TAX.
+- "Unlock Month" = when the commission becomes payable (SaaS: when the first invoice is paid; hardware: when both hardware and first SaaS are paid).
+- Once a commission is marked PAID it is frozen — recalculations never change paid history.
+- Pay stubs: periods up to April 2026 come from imported Excel pay files (the files are the source of truth, including invoices not in the database, flagged "not in DB (pre-2025)"); from May 2026 the app generates the stub (unpaid unlocked commissions + signup payments) and admins commit it with "Mark this period paid".
+- Signup payment: a configurable per-rep bonus (default $100) for each Zentact merchant activation.
+
+LOGIN & ACCOUNTS:
+- Internal users sign in with Zoho (SSO button). External users are invited by an admin (email invitation), set a password, and MUST set up two-step verification (authenticator app, 6-digit codes). Permissions come from roles assigned by admins; without a role an external user sees nothing.
+- Password reset: "Forgot password?" on the login page (external accounts only).
+
+RULES:
+- Be concise. Use short paragraphs or bullets. No headers unless really useful.
+- Only discuss Sales Hub and how to use it. For anything else (general questions, other software, personal advice), politely decline and steer back to the app.
+- You CANNOT see the user's data (numbers, invoices, commissions). Never invent figures. For data questions, tell the user where in the app to look.
+- If you don't know or the question needs a human (billing disputes, account issues, bugs), direct them to saleshub@clustersystems.com.
+- Admin-only features: mention they require admin access when relevant.`;
+
+app.post('/api/assistant/chat', authenticateToken, async (req, res) => {
+  const client = getAnthropic();
+  if (!client) return res.status(503).json({ error: 'assistant_not_configured' });
+  const userKey = req.user.email || req.user.name || req.ip;
+  if (rateLimited(`assistant:${userKey}`, 30)) {
+    return res.status(429).json({ error: 'Too many messages — try again in a few minutes' });
+  }
+  // Sanitize the client-sent history: cap turns and length, force roles.
+  const raw = Array.isArray(req.body.messages) ? req.body.messages : [];
+  const history = raw.slice(-12)
+    .map(m => ({
+      role: m && m.role === 'assistant' ? 'assistant' : 'user',
+      content: String((m && m.content) || '').slice(0, 4000),
+    }))
+    .filter(m => m.content.trim());
+  while (history.length && history[0].role !== 'user') history.shift();
+  if (!history.length || history[history.length - 1].role !== 'user') {
+    return res.status(400).json({ error: 'messages must end with a user message' });
+  }
+  try {
+    const response = await client.messages.create({
+      model: 'claude-opus-4-8',
+      max_tokens: 1024,
+      thinking: { type: 'adaptive' },
+      output_config: { effort: 'low' },
+      system: [
+        { type: 'text', text: ASSISTANT_SYSTEM },
+        { type: 'text', text: `Current user: ${req.user.name || req.user.email || 'unknown'}${req.user.isAdmin ? ' (administrator)' : ''}.` },
+      ],
+      messages: history,
+    });
+    const reply = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
+    res.json({ reply });
+  } catch (e) {
+    console.warn('[ASSISTANT] error:', e.message);
+    res.status(502).json({ error: 'assistant_error' });
   }
 });
 
