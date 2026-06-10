@@ -4916,6 +4916,46 @@ app.get('/api/admin/unassigned-invoices', async (req, res) => {
   }
 });
 
+// GET /api/admin/rep-customers?secret=<shared>&rep=<name-or-part>&from=YYYY-MM-DD&to=YYYY-MM-DD
+// Distinct customers (accounts) on a rep's commission invoices, with activity stats and
+// whether the account was a NEW activation (has a saas_first invoice) in the window.
+app.get('/api/admin/rep-customers', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const rep = String(req.query.rep || '').trim();
+  if (!rep) return res.status(400).json({ error: 'rep required' });
+  const from = req.query.from || '2025-01-01';
+  const to = req.query.to || '2099-01-01';
+  try {
+    const reps = (await pool.query(
+      `SELECT DISTINCT salesperson_name FROM invoices
+       WHERE LOWER(salesperson_name) LIKE '%' || LOWER($1) || '%'`, [rep]
+    )).rows.map(r => r.salesperson_name);
+    const rows = (await pool.query(
+      `SELECT customer_name,
+              COUNT(*)::int AS invoices,
+              MIN(date)::date AS first_invoice,
+              MAX(date)::date AS last_invoice,
+              COALESCE(SUM(total), 0)::float AS revenue,
+              COALESCE(SUM(commission), 0)::float AS commission,
+              BOOL_OR(commission_status = 'saas_first') AS new_activation,
+              MIN(date) FILTER (WHERE commission_status = 'saas_first')::date AS activation_date
+       FROM invoices
+       WHERE LOWER(salesperson_name) LIKE '%' || LOWER($1) || '%'
+         AND organization_id = $2
+         AND date >= $3::date AND date < $4::date
+       GROUP BY customer_name
+       ORDER BY MIN(date)`,
+      [rep, process.env.ZOHO_ORG_ID, from, to]
+    )).rows;
+    res.json({ matched_reps: reps, count: rows.length, rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/admin/invoice-lookup?secret=<shared>&numbers=INV-1,INV-2
 // Debug helper: full commission-relevant state for specific invoices.
 app.get('/api/admin/invoice-lookup', async (req, res) => {
