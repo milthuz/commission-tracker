@@ -8064,12 +8064,14 @@ let recalcJob = { status: 'idle', processed: 0, total: 0, message: '' };
 // ============================================================================
 // New rules (applied per eligible invoice):
 //   Hardware           → hardware_amount × rep_rate%
-//   SaaS first month   → saas_amount × 100% (one-time activation commission)
+//   SaaS first month   → 100% of MAX(billed SaaS, plan recurring_price × qty) per line —
+//                        the plan price floor fills in prorated first invoices (2026-06-10)
 //   SaaS renewal       → 0 (already paid on activation)
 //   Not eligible       → 0
 //
 // "First month" detection: for each customer, the EARLIEST paid SaaS invoice
 // per subscription_activation_date is the first month; all others are renewals.
+// Invoices with approval_status='paid' are FROZEN — recalc never rewrites them.
 
 let recalcV2Job = {
   status: 'idle', processed: 0, total: 0, message: '',
@@ -8143,6 +8145,38 @@ async function runRecalcV2(source = 'manual') {
         }
       }
 
+      // PASS 1b: Activation commission base = PLAN PRICE, not the (often prorated) first
+      // invoice amount (user decision 2026-06-10: "an activation is an activation, whatever
+      // the day of the month"). For each first-month invoice, per SaaS line take
+      // MAX(billed amount, plan recurring_price × quantity) — fills in proration without
+      // ever reducing an invoice that billed more (e.g. prepaid periods). Falls back to
+      // saas_amount when line_items/plan are unavailable.
+      const planPrices = new Map();
+      (await pool.query(
+        `SELECT plan_code, recurring_price::float AS price FROM zoho_plans WHERE recurring_price > 0`
+      )).rows.forEach(p => planPrices.set(String(p.plan_code).toLowerCase(), p.price));
+      const saasFirstBase = new Map();
+      const firstIds = [...new Set(firstMonthByGroup.values())];
+      if (firstIds.length && planPrices.size) {
+        const liRows = (await pool.query(
+          `SELECT id, line_items FROM invoices WHERE id = ANY($1) AND line_items IS NOT NULL`,
+          [firstIds]
+        )).rows;
+        for (const row of liRows) {
+          const items = Array.isArray(row.line_items) ? row.line_items : [];
+          let base = 0, sawSaas = false;
+          for (const li of items) {
+            if (li.type !== 'saas') continue;
+            sawSaas = true;
+            const amt   = parseFloat(li.amount) || 0;
+            const qty   = parseInt(li.quantity) || 1;
+            const price = li.plan_code ? (planPrices.get(String(li.plan_code).toLowerCase()) || 0) : 0;
+            base += Math.max(amt, price * qty);
+          }
+          if (sawSaas) saasFirstBase.set(row.id, Math.round(base * 100) / 100);
+        }
+      }
+
       // Batched persistence for PASS 2: buffer the per-invoice writes and flush them in
       // chunks (one UPDATE ... FROM (VALUES ...) per ~500 rows) instead of one cross-cloud
       // round-trip per invoice. Flushing per chunk keeps progress + stoppability intact.
@@ -8193,11 +8227,11 @@ async function runRecalcV2(source = 'manual') {
         } else if (inv.status !== 'paid' || !invPaidDate) {
           bucket = 'pending_payment';
         } else if (saasAmount > 0 && hardwareAmount === 0) {
-          // Pure SaaS — first month gets 100%, renewals get 0
+          // Pure SaaS — first month gets 100% (of the PLAN price when known), renewals get 0
           const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
           const isFirstMonth = firstMonthByGroup.get(key) === inv.id;
           if (isFirstMonth) {
-            commission = saasAmount;
+            commission = saasFirstBase.get(inv.id) ?? saasAmount;
             bucket = 'saas_first';
             payableDate = invPaidDate;
           } else {
@@ -8225,7 +8259,7 @@ async function runRecalcV2(source = 'manual') {
           const isFirstMonth = firstMonthByGroup.get(key) === inv.id;
           const firstSaasPaid = firstSaasPaidByCustomer.get(inv.customer_name);
           if (isFirstMonth) {
-            commission += saasAmount;
+            commission += saasFirstBase.get(inv.id) ?? saasAmount;
             bucket = 'saas_first';
             payableDate = invPaidDate;
           } else {
