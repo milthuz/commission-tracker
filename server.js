@@ -4350,28 +4350,84 @@ app.get('/api/admin/unassigned-invoices', async (req, res) => {
     return res.status(401).json({ error: 'invalid secret' });
   }
   try {
-    const rows = (await pool.query(
-      `SELECT i.invoice_number,
-              i.date::date AS invoice_date,
-              i.customer_name,
-              i.total::float AS total,
-              i.commission::float AS commission,
-              i.commission_status,
-              i.status,
-              i.approval_status,
-              zm.rep AS suggested_rep
-       FROM invoices i
-       LEFT JOIN (
-         SELECT regexp_replace(lower(business_name), '[^a-z0-9]', '', 'g') AS norm,
-                MIN(sales_rep_name) AS rep
-         FROM zentact_merchants
+    const norm = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const [invRes, sameCustRes, crmRes, zenRes] = await Promise.all([
+      pool.query(
+        `SELECT invoice_number, date::date AS invoice_date, customer_name,
+                total::float AS total, commission::float AS commission,
+                commission_status, status, approval_status
+         FROM invoices
+         WHERE salesperson_name = 'Unassigned' AND commission > 0
+         ORDER BY commission DESC`
+      ),
+      // Strongest signal: the SAME customer's other invoices that DO have a salesperson.
+      pool.query(
+        `SELECT customer_name, salesperson_name, COUNT(*)::int AS cnt
+         FROM invoices
+         WHERE salesperson_name <> 'Unassigned' AND salesperson_name IS NOT NULL
+           AND customer_name IN (SELECT DISTINCT customer_name FROM invoices
+                                 WHERE salesperson_name = 'Unassigned' AND commission > 0)
+         GROUP BY 1, 2`
+      ),
+      pool.query(
+        `SELECT deal_name, account_name, owner_name FROM crm_sold_deals
+         WHERE owner_name IS NOT NULL AND owner_name <> ''`
+      ),
+      pool.query(
+        `SELECT business_name, sales_rep_name FROM zentact_merchants
          WHERE business_name IS NOT NULL AND business_name <> ''
-           AND sales_rep_name IS NOT NULL AND sales_rep_name <> ''
-         GROUP BY 1
-       ) zm ON zm.norm = regexp_replace(lower(i.customer_name), '[^a-z0-9]', '', 'g')
-       WHERE i.salesperson_name = 'Unassigned' AND i.commission > 0
-       ORDER BY i.commission DESC`
-    )).rows;
+           AND sales_rep_name IS NOT NULL AND sales_rep_name <> ''`
+      ),
+    ]);
+
+    // customer_name → most-frequent rep among their assigned invoices
+    const sameCust = new Map();
+    for (const r of sameCustRes.rows) {
+      const cur = sameCust.get(r.customer_name);
+      if (!cur || r.cnt > cur.cnt) sameCust.set(r.customer_name, { rep: r.salesperson_name, cnt: r.cnt });
+    }
+    // normalized CRM account/deal name → owner
+    const crmMap = new Map();
+    for (const d of crmRes.rows) {
+      for (const n of [d.account_name, d.deal_name]) {
+        const k = norm(n);
+        if (k && !crmMap.has(k)) crmMap.set(k, d.owner_name);
+      }
+    }
+    const zenMap = new Map();
+    for (const m of zenRes.rows) {
+      const k = norm(m.business_name);
+      if (k && !zenMap.has(k)) zenMap.set(k, m.sales_rep_name);
+    }
+    // Substring fallback (either direction), min 6 chars to avoid junk matches.
+    const crmList = [...crmMap.entries()].filter(([k]) => k.length >= 6);
+    const zenList = [...zenMap.entries()].filter(([k]) => k.length >= 6);
+    const fuzzy = (k, list) => {
+      if (k.length < 6) return null;
+      for (const [n, rep] of list) {
+        if (n.includes(k) || k.includes(n)) return rep;
+      }
+      return null;
+    };
+
+    const rows = invRes.rows.map(r => {
+      const k = norm(r.customer_name);
+      let suggested_rep = null, suggestion_source = null;
+      const sc = sameCust.get(r.customer_name);
+      if (sc) { suggested_rep = sc.rep; suggestion_source = 'autres factures du client'; }
+      else if (crmMap.has(k)) { suggested_rep = crmMap.get(k); suggestion_source = 'deal CRM'; }
+      else if (zenMap.has(k)) { suggested_rep = zenMap.get(k); suggestion_source = 'Zentact'; }
+      else {
+        const f = fuzzy(k, crmList);
+        if (f) { suggested_rep = f; suggestion_source = 'deal CRM (partiel)'; }
+        else {
+          const z = fuzzy(k, zenList);
+          if (z) { suggested_rep = z; suggestion_source = 'Zentact (partiel)'; }
+        }
+      }
+      return { ...r, suggested_rep, suggestion_source };
+    });
+
     res.json({ count: rows.length, total_commission: rows.reduce((a, r) => a + (r.commission || 0), 0), rows });
   } catch (e) {
     res.status(500).json({ error: e.message });
