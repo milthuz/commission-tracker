@@ -7658,9 +7658,10 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
     const periodEnd   = new Date(periodStart); periodEnd.setMonth(periodEnd.getMonth() + 1);
 
     // App-generated invoice lines: commissions that UNLOCKED in this period.
+    // Each line carries approval_status so callers can split paid vs unpaid.
     const genLines = async () => {
       const rows = (await pool.query(
-        `SELECT invoice_number, customer_name, commission::float AS commission
+        `SELECT invoice_number, customer_name, commission::float AS commission, approval_status
          FROM invoices
          WHERE salesperson_name = $1 AND organization_id = $2
            AND commission_payable_date >= $3 AND commission_payable_date < $4
@@ -7673,6 +7674,7 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
         customer:       r.customer_name || null,
         paid_amount:    r.commission || 0,
         app_commission: r.commission || 0,
+        approval_status: r.approval_status || 'pending',
       }));
     };
     // App-generated signup bonuses: Zentact merchants this rep activated in the period.
@@ -7712,6 +7714,11 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
         [imp.id]
       )).rows;
       const linesStored = lines.length > 0;
+      // "Missed" = earned (unlocked) in this period per the app's model but still NOT paid —
+      // i.e. invoices the pay file didn't cover. This is the user's forgot-to-pay radar.
+      const appLines = await genLines();
+      const missed   = appLines.filter(l => l.approval_status !== 'paid')
+        .map(l => ({ invoice_number: l.invoice_number, customer: l.customer, app_commission: l.app_commission }));
       return res.json({
         source:      'imported',
         linesStored,
@@ -7719,14 +7726,18 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
         period:      `${year}-${mm}`,
         importId:    imp.id,
         filename:    imp.filename,
-        lines:       linesStored ? lines : await genLines(),
+        lines:       linesStored ? lines : appLines,
         bonuses,
         total:       parseFloat(imp.total_amount) || 0,
+        missed,
+        missedTotal: missed.reduce((a, l) => a + l.app_commission, 0),
       });
     }
 
-    // No import → app generates the stub from its own model.
-    const lines   = await genLines();
+    // No import → app generates the stub from its own model: UNPAID unlocked commissions only
+    // (what you'd pay now — matches what the commit endpoint would mark). Already-paid lines
+    // are excluded so the stub total = the amount actually owed.
+    const lines   = (await genLines()).filter(l => l.approval_status !== 'paid');
     const bonuses = await genBonuses();
     const total   = lines.reduce((a, l) => a + l.paid_amount, 0) + bonuses.reduce((a, b) => a + b.amount, 0);
     return res.json({
@@ -7882,7 +7893,7 @@ async function runRecalcV2(source = 'manual') {
     source,
     processed: 0, total: 0,
     message: `Starting (${source})...`,
-    stats: { hardware: 0, saas_first: 0, saas_renewal: 0, too_late: 0, pending_saas: 0, pending_payment: 0, not_eligible: 0, total_commission: 0 },
+    stats: { hardware: 0, saas_first: 0, saas_renewal: 0, too_late: 0, pending_saas: 0, pending_payment: 0, not_eligible: 0, frozen_paid: 0, total_commission: 0 },
   };
   try {
       // Load rep rates
@@ -7894,7 +7905,7 @@ async function runRecalcV2(source = 'manual') {
       const invRes = await pool.query(`
         SELECT id, invoice_number, salesperson_name, customer_name, total,
                hardware_amount, saas_amount, subscription_activation_date,
-               paid_date, commission_status, status
+               paid_date, commission_status, status, approval_status, commission
         FROM invoices
         WHERE organization_id = $1
         ORDER BY date ASC
@@ -8036,6 +8047,18 @@ async function runRecalcV2(source = 'manual') {
               }
             }
           }
+        }
+
+        // FREEZE: once a commission has been PAID (import or mark-paid/pay-stub commit), the
+        // user's pay records are the source of truth — recalc must never rewrite its
+        // commission/status/payable_date. PASS 1 above still SEES paid invoices (first-month
+        // detection needs them); we only skip the write. Unapprove unfreezes (status leaves 'paid').
+        if (inv.approval_status === 'paid') {
+          recalcV2Job.stats.frozen_paid = (recalcV2Job.stats.frozen_paid || 0) + 1;
+          recalcV2Job.stats.total_commission += parseFloat(inv.commission) || 0;
+          recalcV2Job.processed++;
+          recalcV2Job.message = `Processed ${recalcV2Job.processed} of ${recalcV2Job.total}`;
+          continue;
         }
 
         recalcV2Job.stats[bucket]++;
