@@ -1379,6 +1379,7 @@ THE APP'S SECTIONS (left sidebar):
 
 THE COMMISSION MODEL:
 - SaaS (subscription) first month: 100% of the SaaS amount, with a floor at the plan's monthly price (so a prorated first invoice still pays the full plan value). Renewals: 0% (the activation already paid it).
+- ANNUAL subscriptions (billed yearly, e.g. integration annual fees): 10% of the first year's invoice, 0% on annual renewals.
 - Hardware: 10% of the hardware amount, only if paid within 3 months of the customer's first paid SaaS.
 - Commission base amounts are PRE-TAX.
 - "Unlock Month" = when the commission becomes payable (SaaS: when the first invoice is paid; hardware: when both hardware and first SaaS are paid).
@@ -5043,7 +5044,7 @@ app.get('/api/admin/db-stats', async (req, res) => {
               commission_payable_date::date AS payable_date
        FROM invoices
        WHERE approval_status IN ('paid','approved')
-         AND (commission_status IS NULL OR commission_status NOT IN ('hardware','saas_first'))
+         AND (commission_status IS NULL OR commission_status NOT IN ('hardware','saas_first','saas_annual'))
        ORDER BY salesperson_name, date
        LIMIT 200`
     )).rows;
@@ -6196,7 +6197,7 @@ app.get('/api/admin/commission-imports/coverage/matrix', (req, res, next) => {
                 COUNT(*)::int AS cnt, COALESCE(SUM(commission), 0)::float AS amt
          FROM invoices
          WHERE organization_id = $1 AND commission > 0
-           AND commission_status IN ('hardware','saas_first')
+           AND commission_status IN ('hardware','saas_first','saas_annual')
            AND approval_status <> 'paid'
            AND commission_payable_date >= '2025-01-01'::date
          GROUP BY 1, 2`,
@@ -8154,7 +8155,7 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
       FROM invoices
       WHERE salesperson_name = $1 AND organization_id = $2
         AND ${dateCol} >= $3 AND ${dateCol} <= $4
-        AND commission > 0 AND commission_status IN ('hardware','saas_first')
+        AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual')
       GROUP BY customer_name ORDER BY commission DESC LIMIT 50
     `, [targetRep, process.env.ZOHO_ORG_ID, startDate, endDate]);
 
@@ -8284,7 +8285,7 @@ app.post('/api/commissions/approve', authenticateToken, async (req, res) => {
              approved_at    = CURRENT_TIMESTAMP,
              updated_at     = CURRENT_TIMESTAMP
          WHERE invoice_number = ANY($1)
-           AND commission > 0 AND commission_status IN ('hardware','saas_first')
+           AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual')
            AND approval_status = 'pending'
          RETURNING invoice_number`,
         [invoiceNumbers, approverEmail]
@@ -8303,7 +8304,7 @@ app.post('/api/commissions/approve', authenticateToken, async (req, res) => {
              updated_at     = CURRENT_TIMESTAMP
          WHERE salesperson_name = $1 AND organization_id = $2
            AND commission_payable_date >= $3 AND commission_payable_date < $4
-           AND commission > 0 AND commission_status IN ('hardware','saas_first')
+           AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual')
            AND approval_status = 'pending'
          RETURNING invoice_number`,
         [repName, process.env.ZOHO_ORG_ID, startDate, endDate, approverEmail]
@@ -8452,7 +8453,7 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
          FROM invoices
          WHERE salesperson_name = $1 AND organization_id = $2
            AND commission_payable_date >= $3 AND commission_payable_date < $4
-           AND commission > 0 AND commission_status IN ('hardware','saas_first')
+           AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual')
          ORDER BY commission DESC`,
         [targetRep, process.env.ZOHO_ORG_ID, periodStart, periodEnd]
       )).rows;
@@ -8576,7 +8577,7 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
        FROM invoices
        WHERE salesperson_name = $1 AND organization_id = $2
          AND commission_payable_date >= $3 AND commission_payable_date < $4
-         AND commission > 0 AND commission_status IN ('hardware','saas_first')
+         AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual')
          AND approval_status <> 'paid'
        ORDER BY commission DESC`,
       [repName, process.env.ZOHO_ORG_ID, periodStart, periodEnd]
@@ -8682,7 +8683,7 @@ async function runRecalcV2(source = 'manual') {
     source,
     processed: 0, total: 0,
     message: `Starting (${source})...`,
-    stats: { hardware: 0, saas_first: 0, saas_renewal: 0, too_late: 0, pending_saas: 0, pending_payment: 0, not_eligible: 0, frozen_paid: 0, total_commission: 0 },
+    stats: { hardware: 0, saas_first: 0, saas_annual: 0, saas_renewal: 0, too_late: 0, pending_saas: 0, pending_payment: 0, not_eligible: 0, frozen_paid: 0, total_commission: 0 },
   };
   try {
       // Load rep rates
@@ -8747,6 +8748,52 @@ async function runRecalcV2(source = 'manual') {
       (await pool.query(
         `SELECT plan_code, recurring_price::float AS price FROM zoho_plans WHERE recurring_price > 0`
       )).rows.forEach(p => planPrices.set(String(p.plan_code).toLowerCase(), p.price));
+
+      // PASS 1c: ANNUAL subscriptions (user rule 2026-06-11) — a yearly-billed SaaS line pays
+      // 10% (rep rate) on the customer's FIRST invoice for that plan, 0% on annual renewals,
+      // and never the 100% monthly-activation rule. "Annual" = plan bills yearly in Zoho
+      // Billing, or the line name says Annual/Annuel/par année/Yearly. Detected from STORED
+      // line_items with one server-side aggregate query (no per-invoice JSONB transfer).
+      const annualPlanCodes = new Set(
+        (await pool.query(
+          `SELECT LOWER(plan_code) AS code FROM zoho_plans WHERE interval_unit ILIKE 'year%'`
+        )).rows.map(r => r.code)
+      );
+      const ANNUAL_NAME_RE = /annual|annuel|yearly|par ann/i;
+      const isAnnualLine = (li) =>
+        (li.plan_code && annualPlanCodes.has(String(li.plan_code).toLowerCase().trim())) ||
+        ANNUAL_NAME_RE.test(String(li.name || ''));
+
+      const annualByInvoice = new Map(); // invoice id → { total, firstTotal }
+      {
+        const annualRows = (await pool.query(
+          `SELECT i.id, i.customer_name,
+                  LOWER(COALESCE(NULLIF(TRIM(li->>'plan_code'), ''), TRIM(li->>'name'), '')) AS line_key,
+                  COALESCE((li->>'amount')::float, 0) AS amount
+           FROM invoices i
+           CROSS JOIN LATERAL jsonb_array_elements(i.line_items) AS li
+           WHERE i.organization_id = $1
+             AND i.line_items IS NOT NULL AND i.saas_amount > 0
+             AND i.status NOT IN ('void', 'deleted')
+             AND li->>'type' = 'saas'
+             AND (
+               LOWER(TRIM(li->>'plan_code')) IN (SELECT LOWER(plan_code) FROM zoho_plans WHERE interval_unit ILIKE 'year%')
+               OR li->>'name' ~* '(annual|annuel|yearly|par ann)'
+             )
+           ORDER BY i.date ASC, i.id ASC`,
+          [process.env.ZOHO_ORG_ID]
+        )).rows;
+        const claimedBy = new Map(); // customer|line_key → first invoice id (claims the 10%)
+        for (const r of annualRows) {
+          const rec = annualByInvoice.get(r.id) || { total: 0, firstTotal: 0 };
+          rec.total += r.amount;
+          const key = `${r.customer_name}|${r.line_key}`;
+          if (!claimedBy.has(key)) claimedBy.set(key, r.id);
+          if (claimedBy.get(key) === r.id) rec.firstTotal += r.amount;
+          annualByInvoice.set(r.id, rec);
+        }
+      }
+
       const saasFirstBase = new Map();
       const firstIds = [...new Set(firstMonthByGroup.values())];
       if (firstIds.length && planPrices.size) {
@@ -8759,6 +8806,7 @@ async function runRecalcV2(source = 'manual') {
           let base = 0, sawSaas = false;
           for (const li of items) {
             if (li.type !== 'saas') continue;
+            if (isAnnualLine(li)) continue; // annual subs follow their own 10%-first-year rule
             sawSaas = true;
             const amt   = parseFloat(li.amount) || 0;
             const qty   = parseInt(li.quantity) || 1;
@@ -8803,6 +8851,11 @@ async function runRecalcV2(source = 'manual') {
         const rate = rateMap[inv.salesperson_name] || 10;
         const hardwareAmount = parseFloat(inv.hardware_amount) || 0;
         const saasAmount     = parseFloat(inv.saas_amount)     || 0;
+        const annualInfo = annualByInvoice.get(inv.id);
+        const annualAmount      = annualInfo ? annualInfo.total : 0;
+        const annualFirstAmount = annualInfo ? annualInfo.firstTotal : 0;
+        // Monthly-SaaS portion only — annual lines follow their own 10% rule (block below).
+        const monthlySaas = Math.max(0, saasAmount - annualAmount);
         const invPaidDate    = toDate(inv.paid_date);
         let commission = 0;
         let bucket = 'not_eligible';
@@ -8818,19 +8871,19 @@ async function runRecalcV2(source = 'manual') {
           bucket = 'not_eligible';
         } else if (inv.status !== 'paid' || !invPaidDate) {
           bucket = 'pending_payment';
-        } else if (saasAmount > 0 && hardwareAmount === 0) {
-          // Pure SaaS — first month gets 100% (of the PLAN price when known), renewals get 0
+        } else if (monthlySaas > 0 && hardwareAmount === 0) {
+          // Pure monthly SaaS — first month gets 100% (of the PLAN price when known), renewals get 0
           const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
           const isFirstMonth = firstMonthByGroup.get(key) === inv.id;
           if (isFirstMonth) {
-            commission = saasFirstBase.get(inv.id) ?? saasAmount;
+            commission = saasFirstBase.get(inv.id) ?? monthlySaas;
             bucket = 'saas_first';
             payableDate = invPaidDate;
           } else {
             commission = 0;
             bucket = 'saas_renewal';
           }
-        } else if (hardwareAmount > 0 && saasAmount === 0) {
+        } else if (hardwareAmount > 0 && monthlySaas === 0) {
           // Pure hardware — eligible if paid before OR within 3 months after first SaaS
           const firstSaasPaid = firstSaasPaidByCustomer.get(inv.customer_name);
           if (!firstSaasPaid) {
@@ -8845,13 +8898,13 @@ async function runRecalcV2(source = 'manual') {
               bucket = 'too_late';
             }
           }
-        } else if (hardwareAmount > 0 && saasAmount > 0) {
-          // Mixed — SaaS portion follows first-month rule, hardware portion needs window
+        } else if (hardwareAmount > 0 && monthlySaas > 0) {
+          // Mixed — monthly-SaaS portion follows first-month rule, hardware portion needs window
           const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
           const isFirstMonth = firstMonthByGroup.get(key) === inv.id;
           const firstSaasPaid = firstSaasPaidByCustomer.get(inv.customer_name);
           if (isFirstMonth) {
-            commission += saasFirstBase.get(inv.id) ?? saasAmount;
+            commission += saasFirstBase.get(inv.id) ?? monthlySaas;
             bucket = 'saas_first';
             payableDate = invPaidDate;
           } else {
@@ -8868,6 +8921,17 @@ async function runRecalcV2(source = 'manual') {
               }
             }
           }
+        } else if (annualAmount > 0) {
+          // Pure annual-subscription invoice — the annual block below pays the first year.
+          bucket = 'saas_renewal';
+        }
+
+        // ANNUAL subscriptions: 10% (rep rate) of the first year's annual lines, unlocked when
+        // the invoice is paid. Annual renewals earn nothing (annualFirstAmount = 0 for them).
+        if (annualFirstAmount > 0 && inv.status === 'paid' && invPaidDate) {
+          commission += annualFirstAmount * (rate / 100);
+          if (bucket !== 'saas_first' && bucket !== 'hardware') bucket = 'saas_annual';
+          if (!payableDate) payableDate = invPaidDate;
         }
 
         // FREEZE: once a commission has been PAID (import or mark-paid/pay-stub commit), the
@@ -8908,8 +8972,16 @@ async function runRecalcV2(source = 'manual') {
 }
 
 // HTTP endpoint — fire-and-forget wrapper around runRecalcV2
-app.post('/api/commissions/recalc-v2/start', authenticateToken, async (req, res) => {
-  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+app.post('/api/commissions/recalc-v2/start', (req, res, next) => {
+  // Shared-secret bypass (same as db-stats) so a recalc can be kicked off without a session.
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) {
+    req.viaSecret = true;
+    return next();
+  }
+  return authenticateToken(req, res, next);
+}, async (req, res) => {
+  if (!req.viaSecret && !req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   if (recalcV2Job.status === 'running') {
     return res.status(409).json({ error: 'Already running' });
   }
