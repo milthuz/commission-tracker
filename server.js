@@ -246,6 +246,15 @@ async function initializeDatabase() {
       );
     `);
 
+    // App-wide settings (key → JSONB). First use: disabled_report_years.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value JSONB NOT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
     // Salespeople table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS salespeople (
@@ -6095,6 +6104,53 @@ app.get('/api/admin/commission-imports/:id', authenticateToken, async (req, res)
   }
 });
 
+// ── Disabled report years ──────────────────────────────────────────────────
+// Admin can hide past years (e.g. 2025) from the Commission Report — the year
+// dropdown and the coverage matrix drop them. Cached 60s per dyno (Railway RTT).
+let _disabledYearsCache = { at: 0, years: [] };
+async function getDisabledReportYears() {
+  if (Date.now() - _disabledYearsCache.at < 60_000) return _disabledYearsCache.years;
+  let years = [];
+  try {
+    const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'disabled_report_years'`);
+    const v = r.rows[0]?.value;
+    if (Array.isArray(v)) years = v.map(Number).filter(Number.isInteger);
+  } catch (_e) { /* table may not exist yet on first boot — treat as none */ }
+  _disabledYearsCache = { at: Date.now(), years };
+  return years;
+}
+
+// Visible to any authenticated user — the report UI hides these years.
+app.get('/api/settings/report-years', authenticateToken, async (_req, res) => {
+  res.json({ disabledYears: await getDisabledReportYears() });
+});
+
+// PUT {disabledYears:[2025]} — toggle lives in Admin → Import Commissions.
+app.put('/api/admin/report-years', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const input = req.body?.disabledYears;
+  if (!Array.isArray(input)) return res.status(400).json({ error: 'disabledYears array required' });
+  const years = [...new Set(input.map(Number))].sort();
+  if (years.some(y => !Number.isInteger(y) || y < 2025 || y > 2100)) {
+    return res.status(400).json({ error: 'invalid year' });
+  }
+  if (years.includes(new Date().getFullYear())) {
+    return res.status(400).json({ error: 'cannot disable the current year' });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at)
+       VALUES ('disabled_report_years', $1::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [JSON.stringify(years)]
+    );
+    _disabledYearsCache = { at: Date.now(), years };
+    res.json({ disabledYears: years });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/admin/commission-imports/coverage/matrix — rep × month reconciliation grid.
 // For every month since Jan 2025: what was paid via imports (file or app-generated commit)
 // and how much earned commission is still UNPAID per the app's model. Lets the user spot
@@ -6112,11 +6168,12 @@ app.get('/api/admin/commission-imports/coverage/matrix', (req, res, next) => {
 }, async (req, res) => {
   if (!req.viaSecret && !(await requirePerm(req, res, 'report:mark_paid'))) return;
   try {
-    // Months from 2025-01 through the current month
+    // Months from 2025-01 through the current month (minus admin-disabled years)
+    const disabledYears = await getDisabledReportYears();
     const months = [];
     const now = new Date();
     for (let d = new Date('2025-01-01T00:00:00Z'); d <= now; d.setUTCMonth(d.getUTCMonth() + 1)) {
-      months.push(d.toISOString().slice(0, 7));
+      if (!disabledYears.includes(d.getUTCFullYear())) months.push(d.toISOString().slice(0, 7));
     }
 
     const [repsRes, importsRes, unpaidRes] = await Promise.all([
@@ -8010,6 +8067,10 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
   const { email, isAdmin, name: jwtName } = req.user;
   const { year, repName, month } = req.query;
   const targetYear = year || new Date().getFullYear().toString();
+
+  if ((await getDisabledReportYears()).includes(parseInt(targetYear, 10))) {
+    return res.status(403).json({ error: 'This report year is disabled', code: 'year_disabled' });
+  }
 
   try {
     const tokenResult = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
