@@ -8432,11 +8432,15 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
   }
   try {
     // Non-admins must hold the dedicated permission; rep resolution below pins them to self.
+    // canAudit gates the model-vs-paid comparison (App calc. + missed radar) — payroll
+    // admins only. Reps must not see how the app's numbers compare to what was paid.
+    let canAudit = !!isAdmin;
     if (!isAdmin) {
       const perms = await getUserPermissions(email);
       if (!userHasPermission(perms, 'report:view_paystub')) {
         return res.status(403).json({ error: 'Permission required: report:view_paystub' });
       }
+      canAudit = userHasPermission(perms, 'report:mark_paid');
     }
     const tokenResult = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
     const myName    = tokenResult.rows[0]?.display_name || jwtName || email;
@@ -8508,6 +8512,8 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
       const appLines = await genLines();
       const missed   = appLines.filter(l => l.approval_status !== 'paid')
         .map(l => ({ invoice_number: l.invoice_number, customer: l.customer, app_commission: l.app_commission }));
+      const outLines = (linesStored ? lines : appLines)
+        .map(l => canAudit ? l : { ...l, app_commission: null });
       return res.json({
         source:      'imported',
         linesStored,
@@ -8515,11 +8521,11 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
         period:      `${year}-${mm}`,
         importId:    imp.id,
         filename:    imp.filename,
-        lines:       linesStored ? lines : appLines,
+        lines:       outLines,
         bonuses,
         total:       parseFloat(imp.total_amount) || 0,
-        missed,
-        missedTotal: missed.reduce((a, l) => a + l.app_commission, 0),
+        missed:      canAudit ? missed : [],
+        missedTotal: canAudit ? missed.reduce((a, l) => a + l.app_commission, 0) : 0,
       });
     }
 
