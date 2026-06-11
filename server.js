@@ -4327,6 +4327,8 @@ app.put('/api/user/preferences', authenticateToken, async (req, res) => {
 
 // GET /api/dashboard?year=
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
+  // Company-wide invoice/revenue stats — not for reps (gate matches the sidebar).
+  if (!(await requirePerm(req, res, 'invoices:view_all'))) return;
   const year = parseInt(req.query.year) || new Date().getFullYear();
   try {
     const startDate = new Date(year, 0, 1);
