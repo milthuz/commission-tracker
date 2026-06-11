@@ -1380,6 +1380,7 @@ THE APP'S SECTIONS (left sidebar):
 THE COMMISSION MODEL:
 - SaaS (subscription) first month: 100% of the SaaS amount, with a floor at the plan's monthly price (so a prorated first invoice still pays the full plan value). Renewals: 0% (the activation already paid it).
 - ANNUAL subscriptions (billed yearly, e.g. integration annual fees): 10% of the first year's invoice, 0% on annual renewals.
+- Monthly add-ons sold to an EXISTING customer: 0% — add-ons only pay when they are part of the initial sale (on the activation invoice).
 - Hardware: 10% of the hardware amount, only if paid within 3 months of the customer's first paid SaaS.
 - Commission base amounts are PRE-TAX.
 - "Unlock Month" = when the commission becomes payable (SaaS: when the first invoice is paid; hardware: when both hardware and first SaaS are paid).
@@ -8660,10 +8661,12 @@ let recalcJob = { status: 'idle', processed: 0, total: 0, message: '' };
 //   SaaS first month   → 100% of MAX(billed SaaS, plan recurring_price × qty) per line —
 //                        the plan price floor fills in prorated first invoices (2026-06-10)
 //   SaaS renewal       → 0 (already paid on activation)
+//   ANNUAL sub lines   → 10% of the customer's FIRST invoice per plan, 0 on annual renewals
 //   Not eligible       → 0
 //
-// "First month" detection: for each customer, the EARLIEST paid SaaS invoice
-// per subscription_activation_date is the first month; all others are renewals.
+// "First month" detection (2026-06-11): only the customer's INITIAL sale group — the
+// activation group of their earliest monthly-SaaS invoice — qualifies for the 100%.
+// Monthly add-ons sold later to an existing customer are renewals (0).
 // Invoices with approval_status='paid' are FROZEN — recalc never rewrites them.
 
 let recalcV2Job = {
@@ -8714,9 +8717,9 @@ async function runRecalcV2(source = 'manual') {
         return x;
       };
 
-      // PASS 1: Build per-customer maps (paidDate stored as Date objects)
+      // PASS 1: first paid SaaS per customer (anchors the hardware 3-month window).
+      // First-month/activation detection moved to PASS 1d (needs the annual-line map).
       const firstSaasPaidByCustomer = new Map();
-      const firstMonthByGroup = new Map();
       for (const inv of invRes.rows) {
         const isSaaS = parseFloat(inv.saas_amount) > 0;
         if (!isSaaS) continue;
@@ -8728,12 +8731,6 @@ async function runRecalcV2(source = 'manual') {
               paidDate: paid,
               invoiceId: inv.id,
             });
-          }
-        }
-        if (inv.subscription_activation_date) {
-          const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
-          if (!firstMonthByGroup.has(key)) {
-            firstMonthByGroup.set(key, inv.id);
           }
         }
       }
@@ -8749,11 +8746,6 @@ async function runRecalcV2(source = 'manual') {
         `SELECT plan_code, recurring_price::float AS price FROM zoho_plans WHERE recurring_price > 0`
       )).rows.forEach(p => planPrices.set(String(p.plan_code).toLowerCase(), p.price));
 
-      // PASS 1c: ANNUAL subscriptions (user rule 2026-06-11) — a yearly-billed SaaS line pays
-      // 10% (rep rate) on the customer's FIRST invoice for that plan, 0% on annual renewals,
-      // and never the 100% monthly-activation rule. "Annual" = plan bills yearly in Zoho
-      // Billing, or the line name says Annual/Annuel/par année/Yearly. Detected from STORED
-      // line_items with one server-side aggregate query (no per-invoice JSONB transfer).
       const annualPlanCodes = new Set(
         (await pool.query(
           `SELECT LOWER(plan_code) AS code FROM zoho_plans WHERE interval_unit ILIKE 'year%'`
@@ -8791,6 +8783,27 @@ async function runRecalcV2(source = 'manual') {
           if (!claimedBy.has(key)) claimedBy.set(key, r.id);
           if (claimedBy.get(key) === r.id) rec.firstTotal += r.amount;
           annualByInvoice.set(r.id, rec);
+        }
+      }
+
+      // PASS 1d: first-month detection — ONLY the customer's INITIAL sale unlocks the 100%
+      // activation commission (user rule 2026-06-11: a monthly add-on sold to an EXISTING
+      // customer pays 0 — it only pays when part of the initial sale/activation invoice).
+      // The initial group = the activation group of the customer's earliest monthly-SaaS
+      // invoice. Later subscription activations (add-ons) are renewals. Pure-annual invoices
+      // neither claim nor define groups (they follow the annual 10% rule); void/deleted
+      // invoices can't claim a group either.
+      const firstMonthByGroup = new Map();
+      const initialGroupByCustomer = new Map();
+      for (const inv of invRes.rows) {
+        if (inv.status === 'void' || inv.status === 'deleted') continue;
+        const saasAmt = parseFloat(inv.saas_amount) || 0;
+        const annualTot = annualByInvoice.get(inv.id)?.total || 0;
+        if (saasAmt - annualTot <= 0.005) continue; // no monthly-SaaS portion
+        if (inv.subscription_activation_date) {
+          const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
+          if (!firstMonthByGroup.has(key)) firstMonthByGroup.set(key, inv.id);
+          if (!initialGroupByCustomer.has(inv.customer_name)) initialGroupByCustomer.set(inv.customer_name, key);
         }
       }
 
@@ -8874,7 +8887,9 @@ async function runRecalcV2(source = 'manual') {
         } else if (monthlySaas > 0 && hardwareAmount === 0) {
           // Pure monthly SaaS — first month gets 100% (of the PLAN price when known), renewals get 0
           const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
-          const isFirstMonth = firstMonthByGroup.get(key) === inv.id;
+          // 100% activation only on the INITIAL sale's group — later add-ons are renewals.
+          const isFirstMonth = firstMonthByGroup.get(key) === inv.id
+            && initialGroupByCustomer.get(inv.customer_name) === key;
           if (isFirstMonth) {
             commission = saasFirstBase.get(inv.id) ?? monthlySaas;
             bucket = 'saas_first';
@@ -8901,7 +8916,9 @@ async function runRecalcV2(source = 'manual') {
         } else if (hardwareAmount > 0 && monthlySaas > 0) {
           // Mixed — monthly-SaaS portion follows first-month rule, hardware portion needs window
           const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
-          const isFirstMonth = firstMonthByGroup.get(key) === inv.id;
+          // 100% activation only on the INITIAL sale's group — later add-ons are renewals.
+          const isFirstMonth = firstMonthByGroup.get(key) === inv.id
+            && initialGroupByCustomer.get(inv.customer_name) === key;
           const firstSaasPaid = firstSaasPaidByCustomer.get(inv.customer_name);
           if (isFirstMonth) {
             commission += saasFirstBase.get(inv.id) ?? monthlySaas;
