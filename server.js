@@ -295,6 +295,9 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE teams ADD COLUMN IF NOT EXISTS sort_order INT DEFAULT 0`);
     // Per-salesperson monthly quota override (NULL = use the default MONTHLY_QUOTA).
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS monthly_quota INT`);
+    // Rep's login email — lets role pre-assignment + impersonation work BEFORE their
+    // first Zoho login (user_tokens has no row yet). Must match their Zoho account email.
+    await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS email VARCHAR(255)`);
     // Manual override of a deal's lead source group. Sync only writes lead_source_group, so this
     // override survives re-syncs. Effective source = COALESCE(override, lead_source_group).
     await pool.query(`ALTER TABLE crm_sold_deals ADD COLUMN IF NOT EXISTS lead_source_group_override VARCHAR(255)`);
@@ -737,9 +740,14 @@ const authenticateToken = async (req, res, next) => {
         req.user.isAdmin        = false;               // never admin while impersonating
         req.user.impersonating  = true;
         // True "view as": adopt the impersonated salesperson's OWN login account
-        // (so their real permissions apply). A rep with no login → no perms at all.
+        // (so their real permissions apply). Falls back to the email set on their
+        // salesperson card (Admin → Salespeople) so pre-assigned roles can be tested
+        // BEFORE the rep's first login. No account and no card email → no perms.
         const acct = await pool.query(
-          'SELECT email FROM user_tokens WHERE LOWER(display_name) = LOWER($1) LIMIT 1',
+          `SELECT COALESCE(
+             (SELECT email FROM user_tokens WHERE LOWER(display_name) = LOWER($1) LIMIT 1),
+             (SELECT email FROM salespeople WHERE LOWER(name) = LOWER($1) LIMIT 1)
+           ) AS email`,
           [result.rows[0].name]
         );
         req.user.email = acct.rows[0]?.email || null;
@@ -6470,13 +6478,14 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
 
     const result = await pool.query(
       `SELECT s.name, s.is_active, s.commission_rate, s.base_salary, s.invoice_count, s.aliases,
-              s.signup_bonus_amount, s.signup_bonus_enabled, s.monthly_quota, s.team_id, t.name AS team_name
+              s.signup_bonus_amount, s.signup_bonus_enabled, s.monthly_quota, s.team_id, s.email, t.name AS team_name
        FROM salespeople s LEFT JOIN teams t ON t.id = s.team_id
        ORDER BY s.name`
     );
     res.json({
       salespeople: result.rows.map(r => ({
         name:               r.name,
+        email:              r.email || null,
         isActive:           r.is_active,
         commissionRate:     parseFloat(r.commission_rate) || 10,
         baseSalary:         parseFloat(r.base_salary)     || 0,
@@ -6523,6 +6532,26 @@ app.put('/api/salespeople/:name/quota', authenticateToken, async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update quota', details: error.message });
+  }
+});
+
+// PUT /api/salespeople/:name/email — the rep's Zoho login email (null/empty clears it).
+// Used by role pre-assignment + impersonation before the rep's first login.
+app.put('/api/salespeople/:name/email', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const raw = (req.body.email || '').trim().toLowerCase();
+  if (raw && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(raw)) {
+    return res.status(400).json({ error: 'Invalid email' });
+  }
+  try {
+    const r = await pool.query(
+      `UPDATE salespeople SET email = $1, updated_at = CURRENT_TIMESTAMP WHERE name = $2 RETURNING name`,
+      [raw || null, req.params.name]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Salesperson not found' });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update email', details: error.message });
   }
 });
 
