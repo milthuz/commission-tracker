@@ -6100,8 +6100,17 @@ app.get('/api/admin/commission-imports/:id', authenticateToken, async (req, res)
 // and how much earned commission is still UNPAID per the app's model. Lets the user spot
 // at a glance which pay files are missing (report era ≤ Apr 2026) and which platform
 // periods (May 2026+) haven't been committed yet.
-app.get('/api/admin/commission-imports/coverage/matrix', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+app.get('/api/admin/commission-imports/coverage/matrix', (req, res, next) => {
+  // Shared-secret bypass (same as rep-customers/db-stats) so reconciliation state
+  // can be audited without a session.
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) {
+    req.viaSecret = true;
+    return next();
+  }
+  return authenticateToken(req, res, next);
+}, async (req, res) => {
+  if (!req.viaSecret && !(await requirePerm(req, res, 'report:mark_paid'))) return;
   try {
     // Months from 2025-01 through the current month
     const months = [];
