@@ -7000,15 +7000,46 @@ app.get('/api/admin/users', authenticateToken, async (req, res) => {
       if (!rolesByUser[key]) rolesByUser[key] = [];
       rolesByUser[key].push({ id: row.id, name: row.name });
     }
-    res.json({
-      users: result.rows.map(r => ({
+    // Merge in EXTERNAL users (local_users) and role-assigned emails that have never
+    // logged in yet ('pending') — so roles can be managed for everyone in one place,
+    // including reps BEFORE their first Zoho login.
+    const seen = new Set(result.rows.map(r => r.email.toLowerCase()));
+    const users = result.rows.map(r => ({
+      email:     r.email,
+      isAdmin:   r.is_admin,
+      createdAt: r.created_at,
+      lastLogin: r.last_login,
+      userType:  'zoho',
+      roles:     rolesByUser[r.email.toLowerCase()] || [],
+    }));
+    const localRes = await pool.query(
+      `SELECT email, status, created_at, last_login_at AS last_login FROM local_users ORDER BY created_at DESC`
+    );
+    for (const r of localRes.rows) {
+      if (seen.has(r.email.toLowerCase())) continue;
+      seen.add(r.email.toLowerCase());
+      users.push({
         email:     r.email,
-        isAdmin:   r.is_admin,
+        isAdmin:   false,
         createdAt: r.created_at,
         lastLogin: r.last_login,
+        userType:  'external',
         roles:     rolesByUser[r.email.toLowerCase()] || [],
-      }))
-    });
+      });
+    }
+    for (const email of Object.keys(rolesByUser)) {
+      if (seen.has(email)) continue;
+      seen.add(email);
+      users.push({
+        email,
+        isAdmin:   false,
+        createdAt: null,
+        lastLogin: null,
+        userType:  'pending',
+        roles:     rolesByUser[email] || [],
+      });
+    }
+    res.json({ users });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch users', details: error.message });
   }
