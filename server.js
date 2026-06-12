@@ -298,6 +298,11 @@ async function initializeDatabase() {
     // Rep's login email — lets role pre-assignment + impersonation work BEFORE their
     // first Zoho login (user_tokens has no row yet). Must match their Zoho account email.
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS email VARCHAR(255)`);
+    // Comp plan v7.7: hire_date drives the 90-day ramp (quota gate waived);
+    // quota_gate_enabled=false exempts a rep from the gate entirely (house
+    // accounts, resellers, execs not on the rep plan).
+    await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS hire_date DATE`);
+    await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS quota_gate_enabled BOOLEAN DEFAULT true`);
     // Invoice-level (entity) discount facts — captured by enrich from the Zoho detail.
     // Comp plan v7.7: commission base = pre-tax value AFTER discount; hardware rate
     // halves (10%→5%) when the discount is ≥ 25%. NULL = not captured yet.
@@ -1398,7 +1403,9 @@ THE COMMISSION MODEL:
 - Commission base amounts are PRE-TAX.
 - "Unlock Month" = when the commission becomes payable (SaaS: when the first invoice is paid; hardware: when both hardware and first SaaS are paid).
 - Once a commission is marked PAID it stays as paid — history doesn't change.
-- Signup payment: a bonus (typically $100) for each Zentact merchant activation.
+- Signup payment: a bonus (typically $100) for each Zentact merchant activation. Never gated by quota.
+- QUOTA GATE (from May 2026): the monthly quota (default 15 points) must be met for hardware/SaaS commissions to be paid that month — otherwise base salary only. New hires have a 90-day ramp with no quota requirement.
+- Monthly performance bonus (from May 2026): 20 points = $250, 25 = $500, 30 = $1,000 (highest tier only).
 
 LOGIN & ACCOUNTS:
 - Internal users sign in with Zoho (SSO button). External users are invited by email, set a password, and MUST set up two-step verification (authenticator app, 6-digit codes).
@@ -6598,7 +6605,8 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
 
     const result = await pool.query(
       `SELECT s.name, s.is_active, s.commission_rate, s.base_salary, s.invoice_count, s.aliases,
-              s.signup_bonus_amount, s.signup_bonus_enabled, s.monthly_quota, s.team_id, s.email, t.name AS team_name
+              s.signup_bonus_amount, s.signup_bonus_enabled, s.monthly_quota, s.team_id, s.email,
+              s.hire_date, s.quota_gate_enabled, t.name AS team_name
        FROM salespeople s LEFT JOIN teams t ON t.id = s.team_id
        ORDER BY s.name`
     );
@@ -6614,6 +6622,8 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
         signupBonusAmount:  r.signup_bonus_amount == null ? 100 : parseFloat(r.signup_bonus_amount),
         signupBonusEnabled: r.signup_bonus_enabled !== false,
         monthlyQuota:       r.monthly_quota == null ? null : parseInt(r.monthly_quota),
+        hireDate:           r.hire_date ? new Date(r.hire_date).toISOString().slice(0, 10) : null,
+        quotaGateEnabled:   r.quota_gate_enabled !== false,
         teamId:             r.team_id || null,
         teamName:           r.team_name || null,
       }))
@@ -6652,6 +6662,39 @@ app.put('/api/salespeople/:name/quota', authenticateToken, async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update quota', details: error.message });
+  }
+});
+
+// PUT /api/salespeople/:name/hire-date — drives the 90-day quota-gate ramp (null clears).
+app.put('/api/salespeople/:name/hire-date', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const raw = (req.body.hireDate || '').trim();
+  if (raw && !/^\d{4}-\d{2}-\d{2}$/.test(raw)) return res.status(400).json({ error: 'Invalid date (YYYY-MM-DD)' });
+  try {
+    const r = await pool.query(
+      `UPDATE salespeople SET hire_date = $1::date, updated_at = CURRENT_TIMESTAMP WHERE name = $2 RETURNING name`,
+      [raw || null, req.params.name]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Salesperson not found' });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update hire date', details: error.message });
+  }
+});
+
+// PUT /api/salespeople/:name/quota-gate — exempt a rep from the plan v7.7 quota gate.
+app.put('/api/salespeople/:name/quota-gate', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const enabled = req.body.enabled !== false;
+  try {
+    const r = await pool.query(
+      `UPDATE salespeople SET quota_gate_enabled = $1, updated_at = CURRENT_TIMESTAMP WHERE name = $2 RETURNING name`,
+      [enabled, req.params.name]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Salesperson not found' });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update quota gate', details: error.message });
   }
 });
 
@@ -8670,12 +8713,34 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
            AND activated_at >= $2 AND activated_at < $3`,
         [targetRep, periodStart, periodEnd]
       )).rows;
-      return rows.map(r => ({
+      const bonuses = rows.map(r => ({
         bonus_type:    'signup',
         merchant_name: r.merchant_name || null,
         amount:        r.bonus_amount || 0,
         report_date:   r.activated_at || null,
       }));
+      // Monthly performance bonus (plan v7.7 §5): when the month's quota is met, the
+      // highest tier reached pays (20→$250, 25→$500, 30→$1000, non-cumulative).
+      // Platform era only — historical (imported) periods carried it inside the file.
+      if (periodStart >= PLAN_START_DATE) {
+        const ptsMap = await getMonthlyPointsByRep(periodStart);
+        const ym = `${periodStart.getFullYear()}-${String(periodStart.getMonth() + 1).padStart(2, '0')}`;
+        const pts = ptsMap.get(`${targetRep}|${ym}`) || 0;
+        const spQ = await pool.query(
+          `SELECT monthly_quota FROM salespeople WHERE name = $1`, [targetRep]
+        );
+        const quota = spQ.rows[0]?.monthly_quota == null ? MONTHLY_QUOTA : parseInt(spQ.rows[0].monthly_quota);
+        const bonus = pts >= quota ? ZohoCRMService.calculateMonthlyBonus(pts) : 0;
+        if (bonus > 0) {
+          bonuses.push({
+            bonus_type:    'monthly_performance',
+            merchant_name: `${pts} pts`,
+            amount:        bonus,
+            report_date:   null,
+          });
+        }
+      }
+      return bonuses;
     };
 
     // Prefer a historical import for this rep+period when one exists.
@@ -8789,7 +8854,18 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
     )).rows;
 
     const bonusTotal = bonusRows.reduce((a, r) => a + (r.bonus_amount || 0), 0);
-    const total      = invRows.reduce((a, r) => a + (r.commission || 0), 0) + bonusTotal;
+
+    // Monthly performance bonus (plan v7.7 §5) — same computation as the generated stub.
+    let perfBonus = 0, perfPts = 0;
+    if (periodStart >= PLAN_START_DATE) {
+      const ptsMap = await getMonthlyPointsByRep(periodStart);
+      perfPts = ptsMap.get(`${repName}|${year}-${mm}`) || 0;
+      const spQ = await client.query(`SELECT monthly_quota FROM salespeople WHERE name = $1`, [repName]);
+      const quota = spQ.rows[0]?.monthly_quota == null ? MONTHLY_QUOTA : parseInt(spQ.rows[0].monthly_quota);
+      perfBonus = perfPts >= quota ? ZohoCRMService.calculateMonthlyBonus(perfPts) : 0;
+    }
+
+    const total      = invRows.reduce((a, r) => a + (r.commission || 0), 0) + bonusTotal + perfBonus;
 
     // Idempotent re-commit: drop any prior app-generated stub for this rep+period (cascades).
     await client.query(
@@ -8804,10 +8880,10 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
          (filename, rep_name, paid_for_period, imported_by, invoices_marked, invoices_skipped,
           invoices_not_found, signup_bonuses_count, signup_bonuses_amount, monthly_bonus_amount,
           total_amount, raw_summary)
-       VALUES ($1, $2, $3::date, $4, $5, 0, 0, $6, $7, 0, $8, $9::jsonb)
+       VALUES ($1, $2, $3::date, $4, $5, 0, 0, $6, $7, $8, $9, $10::jsonb)
        RETURNING id`,
-      [filename, repName, periodDate, actor, invRows.length, bonusRows.length, bonusTotal, total,
-       JSON.stringify({ source: 'app-generated', period: `${year}-${mm}` })]
+      [filename, repName, periodDate, actor, invRows.length, bonusRows.length, bonusTotal, perfBonus, total,
+       JSON.stringify({ source: 'app-generated', period: `${year}-${mm}`, performance_points: perfPts })]
     )).rows[0];
 
     for (const r of invRows) {
@@ -8833,6 +8909,14 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
            (import_id, rep_name, bonus_type, merchant_name, matched_zentact_id, amount, paid_for_period, report_date)
          VALUES ($1, $2, 'signup', $3, $4, $5, $6::date, $7::date)`,
         [imp.id, repName, b.business_name || null, b.merchant_account_id || null, b.bonus_amount || 0, periodDate, b.activated_at || null]
+      );
+    }
+    if (perfBonus > 0) {
+      await client.query(
+        `INSERT INTO commission_bonuses
+           (import_id, rep_name, bonus_type, merchant_name, amount, paid_for_period)
+         VALUES ($1, $2, 'monthly_performance', $3, $4, $5::date)`,
+        [imp.id, repName, `${perfPts} pts`, perfBonus, periodDate]
       );
     }
 
@@ -8873,6 +8957,52 @@ let recalcV2Job = {
 
 // Shared recalc routine — used both by the HTTP endpoint and by post-sync auto-trigger.
 // Returns the final recalcV2Job state. Caller decides whether to await or fire-and-forget.
+// Monthly sales points per rep — same rules as /api/crm/points (deal-type points for
+// CRM deals by sold_date + Zentact activation points, reseller-boarded excluded).
+// Used by the QUOTA GATE in recalc-v2 and the monthly performance bonus in pay stubs.
+// Returns Map('Rep Name|YYYY-MM' → points).
+async function getMonthlyPointsByRep(fromDate) {
+  const dealSourcePoints = new Map(
+    (await pool.query(`SELECT source_group, points FROM deal_source_points`)).rows
+      .map(r => [String(r.source_group).toLowerCase(), parseInt(r.points)])
+  );
+  const repByGroup = new Map();
+  for (const r of (await pool.query(`
+    SELECT COALESCE(lead_source_group_override, lead_source_group) AS g, points, COUNT(*)::int AS c
+    FROM crm_sold_deals
+    WHERE COALESCE(lead_source_group_override, lead_source_group) IS NOT NULL
+      AND COALESCE(lead_source_group_override, lead_source_group) <> ''
+    GROUP BY g, points
+  `)).rows) {
+    const cur = repByGroup.get(r.g);
+    if (!cur || r.c > cur.c) repByGroup.set(r.g, { points: parseInt(r.points) || 0, c: r.c });
+  }
+  const map = new Map();
+  const add = (rep, ym, pts) => { const k = `${rep}|${ym}`; map.set(k, (map.get(k) || 0) + pts); };
+  for (const r of (await pool.query(`
+    SELECT owner_name AS rep, to_char(sold_date, 'YYYY-MM') AS ym,
+           COALESCE(lead_source_group_override, lead_source_group) AS g,
+           points, COUNT(*)::int AS c
+    FROM crm_sold_deals
+    WHERE sold_date >= $1 AND owner_name IS NOT NULL
+    GROUP BY 1, 2, 3, 4
+  `, [fromDate])).rows) {
+    const g = String(r.g || '');
+    const mapped = dealSourcePoints.get(g.toLowerCase());
+    const pts = mapped != null ? mapped : (repByGroup.get(g) ? repByGroup.get(g).points : (parseInt(r.points) || 0));
+    add(r.rep, r.ym, pts * r.c);
+  }
+  for (const r of (await pool.query(`
+    SELECT sales_rep_name AS rep, to_char(activated_at, 'YYYY-MM') AS ym,
+           SUM(COALESCE(points, 1))::int AS pts
+    FROM zentact_merchants
+    WHERE status = 'ACTIVE' AND activated_at >= $1 AND sales_rep_name IS NOT NULL
+      AND (reseller_attribute IS NULL OR reseller_attribute = '')
+    GROUP BY 1, 2
+  `, [fromDate])).rows) add(r.rep, r.ym, parseInt(r.pts) || 0);
+  return map;
+}
+
 async function runRecalcV2(source = 'manual') {
   if (recalcV2Job.status === 'running') {
     return { skipped: true, reason: 'already_running' };
@@ -8883,13 +9013,37 @@ async function runRecalcV2(source = 'manual') {
     source,
     processed: 0, total: 0,
     message: `Starting (${source})...`,
-    stats: { hardware: 0, saas_first: 0, saas_annual: 0, saas_renewal: 0, too_late: 0, pending_saas: 0, pending_payment: 0, not_eligible: 0, frozen_paid: 0, total_commission: 0 },
+    stats: { hardware: 0, saas_first: 0, saas_annual: 0, saas_renewal: 0, too_late: 0, pending_saas: 0, pending_payment: 0, not_eligible: 0, quota_not_met: 0, frozen_paid: 0, total_commission: 0 },
   };
   try {
-      // Load rep rates
-      const spRes = await pool.query('SELECT name, commission_rate FROM salespeople');
+      // Load rep rates + quota-gate config (plan v7.7)
+      const spRes = await pool.query(
+        'SELECT name, commission_rate, monthly_quota, hire_date, quota_gate_enabled FROM salespeople'
+      );
       const rateMap = {};
-      spRes.rows.forEach(r => { rateMap[r.name] = parseFloat(r.commission_rate) || 10; });
+      const spInfo = new Map();
+      spRes.rows.forEach(r => {
+        rateMap[r.name] = parseFloat(r.commission_rate) || 10;
+        spInfo.set(r.name, {
+          quota:    r.monthly_quota == null ? MONTHLY_QUOTA : parseInt(r.monthly_quota),
+          hireDate: r.hire_date ? new Date(r.hire_date) : null,
+          gated:    r.quota_gate_enabled !== false,
+        });
+      });
+
+      // QUOTA GATE (plan v7.7 §2, platform era only): a month where the rep missed their
+      // monthly quota pays NO hardware/SaaS commissions ("base salary only"). Signup
+      // bonuses are never gated. 90-day ramp from hire_date waives the gate (§7);
+      // quota_gate_enabled=false exempts the rep entirely.
+      const pointsByRepMonth = await getMonthlyPointsByRep(PLAN_START_DATE);
+      const RAMP_MS = 90 * 86400000;
+      const quotaGatePasses = (rep, payDate) => {
+        const sp = spInfo.get(rep);
+        if (!sp || !sp.gated) return true;
+        if (sp.hireDate && (payDate.getTime() - sp.hireDate.getTime()) < RAMP_MS) return true; // ramp
+        const ym = `${payDate.getUTCFullYear()}-${String(payDate.getUTCMonth() + 1).padStart(2, '0')}`;
+        return (pointsByRepMonth.get(`${rep}|${ym}`) || 0) >= sp.quota;
+      };
 
       // Load all invoices (paid + not paid) with enriched data
       const invRes = await pool.query(`
@@ -9165,6 +9319,15 @@ async function runRecalcV2(source = 'manual') {
           commission += annualFirstAmount * factor * (rate / 100);
           if (bucket !== 'saas_first' && bucket !== 'hardware') bucket = 'saas_annual';
           if (!payableDate) payableDate = invPaidDate;
+        }
+
+        // QUOTA GATE: from the platform era (PLAN_START_DATE), commissions whose unlock
+        // month missed the rep's quota are forfeited (plan v7.7 §2 — base salary only).
+        if (commission > 0 && payableDate && payableDate >= PLAN_START_DATE
+            && !quotaGatePasses(inv.salesperson_name, payableDate)) {
+          commission = 0;
+          bucket = 'quota_not_met';
+          payableDate = null;
         }
 
         // FREEZE: once a commission has been PAID (import or mark-paid/pay-stub commit), the
