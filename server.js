@@ -5003,6 +5003,54 @@ app.get('/api/admin/invoice-lookup', async (req, res) => {
   }
 });
 
+// POST /api/admin/reclassify-noncommission?secret=<shared>
+// Maintenance: flip STORED hardware lines whose name matches the noncommission rules
+// (shipping/livraison/freight — classifyLineType already excludes them going forward)
+// and recompute hardware_amount on the touched invoices. Idempotent; run recalc-v2 after.
+app.post('/api/admin/reclassify-noncommission', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const flip = await pool.query(`
+      WITH affected AS (
+        SELECT id FROM invoices
+        WHERE line_items IS NOT NULL AND jsonb_typeof(line_items) = 'array'
+          AND EXISTS (
+            SELECT 1 FROM jsonb_array_elements(line_items) li
+            WHERE li->>'type' = 'hardware' AND li->>'name' ~* '\\m(shipping|livraison|freight)'
+          )
+      )
+      UPDATE invoices i SET
+        line_items = (
+          SELECT jsonb_agg(
+            CASE WHEN li->>'type' = 'hardware' AND li->>'name' ~* '\\m(shipping|livraison|freight)'
+                 THEN jsonb_set(li, '{type}', '"noncommission"')
+                 ELSE li END)
+          FROM jsonb_array_elements(i.line_items) li
+        ),
+        updated_at = CURRENT_TIMESTAMP
+      WHERE i.id IN (SELECT id FROM affected)
+      RETURNING i.id
+    `);
+    const ids = flip.rows.map(r => r.id);
+    if (ids.length) {
+      await pool.query(`
+        UPDATE invoices i SET hardware_amount = COALESCE((
+          SELECT SUM((li->>'amount')::numeric)
+          FROM jsonb_array_elements(i.line_items) li
+          WHERE li->>'type' = 'hardware'
+        ), 0)
+        WHERE i.id = ANY($1)
+      `, [ids]);
+    }
+    res.json({ invoices_updated: ids.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/admin/db-stats', async (req, res) => {
   const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
   if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
@@ -7404,8 +7452,9 @@ function normalizePlanName(s) {
 // noncommission amounts are excluded from BOTH saas_amount and hardware_amount, so they pay $0.
 function classifyLineType(name, sku, planCodes, planNames) {
   const n = normalizePlanName(name);
-  // Non-commissionable: residuals, referral payouts, and fees earn nothing.
-  if (/\b(residual|referral|fee|frais)/.test(n)) return 'noncommission';
+  // Non-commissionable: residuals, referral payouts, fees, and shipping earn nothing
+  // (shipping excluded per user decision 2026-06-11 — old reports never paid on it).
+  if (/\b(residual|referral|fee|frais|shipping|livraison|freight)/.test(n)) return 'noncommission';
   // SaaS: matches a Zoho plan, OR a recurring software product/add-on by keyword.
   if (sku && planCodes.has(String(sku).toLowerCase().trim())) return 'saas';
   if (n && planNames.has(n)) return 'saas';
