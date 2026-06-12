@@ -298,6 +298,11 @@ async function initializeDatabase() {
     // Rep's login email — lets role pre-assignment + impersonation work BEFORE their
     // first Zoho login (user_tokens has no row yet). Must match their Zoho account email.
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS email VARCHAR(255)`);
+    // Invoice-level (entity) discount facts — captured by enrich from the Zoho detail.
+    // Comp plan v7.7: commission base = pre-tax value AFTER discount; hardware rate
+    // halves (10%→5%) when the discount is ≥ 25%. NULL = not captured yet.
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS sub_total NUMERIC(12,2)`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS discount_total NUMERIC(12,2)`);
     // Manual override of a deal's lead source group. Sync only writes lead_source_group, so this
     // override survives re-syncs. Effective source = COALESCE(override, lead_source_group).
     await pool.query(`ALTER TABLE crm_sold_deals ADD COLUMN IF NOT EXISTS lead_source_group_override VARCHAR(255)`);
@@ -1389,7 +1394,7 @@ THE COMMISSION MODEL:
 - SaaS (subscription) first month: 100% of the SaaS amount, with a floor at the plan's monthly price (so a prorated first invoice still pays the full plan value). Renewals: 0% (the activation already paid it).
 - ANNUAL subscriptions (billed yearly, e.g. integration annual fees): 10% of the first year's invoice, 0% on annual renewals.
 - Monthly add-ons sold to an EXISTING customer: 0% — add-ons only pay when they are part of the initial sale (on the activation invoice).
-- Hardware: 10% of the hardware amount, only if paid within 6 months of the customer's first paid SaaS.
+- Hardware: 10% of the hardware amount, only if paid within 6 months of the customer's first paid SaaS. Commission is computed on the discounted pre-tax value; if the client's invoice discount is 25% or more, the hardware rate drops to 5%.
 - Commission base amounts are PRE-TAX.
 - "Unlock Month" = when the commission becomes payable (SaaS: when the first invoice is paid; hardware: when both hardware and first SaaS are paid).
 - Once a commission is marked PAID it stays as paid — history doesn't change.
@@ -4992,6 +4997,7 @@ app.get('/api/admin/invoice-lookup', async (req, res) => {
               status, approval_status, commission::float AS commission, commission_status,
               commission_payable_date::date AS commission_payable_date,
               total::float AS total, saas_amount::float AS saas_amount, hardware_amount::float AS hardware_amount,
+              sub_total::float AS sub_total, discount_total::float AS discount_total,
               subscription_activation_date::date AS subscription_activation_date, line_items
        FROM invoices WHERE invoice_number = ANY($1)`,
       [numbers]
@@ -5001,6 +5007,72 @@ app.get('/api/admin/invoice-lookup', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// POST /api/admin/backfill-subtotals?secret=<shared>&from=YYYY-MM-DD
+// Maintenance: fetch sub_total/discount_total from Zoho for paid invoices that don't
+// have them yet (column added 2026-06-11). 2 Zoho calls/invoice — scoped by `from`
+// (default 2026-04-01: the report era ≤ Apr 2026 is frozen history anyway).
+// Fire-and-forget; poll progress via ?status=1 (rows remaining).
+let subtotalBackfill = { status: 'idle', processed: 0, total: 0, errors: 0 };
+app.post('/api/admin/backfill-subtotals', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  if (req.query.status) return res.json(subtotalBackfill);
+  if (subtotalBackfill.status === 'running') return res.status(409).json({ error: 'already running', ...subtotalBackfill });
+  const from = req.query.from || '2026-04-01';
+  res.json({ started: true, from });
+  (async () => {
+    subtotalBackfill = { status: 'running', processed: 0, total: 0, errors: 0, from };
+    try {
+      const adminResult = await pool.query(
+        'SELECT email, api_domain FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
+      );
+      const admin = adminResult.rows[0];
+      const tokenData = await ensureValidToken(admin.email);
+      const accessToken = typeof tokenData === 'string' ? tokenData : tokenData?.access_token;
+      const orgId = process.env.ZOHO_ORG_ID;
+      const rows = (await pool.query(
+        `SELECT invoice_number FROM invoices
+         WHERE organization_id = $1 AND status = 'paid' AND sub_total IS NULL AND date >= $2::date
+         ORDER BY date DESC`,
+        [orgId, from]
+      )).rows;
+      subtotalBackfill.total = rows.length;
+      for (const row of rows) {
+        try {
+          const searchRes = await axios.get(`${admin.api_domain}/books/v3/invoices`, {
+            params: { organization_id: orgId, invoice_number: row.invoice_number },
+            headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
+          });
+          const stubInv = searchRes.data?.invoices?.[0];
+          if (!stubInv) { subtotalBackfill.errors++; subtotalBackfill.processed++; continue; }
+          const detRes = await axios.get(`${admin.api_domain}/books/v3/invoices/${stubInv.invoice_id}`, {
+            params: { organization_id: orgId },
+            headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
+          });
+          const det = detRes.data?.invoice;
+          if (!det) { subtotalBackfill.errors++; subtotalBackfill.processed++; continue; }
+          const subTotal  = parseFloat(det.sub_total) || 0;
+          const discTotal = det.discount_type === 'item_level' ? 0 : (parseFloat(det.discount_total) || 0);
+          await pool.query(
+            `UPDATE invoices SET sub_total = $1, discount_total = $2, updated_at = CURRENT_TIMESTAMP
+             WHERE invoice_number = $3 AND organization_id = $4`,
+            [subTotal || null, discTotal, row.invoice_number, orgId]
+          );
+          subtotalBackfill.processed++;
+        } catch (_e) { subtotalBackfill.errors++; subtotalBackfill.processed++; }
+      }
+      subtotalBackfill.status = 'completed';
+      console.log(`[SUBTOTAL-BACKFILL] done: ${subtotalBackfill.processed}/${subtotalBackfill.total} (${subtotalBackfill.errors} errors)`);
+    } catch (e) {
+      subtotalBackfill.status = 'error';
+      subtotalBackfill.message = e.message;
+      console.error('[SUBTOTAL-BACKFILL]', e.message);
+    }
+  })();
 });
 
 // POST /api/admin/reclassify-noncommission?secret=<shared>
@@ -7626,6 +7698,11 @@ async function runEnrichInvoices({ onlyMissing = true, source = 'manual' } = {})
           subActivation = await fetchSubActivation(det.recurring_invoice_id, apiDomain, accessToken, subCache);
         }
 
+        // Invoice-level (entity) discount only — item-level discounts are already net in
+        // each line's item_total, so counting them here would double-discount.
+        const subTotal  = parseFloat(det.sub_total) || 0;
+        const discTotal = det.discount_type === 'item_level' ? 0 : (parseFloat(det.discount_total) || 0);
+
         // Write this invoice's enriched facts IMMEDIATELY — incremental so progress is saved
         // continuously (resumable across restarts/OOM, no big in-memory accumulation, and the
         // count climbs visibly). commission_status / commission_payable_date are owned by
@@ -7637,9 +7714,12 @@ async function runEnrichInvoices({ onlyMissing = true, source = 'manual' } = {})
             saas_amount = $3,
             subscription_activation_date = $4::date,
             paid_date = $5::date,
+            sub_total = $6,
+            discount_total = $7,
             updated_at = CURRENT_TIMESTAMP
-          WHERE invoice_number = $6 AND organization_id = $7
-        `, [JSON.stringify(classified), hardwareAmount, saasAmount, subActivation, paidDate, det.invoice_number, orgId]);
+          WHERE invoice_number = $8 AND organization_id = $9
+        `, [JSON.stringify(classified), hardwareAmount, saasAmount, subActivation, paidDate,
+            subTotal || null, discTotal, det.invoice_number, orgId]);
 
         enrichJob.processed++;
         enrichJob.stats[type] = (enrichJob.stats[type] || 0) + 1;
@@ -8815,7 +8895,8 @@ async function runRecalcV2(source = 'manual') {
       const invRes = await pool.query(`
         SELECT id, invoice_number, salesperson_name, customer_name, total,
                hardware_amount, saas_amount, subscription_activation_date,
-               paid_date, commission_status, status, approval_status, commission
+               paid_date, commission_status, status, approval_status, commission,
+               sub_total, discount_total
         FROM invoices
         WHERE organization_id = $1
         ORDER BY date ASC
@@ -8924,21 +9005,32 @@ async function runRecalcV2(source = 'manual') {
         }
       }
 
+      // Invoice-level discount factor: scale billed amounts to what the customer actually
+      // pays pre-tax (comp plan v7.7 — commission on discounted value). The plan-price
+      // floor below is applied AFTER the factor, so a discounted/prorated activation
+      // still pays at least the full plan value.
+      const discountFactorOf = (subTotal, discTotal) => {
+        const st = parseFloat(subTotal) || 0, dt = parseFloat(discTotal) || 0;
+        if (st <= 0 || dt <= 0) return 1;
+        return Math.max(0, (st - dt) / st);
+      };
+
       const saasFirstBase = new Map();
       const firstIds = [...new Set(firstMonthByGroup.values())];
       if (firstIds.length && planPrices.size) {
         const liRows = (await pool.query(
-          `SELECT id, line_items FROM invoices WHERE id = ANY($1) AND line_items IS NOT NULL`,
+          `SELECT id, line_items, sub_total, discount_total FROM invoices WHERE id = ANY($1) AND line_items IS NOT NULL`,
           [firstIds]
         )).rows;
         for (const row of liRows) {
           const items = Array.isArray(row.line_items) ? row.line_items : [];
+          const factor = discountFactorOf(row.sub_total, row.discount_total);
           let base = 0, sawSaas = false;
           for (const li of items) {
             if (li.type !== 'saas') continue;
             if (isAnnualLine(li)) continue; // annual subs follow their own 10%-first-year rule
             sawSaas = true;
-            const amt   = parseFloat(li.amount) || 0;
+            const amt   = (parseFloat(li.amount) || 0) * factor;
             const qty   = parseInt(li.quantity) || 1;
             const price = li.plan_code ? (planPrices.get(String(li.plan_code).toLowerCase()) || 0) : 0;
             base += Math.max(amt, price * qty);
@@ -8979,7 +9071,13 @@ async function runRecalcV2(source = 'manual') {
         if (recalcV2Job.status === 'stopping') break;
 
         const rate = rateMap[inv.salesperson_name] || 10;
-        const hardwareAmount = parseFloat(inv.hardware_amount) || 0;
+        // Invoice-level discount (plan v7.7): bases are scaled to the discounted pre-tax
+        // value, and the HARDWARE rate halves (10%→5%) when the discount is ≥ 25%.
+        const factor = discountFactorOf(inv.sub_total, inv.discount_total);
+        const discountPct = (parseFloat(inv.sub_total) || 0) > 0
+          ? (parseFloat(inv.discount_total) || 0) / parseFloat(inv.sub_total) : 0;
+        const hwRate = discountPct >= 0.25 ? rate / 2 : rate;
+        const hardwareAmount = (parseFloat(inv.hardware_amount) || 0) * factor;
         const saasAmount     = parseFloat(inv.saas_amount)     || 0;
         const annualInfo = annualByInvoice.get(inv.id);
         const annualAmount      = annualInfo ? annualInfo.total : 0;
@@ -9023,7 +9121,7 @@ async function runRecalcV2(source = 'manual') {
           } else {
             const windowEnd = monthsLater(firstSaasPaid.paidDate, 6);
             if (invPaidDate <= windowEnd) {
-              commission = hardwareAmount * (rate / 100);
+              commission = hardwareAmount * (hwRate / 100);
               bucket = 'hardware';
               payableDate = invPaidDate > firstSaasPaid.paidDate ? invPaidDate : firstSaasPaid.paidDate;
             } else {
@@ -9047,7 +9145,7 @@ async function runRecalcV2(source = 'manual') {
           if (firstSaasPaid) {
             const windowEnd = monthsLater(firstSaasPaid.paidDate, 6);
             if (invPaidDate <= windowEnd) {
-              commission += hardwareAmount * (rate / 100);
+              commission += hardwareAmount * (hwRate / 100);
               // If the SaaS portion didn't already set a payable date (renewal w/ HW), use the
               // later of this invoice's paid_date and the first-SaaS paid_date.
               if (!payableDate) {
@@ -9060,10 +9158,11 @@ async function runRecalcV2(source = 'manual') {
           bucket = 'saas_renewal';
         }
 
-        // ANNUAL subscriptions: 10% (rep rate) of the first year's annual lines, unlocked when
-        // the invoice is paid. Annual renewals earn nothing (annualFirstAmount = 0 for them).
+        // ANNUAL subscriptions: 10% (rep rate) of the first year's annual lines (after the
+        // invoice-level discount), unlocked when the invoice is paid. Annual renewals earn
+        // nothing (annualFirstAmount = 0 for them).
         if (annualFirstAmount > 0 && inv.status === 'paid' && invPaidDate) {
-          commission += annualFirstAmount * (rate / 100);
+          commission += annualFirstAmount * factor * (rate / 100);
           if (bucket !== 'saas_first' && bucket !== 'hardware') bucket = 'saas_annual';
           if (!payableDate) payableDate = invPaidDate;
         }
