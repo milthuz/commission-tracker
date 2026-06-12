@@ -298,6 +298,17 @@ async function initializeDatabase() {
     // Rep's login email — lets role pre-assignment + impersonation work BEFORE their
     // first Zoho login (user_tokens has no row yet). Must match their Zoho account email.
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS email VARCHAR(255)`);
+    // Per-month quota waivers — admin decision to pay a rep's commissions for a month
+    // even though they missed quota (plan v7.7 exception, "payer quand même").
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS quota_month_waivers (
+        rep_name   VARCHAR(255) NOT NULL,
+        period     DATE NOT NULL,
+        created_by VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (rep_name, period)
+      );
+    `);
     // Comp plan v7.7: hire_date drives the 90-day ramp (quota gate waived);
     // quota_gate_enabled=false exempts a rep from the gate entirely (house
     // accounts, resellers, execs not on the rep plan).
@@ -8791,6 +8802,27 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
     const lines   = (await genLines()).filter(l => l.approval_status !== 'paid');
     const bonuses = await genBonuses();
     const total   = lines.reduce((a, l) => a + l.paid_amount, 0) + bonuses.reduce((a, b) => a + b.amount, 0);
+
+    // Quota-gate context for payroll admins (plan v7.7 §2): lets the modal show
+    // "quota non atteint (X/15 pts)" + the per-month "payer quand même" override.
+    let quota = null;
+    if (canAudit && periodStart >= PLAN_START_DATE) {
+      const sp = (await pool.query(
+        `SELECT monthly_quota, quota_gate_enabled, hire_date FROM salespeople WHERE name = $1`, [targetRep]
+      )).rows[0];
+      if (sp && sp.quota_gate_enabled !== false) {
+        const ptsMap = await getMonthlyPointsByRep(periodStart);
+        const points = ptsMap.get(`${targetRep}|${year}-${mm}`) || 0;
+        const required = sp.monthly_quota == null ? MONTHLY_QUOTA : parseInt(sp.monthly_quota);
+        const ramp = sp.hire_date && (periodStart.getTime() - new Date(sp.hire_date).getTime()) < 90 * 86400000;
+        const waived = (await pool.query(
+          `SELECT 1 FROM quota_month_waivers WHERE rep_name = $1 AND period = $2::date`,
+          [targetRep, `${year}-${mm}-01`]
+        )).rows.length > 0;
+        quota = { points, required, met: points >= required, ramp: !!ramp, waived };
+      }
+    }
+
     return res.json({
       source:      'generated',
       linesStored: true,
@@ -8799,9 +8831,37 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
       lines,
       bonuses,
       total,
+      quota,
     });
   } catch (e) {
     res.status(500).json({ error: 'Failed to build pay stub', details: e.message });
+  }
+});
+
+// POST /api/commissions/quota-waiver — admin decision: pay a rep's month DESPITE the
+// missed quota (plan v7.7 exception). Body: { repName, year, month, waived }. Setting or
+// removing a waiver kicks a recalc so the month's forfeited commissions come back (or
+// get re-gated) — allow ~2 minutes before reopening the stub.
+app.post('/api/commissions/quota-waiver', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const { repName, year, month, waived } = req.body;
+  if (!repName || !year || !month) return res.status(400).json({ error: 'repName, year, month required' });
+  const period = `${year}-${String(month).padStart(2, '0')}-01`;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  try {
+    if (waived === false) {
+      await pool.query(`DELETE FROM quota_month_waivers WHERE rep_name = $1 AND period = $2::date`, [repName, period]);
+    } else {
+      await pool.query(
+        `INSERT INTO quota_month_waivers (rep_name, period, created_by)
+         VALUES ($1, $2::date, $3) ON CONFLICT (rep_name, period) DO NOTHING`,
+        [repName, period, actor]
+      );
+    }
+    res.json({ success: true, waived: waived !== false, recalc: 'started' });
+    runRecalcV2('quota-waiver').catch(e => console.error('waiver recalc error:', e.message));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -9036,12 +9096,18 @@ async function runRecalcV2(source = 'manual') {
       // bonuses are never gated. 90-day ramp from hire_date waives the gate (§7);
       // quota_gate_enabled=false exempts the rep entirely.
       const pointsByRepMonth = await getMonthlyPointsByRep(PLAN_START_DATE);
+      // Per-month admin waivers ("payer quand même") override the gate for that rep+month.
+      const waivers = new Set(
+        (await pool.query(`SELECT rep_name, to_char(period, 'YYYY-MM') AS ym FROM quota_month_waivers`))
+          .rows.map(r => `${r.rep_name}|${r.ym}`)
+      );
       const RAMP_MS = 90 * 86400000;
       const quotaGatePasses = (rep, payDate) => {
         const sp = spInfo.get(rep);
         if (!sp || !sp.gated) return true;
         if (sp.hireDate && (payDate.getTime() - sp.hireDate.getTime()) < RAMP_MS) return true; // ramp
         const ym = `${payDate.getUTCFullYear()}-${String(payDate.getUTCMonth() + 1).padStart(2, '0')}`;
+        if (waivers.has(`${rep}|${ym}`)) return true; // admin month waiver
         return (pointsByRepMonth.get(`${rep}|${ym}`) || 0) >= sp.quota;
       };
 
