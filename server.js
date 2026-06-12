@@ -1389,7 +1389,7 @@ THE COMMISSION MODEL:
 - SaaS (subscription) first month: 100% of the SaaS amount, with a floor at the plan's monthly price (so a prorated first invoice still pays the full plan value). Renewals: 0% (the activation already paid it).
 - ANNUAL subscriptions (billed yearly, e.g. integration annual fees): 10% of the first year's invoice, 0% on annual renewals.
 - Monthly add-ons sold to an EXISTING customer: 0% — add-ons only pay when they are part of the initial sale (on the activation invoice).
-- Hardware: 10% of the hardware amount, only if paid within 3 months of the customer's first paid SaaS.
+- Hardware: 10% of the hardware amount, only if paid within 6 months of the customer's first paid SaaS.
 - Commission base amounts are PRE-TAX.
 - "Unlock Month" = when the commission becomes payable (SaaS: when the first invoice is paid; hardware: when both hardware and first SaaS are paid).
 - Once a commission is marked PAID it stays as paid — history doesn't change.
@@ -8150,7 +8150,7 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
 
     // groupBy=payable (default, new behaviour) → bucket invoices by commission_payable_date.
     //   That's the month the rep "unlocks" the commission (paid SaaS first month / hardware
-    //   within 3-month window). Invoices with NULL payable_date are not yet earned and
+    //   within 6-month window). Invoices with NULL payable_date are not yet earned and
     //   are surfaced separately (see pending stats below).
     // groupBy=invoice → legacy: bucket by invoice date.
     const groupBy = (req.query.groupBy || 'payable').toString();
@@ -8785,7 +8785,7 @@ async function runRecalcV2(source = 'manual') {
         return x;
       };
 
-      // PASS 1: first paid SaaS per customer (anchors the hardware 3-month window).
+      // PASS 1: first paid SaaS per customer (anchors the hardware 6-month window).
       // First-month/activation detection moved to PASS 1d (needs the annual-line map).
       const firstSaasPaidByCustomer = new Map();
       for (const inv of invRes.rows) {
@@ -8967,12 +8967,12 @@ async function runRecalcV2(source = 'manual') {
             bucket = 'saas_renewal';
           }
         } else if (hardwareAmount > 0 && monthlySaas === 0) {
-          // Pure hardware — eligible if paid before OR within 3 months after first SaaS
+          // Pure hardware — eligible if paid before OR within 6 months after first SaaS
           const firstSaasPaid = firstSaasPaidByCustomer.get(inv.customer_name);
           if (!firstSaasPaid) {
             bucket = 'pending_saas';
           } else {
-            const windowEnd = monthsLater(firstSaasPaid.paidDate, 3);
+            const windowEnd = monthsLater(firstSaasPaid.paidDate, 6);
             if (invPaidDate <= windowEnd) {
               commission = hardwareAmount * (rate / 100);
               bucket = 'hardware';
@@ -8996,7 +8996,7 @@ async function runRecalcV2(source = 'manual') {
             bucket = 'saas_renewal';
           }
           if (firstSaasPaid) {
-            const windowEnd = monthsLater(firstSaasPaid.paidDate, 3);
+            const windowEnd = monthsLater(firstSaasPaid.paidDate, 6);
             if (invPaidDate <= windowEnd) {
               commission += hardwareAmount * (rate / 100);
               // If the SaaS portion didn't already set a payable date (renewal w/ HW), use the
