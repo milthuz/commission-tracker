@@ -4992,7 +4992,7 @@ app.get('/api/admin/invoice-lookup', async (req, res) => {
               status, approval_status, commission::float AS commission, commission_status,
               commission_payable_date::date AS commission_payable_date,
               total::float AS total, saas_amount::float AS saas_amount, hardware_amount::float AS hardware_amount,
-              subscription_activation_date::date AS subscription_activation_date
+              subscription_activation_date::date AS subscription_activation_date, line_items
        FROM invoices WHERE invoice_number = ANY($1)`,
       [numbers]
     )).rows;
