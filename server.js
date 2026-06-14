@@ -1417,6 +1417,7 @@ THE COMMISSION MODEL:
 - Signup payment: a bonus (typically $100) for each Zentact merchant activation. Never gated by quota.
 - QUOTA GATE (from May 2026): the monthly quota (default 15 points) must be met for hardware/SaaS commissions to be paid that month — otherwise base salary only. New hires have a 90-day ramp with no quota requirement.
 - Monthly performance bonus (from May 2026): 20 points = $250, 25 = $500, 30 = $1,000 (highest tier only).
+- Processing bonus: paid twice a year (June and December) on the trailing 6 months. Per merchant account, the monthly average of (transaction profit + other revenue) is taken over the months it was active (must be active at least 3 of the 6 months); the rep earns that average minus the first $100, capped at $400 per account. Always paid (not gated by quota).
 
 LOGIN & ACCOUNTS:
 - Internal users sign in with Zoho (SSO button). External users are invited by email, set a password, and MUST set up two-step verification (authenticator app, 6-digit codes).
@@ -8751,6 +8752,22 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
           });
         }
       }
+      // Bi-annual processing bonus — only in June (window Dec→May) and December (Jun→Nov).
+      const pm = periodStart.getMonth() + 1;
+      if (periodStart >= PLAN_START_DATE && (pm === 6 || pm === 12)) {
+        const proc = await computeProcessingBonuses(periodStart.getFullYear(), pm);
+        const mine = proc?.byRep.get(targetRep);
+        if (mine) {
+          for (const a of mine.accounts) {
+            bonuses.push({
+              bonus_type:    'processing',
+              merchant_name: `${a.business_name} (${a.activeMonths} mo · ~$${a.avg.toFixed(0)}/mo)`,
+              amount:        a.bonus,
+              report_date:   null,
+            });
+          }
+        }
+      }
       return bonuses;
     };
 
@@ -8925,7 +8942,16 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
       perfBonus = perfPts >= quota ? ZohoCRMService.calculateMonthlyBonus(perfPts) : 0;
     }
 
-    const total      = invRows.reduce((a, r) => a + (r.commission || 0), 0) + bonusTotal + perfBonus;
+    // Bi-annual processing bonus (June/December only) — same computation as the stub.
+    let procAccounts = [], procTotal = 0;
+    const pm = periodStart.getMonth() + 1;
+    if (periodStart >= PLAN_START_DATE && (pm === 6 || pm === 12)) {
+      const proc = await computeProcessingBonuses(periodStart.getFullYear(), pm);
+      const mine = proc?.byRep.get(repName);
+      if (mine) { procAccounts = mine.accounts; procTotal = mine.total; }
+    }
+
+    const total      = invRows.reduce((a, r) => a + (r.commission || 0), 0) + bonusTotal + perfBonus + procTotal;
 
     // Idempotent re-commit: drop any prior app-generated stub for this rep+period (cascades).
     await client.query(
@@ -8979,9 +9005,17 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
         [imp.id, repName, `${perfPts} pts`, perfBonus, periodDate]
       );
     }
+    for (const a of procAccounts) {
+      await client.query(
+        `INSERT INTO commission_bonuses
+           (import_id, rep_name, bonus_type, merchant_name, matched_zentact_id, amount, paid_for_period)
+         VALUES ($1, $2, 'processing', $3, $4, $5, $6::date)`,
+        [imp.id, repName, `${a.business_name} (${a.activeMonths} mo · ~$${a.avg.toFixed(0)}/mo)`, a.merchant_account_id || null, a.bonus, periodDate]
+      );
+    }
 
     await client.query('COMMIT');
-    res.json({ success: true, invoicesMarked: invRows.length, bonuses: bonusRows.length, total });
+    res.json({ success: true, invoicesMarked: invRows.length, bonuses: bonusRows.length, processingBonus: procTotal, total });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
     res.status(500).json({ error: 'Failed to commit pay stub', details: e.message });
@@ -9021,6 +9055,74 @@ let recalcV2Job = {
 // CRM deals by sold_date + Zentact activation points, reseller-boarded excluded).
 // Used by the QUOTA GATE in recalc-v2 and the monthly performance bonus in pay stubs.
 // Returns Map('Rep Name|YYYY-MM' → points).
+// Bi-annual PROCESSING bonus (comp plan): paid in June (window Dec prev-year → May) and
+// December (window Jun → Nov), on a trailing 6-month basis. Per merchant, monthly revenue =
+// transaction_profit + other_revenue (Zentact). Eligible if revenue in >= 3 of the 6 months;
+// monthly average = total / (# of months with revenue); bonus = clamp(avg - 100, 0, 400).
+// Attributed to the account's rep; reseller-boarded merchants excluded (like the signup bonus).
+// Returns { window:[{y,m}], byRep: Map(rep -> { accounts:[{merchant_account_id,business_name,
+// avg,activeMonths,bonus}], total }) } or null if payoutMonth isn't 6 or 12.
+const PROCESSING_THRESHOLD = 100;   // first $100/mo of average earns nothing
+const PROCESSING_CAP       = 400;   // max bonus per account
+async function computeProcessingBonuses(payoutYear, payoutMonth) {
+  let window;
+  if (payoutMonth === 6)       window = [[payoutYear-1,12],[payoutYear,1],[payoutYear,2],[payoutYear,3],[payoutYear,4],[payoutYear,5]];
+  else if (payoutMonth === 12) window = [[payoutYear,6],[payoutYear,7],[payoutYear,8],[payoutYear,9],[payoutYear,10],[payoutYear,11]];
+  else return null;
+  const yyyymm = window.map(([y,m]) => y*100 + m);
+  const rows = (await pool.query(
+    `SELECT m.sales_rep_name AS rep, r.merchant_account_id, m.business_name,
+            SUM(r.transaction_profit_cents + COALESCE(r.other_revenue_cents,0))::bigint AS total_cents,
+            COUNT(*) FILTER (WHERE (r.transaction_profit_cents + COALESCE(r.other_revenue_cents,0)) > 0)::int AS active_months
+     FROM zentact_merchant_revenue r
+     JOIN zentact_merchants m ON m.merchant_account_id = r.merchant_account_id
+     WHERE (r.year*100 + r.month) = ANY($1)
+       AND m.sales_rep_name IS NOT NULL AND m.sales_rep_name <> ''
+       AND (m.reseller_attribute IS NULL OR m.reseller_attribute = '')
+     GROUP BY m.sales_rep_name, r.merchant_account_id, m.business_name`,
+    [yyyymm]
+  )).rows;
+  const byRep = new Map();
+  for (const r of rows) {
+    const activeMonths = parseInt(r.active_months) || 0;
+    if (activeMonths < 3) continue;                       // must be active >= 3 of the 6 months
+    const avg = (Number(r.total_cents) / 100) / activeMonths;
+    if (avg < PROCESSING_THRESHOLD) continue;             // below $100/mo average → nothing
+    const bonus = Math.min(Math.round((avg - PROCESSING_THRESHOLD) * 100) / 100, PROCESSING_CAP);
+    if (bonus <= 0) continue;
+    if (!byRep.has(r.rep)) byRep.set(r.rep, { accounts: [], total: 0 });
+    const e = byRep.get(r.rep);
+    e.accounts.push({
+      merchant_account_id: r.merchant_account_id,
+      business_name: r.business_name,
+      avg: Math.round(avg * 100) / 100,
+      activeMonths, bonus,
+    });
+    e.total = Math.round((e.total + bonus) * 100) / 100;
+  }
+  return { window, byRep };
+}
+
+// GET /api/admin/processing-bonus?secret=&year=&month=  — preview the bi-annual bonus
+// (month must be 6 or 12). Without secret, falls back to JWT report:mark_paid.
+app.get('/api/admin/processing-bonus', (req, res, next) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) { req.viaSecret = true; return next(); }
+  return authenticateToken(req, res, next);
+}, async (req, res) => {
+  if (!req.viaSecret && !(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const year = parseInt(req.query.year), month = parseInt(req.query.month);
+  if (!year || (month !== 6 && month !== 12)) return res.status(400).json({ error: 'year + month (6 or 12) required' });
+  try {
+    const result = await computeProcessingBonuses(year, month);
+    const reps = [...result.byRep.entries()].map(([rep, v]) => ({ rep, total: v.total, accounts: v.accounts }))
+      .sort((a, b) => b.total - a.total);
+    res.json({ year, month, window: result.window, grandTotal: Math.round(reps.reduce((a, r) => a + r.total, 0) * 100) / 100, reps });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 async function getMonthlyPointsByRep(fromDate) {
   const dealSourcePoints = new Map(
     (await pool.query(`SELECT source_group, points FROM deal_source_points`)).rows
