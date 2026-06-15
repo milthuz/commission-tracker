@@ -8899,25 +8899,9 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
           });
         }
       }
-      // Bi-annual processing bonus — only in June (window Dec→May) and December (Jun→Nov).
-      // ADMIN-ONLY in the generated (un-committed) stub: it must be APPROVED (committed)
-      // before the rep sees it. Once committed the stub is 'imported' and the rep sees the
-      // stored processing rows normally.
-      const pm = periodStart.getMonth() + 1;
-      if (canAudit && periodStart >= PLAN_START_DATE && (pm === 6 || pm === 12)) {
-        const proc = await computeProcessingBonuses(periodStart.getFullYear(), pm);
-        const mine = proc?.byRep.get(targetRep);
-        if (mine) {
-          for (const a of mine.accounts) {
-            bonuses.push({
-              bonus_type:    'processing',
-              merchant_name: `${a.business_name} (${a.activeMonths} mo · ~$${a.avg.toFixed(0)}/mo)`,
-              amount:        a.bonus,
-              report_date:   null,
-            });
-          }
-        }
-      }
+      // NOTE: the bi-annual PROCESSING bonus is intentionally NOT added here. It is managed
+      // entirely separately via the "Processing Bonus (bi-annual)" card (Admin → Import
+      // Commissions) so it never clutters the monthly pay stub (user decision 2026-06-15).
       return bonuses;
     };
 
@@ -9197,15 +9181,10 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
     }
 
     // Bi-annual processing bonus (June/December only) — same computation as the stub.
-    let procAccounts = [], procTotal = 0;
-    const pm = periodStart.getMonth() + 1;
-    if (periodStart >= PLAN_START_DATE && (pm === 6 || pm === 12)) {
-      const proc = await computeProcessingBonuses(periodStart.getFullYear(), pm);
-      const mine = proc?.byRep.get(repName);
-      if (mine) { procAccounts = mine.accounts; procTotal = mine.total; }
-    }
-
-    const total      = invRows.reduce((a, r) => a + (r.commission || 0), 0) + bonusTotal + perfBonus + procTotal;
+    // Bi-annual processing bonus is managed separately (its own card) — never part of the
+    // monthly stub commit (user decision 2026-06-15).
+    const procAccounts = [];
+    const total      = invRows.reduce((a, r) => a + (r.commission || 0), 0) + bonusTotal + perfBonus;
 
     // Idempotent re-commit: drop any prior app-generated stub for this rep+period (cascades).
     await client.query(
@@ -9269,7 +9248,7 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
     }
 
     await client.query('COMMIT');
-    res.json({ success: true, invoicesMarked: invRows.length, bonuses: bonusRows.length, processingBonus: procTotal, total });
+    res.json({ success: true, invoicesMarked: invRows.length, bonuses: bonusRows.length, total });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
     res.status(500).json({ error: 'Failed to commit pay stub', details: e.message });
@@ -9316,7 +9295,6 @@ async function payrollDataForMonth(year, month) {
   const orgId = process.env.ZOHO_ORG_ID;
   const platform = periodStart >= PLAN_START_DATE;
   const ptsMap = platform ? await getMonthlyPointsByRep(periodStart) : new Map();
-  const proc = (platform && (month === 6 || month === 12)) ? await computeProcessingBonuses(year, month) : null;
 
   const reps = (await pool.query(`SELECT name, monthly_quota FROM salespeople WHERE is_active = true ORDER BY name`)).rows;
   const out = [];
@@ -9357,10 +9335,8 @@ async function payrollDataForMonth(year, month) {
         const mb = pts >= quota ? ZohoCRMService.calculateMonthlyBonus(pts) : 0;
         if (mb > 0) bonuses.push({ bonus_type: 'monthly_performance', merchant_name: `${pts} pts`, amount: mb });
       }
-      if (proc) {
-        const mine = proc.byRep.get(rep);
-        if (mine) for (const a of mine.accounts) bonuses.push({ bonus_type: 'processing', merchant_name: a.business_name, amount: a.bonus });
-      }
+      // Processing bonus excluded from the monthly payroll send — it's bi-annual and handled
+      // via its own card/flow (user decision 2026-06-15).
       total = lines.reduce((s, l) => s + (l.paid_amount || 0), 0) + bonuses.reduce((s, b) => s + (b.amount || 0), 0);
     }
     total = Math.round(total * 100) / 100;
