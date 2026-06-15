@@ -370,6 +370,12 @@ async function initializeDatabase() {
          '["*"]'::jsonb, true)
       ON CONFLICT (name) DO NOTHING;
     `);
+    // Ensure the 'Sales Rep' role can view its own pay stub (permission added after the
+    // role was first seeded). Idempotent — only appends if missing.
+    await pool.query(`
+      UPDATE roles SET permissions = permissions || '["report:view_paystub"]'::jsonb
+      WHERE name = 'Sales Rep' AND NOT (permissions ? 'report:view_paystub')
+    `);
     // Auto-assign 'Administrator' role to existing is_admin users
     await pool.query(`
       INSERT INTO user_roles (user_email, role_id)
@@ -924,6 +930,21 @@ app.get('/api/auth/callback', async (req, res) => {
       console.error('❌ Database error:', dbError.message);
       return res.status(500).json({ error: 'Failed to store tokens in database' });
     }
+
+    // Auto-assign the default 'Sales Rep' role IF this login is an ACTIVE salesperson and
+    // has no roles yet (so new reps get access without manual setup — but NOT every new
+    // user: admins/non-reps are unaffected since they don't match an active salesperson).
+    try {
+      await pool.query(
+        `INSERT INTO user_roles (user_email, role_id)
+         SELECT $1, r.id FROM roles r
+         WHERE r.name = 'Sales Rep'
+           AND EXISTS (SELECT 1 FROM salespeople s WHERE s.is_active = true AND LOWER(s.name) = LOWER($2))
+           AND NOT EXISTS (SELECT 1 FROM user_roles ur WHERE LOWER(ur.user_email) = LOWER($1))
+         ON CONFLICT DO NOTHING`,
+        [userEmail, userName]
+      );
+    } catch (_e) { /* non-fatal — role can be assigned manually */ }
 
     // Create JWT — photo stored in DB, not JWT (base64 would be too large for URL)
     const jwtToken = jwt.sign(
@@ -7194,6 +7215,47 @@ app.delete('/api/roles/:id', authenticateToken, async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/admin/assign-default-rep-role — give the 'Sales Rep' role to every ACTIVE
+// salesperson who doesn't already have a role. Resolves each rep's email via their login
+// account (user_tokens.display_name) or the "Courriel de connexion" on their card. Reps
+// with neither are returned in `noEmail` so the admin can set their email. Idempotent.
+app.post('/api/admin/assign-default-rep-role', (req, res, next) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) { req.viaSecret = true; return next(); }
+  return authenticateToken(req, res, next);
+}, async (req, res) => {
+  if (!req.viaSecret && !req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const role = (await pool.query(`SELECT id FROM roles WHERE name = 'Sales Rep' LIMIT 1`)).rows[0];
+    if (!role) return res.status(500).json({ error: "'Sales Rep' role not found" });
+    const reps = (await pool.query(`
+      SELECT s.name,
+             COALESCE(
+               (SELECT email FROM user_tokens WHERE LOWER(display_name) = LOWER(s.name) LIMIT 1),
+               s.email
+             ) AS email
+      FROM salespeople s WHERE s.is_active = true
+    `)).rows;
+    let assigned = 0, alreadyHad = 0;
+    const noEmail = [];
+    for (const r of reps) {
+      if (!r.email) { noEmail.push(r.name); continue; }
+      const has = (await pool.query(
+        `SELECT 1 FROM user_roles WHERE LOWER(user_email) = LOWER($1) LIMIT 1`, [r.email]
+      )).rows.length > 0;
+      if (has) { alreadyHad++; continue; }
+      await pool.query(
+        `INSERT INTO user_roles (user_email, role_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [r.email, role.id]
+      );
+      assigned++;
+    }
+    res.json({ assigned, alreadyHad, noEmail });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
