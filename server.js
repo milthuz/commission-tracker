@@ -8917,6 +8917,36 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
   }
 });
 
+// POST /api/commissions/missing-report — a rep flags a commission they think is missing.
+// Emails all admins (+ SMTP_FROM fallback). Body: { invoiceNumber?, period?, message }.
+app.post('/api/commissions/missing-report', authenticateToken, async (req, res) => {
+  const { email, name: jwtName } = req.user;
+  const invoiceNumber = (req.body.invoiceNumber || '').toString().trim().slice(0, 40);
+  const period        = (req.body.period || '').toString().trim().slice(0, 20);
+  const message       = (req.body.message || '').toString().trim().slice(0, 2000);
+  if (!message) return res.status(400).json({ error: 'message required' });
+  try {
+    const tok = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
+    const repName = tok.rows[0]?.display_name || jwtName || email || 'Unknown rep';
+    const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // Recipients: all admins, plus the configured from-address as a safety net.
+    const admins = (await pool.query('SELECT email FROM user_tokens WHERE is_admin = true AND email IS NOT NULL')).rows.map(r => r.email);
+    const recipients = [...new Set([...admins, process.env.SMTP_FROM || process.env.SMTP_USER].filter(Boolean))];
+    const html = mailShell(
+      'Signalement de commission manquante',
+      `<strong>${esc(repName)}</strong> (${esc(email || '—')}) signale une commission possiblement manquante.<br><br>`
+      + (invoiceNumber ? `<strong>Facture :</strong> ${esc(invoiceNumber)}<br>` : '')
+      + (period ? `<strong>Période :</strong> ${esc(period)}<br>` : '')
+      + `<strong>Message :</strong><br>${esc(message).replace(/\n/g, '<br>')}`,
+      null, null
+    );
+    const r = await sendMail(recipients.join(','), `Commission manquante — ${repName}`, html);
+    res.json({ sent: r.sent, reason: r.reason, recipients: recipients.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /api/commissions/quota-waiver — admin decision: pay a rep's month DESPITE the
 // missed quota (plan v7.7 exception). Body: { repName, year, month, waived }. Setting or
 // removing a waiver kicks a recalc so the month's forfeited commissions come back (or
