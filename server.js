@@ -328,6 +328,9 @@ async function initializeDatabase() {
     // accounts, resellers, execs not on the rep plan).
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS hire_date DATE`);
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS quota_gate_enabled BOOLEAN DEFAULT true`);
+    // processing_bonus_enabled=false excludes an ACTIVE rep from the bi-annual processing/volume
+    // bonus (e.g. someone not entitled to it). Inactive reps are already excluded entirely.
+    await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS processing_bonus_enabled BOOLEAN DEFAULT true`);
     // Invoice-level (entity) discount facts — captured by enrich from the Zoho detail.
     // Comp plan v7.7: commission base = pre-tax value AFTER discount; hardware rate
     // halves (10%→5%) when the discount is ≥ 25%. NULL = not captured yet.
@@ -6745,7 +6748,7 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
     const result = await pool.query(
       `SELECT s.name, s.is_active, s.commission_rate, s.base_salary, s.invoice_count, s.aliases,
               s.signup_bonus_amount, s.signup_bonus_enabled, s.monthly_quota, s.team_id, s.email,
-              s.hire_date, s.quota_gate_enabled, t.name AS team_name
+              s.hire_date, s.quota_gate_enabled, s.processing_bonus_enabled, t.name AS team_name
        FROM salespeople s LEFT JOIN teams t ON t.id = s.team_id
        ORDER BY s.name`
     );
@@ -6763,6 +6766,7 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
         monthlyQuota:       r.monthly_quota == null ? null : parseInt(r.monthly_quota),
         hireDate:           r.hire_date ? new Date(r.hire_date).toISOString().slice(0, 10) : null,
         quotaGateEnabled:   r.quota_gate_enabled !== false,
+        processingBonusEnabled: r.processing_bonus_enabled !== false,
         teamId:             r.team_id || null,
         teamName:           r.team_name || null,
       }))
@@ -6834,6 +6838,23 @@ app.put('/api/salespeople/:name/quota-gate', authenticateToken, async (req, res)
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update quota gate', details: error.message });
+  }
+});
+
+// PUT /api/salespeople/:name/processing-bonus — exclude an active rep from the bi-annual
+// processing/volume bonus (enabled=false). Inactive reps are already excluded entirely.
+app.put('/api/salespeople/:name/processing-bonus', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const enabled = req.body.enabled !== false;
+  try {
+    const r = await pool.query(
+      `UPDATE salespeople SET processing_bonus_enabled = $1, updated_at = CURRENT_TIMESTAMP WHERE name = $2 RETURNING name`,
+      [enabled, req.params.name]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Salesperson not found' });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update processing bonus', details: error.message });
   }
 });
 
@@ -9621,7 +9642,7 @@ async function computeProcessingBonuses(payoutYear, payoutMonth) {
        WHERE m.activated_at IS NOT NULL
          AND m.sales_rep_name IS NOT NULL AND m.sales_rep_name <> ''
          AND (m.reseller_attribute IS NULL OR m.reseller_attribute = '')
-         AND m.sales_rep_name IN (SELECT name FROM salespeople WHERE is_active = true)
+         AND m.sales_rep_name IN (SELECT name FROM salespeople WHERE is_active = true AND processing_bonus_enabled IS NOT FALSE)
          AND date_trunc('month', m.activated_at) + interval '6 months' <= make_date($1, $2, 1)
          AND NOT EXISTS (
            SELECT 1 FROM commission_bonuses cb
