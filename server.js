@@ -9774,6 +9774,49 @@ app.get('/api/admin/processing-bonus/debug', (req, res, next) => {
   }
 });
 
+// GET /api/admin/processing-bonus/audit?secret=
+// Lists every recorded 'processing' bonus with matched_zentact_id NULL and, for each, whether
+// the fuzzy matcher (accent/space-insensitive) can still find a Zentact merchant by name.
+// `unmatched` rows match NOTHING → potential silent leaks into the bi-annual (typos to relink).
+app.get('/api/admin/processing-bonus/audit', (req, res, next) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) { req.viaSecret = true; return next(); }
+  return authenticateToken(req, res, next);
+}, async (req, res) => {
+  if (!req.viaSecret && !(await requirePerm(req, res, 'report:mark_paid'))) return;
+  try {
+    const matchZentact = await buildZentactMatcher();
+    const candidates = (await pool.query(
+      `SELECT merchant_account_id, business_name FROM zentact_merchants
+        WHERE business_name IS NOT NULL AND business_name <> ''`
+    )).rows;
+    const nameById = new Map(candidates.map(c => [c.merchant_account_id, c.business_name]));
+    const nullRows = (await pool.query(
+      `SELECT cb.id, cb.merchant_name, cb.amount::float AS amount, cb.paid_for_period,
+              i.filename, i.rep_name
+         FROM commission_bonuses cb
+         LEFT JOIN commission_payment_imports i ON i.id = cb.import_id
+        WHERE cb.bonus_type = 'processing' AND cb.matched_zentact_id IS NULL
+        ORDER BY i.rep_name, cb.merchant_name`
+    )).rows;
+    const matched = [], unmatched = [];
+    for (const r of nullRows) {
+      const id = matchZentact(r.merchant_name);
+      if (id) matched.push({ ...r, fuzzy_zentact_id: id, fuzzy_business_name: nameById.get(id) || null });
+      else unmatched.push(r);
+    }
+    res.json({
+      total_null_id: nullRows.length,
+      fuzzy_matched_count: matched.length,   // excluded by name already — safe, no action
+      unmatched_count: unmatched.length,     // match nothing → potential leak, needs relink
+      unmatched,
+      fuzzy_matched: matched,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /api/admin/processing-bonus/relink?secret=  body { match, zentactId, dryRun? }
 // Manually re-link recorded 'processing' bonuses to a Zentact merchant when the imported
 // name had a typo the fuzzy matcher couldn't catch (e.g. "Arkhavan" vs "Akhavan"). Sets
