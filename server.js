@@ -319,6 +319,11 @@ async function initializeDatabase() {
     // halves (10%→5%) when the discount is ≥ 25%. NULL = not captured yet.
     await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS sub_total NUMERIC(12,2)`);
     await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS discount_total NUMERIC(12,2)`);
+    // Sum of ALL line amounts (hw + saas + noncommission), pre-discount. The discount factor
+    // = (sub_total - discount_total) / gross_line_total, because Zoho sometimes bakes the
+    // discount into sub_total (discount_total=0, sub_total < line sum) and sometimes reports it
+    // separately — dividing the real net pre-tax by our gross line sum handles both.
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS gross_line_total NUMERIC(12,2)`);
     // Manual override of a deal's lead source group. Sync only writes lead_source_group, so this
     // override survives re-syncs. Effective source = COALESCE(override, lead_source_group).
     await pool.query(`ALTER TABLE crm_sold_deals ADD COLUMN IF NOT EXISTS lead_source_group_override VARCHAR(255)`);
@@ -5017,6 +5022,7 @@ app.get('/api/admin/invoice-lookup', async (req, res) => {
               commission_payable_date::date AS commission_payable_date,
               total::float AS total, saas_amount::float AS saas_amount, hardware_amount::float AS hardware_amount,
               sub_total::float AS sub_total, discount_total::float AS discount_total,
+              gross_line_total::float AS gross_line_total,
               subscription_activation_date::date AS subscription_activation_date, line_items
        FROM invoices WHERE invoice_number = ANY($1)`,
       [numbers]
@@ -5053,6 +5059,19 @@ app.post('/api/admin/backfill-subtotals', async (req, res) => {
       const tokenData = await ensureValidToken(admin.email);
       const accessToken = typeof tokenData === 'string' ? tokenData : tokenData?.access_token;
       const orgId = process.env.ZOHO_ORG_ID;
+
+      // Pre-step (no Zoho): populate gross_line_total from already-stored line_items. Instant.
+      await pool.query(
+        `UPDATE invoices SET gross_line_total = sub.s
+         FROM (
+           SELECT id, ROUND(SUM((li->>'amount')::numeric), 2) AS s
+           FROM invoices, jsonb_array_elements(line_items) li
+           WHERE line_items IS NOT NULL AND jsonb_typeof(line_items) = 'array'
+           GROUP BY id
+         ) sub
+         WHERE invoices.id = sub.id AND invoices.gross_line_total IS DISTINCT FROM sub.s`
+      );
+
       const rows = (await pool.query(
         `SELECT invoice_number FROM invoices
          WHERE organization_id = $1 AND status = 'paid' AND sub_total IS NULL AND date >= $2::date
@@ -5060,19 +5079,24 @@ app.post('/api/admin/backfill-subtotals', async (req, res) => {
         [orgId, from]
       )).rows;
       subtotalBackfill.total = rows.length;
+      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+      const getWithRetry = async (url, params) => {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const res = await axios.get(url, { params, headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true });
+          if (res.status === 200) return res;
+          if (res.status === 429 || res.status >= 500) { await sleep(2000 * (attempt + 1)); continue; } // rate limit / transient
+          return res; // 4xx other than 429 → don't retry
+        }
+        return null;
+      };
       for (const row of rows) {
         try {
-          const searchRes = await axios.get(`${admin.api_domain}/books/v3/invoices`, {
-            params: { organization_id: orgId, invoice_number: row.invoice_number },
-            headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
-          });
-          const stubInv = searchRes.data?.invoices?.[0];
+          await sleep(120); // throttle to stay under Zoho's burst limit
+          const searchRes = await getWithRetry(`${admin.api_domain}/books/v3/invoices`, { organization_id: orgId, invoice_number: row.invoice_number });
+          const stubInv = searchRes?.data?.invoices?.[0];
           if (!stubInv) { subtotalBackfill.errors++; subtotalBackfill.processed++; continue; }
-          const detRes = await axios.get(`${admin.api_domain}/books/v3/invoices/${stubInv.invoice_id}`, {
-            params: { organization_id: orgId },
-            headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
-          });
-          const det = detRes.data?.invoice;
+          const detRes = await getWithRetry(`${admin.api_domain}/books/v3/invoices/${stubInv.invoice_id}`, { organization_id: orgId });
+          const det = detRes?.data?.invoice;
           if (!det) { subtotalBackfill.errors++; subtotalBackfill.processed++; continue; }
           const subTotal  = parseFloat(det.sub_total) || 0;
           const discTotal = det.discount_type === 'item_level' ? 0 : (parseFloat(det.discount_total) || 0);
@@ -5573,9 +5597,14 @@ function parseStandardReport(rows, headerIdx) {
     }
   }
 
-  // Now scan everything below for bonus rows. The "Lead Source" column is what
-  // tags bonus types ("Signup commission" or "<MONTH> BONUS").
+  // Now scan everything below for bonus rows. The "Lead Source" column tags the type:
+  //   "Signup commission"  → per-merchant signup bonus
+  //   "Volume Bonus" / "Processing Bonus" → per-merchant PROCESSING bonus (historical payouts;
+  //     recorded per account so the automated bi-annual payout excludes them — "paid once").
+  //   anything else ending in "BONUS" → a generic monthly bonus (summed).
+  // Volume/Processing is checked FIRST (it also ends in "BONUS").
   const signupBonuses = [];
+  const volumeBonuses = [];
   let monthlyBonus = 0;
   for (i = headerIdx + 1; i < rows.length; i++) {
     const r = rows[i];
@@ -5587,12 +5616,18 @@ function parseStandardReport(rows, headerIdx) {
         amount,
         date: r[0] || null,
       });
+    } else if (/(volume|processing)\s*bonus/i.test(tag) && amount > 0) {
+      volumeBonuses.push({
+        merchant: r[idxCustomer] ? String(r[idxCustomer]).trim() : null,
+        amount,
+        date: r[0] || null,
+      });
     } else if (/BONUS$/i.test(tag) && amount > 0) {
       monthlyBonus += amount;
     }
   }
 
-  return { invoices, signupBonuses, monthlyBonus };
+  return { invoices, signupBonuses, volumeBonuses, monthlyBonus };
 }
 
 // "Addon" layout: columns [account/customer], INVOICE, SUB-TOTAL, COMMISSION, TYPE, STATUS,
@@ -5624,7 +5659,7 @@ function parseAddonReport(rows, headerIdx) {
     });
   }
 
-  return { invoices, signupBonuses: [], monthlyBonus: 0 };
+  return { invoices, signupBonuses: [], volumeBonuses: [], monthlyBonus: 0 };
 }
 
 // Load zentact_merchants ONCE and return a fuzzy matcher — case-insensitive, ignores
@@ -5713,6 +5748,13 @@ async function importCommissionReport(req, res, { commit }) {
     ...b,
     matched_zentact_id: matchZentact(b.merchant),
   }));
+  // Volume/processing bonuses → per-account 'processing' bonuses (matched so the automated
+  // bi-annual payout excludes these already-paid accounts).
+  const volumeBonusesWithMatch = (parsed.volumeBonuses || []).map(b => ({
+    ...b,
+    matched_zentact_id: matchZentact(b.merchant),
+  }));
+  const volumeBonusAmount = volumeBonusesWithMatch.reduce((s, b) => s + b.amount, 0);
 
   const summary = {
     filename:               file.originalname,
@@ -5725,11 +5767,14 @@ async function importCommissionReport(req, res, { commit }) {
     signup_bonuses_count:   bonusesWithMatch.length,
     signup_bonuses_amount:  bonusesWithMatch.reduce((s, b) => s + b.amount, 0),
     monthly_bonus_amount:   parsed.monthlyBonus,
+    volume_bonuses_count:   volumeBonusesWithMatch.length,
+    volume_bonuses_amount:  Math.round(volumeBonusAmount * 100) / 100,
     // The FULL amount the file paid out — including invoices not in our DB (pre-2025).
     // The user's pay reports are the source of truth; the stub total must match the file.
     total_to_pay:           matched.reduce((s, i) => s + i.commission, 0)
                             + notFoundAmount
                             + bonusesWithMatch.reduce((s, b) => s + b.amount, 0)
+                            + volumeBonusAmount
                             + parsed.monthlyBonus,
   };
 
@@ -5741,6 +5786,7 @@ async function importCommissionReport(req, res, { commit }) {
       skipped_zero: skipped,
       not_found: notFound,
       bonuses: bonusesWithMatch,
+      volume_bonuses: volumeBonusesWithMatch,
     });
   }
 
@@ -5821,6 +5867,17 @@ async function importCommissionReport(req, res, { commit }) {
            (import_id, rep_name, bonus_type, amount, paid_for_period)
          VALUES ($1, $2, 'monthly', $3, $4::date)`,
         [importRow.id, repFullName, parsed.monthlyBonus, meta.periodDate]
+      );
+    }
+
+    // 5. Volume/processing bonuses → per-account 'processing' rows. matched_zentact_id makes
+    //    the automated bi-annual payout treat these accounts as already paid ("paid once").
+    for (const b of volumeBonusesWithMatch) {
+      await client.query(
+        `INSERT INTO commission_bonuses
+           (import_id, rep_name, bonus_type, merchant_name, matched_zentact_id, amount, paid_for_period, report_date)
+         VALUES ($1, $2, 'processing', $3, $4, $5, $6::date, $7::date)`,
+        [importRow.id, repFullName, b.merchant, b.matched_zentact_id, b.amount, meta.periodDate, b.date || null]
       );
     }
 
@@ -7744,6 +7801,7 @@ async function runEnrichInvoices({ onlyMissing = true, source = 'manual' } = {})
         // hardware_amount = hardware lines ONLY (noncommission lines excluded from both → pay $0)
         const saasAmount = classified.filter(l => l.type === 'saas').reduce((s, l) => s + l.amount, 0);
         const hardwareAmount = classified.filter(l => l.type === 'hardware').reduce((s, l) => s + l.amount, 0);
+        const grossLineTotal = classified.reduce((s, l) => s + (parseFloat(l.amount) || 0), 0); // incl. noncommission
         const totalAmount = saasAmount + hardwareAmount;
         const paidDate = det.last_payment_date || (det.status === 'paid' ? det.date : null);
 
@@ -7771,10 +7829,11 @@ async function runEnrichInvoices({ onlyMissing = true, source = 'manual' } = {})
             paid_date = $5::date,
             sub_total = $6,
             discount_total = $7,
+            gross_line_total = $8,
             updated_at = CURRENT_TIMESTAMP
-          WHERE invoice_number = $8 AND organization_id = $9
+          WHERE invoice_number = $9 AND organization_id = $10
         `, [JSON.stringify(classified), hardwareAmount, saasAmount, subActivation, paidDate,
-            subTotal || null, discTotal, det.invoice_number, orgId]);
+            subTotal || null, discTotal, Math.round(grossLineTotal * 100) / 100, det.invoice_number, orgId]);
 
         enrichJob.processed++;
         enrichJob.stats[type] = (enrichJob.stats[type] || 0) + 1;
@@ -9236,7 +9295,7 @@ async function runRecalcV2(source = 'manual') {
         SELECT id, invoice_number, salesperson_name, customer_name, total,
                hardware_amount, saas_amount, subscription_activation_date,
                paid_date, commission_status, status, approval_status, commission,
-               sub_total, discount_total
+               sub_total, discount_total, gross_line_total
         FROM invoices
         WHERE organization_id = $1
         ORDER BY date ASC
@@ -9349,22 +9408,28 @@ async function runRecalcV2(source = 'manual') {
       // pays pre-tax (comp plan v7.7 — commission on discounted value). The plan-price
       // floor below is applied AFTER the factor, so a discounted/prorated activation
       // still pays at least the full plan value.
-      const discountFactorOf = (subTotal, discTotal) => {
-        const st = parseFloat(subTotal) || 0, dt = parseFloat(discTotal) || 0;
-        if (st <= 0 || dt <= 0) return 1;
-        return Math.max(0, (st - dt) / st);
+      // factor = real net pre-tax / our gross line sum. Zoho may bake the discount into
+      // sub_total (discount_total=0, sub_total < gross) or report it separately — both handled.
+      const discountFactorOf = (subTotal, discTotal, grossLineTotal) => {
+        const st = parseFloat(subTotal) || 0;
+        const dt = parseFloat(discTotal) || 0;
+        const gross = parseFloat(grossLineTotal) || 0;
+        if (st <= 0 || gross <= 0) return 1;            // no captured discount info → full value
+        const net = st - dt;
+        if (net <= 0 || net >= gross) return 1;          // no discount (or data noise)
+        return net / gross;
       };
 
       const saasFirstBase = new Map();
       const firstIds = [...new Set(firstMonthByGroup.values())];
       if (firstIds.length && planPrices.size) {
         const liRows = (await pool.query(
-          `SELECT id, line_items, sub_total, discount_total FROM invoices WHERE id = ANY($1) AND line_items IS NOT NULL`,
+          `SELECT id, line_items, sub_total, discount_total, gross_line_total FROM invoices WHERE id = ANY($1) AND line_items IS NOT NULL`,
           [firstIds]
         )).rows;
         for (const row of liRows) {
           const items = Array.isArray(row.line_items) ? row.line_items : [];
-          const factor = discountFactorOf(row.sub_total, row.discount_total);
+          const factor = discountFactorOf(row.sub_total, row.discount_total, row.gross_line_total);
           let base = 0, sawSaas = false;
           for (const li of items) {
             if (li.type !== 'saas') continue;
@@ -9413,9 +9478,8 @@ async function runRecalcV2(source = 'manual') {
         const rate = rateMap[inv.salesperson_name] || 10;
         // Invoice-level discount (plan v7.7): bases are scaled to the discounted pre-tax
         // value, and the HARDWARE rate halves (10%→5%) when the discount is ≥ 25%.
-        const factor = discountFactorOf(inv.sub_total, inv.discount_total);
-        const discountPct = (parseFloat(inv.sub_total) || 0) > 0
-          ? (parseFloat(inv.discount_total) || 0) / parseFloat(inv.sub_total) : 0;
+        const factor = discountFactorOf(inv.sub_total, inv.discount_total, inv.gross_line_total);
+        const discountPct = 1 - factor;   // effective discount (0 when no discount captured)
         const hwRate = discountPct >= 0.25 ? rate / 2 : rate;
         const hardwareAmount = (parseFloat(inv.hardware_amount) || 0) * factor;
         const saasAmount     = parseFloat(inv.saas_amount)     || 0;
