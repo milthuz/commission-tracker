@@ -8968,6 +8968,29 @@ app.post('/api/commissions/pay-stub/email', authenticateToken, async (req, res) 
   }
 });
 
+// POST /api/feedback/feature-request — any authenticated user suggests a feature. Emails admins.
+app.post('/api/feedback/feature-request', authenticateToken, async (req, res) => {
+  const { email, name: jwtName } = req.user;
+  const message = (req.body.message || '').toString().trim().slice(0, 4000);
+  if (!message) return res.status(400).json({ error: 'message required' });
+  try {
+    const tok = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
+    const who = tok.rows[0]?.display_name || jwtName || email || 'Unknown user';
+    const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const admins = (await pool.query('SELECT email FROM user_tokens WHERE is_admin = true AND email IS NOT NULL')).rows.map(r => r.email);
+    const recipients = [...new Set([...admins, process.env.SMTP_FROM || process.env.SMTP_USER].filter(Boolean))];
+    const html = mailShell(
+      'Demande de fonctionnalité',
+      `<strong>${esc(who)}</strong> (${esc(email || '—')}) propose :<br><br>${esc(message).replace(/\n/g, '<br>')}`,
+      null, null
+    );
+    const r = await sendMail(recipients.join(','), `Demande de fonctionnalité — ${who}`, html);
+    res.json({ sent: r.sent, reason: r.reason });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /api/commissions/missing-report — a rep flags a commission they think is missing.
 // Emails all admins (+ SMTP_FROM fallback). Body: { invoiceNumber?, period?, message }.
 app.post('/api/commissions/missing-report', authenticateToken, async (req, res) => {
