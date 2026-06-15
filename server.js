@@ -8917,6 +8917,57 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
   }
 });
 
+// POST /api/commissions/pay-stub/email — email a branded copy of a pay stub.
+// Body: { repName, period, to, lines[], bonuses[], total, source }. Gated by report:view_paystub
+// (admins pass). The stub content is rendered server-side into the branded mail shell.
+app.post('/api/commissions/pay-stub/email', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:view_paystub'))) return;
+  const { repName, period, to, lines = [], bonuses = [], total = 0, source } = req.body || {};
+  const recipient = String(to || '').trim();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(recipient)) return res.status(400).json({ error: 'valid recipient email required' });
+  const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  try {
+    const lineRows = (lines || []).map(l =>
+      `<tr><td style="padding:6px 10px;border-top:1px solid #eef1f6;font-family:monospace">${esc(l.invoice_number)}</td>
+           <td style="padding:6px 10px;border-top:1px solid #eef1f6">${esc(l.customer) || '—'}</td>
+           <td style="padding:6px 10px;border-top:1px solid #eef1f6;text-align:right">${money(l.paid_amount)}</td></tr>`).join('');
+    const bonusRows = (bonuses || []).map(b => {
+      const label = b.bonus_type === 'signup' ? 'Bonus d\'inscription'
+        : (b.bonus_type === 'monthly' || b.bonus_type === 'monthly_performance') ? 'Bonus mensuel'
+        : b.bonus_type === 'processing' ? 'Bonus de paiement' : esc(b.bonus_type);
+      return `<tr><td style="padding:6px 10px;border-top:1px solid #eef1f6">${label}</td>
+           <td style="padding:6px 10px;border-top:1px solid #eef1f6">${esc(b.merchant_name) || '—'}</td>
+           <td style="padding:6px 10px;border-top:1px solid #eef1f6;text-align:right">${money(b.amount)}</td></tr>`;
+    }).join('');
+    const statusLabel = source === 'imported' ? 'Payé / Paid' : 'En attente d\'approbation / Pending approval';
+    const html = `<!doctype html><html><body style="margin:0;background:#f4f6fa;font-family:Arial,Helvetica,sans-serif">
+      <table width="100%" cellpadding="0" cellspacing="0" style="padding:28px 12px"><tr><td align="center">
+        <table width="620" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:10px;overflow:hidden">
+          <tr><td style="background:#1c2434;padding:20px 28px">
+            <span style="color:#fff;font-size:19px;font-weight:bold">Sales Hub</span>
+            <span style="color:#8a99af;font-size:12px;margin-left:8px">Bulletin de paie / Pay Stub</span></td></tr>
+          <tr><td style="padding:24px 28px">
+            <p style="margin:0 0 4px;color:#1c2434;font-size:16px;font-weight:bold">${esc(repName)}</p>
+            <p style="margin:0 0 14px;color:#64748b;font-size:13px">Période / Period: ${esc(period)} · ${statusLabel}</p>
+            ${lineRows ? `<p style="margin:14px 0 4px;color:#94a3b8;font-size:11px;text-transform:uppercase;font-weight:bold">Commissions</p>
+            <table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434">${lineRows}</table>` : ''}
+            ${bonusRows ? `<p style="margin:16px 0 4px;color:#94a3b8;font-size:11px;text-transform:uppercase;font-weight:bold">Bonus</p>
+            <table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434">${bonusRows}</table>` : ''}
+            <table width="100%" style="margin-top:18px"><tr>
+              <td style="font-size:14px;font-weight:bold;color:#1c2434">Total</td>
+              <td style="text-align:right;font-size:18px;font-weight:bold;color:#f97316">${money(total)}</td></tr></table>
+            <p style="margin:18px 0 0;color:#94a3b8;font-size:11px">Montants bruts, avant impôts et retenues. / Gross amounts, before tax and withholdings.</p>
+          </td></tr>
+        </table></td></tr></table></body></html>`;
+    const r = await sendMail(recipient, `Bulletin de paie / Pay Stub — ${repName} · ${period}`, html);
+    if (!r.sent) return res.status(502).json({ error: r.reason || 'send failed' });
+    res.json({ sent: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /api/commissions/missing-report — a rep flags a commission they think is missing.
 // Emails all admins (+ SMTP_FROM fallback). Body: { invoiceNumber?, period?, message }.
 app.post('/api/commissions/missing-report', authenticateToken, async (req, res) => {
