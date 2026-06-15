@@ -310,6 +310,19 @@ async function initializeDatabase() {
         PRIMARY KEY (rep_name, period)
       );
     `);
+    // Manually-added bonuses on a rep's monthly pay stub (free-text description + amount).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS manual_bonuses (
+        id          SERIAL PRIMARY KEY,
+        rep_name    VARCHAR(255) NOT NULL,
+        period      DATE NOT NULL,
+        amount      NUMERIC(12,2) NOT NULL,
+        description TEXT DEFAULT '',
+        created_by  VARCHAR(255),
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_manual_bonus_period ON manual_bonuses(rep_name, period)`);
     // Comp plan v7.7: hire_date drives the 90-day ramp (quota gate waived);
     // quota_gate_enabled=false exempts a rep from the gate entirely (house
     // accounts, resellers, execs not on the rep plan).
@@ -8902,6 +8915,15 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
       // NOTE: the bi-annual PROCESSING bonus is intentionally NOT added here. It is managed
       // entirely separately via the "Processing Bonus (bi-annual)" card (Admin → Import
       // Commissions) so it never clutters the monthly pay stub (user decision 2026-06-15).
+      // Manually-added bonuses (admin-curated, free-text) for this rep + period.
+      const manual = (await pool.query(
+        `SELECT amount::float AS amount, description FROM manual_bonuses
+         WHERE rep_name = $1 AND period = $2::date ORDER BY created_at`,
+        [targetRep, periodStart]
+      )).rows;
+      for (const m of manual) {
+        bonuses.push({ bonus_type: 'manual', merchant_name: m.description || null, amount: m.amount, report_date: null });
+      }
       return bonuses;
     };
 
@@ -9097,6 +9119,51 @@ app.post('/api/commissions/missing-report', authenticateToken, async (req, res) 
 // missed quota (plan v7.7 exception). Body: { repName, year, month, waived }. Setting or
 // removing a waiver kicks a recalc so the month's forfeited commissions come back (or
 // get re-gated) — allow ~2 minutes before reopening the stub.
+// ── Manual bonuses ──────────────────────────────────────────────────────────
+// Add/list/delete a free-text bonus on a rep's monthly pay stub (admin-curated).
+// GET ?year=&month= → all manual bonuses for that period (optionally ?repName=).
+app.get('/api/commissions/manual-bonus', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const year = parseInt(req.query.year), month = parseInt(req.query.month);
+  if (!year || month < 1 || month > 12) return res.status(400).json({ error: 'year + month required' });
+  const period = `${year}-${String(month).padStart(2, '0')}-01`;
+  try {
+    const params = [period];
+    let where = 'period = $1::date';
+    if (req.query.repName) { params.push(req.query.repName); where += ` AND rep_name = $2`; }
+    const rows = (await pool.query(
+      `SELECT id, rep_name, amount::float AS amount, description, created_by, created_at
+       FROM manual_bonuses WHERE ${where} ORDER BY created_at DESC`, params
+    )).rows;
+    res.json({ bonuses: rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/commissions/manual-bonus', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const { repName, year, month, amount, description } = req.body;
+  const amt = parseFloat(amount);
+  if (!repName || !year || !month || isNaN(amt)) return res.status(400).json({ error: 'repName, year, month, amount required' });
+  const period = `${year}-${String(month).padStart(2, '0')}-01`;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  try {
+    const r = (await pool.query(
+      `INSERT INTO manual_bonuses (rep_name, period, amount, description, created_by)
+       VALUES ($1, $2::date, $3, $4, $5) RETURNING id`,
+      [repName, period, Math.round(amt * 100) / 100, (description || '').toString().slice(0, 500), actor]
+    )).rows[0];
+    res.json({ success: true, id: r.id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/commissions/manual-bonus/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  try {
+    await pool.query(`DELETE FROM manual_bonuses WHERE id = $1`, [parseInt(req.params.id)]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/commissions/quota-waiver', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
   const { repName, year, month, waived } = req.body;
@@ -9184,7 +9251,14 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
     // Bi-annual processing bonus is managed separately (its own card) — never part of the
     // monthly stub commit (user decision 2026-06-15).
     const procAccounts = [];
-    const total      = invRows.reduce((a, r) => a + (r.commission || 0), 0) + bonusTotal + perfBonus;
+    // Manual bonuses for this rep + period (snapshot into the committed stub).
+    const manualRows = (await client.query(
+      `SELECT amount::float AS amount, description FROM manual_bonuses
+       WHERE rep_name = $1 AND period = $2::date ORDER BY created_at`,
+      [repName, periodDate]
+    )).rows;
+    const manualTotal = manualRows.reduce((a, m) => a + (m.amount || 0), 0);
+    const total      = invRows.reduce((a, r) => a + (r.commission || 0), 0) + bonusTotal + perfBonus + manualTotal;
 
     // Idempotent re-commit: drop any prior app-generated stub for this rep+period (cascades).
     await client.query(
@@ -9236,6 +9310,14 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
            (import_id, rep_name, bonus_type, merchant_name, amount, paid_for_period)
          VALUES ($1, $2, 'monthly_performance', $3, $4, $5::date)`,
         [imp.id, repName, `${perfPts} pts`, perfBonus, periodDate]
+      );
+    }
+    for (const m of manualRows) {
+      await client.query(
+        `INSERT INTO commission_bonuses
+           (import_id, rep_name, bonus_type, merchant_name, amount, paid_for_period)
+         VALUES ($1, $2, 'manual', $3, $4, $5::date)`,
+        [imp.id, repName, m.description || null, m.amount, periodDate]
       );
     }
     for (const a of procAccounts) {
@@ -9337,6 +9419,11 @@ async function payrollDataForMonth(year, month) {
       }
       // Processing bonus excluded from the monthly payroll send — it's bi-annual and handled
       // via its own card/flow (user decision 2026-06-15).
+      const manual = (await pool.query(
+        `SELECT amount::float AS amount, description FROM manual_bonuses
+         WHERE rep_name = $1 AND period = $2::date`, [rep, periodStart]
+      )).rows;
+      for (const m of manual) bonuses.push({ bonus_type: 'manual', merchant_name: m.description, amount: m.amount });
       total = lines.reduce((s, l) => s + (l.paid_amount || 0), 0) + bonuses.reduce((s, b) => s + (b.amount || 0), 0);
     }
     total = Math.round(total * 100) / 100;
