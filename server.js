@@ -5659,10 +5659,11 @@ function parseStandardReport(rows, headerIdx) {
 
   // Now scan everything below for bonus rows. The "Lead Source" column tags the type:
   //   "Signup commission"  → per-merchant signup bonus
-  //   "Volume Bonus" / "Processing Bonus" → per-merchant PROCESSING bonus (historical payouts;
-  //     recorded per account so the automated bi-annual payout excludes them — "paid once").
+  //   "Volume Bonus"/"Volume Commission"/"Processing Bonus"/... → per-merchant PROCESSING bonus
+  //     (historical payouts; recorded per account so the automated bi-annual payout excludes them
+  //     — "paid once").
   //   anything else ending in "BONUS" → a generic monthly bonus (summed).
-  // Volume/Processing is checked FIRST (it also ends in "BONUS").
+  // Volume/Processing is checked FIRST (it can also end in "BONUS").
   const signupBonuses = [];
   const volumeBonuses = [];
   let monthlyBonus = 0;
@@ -5676,7 +5677,7 @@ function parseStandardReport(rows, headerIdx) {
         amount,
         date: r[0] || null,
       });
-    } else if (/(volume|processing)\s*bonus/i.test(tag) && amount > 0) {
+    } else if (/(volume|processing)\s*(bonus|commission)/i.test(tag) && amount > 0) {
       volumeBonuses.push({
         merchant: r[idxCustomer] ? String(r[idxCustomer]).trim() : null,
         amount,
