@@ -9774,6 +9774,53 @@ app.get('/api/admin/processing-bonus/debug', (req, res, next) => {
   }
 });
 
+// POST /api/admin/processing-bonus/relink?secret=  body { match, zentactId, dryRun? }
+// Manually re-link recorded 'processing' bonuses to a Zentact merchant when the imported
+// name had a typo the fuzzy matcher couldn't catch (e.g. "Arkhavan" vs "Akhavan"). Sets
+// matched_zentact_id + rewrites merchant_name to the canonical Zentact business_name so the
+// account is then excluded from the bi-annual payout. `match` is an ILIKE substring of the
+// CURRENT (mistyped) merchant_name. dryRun=true previews without writing.
+app.post('/api/admin/processing-bonus/relink', (req, res, next) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) { req.viaSecret = true; return next(); }
+  return authenticateToken(req, res, next);
+}, async (req, res) => {
+  if (!req.viaSecret && !(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const match = String(req.body.match || '').trim();
+  const zentactId = String(req.body.zentactId || '').trim();
+  const dryRun = req.body.dryRun === true;
+  if (!match || !zentactId) return res.status(400).json({ error: 'match (current merchant_name substring) and zentactId required' });
+  try {
+    const merchant = (await pool.query(
+      `SELECT merchant_account_id, business_name FROM zentact_merchants WHERE merchant_account_id = $1`,
+      [zentactId]
+    )).rows[0];
+    if (!merchant) return res.status(404).json({ error: `No Zentact merchant with id ${zentactId}` });
+
+    const targets = (await pool.query(
+      `SELECT id, merchant_name, matched_zentact_id, amount::float AS amount, import_id
+         FROM commission_bonuses
+        WHERE bonus_type = 'processing' AND merchant_name ILIKE '%' || $1 || '%'`,
+      [match]
+    )).rows;
+    if (!targets.length) return res.json({ updated: 0, note: `No processing bonus matched '%${match}%'`, targets: [] });
+
+    if (dryRun) {
+      return res.json({ dryRun: true, wouldUpdate: targets.length, to: merchant, targets });
+    }
+    const upd = await pool.query(
+      `UPDATE commission_bonuses
+          SET matched_zentact_id = $1, merchant_name = $2
+        WHERE bonus_type = 'processing' AND merchant_name ILIKE '%' || $3 || '%'
+        RETURNING id, merchant_name, matched_zentact_id, amount::float AS amount`,
+      [merchant.merchant_account_id, merchant.business_name, match]
+    );
+    res.json({ updated: upd.rowCount, to: merchant, rows: upd.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 async function getMonthlyPointsByRep(fromDate) {
   const dealSourcePoints = new Map(
     (await pool.query(`SELECT source_group, points FROM deal_source_points`)).rows
