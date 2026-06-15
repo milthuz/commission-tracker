@@ -9629,9 +9629,27 @@ async function computeProcessingBonuses(payoutYear, payoutMonth) {
      GROUP BY e.merchant_account_id, e.business_name, e.rep, e.win_start`,
     [payoutYear, payoutMonth]
   )).rows;
+  // Accounts already paid a processing/volume bonus via import must NEVER re-enter the bi-annual
+  // payout. The SQL NOT EXISTS above covers rows matched to a merchant_account_id; imported lines
+  // whose Zentact name-match failed (matched_zentact_id NULL) are caught here by a fuzzy
+  // business-name comparison using the SAME normalization as buildZentactMatcher. We err toward
+  // EXCLUSION (loose substring match) — per requirement, a paid account must not come back.
+  const paidProcNames = (await pool.query(
+    `SELECT DISTINCT merchant_name FROM commission_bonuses
+      WHERE bonus_type = 'processing' AND merchant_name IS NOT NULL AND merchant_name <> ''`
+  )).rows;
+  const normName = (s) => (s || '').toLowerCase().replace(/[\s\-_'.,&]+/g, '');
+  const paidNorms = paidProcNames.map(r => normName(r.merchant_name)).filter(Boolean);
+  const alreadyPaidByName = (business) => {
+    const n = normName(business);
+    if (!n) return false;
+    return paidNorms.some(p => p === n || p.includes(n) || n.includes(p));
+  };
+
   const fmtYM = (d) => { const x = new Date(d); return `${x.getUTCFullYear()}-${String(x.getUTCMonth() + 1).padStart(2, '0')}`; };
   const byRep = new Map();
   for (const r of rows) {
+    if (alreadyPaidByName(r.business_name)) continue;     // already paid via import (name fallback)
     const activeMonths = parseInt(r.active_months) || 0;
     if (activeMonths < 3) continue;                       // need revenue in >= 3 of the 6 window months
     const avg = (Number(r.total_cents) / 100) / activeMonths;
