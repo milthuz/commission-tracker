@@ -13,6 +13,7 @@ const jwt = require('jsonwebtoken');
 const bodyParser = require('body-parser');
 const multer = require('multer');
 const xlsx = require('xlsx');
+const PDFDocument = require('pdfkit');
 const { Pool } = require('pg');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
@@ -9187,6 +9188,221 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
     res.status(500).json({ error: 'Failed to commit pay stub', details: e.message });
   } finally {
     client.release();
+  }
+});
+
+// ============================================================================
+// PAYROLL SEND — compile all active reps' pay for a month and email it to payroll
+// ============================================================================
+// Bi-weekly pay calendar (user-provided 2026). Each entry: [periodStart, periodEnd,
+// commissionDueBy] in YYYY-MM-DD. "Commission due by" = the deadline to send to payroll.
+const PAY_CALENDAR = [
+  ['2025-12-28','2026-01-10','2026-01-13'],['2026-01-11','2026-01-24','2026-01-27'],
+  ['2026-01-25','2026-02-07','2026-02-10'],['2026-02-08','2026-02-21','2026-02-24'],
+  ['2026-02-22','2026-03-07','2026-03-10'],['2026-03-08','2026-03-21','2026-03-24'],
+  ['2026-03-22','2026-04-04','2026-04-07'],['2026-04-05','2026-04-18','2026-04-21'],
+  ['2026-04-19','2026-05-02','2026-05-05'],['2026-05-03','2026-05-16','2026-05-19'],
+  ['2026-05-17','2026-05-30','2026-06-02'],['2026-05-31','2026-06-13','2026-06-16'],
+  ['2026-06-14','2026-06-27','2026-06-30'],['2026-06-28','2026-07-11','2026-07-14'],
+  ['2026-07-12','2026-07-25','2026-07-28'],['2026-07-26','2026-08-08','2026-08-11'],
+  ['2026-08-09','2026-08-22','2026-08-25'],['2026-08-23','2026-09-05','2026-09-08'],
+  ['2026-09-06','2026-09-19','2026-09-22'],['2026-09-20','2026-10-03','2026-10-06'],
+  ['2026-10-04','2026-10-17','2026-10-20'],['2026-10-18','2026-10-31','2026-11-03'],
+  ['2026-11-01','2026-11-14','2026-11-17'],['2026-11-15','2026-11-28','2026-12-01'],
+  ['2026-11-29','2026-12-12','2026-12-15'],['2026-12-13','2026-12-26','2026-12-29'],
+];
+
+async function getPayrollRecipients() {
+  try {
+    const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'payroll_recipients'`);
+    const v = r.rows[0]?.value;
+    return Array.isArray(v) ? v.filter(e => typeof e === 'string') : [];
+  } catch { return []; }
+}
+
+// Per-rep pay for a month: committed import total if present, else the generated model
+// (unpaid qualifying commissions + signup + monthly-performance + processing bonuses).
+async function payrollDataForMonth(year, month) {
+  const mm = String(month).padStart(2, '0');
+  const periodStart = new Date(`${year}-${mm}-01`);
+  const periodEnd = new Date(periodStart); periodEnd.setMonth(periodEnd.getMonth() + 1);
+  const orgId = process.env.ZOHO_ORG_ID;
+  const platform = periodStart >= PLAN_START_DATE;
+  const ptsMap = platform ? await getMonthlyPointsByRep(periodStart) : new Map();
+  const proc = (platform && (month === 6 || month === 12)) ? await computeProcessingBonuses(year, month) : null;
+
+  const reps = (await pool.query(`SELECT name, monthly_quota FROM salespeople WHERE is_active = true ORDER BY name`)).rows;
+  const out = [];
+  for (const sp of reps) {
+    const rep = sp.name;
+    const imp = (await pool.query(
+      `SELECT id, total_amount FROM commission_payment_imports
+       WHERE rep_name = $1 AND paid_for_period >= $2::date AND paid_for_period < $3::date
+       ORDER BY imported_at DESC LIMIT 1`, [rep, periodStart, periodEnd]
+    )).rows[0];
+    let lines = [], bonuses = [], total = 0, source;
+    if (imp) {
+      source = 'imported';
+      lines = (await pool.query(
+        `SELECT invoice_number, customer, paid_amount::float AS paid_amount FROM commission_payment_lines
+         WHERE import_id = $1 ORDER BY paid_amount DESC`, [imp.id])).rows;
+      bonuses = (await pool.query(
+        `SELECT bonus_type, merchant_name, amount::float AS amount FROM commission_bonuses
+         WHERE import_id = $1 ORDER BY bonus_type`, [imp.id])).rows;
+      total = parseFloat(imp.total_amount) || 0;
+    } else {
+      source = 'generated';
+      lines = (await pool.query(
+        `SELECT invoice_number, customer_name AS customer, commission::float AS paid_amount FROM invoices
+         WHERE salesperson_name = $1 AND organization_id = $2
+           AND commission_payable_date >= $3 AND commission_payable_date < $4
+           AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual')
+           AND approval_status <> 'paid' ORDER BY commission DESC`,
+        [rep, orgId, periodStart, periodEnd])).rows;
+      const signups = (await pool.query(
+        `SELECT business_name AS merchant_name, bonus_amount::float AS amount FROM zentact_merchants
+         WHERE LOWER(sales_rep_name) = LOWER($1) AND status = 'ACTIVE' AND activated_at >= $2 AND activated_at < $3`,
+        [rep, periodStart, periodEnd])).rows;
+      bonuses = signups.map(b => ({ bonus_type: 'signup', merchant_name: b.merchant_name, amount: b.amount }));
+      if (platform) {
+        const pts = ptsMap.get(`${rep}|${year}-${mm}`) || 0;
+        const quota = sp.monthly_quota == null ? MONTHLY_QUOTA : parseInt(sp.monthly_quota);
+        const mb = pts >= quota ? ZohoCRMService.calculateMonthlyBonus(pts) : 0;
+        if (mb > 0) bonuses.push({ bonus_type: 'monthly_performance', merchant_name: `${pts} pts`, amount: mb });
+      }
+      if (proc) {
+        const mine = proc.byRep.get(rep);
+        if (mine) for (const a of mine.accounts) bonuses.push({ bonus_type: 'processing', merchant_name: a.business_name, amount: a.bonus });
+      }
+      total = lines.reduce((s, l) => s + (l.paid_amount || 0), 0) + bonuses.reduce((s, b) => s + (b.amount || 0), 0);
+    }
+    total = Math.round(total * 100) / 100;
+    if (total > 0 || lines.length || bonuses.length) out.push({ rep, source, lines, bonuses, total });
+  }
+  return out;
+}
+
+// Build a single combined PDF (one rep per page) with pdfkit. Returns a Buffer.
+function buildPayrollPdf(periodLabel, reps) {
+  return new Promise((resolve, reject) => {
+    try {
+      const doc = new PDFDocument({ size: 'LETTER', margin: 50 });
+      const chunks = [];
+      doc.on('data', c => chunks.push(c));
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const bl = (t) => t === 'signup' ? 'Signup bonus' : (t === 'monthly' || t === 'monthly_performance') ? 'Monthly bonus' : t === 'processing' ? 'Processing bonus' : t;
+      reps.forEach((r, idx) => {
+        if (idx > 0) doc.addPage();
+        doc.fillColor('#1c2434').fontSize(18).text('Sales Hub', { continued: true }).fillColor('#8a99af').fontSize(11).text('  Pay Stub');
+        doc.moveDown(0.3).fillColor('#1c2434').fontSize(15).text(r.rep);
+        doc.fillColor('#64748b').fontSize(10).text(`Period: ${periodLabel}  ·  ${r.source === 'imported' ? 'Paid' : 'Pending approval'}`);
+        doc.moveDown(0.6);
+        if (r.lines.length) {
+          doc.fillColor('#94a3b8').fontSize(9).text('COMMISSIONS');
+          doc.fillColor('#1c2434').fontSize(10);
+          r.lines.forEach(l => doc.text(`${l.invoice_number}   ${(l.customer || '').slice(0, 38)}`, { continued: true }).text(money(l.paid_amount), { align: 'right' }));
+          doc.moveDown(0.4);
+        }
+        if (r.bonuses.length) {
+          doc.fillColor('#94a3b8').fontSize(9).text('BONUSES');
+          doc.fillColor('#1c2434').fontSize(10);
+          r.bonuses.forEach(b => doc.text(`${bl(b.bonus_type)}   ${(b.merchant_name || '').slice(0, 34)}`, { continued: true }).text(money(b.amount), { align: 'right' }));
+          doc.moveDown(0.4);
+        }
+        doc.moveTo(50, doc.y).lineTo(560, doc.y).strokeColor('#e2e8f0').stroke();
+        doc.moveDown(0.3).fillColor('#1c2434').fontSize(13).text('TOTAL', { continued: true }).fillColor('#f97316').text(money(r.total), { align: 'right' });
+        doc.moveDown(1).fillColor('#94a3b8').fontSize(8).text('Gross amounts, before tax and withholdings.');
+      });
+      doc.end();
+    } catch (e) { reject(e); }
+  });
+}
+
+// GET /api/commissions/payroll/preview?year=&month= — per-rep totals + the calendar deadline.
+app.get('/api/commissions/payroll/preview', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const year = parseInt(req.query.year), month = parseInt(req.query.month);
+  if (!year || month < 1 || month > 12) return res.status(400).json({ error: 'year + month required' });
+  try {
+    const reps = await payrollDataForMonth(year, month);
+    const mm = String(month).padStart(2, '0');
+    // Deadline = the "commission due by" of the LAST pay period whose end falls in the month.
+    const inMonth = PAY_CALENDAR.filter(p => p[1].startsWith(`${year}-${mm}`));
+    const dueBy = inMonth.length ? inMonth[inMonth.length - 1][2] : null;
+    res.json({
+      year, month, dueBy,
+      recipients: await getPayrollRecipients(),
+      grandTotal: Math.round(reps.reduce((s, r) => s + r.total, 0) * 100) / 100,
+      reps: reps.map(r => ({ rep: r.rep, source: r.source, total: r.total, lineCount: r.lines.length, bonusCount: r.bonuses.length })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/commissions/payroll/recipients { emails:[...] }
+app.put('/api/commissions/payroll/recipients', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const emails = Array.isArray(req.body?.emails) ? req.body.emails.map(e => String(e).trim().toLowerCase()).filter(Boolean) : null;
+  if (!emails) return res.status(400).json({ error: 'emails array required' });
+  if (emails.some(e => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e))) return res.status(400).json({ error: 'invalid email' });
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('payroll_recipients', $1::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [JSON.stringify(emails)]
+    );
+    res.json({ recipients: emails });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/commissions/payroll/send { year, month } — email payroll the month's commissions:
+// a summary table in the body + one combined PDF (all reps, one per page).
+app.post('/api/commissions/payroll/send', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const year = parseInt(req.body.year), month = parseInt(req.body.month);
+  if (!year || month < 1 || month > 12) return res.status(400).json({ error: 'year + month required' });
+  try {
+    const recipients = await getPayrollRecipients();
+    if (!recipients.length) return res.status(400).json({ error: 'no payroll recipients configured' });
+    const reps = await payrollDataForMonth(year, month);
+    if (!reps.length) return res.status(400).json({ error: 'nothing to send for this period' });
+    const mm = String(month).padStart(2, '0');
+    const periodLabel = `${year}-${mm}`;
+    const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const grand = Math.round(reps.reduce((s, r) => s + r.total, 0) * 100) / 100;
+    const rowsHtml = reps.map(r =>
+      `<tr><td style="padding:6px 10px;border-top:1px solid #eef1f6">${r.rep}</td>
+           <td style="padding:6px 10px;border-top:1px solid #eef1f6;text-align:right">${money(r.total)}</td></tr>`).join('');
+    const html = `<!doctype html><html><body style="margin:0;background:#f4f6fa;font-family:Arial,Helvetica,sans-serif">
+      <table width="100%" cellpadding="0" cellspacing="0" style="padding:28px 12px"><tr><td align="center">
+        <table width="560" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:10px;overflow:hidden">
+          <tr><td style="background:#1c2434;padding:20px 28px"><span style="color:#fff;font-size:19px;font-weight:bold">Sales Hub</span></td></tr>
+          <tr><td style="padding:24px 28px">
+            <h2 style="margin:0 0 12px;color:#1c2434;font-size:18px">Commissions à verser — ${periodLabel}</h2>
+            <table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434">
+              <tr><th style="text-align:left;padding:6px 10px;color:#94a3b8;font-size:11px">REP</th><th style="text-align:right;padding:6px 10px;color:#94a3b8;font-size:11px">TOTAL</th></tr>
+              ${rowsHtml}
+              <tr><td style="padding:10px;border-top:2px solid #1c2434;font-weight:bold">Total</td><td style="padding:10px;border-top:2px solid #1c2434;text-align:right;font-weight:bold;color:#f97316">${money(grand)}</td></tr>
+            </table>
+            <p style="margin:18px 0 0;color:#94a3b8;font-size:11px">Bulletins détaillés en pièce jointe (PDF). Montants bruts, avant impôts et retenues.</p>
+          </td></tr></table></td></tr></table></body></html>`;
+    const pdf = await buildPayrollPdf(periodLabel, reps);
+    const t = getMailer();
+    if (!t) return res.status(502).json({ error: 'smtp_not_configured' });
+    await t.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: recipients.join(','),
+      subject: `Commissions à verser — ${periodLabel}`,
+      html,
+      attachments: [{ filename: `Commissions_${periodLabel}.pdf`, content: pdf }],
+    });
+    res.json({ sent: true, recipients: recipients.length, reps: reps.length, grandTotal: grand });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to send payroll', details: e.message });
   }
 });
 
