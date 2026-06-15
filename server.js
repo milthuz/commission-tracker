@@ -5723,18 +5723,27 @@ function parseAddonReport(rows, headerIdx) {
   return { invoices, signupBonuses: [], volumeBonuses: [], monthlyBonus: 0 };
 }
 
+// Normalize a merchant name for fuzzy comparison: strip ACCENTS/diacritics, lowercase,
+// drop spaces/punctuation. Shared by the Zentact matcher and the processing-bonus exclusion
+// so "Café Gentile" and "Cafe Gentile" compare equal. (Accent-stripping added 2026-06-15 —
+// without it, an account paid as "Café…" wasn't excluded from the bi-annual "Cafe…" row.)
+function normMerchant(s) {
+  return (s || '').normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .toLowerCase().replace(/[\s\-_'.,&]+/g, '');
+}
+
 // Load zentact_merchants ONCE and return a fuzzy matcher — case-insensitive, ignores
-// spaces/hyphens. Avoids the full-table scan per bonus that previously serialized into
+// accents/spaces/hyphens. Avoids the full-table scan per bonus that previously serialized into
 // the Heroku 30s request timeout (H12) on large reports.
 async function buildZentactMatcher() {
   const all = await pool.query(`SELECT merchant_account_id, business_name FROM zentact_merchants WHERE business_name IS NOT NULL AND business_name <> ''`);
   const candidates = all.rows.map(row => ({
     id: row.merchant_account_id,
-    norm: (row.business_name || '').toLowerCase().replace(/[\s\-_'.,&]+/g, ''),
+    norm: normMerchant(row.business_name),
   }));
   return (name) => {
     if (!name) return null;
-    const norm = name.toLowerCase().replace(/[\s\-_'.,&]+/g, '');
+    const norm = normMerchant(name);
     for (const c of candidates) {
       if (c.norm === norm) return c.id;
       if (c.norm.includes(norm) || norm.includes(c.norm)) return c.id;
@@ -9638,7 +9647,7 @@ async function computeProcessingBonuses(payoutYear, payoutMonth) {
     `SELECT DISTINCT merchant_name FROM commission_bonuses
       WHERE bonus_type = 'processing' AND merchant_name IS NOT NULL AND merchant_name <> ''`
   )).rows;
-  const normName = (s) => (s || '').toLowerCase().replace(/[\s\-_'.,&]+/g, '');
+  const normName = normMerchant;  // accent-insensitive (see normMerchant)
   const paidNorms = paidProcNames.map(r => normName(r.merchant_name)).filter(Boolean);
   const alreadyPaidByName = (business) => {
     const n = normName(business);
@@ -9704,7 +9713,7 @@ app.get('/api/admin/processing-bonus/debug', (req, res, next) => {
   if (!req.viaSecret && !(await requirePerm(req, res, 'report:mark_paid'))) return;
   const q = String(req.query.q || '').trim();
   if (!q) return res.status(400).json({ error: 'q (merchant name) required' });
-  const normName = (s) => (s || '').toLowerCase().replace(/[\s\-_'.,&]+/g, '');
+  const normName = normMerchant;  // accent-insensitive (see normMerchant)
   try {
     const merchants = (await pool.query(
       `SELECT merchant_account_id, business_name, sales_rep_name, activated_at
