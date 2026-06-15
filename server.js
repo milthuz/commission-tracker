@@ -760,8 +760,22 @@ const authenticateToken = async (req, res, next) => {
     const user = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
     req.user = user;
 
+    // SECURITY: the Zoho-login JWT is signed isAdmin:true for everyone (legacy). NEVER trust
+    // that flag — re-resolve the REAL admin status from user_tokens on every request. Without
+    // this, any logged-in rep is treated as a full admin server-side (requirePerm auto-passes,
+    // /api/crm/points returns everyone's deals, etc.). Local (external) users aren't in
+    // user_tokens → resolves false, which is correct (they're never admins).
+    let realIsAdmin = false;
+    if (user.email) {
+      try {
+        const r = await pool.query('SELECT is_admin FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1', [user.email]);
+        realIsAdmin = r.rows[0]?.is_admin === true;
+      } catch { /* default false */ }
+    }
+    req.user.isAdmin = realIsAdmin;
+
     const impersonateName = req.headers['x-impersonate-as'];
-    if (impersonateName && user.isAdmin === true) {
+    if (impersonateName && realIsAdmin) {
       const result = await pool.query(
         'SELECT name FROM salespeople WHERE LOWER(name) = LOWER($1) LIMIT 1',
         [String(impersonateName).trim()]
@@ -5102,18 +5116,29 @@ app.post('/api/admin/backfill-subtotals', async (req, res) => {
       )).rows;
       subtotalBackfill.total = rows.length;
       const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+      let curToken = accessToken;
       const getWithRetry = async (url, params) => {
         for (let attempt = 0; attempt < 3; attempt++) {
-          const res = await axios.get(url, { params, headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true });
+          const res = await axios.get(url, { params, headers: { Authorization: `Zoho-oauthtoken ${curToken}` }, validateStatus: () => true });
           if (res.status === 200) return res;
+          if (res.status === 401) { // token expired mid-run → refresh and retry
+            const td = await ensureValidToken(admin.email);
+            curToken = typeof td === 'string' ? td : td?.access_token;
+            continue;
+          }
           if (res.status === 429 || res.status >= 500) { await sleep(2000 * (attempt + 1)); continue; } // rate limit / transient
-          return res; // 4xx other than 429 → don't retry
+          return res; // 4xx other than 401/429 → don't retry
         }
         return null;
       };
+      let i = 0;
       for (const row of rows) {
         try {
           await sleep(120); // throttle to stay under Zoho's burst limit
+          if (++i % 400 === 0) { // proactively refresh the token on long runs (tokens ~1h)
+            const td = await ensureValidToken(admin.email);
+            curToken = typeof td === 'string' ? td : td?.access_token;
+          }
           const searchRes = await getWithRetry(`${admin.api_domain}/books/v3/invoices`, { organization_id: orgId, invoice_number: row.invoice_number });
           const stubInv = searchRes?.data?.invoices?.[0];
           if (!stubInv) { subtotalBackfill.errors++; subtotalBackfill.processed++; continue; }
