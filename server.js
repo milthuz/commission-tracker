@@ -8812,8 +8812,11 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
         }
       }
       // Bi-annual processing bonus — only in June (window Dec→May) and December (Jun→Nov).
+      // ADMIN-ONLY in the generated (un-committed) stub: it must be APPROVED (committed)
+      // before the rep sees it. Once committed the stub is 'imported' and the rep sees the
+      // stored processing rows normally.
       const pm = periodStart.getMonth() + 1;
-      if (periodStart >= PLAN_START_DATE && (pm === 6 || pm === 12)) {
+      if (canAudit && periodStart >= PLAN_START_DATE && (pm === 6 || pm === 12)) {
         const proc = await computeProcessingBonuses(periodStart.getFullYear(), pm);
         const mine = proc?.byRep.get(targetRep);
         if (mine) {
