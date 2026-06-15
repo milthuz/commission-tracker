@@ -9692,6 +9692,58 @@ app.get('/api/admin/processing-bonus', (req, res, next) => {
   }
 });
 
+// GET /api/admin/processing-bonus/debug?secret=&q=<merchant name>
+// Diagnostic: why is (or isn't) an account excluded from the bi-annual payout?
+// Returns the matching Zentact merchants + every recorded 'processing' bonus matching q,
+// and whether the fuzzy name-exclusion in computeProcessingBonuses would catch it.
+app.get('/api/admin/processing-bonus/debug', (req, res, next) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) { req.viaSecret = true; return next(); }
+  return authenticateToken(req, res, next);
+}, async (req, res) => {
+  if (!req.viaSecret && !(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.status(400).json({ error: 'q (merchant name) required' });
+  const normName = (s) => (s || '').toLowerCase().replace(/[\s\-_'.,&]+/g, '');
+  try {
+    const merchants = (await pool.query(
+      `SELECT merchant_account_id, business_name, sales_rep_name, activated_at
+         FROM zentact_merchants WHERE business_name ILIKE '%' || $1 || '%' ORDER BY business_name`,
+      [q]
+    )).rows;
+    const bonuses = (await pool.query(
+      `SELECT cb.merchant_name, cb.matched_zentact_id, cb.amount::float AS amount,
+              cb.paid_for_period, cb.report_date, i.filename, i.rep_name
+         FROM commission_bonuses cb
+         LEFT JOIN commission_payment_imports i ON i.id = cb.import_id
+        WHERE cb.bonus_type = 'processing' AND cb.merchant_name ILIKE '%' || $1 || '%'
+        ORDER BY cb.paid_for_period DESC NULLS LAST`,
+      [q]
+    )).rows;
+    // All recorded processing-bonus names (for the fuzzy-exclusion check the payout uses).
+    const paidNorms = (await pool.query(
+      `SELECT DISTINCT merchant_name FROM commission_bonuses
+        WHERE bonus_type = 'processing' AND merchant_name IS NOT NULL AND merchant_name <> ''`
+    )).rows.map(r => normName(r.merchant_name)).filter(Boolean);
+    const wouldExclude = (business) => {
+      const n = normName(business);
+      if (!n) return false;
+      return paidNorms.some(p => p === n || p.includes(n) || n.includes(p));
+    };
+    res.json({
+      q,
+      merchants: merchants.map(m => ({
+        ...m,
+        excluded_by_id: bonuses.some(b => b.matched_zentact_id === m.merchant_account_id),
+        excluded_by_name: wouldExclude(m.business_name),
+      })),
+      recorded_processing_bonuses: bonuses,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 async function getMonthlyPointsByRep(fromDate) {
   const dealSourcePoints = new Map(
     (await pool.query(`SELECT source_group, points FROM deal_source_points`)).rows
