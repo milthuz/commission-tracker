@@ -8907,6 +8907,22 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
         approval_status: r.approval_status || 'pending',
       }));
     };
+    // Committed bi-annual processing bonuses (platform commit = import_id NULL) whose payout
+    // period is this month. Shows on the June/December stub once the bi-annual payout is
+    // ACCEPTED via the Processing-bonus card commit. Read-only here (the card owns the rows),
+    // so it never double-counts. Empty for non-June/December months (no such rows exist).
+    const committedProcessing = async () => {
+      const rows = (await pool.query(
+        `SELECT merchant_name, amount::float AS amount, report_date::date AS report_date
+           FROM commission_bonuses
+          WHERE rep_name = $1 AND bonus_type = 'processing' AND import_id IS NULL
+            AND paid_for_period >= $2::date AND paid_for_period < $3::date
+          ORDER BY amount DESC`,
+        [targetRep, periodStart, periodEnd]
+      )).rows;
+      return rows.map(r => ({ bonus_type: 'processing', merchant_name: r.merchant_name, amount: r.amount, report_date: r.report_date }));
+    };
+
     // App-generated signup bonuses: Zentact merchants this rep activated in the period.
     const genBonuses = async () => {
       const rows = (await pool.query(
@@ -8955,6 +8971,8 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
       for (const m of manual) {
         bonuses.push({ bonus_type: 'manual', merchant_name: m.description || null, amount: m.amount, report_date: null });
       }
+      // Accepted bi-annual processing payout for this month (June/December).
+      bonuses.push(...(await committedProcessing()));
       return bonuses;
     };
 
@@ -8977,6 +8995,11 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
          FROM commission_bonuses WHERE import_id = $1 ORDER BY bonus_type, amount DESC`,
         [imp.id]
       )).rows;
+      // An accepted bi-annual processing payout (import_id NULL) for June/December isn't linked
+      // to this import row, but still belongs on the period's stub — append it + add to total.
+      const procExtra = await committedProcessing();
+      bonuses.push(...procExtra);
+      const procExtraTotal = procExtra.reduce((a, b) => a + b.amount, 0);
       const linesStored = lines.length > 0;
       // "Missed" = earned (unlocked) in this period per the app's model but still NOT paid —
       // i.e. invoices the pay file didn't cover. This is the user's forgot-to-pay radar.
@@ -8994,7 +9017,7 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
         filename:    imp.filename,
         lines:       outLines,
         bonuses,
-        total:       parseFloat(imp.total_amount) || 0,
+        total:       (parseFloat(imp.total_amount) || 0) + procExtraTotal,
         missed:      canAudit ? missed : [],
         missedTotal: canAudit ? missed.reduce((a, l) => a + l.app_commission, 0) : 0,
       });
@@ -9425,6 +9448,15 @@ async function payrollDataForMonth(year, month) {
        WHERE rep_name = $1 AND paid_for_period >= $2::date AND paid_for_period < $3::date
        ORDER BY imported_at DESC LIMIT 1`, [rep, periodStart, periodEnd]
     )).rows[0];
+    // Accepted bi-annual processing payout (platform commit = import_id NULL) for this month.
+    // Added to BOTH stub branches so the June/December payroll matches the on-screen stub.
+    const committedProc = (await pool.query(
+      `SELECT merchant_name, amount::float AS amount FROM commission_bonuses
+        WHERE rep_name = $1 AND bonus_type = 'processing' AND import_id IS NULL
+          AND paid_for_period >= $2::date AND paid_for_period < $3::date`,
+      [rep, periodStart, periodEnd]
+    )).rows.map(p => ({ bonus_type: 'processing', merchant_name: p.merchant_name, amount: p.amount }));
+    const committedProcTotal = committedProc.reduce((s, b) => s + b.amount, 0);
     let lines = [], bonuses = [], total = 0, source;
     if (imp) {
       source = 'imported';
@@ -9434,7 +9466,8 @@ async function payrollDataForMonth(year, month) {
       bonuses = (await pool.query(
         `SELECT bonus_type, merchant_name, amount::float AS amount FROM commission_bonuses
          WHERE import_id = $1 ORDER BY bonus_type`, [imp.id])).rows;
-      total = parseFloat(imp.total_amount) || 0;
+      bonuses.push(...committedProc);
+      total = (parseFloat(imp.total_amount) || 0) + committedProcTotal;
     } else {
       source = 'generated';
       lines = (await pool.query(
@@ -9455,13 +9488,13 @@ async function payrollDataForMonth(year, month) {
         const mb = pts >= quota ? ZohoCRMService.calculateMonthlyBonus(pts) : 0;
         if (mb > 0) bonuses.push({ bonus_type: 'monthly_performance', merchant_name: `${pts} pts`, amount: mb });
       }
-      // Processing bonus excluded from the monthly payroll send — it's bi-annual and handled
-      // via its own card/flow (user decision 2026-06-15).
       const manual = (await pool.query(
         `SELECT amount::float AS amount, description FROM manual_bonuses
          WHERE rep_name = $1 AND period = $2::date`, [rep, periodStart]
       )).rows;
       for (const m of manual) bonuses.push({ bonus_type: 'manual', merchant_name: m.description, amount: m.amount });
+      // Accepted bi-annual processing payout (June/December) — same rows the stub shows.
+      bonuses.push(...committedProc);
       total = lines.reduce((s, l) => s + (l.paid_amount || 0), 0) + bonuses.reduce((s, b) => s + (b.amount || 0), 0);
     }
     total = Math.round(total * 100) / 100;
