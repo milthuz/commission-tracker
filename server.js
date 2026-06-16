@@ -7824,14 +7824,14 @@ async function fetchSubActivation(subscriptionId, apiDomain, accessToken, cache)
 //   onlyMissing=false          — re-enrich everything
 // Shared enrich routine — runs the background enrichment job. Used by both the
 // HTTP endpoint and the post-sync auto-trigger.
-async function runEnrichInvoices({ onlyMissing = true, source = 'manual' } = {}) {
+async function runEnrichInvoices({ onlyMissing = true, source = 'manual', extraWhere = '' } = {}) {
   if (enrichJob.status === 'running') {
     return { skipped: true, reason: 'already_running' };
   }
   enrichJob = {
     status: 'running', startedAt: new Date().toISOString(),
     processed: 0, total: 0, message: `Starting (${source})...`,
-    onlyMissing, source,
+    onlyMissing, source, extraWhere,
     stats: { saas: 0, hardware: 0, unknown: 0, eligible: 0, pending_payment: 0, pending_saas: 0, skipped: 0 },
   };
   try {
@@ -7856,10 +7856,13 @@ async function runEnrichInvoices({ onlyMissing = true, source = 'manual' } = {})
       // When onlyMissing=true, skip those already enriched (line_items populated).
       const skipFilter = enrichJob.onlyMissing
         ? `AND (line_items IS NULL OR line_items = '[]'::jsonb)` : '';
+      // Optional targeted filter (e.g. re-enrich only phantom-discount invoices). Trusted —
+      // built server-side, never from user input.
+      const extra = enrichJob.extraWhere ? ` ${enrichJob.extraWhere}` : '';
       const invRes = await pool.query(
         `SELECT invoice_number FROM invoices
          WHERE organization_id = $1 AND status = 'paid'
-         ${skipFilter}
+         ${skipFilter}${extra}
          ORDER BY date DESC`,
         [orgId]
       );
@@ -7920,9 +7923,15 @@ async function runEnrichInvoices({ onlyMissing = true, source = 'manual' } = {})
           const lineType = classifyLineType(li.name, sku, planCodes, planNames);
           if (lineType === 'saas') saasLines++; else if (lineType === 'hardware') hardwareLines++;
           const matchedBySku = sku && planCodes.has(sku.toLowerCase());
+          // Use Zoho's net line item_total when present — INCLUDING 0 (a 100%-discounted/free
+          // line). The old `parseFloat(item_total) || rate*qty` treated 0 as missing and fell
+          // back to rate*qty, storing a free line at full price → phantom invoice-level discount
+          // that wrongly halved the hardware rate on the OTHER (full-price) lines.
+          const it = parseFloat(li.item_total);
+          const amount = Number.isFinite(it) ? it : ((parseFloat(li.rate) * parseInt(li.quantity)) || 0);
           return {
             name: li.name, sku, quantity: li.quantity, rate: li.rate,
-            amount: parseFloat(li.item_total) || (parseFloat(li.rate) * parseInt(li.quantity)) || 0,
+            amount,
             type: lineType,
             plan_code: matchedBySku ? sku : (planNames.get(normalizeName(li.name)) || null),
           };
@@ -8010,6 +8019,34 @@ app.post('/api/invoices/enrich/stop', authenticateToken, (req, res) => {
   res.json({ success: true });
 });
 
+// POST /api/admin/reenrich-discounted?secret=&count=  — re-enrich ONLY "phantom discount"
+// invoices (sub_total < gross_line_total) so 100%-discounted/free lines, which the old parser
+// stored at full price (item_total=0 fell back to rate*qty), get their correct net amount (0).
+// Bounded re-fetch from Zoho, then auto-recalc. ?count=1 reports how many would be processed.
+app.post('/api/admin/reenrich-discounted', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const where = `AND sub_total IS NOT NULL AND gross_line_total IS NOT NULL AND sub_total < gross_line_total - 0.01`;
+  try {
+    if (req.query.count === '1') {
+      const c = (await pool.query(
+        `SELECT COUNT(*)::int AS n FROM invoices WHERE organization_id = $1 AND status = 'paid' ${where}`,
+        [process.env.ZOHO_ORG_ID]
+      )).rows[0].n;
+      return res.json({ wouldReenrich: c });
+    }
+    if (enrichJob.status === 'running') return res.status(409).json({ error: 'Enrich already running' });
+    res.json({ success: true, message: 'Re-enrich of phantom-discount invoices started; recalc-v2 runs after.' });
+    runEnrichInvoices({ onlyMissing: false, source: 'reenrich-discounted', extraWhere: where })
+      .then(() => runRecalcV2('reenrich-discounted'))
+      .catch(e => console.error('reenrich-discounted bg error:', e));
+  } catch (e) {
+    if (!res.headersSent) res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/invoices/enrich-preview/:invoiceNumber — fetches ONE invoice from Zoho Books
 // with full line items, classifies it as hardware OR SaaS via cached plan_codes,
 // and computes commission_payable_date with customer-level linking.
@@ -8084,7 +8121,13 @@ app.get('/api/invoices/enrich-preview/:invoiceNumber', authenticateToken, async 
     const classified = (inv.line_items || []).map(li => {
       const sku = (li.sku || li.item_code || '').trim();
       const m = matchPlan(sku, li.name);
-      const amount = parseFloat(li.item_total) || (parseFloat(li.rate) * parseInt(li.quantity)) || 0;
+      // Stored line carries the net `amount` already (incl. 0 for free lines) — prefer it;
+      // fall back to item_total / rate*qty only when absent. Treats 0 as a valid amount.
+      const stored = parseFloat(li.amount);
+      const it = parseFloat(li.item_total);
+      const amount = Number.isFinite(stored) ? stored
+                   : Number.isFinite(it) ? it
+                   : ((parseFloat(li.rate) * parseInt(li.quantity)) || 0);
       if (m.matched) saasLineCount++; else hardwareLineCount++;
       const subDate = li.subscription_activation_date || li.start_date || null;
       if (subDate) {
