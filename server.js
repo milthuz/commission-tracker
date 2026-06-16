@@ -9038,6 +9038,13 @@ app.post('/api/commissions/unapprove', authenticateToken, async (req, res) => {
          RETURNING invoice_number`,
         [repName, process.env.ZOHO_ORG_ID, startDate, endDate]
       );
+      // Also remove the app-generated pay-stub record for the period (created by Mark Paid /
+      // commit) so undo is clean — never deletes a real imported pay file.
+      await pool.query(
+        `DELETE FROM commission_payment_imports
+         WHERE rep_name = $1 AND paid_for_period = $2::date AND filename LIKE 'app-generated%'`,
+        [repName, `${year}-${String(month).padStart(2, '0')}-01`]
+      );
     } else {
       return res.status(400).json({ error: 'Provide repName+year+month or invoiceNumbers' });
     }
