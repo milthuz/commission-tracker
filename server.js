@@ -359,6 +359,21 @@ async function initializeDatabase() {
     // (recalc honors it instead of recomputing), so the invoice appears in the target month's
     // report/stub/payroll as a normal commission line. Cleared on undo. See commission_adjustments.
     await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS payable_override DATE`);
+    // One-time migration: convert OLD-style adjustments (source invoice marked paid in its
+    // original month) to the new re-home model (move the unlock month to the target, keep
+    // pending). Idempotent — after conversion the payout note is cleared so it won't re-match.
+    await pool.query(`
+      UPDATE invoices i
+         SET payable_override = ca.target_period,
+             commission_payable_date = ca.target_period,
+             approval_status = 'pending', commission_paid = false,
+             payout_paid_by = NULL, payout_paid_at = NULL,
+             updated_at = CURRENT_TIMESTAMP
+        FROM commission_adjustments ca
+       WHERE i.invoice_number = ca.invoice_number
+         AND i.payout_paid_by LIKE 'adjustment:%'
+         AND i.payable_override IS NULL
+    `);
     // Sum of ALL line amounts (hw + saas + noncommission), pre-discount. The discount factor
     // = (sub_total - discount_total) / gross_line_total, because Zoho sometimes bakes the
     // discount into sub_total (discount_total=0, sub_total < line sum) and sometimes reports it
