@@ -7812,7 +7812,7 @@ function classifyLineType(name, sku, planCodes, planNames) {
   // SaaS: matches a Zoho plan, OR a recurring software product/add-on by keyword.
   if (sku && planCodes.has(String(sku).toLowerCase().trim())) return 'saas';
   if (n && planNames.has(n)) return 'saas';
-  if (/integration|online ordering|qr table|delivery|bundle|cluster os|add-?on/.test(n)) return 'saas';
+  if (/integration|online ordering|qr table|delivery|bundle|cluster os|add-?on|saas/.test(n)) return 'saas';
   // Everything else (POS, printers, terminals, installation/labor/shipping services) → hardware.
   return 'hardware';
 }
@@ -8096,6 +8096,55 @@ app.get('/api/admin/zoho-invoice-raw', async (req, res) => {
       })),
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/admin/reclassify-saas?secret=&count=  — re-classify STORED line_items so lines named
+// "...saas..." that were mislabeled 'hardware' become 'saas' (classifier now matches "saas").
+// Recomputes hardware_amount/saas_amount/type per invoice (no Zoho), then auto-recalcs.
+app.post('/api/admin/reclassify-saas', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const orgId = process.env.ZOHO_ORG_ID;
+  // Affected = a stored line currently typed 'hardware' whose name contains "saas".
+  const findSql = `
+    SELECT i.invoice_number, i.line_items FROM invoices i
+    WHERE i.organization_id = $1 AND i.line_items IS NOT NULL AND jsonb_typeof(i.line_items) = 'array'
+      AND EXISTS (
+        SELECT 1 FROM jsonb_array_elements(i.line_items) li
+        WHERE COALESCE(li->>'type','') = 'hardware' AND lower(li->>'name') LIKE '%saas%'
+      )`;
+  try {
+    if (req.query.count === '1') {
+      const c = (await pool.query(`SELECT COUNT(*)::int AS n FROM (${findSql}) x`, [orgId])).rows[0].n;
+      return res.json({ wouldReclassify: c });
+    }
+    const plansRes = await pool.query('SELECT plan_code, name FROM zoho_plans');
+    const planCodes = new Set(plansRes.rows.map(r => (r.plan_code || '').toLowerCase().trim()));
+    const normName = (s) => (s || '').toLowerCase().replace(/^\*+/, '').replace(/\s+/g, ' ').trim();
+    const planNames = new Map();
+    for (const p of plansRes.rows) { const k = normName(p.name); if (k) planNames.set(k, p.plan_code); }
+
+    const rows = (await pool.query(findSql, [orgId])).rows;
+    let updated = 0;
+    for (const r of rows) {
+      const lines = Array.isArray(r.line_items) ? r.line_items : [];
+      const reclassified = lines.map(li => ({ ...li, type: classifyLineType(li.name, String(li.sku || li.item_code || '').trim(), planCodes, planNames) }));
+      const saasAmount = reclassified.filter(l => l.type === 'saas').reduce((s, l) => s + (parseFloat(l.amount) || 0), 0);
+      const hardwareAmount = reclassified.filter(l => l.type === 'hardware').reduce((s, l) => s + (parseFloat(l.amount) || 0), 0);
+      await pool.query(
+        `UPDATE invoices SET line_items = $1::jsonb, saas_amount = $2, hardware_amount = $3, updated_at = CURRENT_TIMESTAMP
+         WHERE invoice_number = $4 AND organization_id = $5`,
+        [JSON.stringify(reclassified), saasAmount, hardwareAmount, r.invoice_number, orgId]
+      );
+      updated++;
+    }
+    res.json({ success: true, reclassified: updated, note: 'recalc-v2 starting' });
+    runRecalcV2('reclassify-saas').catch(e => console.error('reclassify-saas recalc error:', e));
+  } catch (e) {
+    if (!res.headersSent) res.status(500).json({ error: e.message });
+  }
 });
 
 // POST /api/admin/reenrich-invoices?secret=&numbers=INV-1,INV-2  — SYNCHRONOUS re-enrich of a
