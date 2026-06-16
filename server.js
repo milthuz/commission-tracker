@@ -9871,33 +9871,92 @@ async function payrollDataForMonth(year, month) {
 function buildPayrollPdf(periodLabel, reps) {
   return new Promise((resolve, reject) => {
     try {
-      const doc = new PDFDocument({ size: 'LETTER', margin: 50 });
+      const doc = new PDFDocument({ size: 'LETTER', margin: 40 });
       const chunks = [];
       doc.on('data', c => chunks.push(c));
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      const bl = (t) => t === 'signup' ? 'Signup bonus' : (t === 'monthly' || t === 'monthly_performance') ? 'Monthly bonus' : t === 'processing' ? 'Processing bonus' : t === 'adjustment' ? 'Adjustment' : t;
+      const bl = (t) => t === 'signup' ? 'Bonus d\'inscription' : (t === 'monthly' || t === 'monthly_performance') ? 'Bonus mensuel' : t === 'processing' ? 'Bonus de processing' : t === 'adjustment' ? 'Ajustement' : t;
+      const L = 40, R = 572, W = R - L, AMT_X = R - 96;     // content area + amount column
+      const C = { dark: '#1c2434', orange: '#f2682c', gray: '#475569', light: '#94a3b8', zebra: '#fafbfd', line: '#e8edf3' };
+      const ensure = (h) => { if (doc.y + h > 748) doc.addPage(); };
+
+      const header = (r) => {
+        doc.rect(0, 0, 612, 6).fill(C.orange);
+        doc.rect(0, 6, 612, 74).fill(C.dark);
+        doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(21).text('Sales Hub', L, 24);
+        doc.fillColor('#8a99af').font('Helvetica').fontSize(9).text('by Cluster Systems', L, 50);
+        doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text('BULLETIN DE PAIE', L, 26, { width: W, align: 'right', characterSpacing: 1.5 });
+        doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(17).text(periodLabel, L, 42, { width: W, align: 'right' });
+        // meta row
+        const my = 96;
+        const meta = [['VENDEUR', r.rep], ['PÉRIODE', periodLabel], ['STATUT', r.source === 'imported' ? 'Payé' : 'En attente d\'approbation']];
+        const cw = W / 3;
+        meta.forEach((m, i) => {
+          const x = L + i * cw;
+          doc.fillColor(C.light).font('Helvetica-Bold').fontSize(7).text(m[0], x, my, { characterSpacing: 1 });
+          doc.fillColor(C.dark).font('Helvetica-Bold').fontSize(11).text(m[1], x, my + 11, { width: cw - 8 });
+        });
+        doc.y = my + 40;
+        doc.moveTo(L, doc.y).lineTo(R, doc.y).strokeColor(C.line).lineWidth(1).stroke();
+        doc.y += 16;
+      };
+
+      const sectionHead = (title, c0, c1) => {
+        ensure(46);
+        doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text(title, L, doc.y, { characterSpacing: 1.5 });
+        doc.y += 15;
+        const hy = doc.y;
+        doc.fillColor(C.light).font('Helvetica-Bold').fontSize(7);
+        doc.text(c0, L + 2, hy, { characterSpacing: 0.5 });
+        doc.text(c1, L + 130, hy, { characterSpacing: 0.5 });
+        doc.text('MONTANT', AMT_X, hy, { width: 92, align: 'right', characterSpacing: 0.5 });
+        doc.y = hy + 11;
+        doc.moveTo(L, doc.y).lineTo(R, doc.y).strokeColor(C.dark).lineWidth(1).stroke();
+        doc.y += 5;
+      };
+      const row = (c0, c1, amt, i) => {
+        ensure(18);
+        const y = doc.y;
+        if (i % 2) doc.rect(L, y - 3, W, 17).fill(C.zebra);
+        doc.fillColor(C.dark).font('Helvetica').fontSize(9).text(String(c0 || ''), L + 2, y, { width: 122, ellipsis: true });
+        doc.fillColor(C.gray).text(String(c1 || '—'), L + 130, y, { width: AMT_X - (L + 130) - 8, ellipsis: true });
+        doc.fillColor(C.dark).font('Helvetica-Bold').text(amt, AMT_X, y, { width: 92, align: 'right' });
+        doc.y = y + 17;
+      };
+      const subtotal = (label, amt) => {
+        doc.moveTo(L, doc.y).lineTo(R, doc.y).strokeColor(C.dark).lineWidth(1).stroke();
+        doc.y += 5;
+        const y = doc.y;
+        doc.fillColor(C.gray).font('Helvetica-Bold').fontSize(8).text(label.toUpperCase(), L, y, { width: AMT_X - L - 8, align: 'right', characterSpacing: 0.5 });
+        doc.fillColor(C.dark).fontSize(10).text(amt, AMT_X, y - 1, { width: 92, align: 'right' });
+        doc.y = y + 18;
+      };
+
       reps.forEach((r, idx) => {
         if (idx > 0) doc.addPage();
-        doc.fillColor('#1c2434').fontSize(18).text('Sales Hub', { continued: true }).fillColor('#8a99af').fontSize(11).text('  Pay Stub');
-        doc.moveDown(0.3).fillColor('#1c2434').fontSize(15).text(r.rep);
-        doc.fillColor('#64748b').fontSize(10).text(`Period: ${periodLabel}  ·  ${r.source === 'imported' ? 'Paid' : 'Pending approval'}`);
-        doc.moveDown(0.6);
+        header(r);
         if (r.lines.length) {
-          doc.fillColor('#94a3b8').fontSize(9).text('COMMISSIONS');
-          doc.fillColor('#1c2434').fontSize(10);
-          r.lines.forEach(l => doc.text(`${l.invoice_number}   ${(l.customer || '').slice(0, 38)}`, { continued: true }).text(money(l.paid_amount), { align: 'right' }));
-          doc.moveDown(0.4);
+          sectionHead('COMMISSIONS', 'FACTURE', 'CLIENT');
+          r.lines.forEach((l, i) => row(l.invoice_number, l.customer, money(l.paid_amount), i));
+          subtotal('Sous-total commissions', money(r.lines.reduce((s, l) => s + (l.paid_amount || 0), 0)));
         }
         if (r.bonuses.length) {
-          doc.fillColor('#94a3b8').fontSize(9).text('BONUSES');
-          doc.fillColor('#1c2434').fontSize(10);
-          r.bonuses.forEach(b => doc.text(`${bl(b.bonus_type)}   ${(b.merchant_name || '').slice(0, 34)}`, { continued: true }).text(money(b.amount), { align: 'right' }));
-          doc.moveDown(0.4);
+          doc.y += 8;
+          sectionHead('BONUS', 'TYPE', 'DÉTAIL');
+          r.bonuses.forEach((b, i) => row(bl(b.bonus_type), b.merchant_name, money(b.amount), i));
+          subtotal('Sous-total bonus', money(r.bonuses.reduce((s, b) => s + (b.amount || 0), 0)));
         }
-        doc.moveTo(50, doc.y).lineTo(560, doc.y).strokeColor('#e2e8f0').stroke();
-        doc.moveDown(0.3).fillColor('#1c2434').fontSize(13).text('TOTAL', { continued: true }).fillColor('#f97316').text(money(r.total), { align: 'right' });
-        doc.moveDown(1).fillColor('#94a3b8').fontSize(8).text('Gross amounts, before tax and withholdings.');
+        // TOTAL box
+        ensure(60);
+        doc.y += 12;
+        const by = doc.y, bx = R - 268;
+        doc.roundedRect(bx, by, 268, 40, 9).fillAndStroke('#fff4ec', '#f7c8ab');
+        doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text('TOTAL VERSÉ', bx + 16, by + 15, { characterSpacing: 1 });
+        doc.fillColor(C.dark).font('Helvetica-Bold').fontSize(18).text(money(r.total), bx + 16, by + 11, { width: 236, align: 'right' });
+        doc.y = by + 56;
+        doc.fillColor(C.light).font('Helvetica-Oblique').fontSize(7.5).text('Montants bruts, avant impôts et retenues.', L, doc.y, { continued: true })
+          .font('Helvetica').text('     Sales Hub · saleshub.clusterpos.com', { align: 'left' });
       });
       doc.end();
     } catch (e) { reject(e); }
