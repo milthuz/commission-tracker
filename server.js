@@ -9904,7 +9904,10 @@ app.post('/api/commissions/payroll/send', authenticateToken, async (req, res) =>
   try {
     const recipients = await getPayrollRecipients();
     if (!recipients.length) return res.status(400).json({ error: 'no payroll recipients configured' });
-    const reps = await payrollDataForMonth(year, month);
+    let reps = await payrollDataForMonth(year, month);
+    // Optional multi-select: send only the chosen reps (default = all).
+    const repFilter = Array.isArray(req.body.reps) ? req.body.reps.map(s => String(s)) : null;
+    if (repFilter && repFilter.length) reps = reps.filter(r => repFilter.includes(r.rep));
     if (!reps.length) return res.status(400).json({ error: 'nothing to send for this period' });
     const mm = String(month).padStart(2, '0');
     const periodLabel = `${year}-${mm}`;
