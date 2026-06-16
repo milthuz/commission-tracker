@@ -8060,6 +8060,72 @@ app.get('/api/admin/zoho-invoice-raw', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST /api/admin/reenrich-invoices?secret=&numbers=INV-1,INV-2  — SYNCHRONOUS re-enrich of a
+// small list of invoices (re-fetch from Zoho, re-store line_items/hardware/saas/gross with the
+// fixed item_total=0 parse). Bypasses the flaky in-memory enrichJob (2 web dynos) so a targeted
+// fix is reliable. Keep the list small (<= ~20) to stay under the 30s request limit.
+app.post('/api/admin/reenrich-invoices', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const numbers = String(req.query.numbers || req.body?.numbers || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (!numbers.length) return res.status(400).json({ error: 'numbers required (comma-separated)' });
+  try {
+    const admin = (await pool.query(
+      'SELECT email, api_domain FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
+    )).rows[0];
+    if (!admin) return res.status(400).json({ error: 'No admin Zoho token' });
+    const tokenData = await ensureValidToken(admin.email);
+    const accessToken = typeof tokenData === 'string' ? tokenData : tokenData?.access_token;
+    const apiDomain = admin.api_domain, orgId = process.env.ZOHO_ORG_ID;
+    const plansRes = await pool.query('SELECT plan_code, name FROM zoho_plans');
+    const planCodes = new Set(plansRes.rows.map(r => (r.plan_code || '').toLowerCase().trim()));
+    const normName = (s) => (s || '').toLowerCase().replace(/^\*+/, '').replace(/\s+/g, ' ').trim();
+    const planNames = new Map();
+    for (const p of plansRes.rows) { const k = normName(p.name); if (k) planNames.set(k, p.plan_code); }
+
+    const out = [];
+    for (const number of numbers) {
+      const search = await axios.get(`${apiDomain}/books/v3/invoices`, {
+        params: { organization_id: orgId, invoice_number: number },
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
+      });
+      const found = search.data?.invoices?.[0];
+      if (!found) { out.push({ number, error: 'not found in Zoho' }); continue; }
+      const detail = await axios.get(`${apiDomain}/books/v3/invoices/${found.invoice_id}`, {
+        params: { organization_id: orgId },
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
+      });
+      const det = detail.data?.invoice;
+      if (!det) { out.push({ number, error: 'no detail' }); continue; }
+      const classified = (det.line_items || []).map(li => {
+        const sku = (li.sku || li.item_code || '').trim();
+        const lineType = classifyLineType(li.name, sku, planCodes, planNames);
+        const matchedBySku = sku && planCodes.has(sku.toLowerCase());
+        const it = parseFloat(li.item_total);
+        const amount = Number.isFinite(it) ? it : ((parseFloat(li.rate) * parseInt(li.quantity)) || 0);
+        return { name: li.name, sku, quantity: li.quantity, rate: li.rate, amount, type: lineType,
+          plan_code: matchedBySku ? sku : (planNames.get(normName(li.name)) || null) };
+      });
+      const saasAmount = classified.filter(l => l.type === 'saas').reduce((s, l) => s + l.amount, 0);
+      const hardwareAmount = classified.filter(l => l.type === 'hardware').reduce((s, l) => s + l.amount, 0);
+      const grossLineTotal = classified.reduce((s, l) => s + (parseFloat(l.amount) || 0), 0);
+      const subTotal  = parseFloat(det.sub_total) || 0;
+      const discTotal = det.discount_type === 'item_level' ? 0 : (parseFloat(det.discount_total) || 0);
+      await pool.query(
+        `UPDATE invoices SET line_items = $1::jsonb, hardware_amount = $2, saas_amount = $3,
+           sub_total = $4, discount_total = $5, gross_line_total = $6, updated_at = CURRENT_TIMESTAMP
+         WHERE invoice_number = $7 AND organization_id = $8`,
+        [JSON.stringify(classified), hardwareAmount, saasAmount, subTotal || null, discTotal,
+         Math.round(grossLineTotal * 100) / 100, number, orgId]
+      );
+      out.push({ number, hardware_amount: hardwareAmount, saas_amount: saasAmount, gross: Math.round(grossLineTotal * 100) / 100, sub_total: subTotal });
+    }
+    res.json({ reenriched: out.length, results: out });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /api/admin/reenrich-discounted?secret=&count=  — re-enrich ONLY "phantom discount"
 // invoices (sub_total < gross_line_total) so 100%-discounted/free lines, which the old parser
 // stored at full price (item_total=0 fell back to rate*qty), get their correct net amount (0).
@@ -8077,6 +8143,13 @@ app.post('/api/admin/reenrich-discounted', async (req, res) => {
         [process.env.ZOHO_ORG_ID]
       )).rows[0].n;
       return res.json({ wouldReenrich: c });
+    }
+    if (req.query.list === '1') {
+      const rows = (await pool.query(
+        `SELECT invoice_number FROM invoices WHERE organization_id = $1 AND status = 'paid' ${where} ORDER BY invoice_number`,
+        [process.env.ZOHO_ORG_ID]
+      )).rows.map(r => r.invoice_number);
+      return res.json({ count: rows.length, numbers: rows });
     }
     if (enrichJob.status === 'running') return res.status(409).json({ error: 'Enrich already running' });
     res.json({ success: true, message: 'Re-enrich of phantom-discount invoices started; recalc-v2 runs after.' });
