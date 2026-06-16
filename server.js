@@ -323,6 +323,25 @@ async function initializeDatabase() {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_manual_bonus_period ON manual_bonuses(rep_name, period)`);
+    // Commission adjustments: carry an unpaid/missed commission from a past month forward to
+    // a chosen target pay period (e.g. pay a missed March invoice in May). Creating one marks
+    // the source invoice settled (clears the radar) and adds an "adjustment" line to the
+    // target month's stub / payroll / commit. Deleting one re-opens the source invoice.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS commission_adjustments (
+        id             SERIAL PRIMARY KEY,
+        rep_name       VARCHAR(255) NOT NULL,
+        target_period  DATE NOT NULL,            -- 1st of the target pay month
+        invoice_number VARCHAR(100),             -- source invoice (null = free adjustment)
+        customer       VARCHAR(255),
+        amount         NUMERIC(12,2) NOT NULL,
+        source_period  DATE,                     -- original unlock month (reference)
+        description    TEXT DEFAULT '',
+        created_by     VARCHAR(255),
+        created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_adjustment_target ON commission_adjustments(rep_name, target_period)`);
     // Comp plan v7.7: hire_date drives the 90-day ramp (quota gate waived);
     // quota_gate_enabled=false exempts a rep from the gate entirely (house
     // accounts, resellers, execs not on the rep plan).
@@ -9080,6 +9099,23 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
       return rows.map(r => ({ bonus_type: 'processing', merchant_name: r.merchant_name, amount: r.amount, report_date: r.report_date }));
     };
 
+    // Commission adjustments carried forward TO this month (e.g. a missed March invoice paid in
+    // May). Shown as an "adjustment" line; the source invoice was marked settled when created.
+    const adjustmentsFor = async () => {
+      const rows = (await pool.query(
+        `SELECT invoice_number, customer, amount::float AS amount, source_period::date AS source_period, description
+           FROM commission_adjustments
+          WHERE rep_name = $1 AND target_period >= $2::date AND target_period < $3::date
+          ORDER BY amount DESC`,
+        [targetRep, periodStart, periodEnd]
+      )).rows;
+      return rows.map(r => ({
+        bonus_type: 'adjustment',
+        merchant_name: r.description || `${r.invoice_number || ''}${r.source_period ? ' (' + String(r.source_period).slice(0, 7) + ')' : ''}`.trim() || '—',
+        amount: r.amount, report_date: r.source_period,
+      }));
+    };
+
     // App-generated signup bonuses: Zentact merchants this rep activated in the period.
     const genBonuses = async () => {
       const rows = (await pool.query(
@@ -9130,6 +9166,8 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
       }
       // Accepted bi-annual processing payout for this month (June/December).
       bonuses.push(...(await committedProcessing()));
+      // Adjustments carried forward to this month.
+      bonuses.push(...(await adjustmentsFor()));
       return bonuses;
     };
 
@@ -9156,7 +9194,9 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
       // to this import row, but still belongs on the period's stub — append it + add to total.
       const procExtra = await committedProcessing();
       bonuses.push(...procExtra);
-      const procExtraTotal = procExtra.reduce((a, b) => a + b.amount, 0);
+      const adjExtra = await adjustmentsFor();
+      bonuses.push(...adjExtra);
+      const procExtraTotal = procExtra.reduce((a, b) => a + b.amount, 0) + adjExtra.reduce((a, b) => a + b.amount, 0);
       const linesStored = lines.length > 0;
       // "Missed" = earned (unlocked) in this period per the app's model but still NOT paid —
       // i.e. invoices the pay file didn't cover. This is the user's forgot-to-pay radar.
@@ -9240,7 +9280,8 @@ app.post('/api/commissions/pay-stub/email', authenticateToken, async (req, res) 
     const bonusRows = (bonuses || []).map(b => {
       const label = b.bonus_type === 'signup' ? 'Bonus d\'inscription'
         : (b.bonus_type === 'monthly' || b.bonus_type === 'monthly_performance') ? 'Bonus mensuel'
-        : b.bonus_type === 'processing' ? 'Bonus de paiement' : esc(b.bonus_type);
+        : b.bonus_type === 'processing' ? 'Bonus de paiement'
+        : b.bonus_type === 'adjustment' ? 'Ajustement' : esc(b.bonus_type);
       return `<tr><td style="padding:6px 10px;border-top:1px solid #eef1f6">${label}</td>
            <td style="padding:6px 10px;border-top:1px solid #eef1f6">${esc(b.merchant_name) || '—'}</td>
            <td style="padding:6px 10px;border-top:1px solid #eef1f6;text-align:right">${money(b.amount)}</td></tr>`;
@@ -9380,6 +9421,123 @@ app.delete('/api/commissions/manual-bonus/:id', authenticateToken, async (req, r
     await pool.query(`DELETE FROM manual_bonuses WHERE id = $1`, [parseInt(req.params.id)]);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Commission adjustments (carry an unpaid commission forward to a target pay month) ──────
+
+// GET /api/commissions/unpaid-commissions?repName=  — a rep's earned-but-unpaid commission
+// invoices (the radar across all months), eligible to be carried forward as an adjustment.
+app.get('/api/commissions/unpaid-commissions', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const rep = req.query.repName;
+  if (!rep) return res.status(400).json({ error: 'repName required' });
+  try {
+    const rows = (await pool.query(
+      `SELECT invoice_number, customer_name AS customer, commission::float AS commission,
+              commission_status, commission_payable_date::date AS payable_date
+       FROM invoices
+       WHERE salesperson_name = $1 AND organization_id = $2
+         AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual')
+         AND approval_status <> 'paid'
+       ORDER BY commission_payable_date, invoice_number`,
+      [rep, process.env.ZOHO_ORG_ID]
+    )).rows;
+    res.json({ rep, invoices: rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/commissions/adjustments?repName=&year=&month=  (or ?all=true) — list adjustments.
+app.get('/api/commissions/adjustments', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const sel = `SELECT id, rep_name, target_period::date AS target_period, invoice_number, customer,
+                      amount::float AS amount, source_period::date AS source_period, description, created_by, created_at
+               FROM commission_adjustments`;
+  try {
+    if (req.query.all === 'true' || req.query.all === '1') {
+      const params = []; let where = '';
+      if (req.query.repName) { params.push(req.query.repName); where = ' WHERE rep_name = $1'; }
+      const rows = (await pool.query(`${sel}${where} ORDER BY target_period DESC, created_at DESC`, params)).rows;
+      return res.json({ adjustments: rows });
+    }
+    const year = parseInt(req.query.year), month = parseInt(req.query.month);
+    if (!year || month < 1 || month > 12) return res.status(400).json({ error: 'year+month or all=true required' });
+    const period = `${year}-${String(month).padStart(2, '0')}-01`;
+    const params = [period]; let where = ' WHERE target_period = $1::date';
+    if (req.query.repName) { params.push(req.query.repName); where += ' AND rep_name = $2'; }
+    const rows = (await pool.query(`${sel}${where} ORDER BY created_at DESC`, params)).rows;
+    res.json({ adjustments: rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/commissions/adjustments  body { repName, year, month, invoiceNumbers[], description? }
+// Carries the selected unpaid invoices' commissions to the (year,month) target pay period:
+// records an adjustment per invoice + marks the source invoice settled (approval_status='paid',
+// payout note 'adjustment') so it leaves the radar. The amount is paid via the target month's stub.
+app.post('/api/commissions/adjustments', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const { repName, year, month, invoiceNumbers, description } = req.body;
+  if (!repName || !year || !month || !Array.isArray(invoiceNumbers) || !invoiceNumbers.length) {
+    return res.status(400).json({ error: 'repName, year, month, invoiceNumbers[] required' });
+  }
+  const target = `${year}-${String(month).padStart(2, '0')}-01`;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const created = [];
+    for (const num of invoiceNumbers) {
+      const inv = (await client.query(
+        `SELECT invoice_number, customer_name, commission::float AS commission,
+                commission_payable_date::date AS payable_date, approval_status
+         FROM invoices WHERE invoice_number = $1 AND organization_id = $2`,
+        [num, process.env.ZOHO_ORG_ID]
+      )).rows[0];
+      if (!inv || !(inv.commission > 0) || inv.approval_status === 'paid') continue; // skip missing/paid
+      await client.query(
+        `INSERT INTO commission_adjustments
+           (rep_name, target_period, invoice_number, customer, amount, source_period, description, created_by)
+         VALUES ($1, $2::date, $3, $4, $5, $6::date, $7, $8)`,
+        [repName, target, inv.invoice_number, inv.customer_name || null, inv.commission,
+         inv.payable_date, (description || '').toString().slice(0, 300), actor]
+      );
+      await client.query(
+        `UPDATE invoices SET approval_status = 'paid', commission_paid = true,
+           payout_paid_by = $2, payout_paid_at = $3::date, updated_at = CURRENT_TIMESTAMP
+         WHERE invoice_number = $1 AND organization_id = $4`,
+        [inv.invoice_number, `adjustment:${target.slice(0, 7)}`, target, process.env.ZOHO_ORG_ID]
+      );
+      created.push({ invoice_number: inv.invoice_number, amount: inv.commission });
+    }
+    await client.query('COMMIT');
+    res.json({ success: true, created: created.length, total: Math.round(created.reduce((a, c) => a + c.amount, 0) * 100) / 100, items: created });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ error: e.message });
+  } finally { client.release(); }
+});
+
+// DELETE /api/commissions/adjustments/:id  — undo: re-open the source invoice (back to the radar).
+app.delete('/api/commissions/adjustments/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const adj = (await client.query(`SELECT invoice_number FROM commission_adjustments WHERE id = $1`, [parseInt(req.params.id)])).rows[0];
+    if (adj && adj.invoice_number) {
+      await client.query(
+        `UPDATE invoices SET approval_status = 'pending', commission_paid = false,
+           payout_paid_by = NULL, payout_paid_at = NULL, updated_at = CURRENT_TIMESTAMP
+         WHERE invoice_number = $1 AND organization_id = $2 AND payout_paid_by LIKE 'adjustment:%'`,
+        [adj.invoice_number, process.env.ZOHO_ORG_ID]
+      );
+    }
+    await client.query(`DELETE FROM commission_adjustments WHERE id = $1`, [parseInt(req.params.id)]);
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ error: e.message });
+  } finally { client.release(); }
 });
 
 app.post('/api/commissions/quota-waiver', authenticateToken, async (req, res) => {
@@ -9614,6 +9772,15 @@ async function payrollDataForMonth(year, month) {
       [rep, periodStart, periodEnd]
     )).rows.map(p => ({ bonus_type: 'processing', merchant_name: p.merchant_name, amount: p.amount }));
     const committedProcTotal = committedProc.reduce((s, b) => s + b.amount, 0);
+    // Adjustments carried forward to this month (e.g. a missed March invoice paid in May).
+    const adjustments = (await pool.query(
+      `SELECT invoice_number, amount::float AS amount, source_period::date AS source_period, description
+         FROM commission_adjustments WHERE rep_name = $1 AND target_period >= $2::date AND target_period < $3::date`,
+      [rep, periodStart, periodEnd]
+    )).rows.map(a => ({ bonus_type: 'adjustment',
+      merchant_name: a.description || `${a.invoice_number || ''}${a.source_period ? ' (' + String(a.source_period).slice(0, 7) + ')' : ''}`.trim() || '—',
+      amount: a.amount }));
+    const adjustmentsTotal = adjustments.reduce((s, b) => s + b.amount, 0);
     let lines = [], bonuses = [], total = 0, source;
     if (imp) {
       source = 'imported';
@@ -9623,8 +9790,8 @@ async function payrollDataForMonth(year, month) {
       bonuses = (await pool.query(
         `SELECT bonus_type, merchant_name, amount::float AS amount FROM commission_bonuses
          WHERE import_id = $1 ORDER BY bonus_type`, [imp.id])).rows;
-      bonuses.push(...committedProc);
-      total = (parseFloat(imp.total_amount) || 0) + committedProcTotal;
+      bonuses.push(...committedProc, ...adjustments);
+      total = (parseFloat(imp.total_amount) || 0) + committedProcTotal + adjustmentsTotal;
     } else {
       source = 'generated';
       lines = (await pool.query(
@@ -9651,7 +9818,7 @@ async function payrollDataForMonth(year, month) {
       )).rows;
       for (const m of manual) bonuses.push({ bonus_type: 'manual', merchant_name: m.description, amount: m.amount });
       // Accepted bi-annual processing payout (June/December) — same rows the stub shows.
-      bonuses.push(...committedProc);
+      bonuses.push(...committedProc, ...adjustments);
       total = lines.reduce((s, l) => s + (l.paid_amount || 0), 0) + bonuses.reduce((s, b) => s + (b.amount || 0), 0);
     }
     total = Math.round(total * 100) / 100;
@@ -9669,7 +9836,7 @@ function buildPayrollPdf(periodLabel, reps) {
       doc.on('data', c => chunks.push(c));
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      const bl = (t) => t === 'signup' ? 'Signup bonus' : (t === 'monthly' || t === 'monthly_performance') ? 'Monthly bonus' : t === 'processing' ? 'Processing bonus' : t;
+      const bl = (t) => t === 'signup' ? 'Signup bonus' : (t === 'monthly' || t === 'monthly_performance') ? 'Monthly bonus' : t === 'processing' ? 'Processing bonus' : t === 'adjustment' ? 'Adjustment' : t;
       reps.forEach((r, idx) => {
         if (idx > 0) doc.addPage();
         doc.fillColor('#1c2434').fontSize(18).text('Sales Hub', { continued: true }).fillColor('#8a99af').fontSize(11).text('  Pay Stub');
