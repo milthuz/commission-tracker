@@ -359,6 +359,9 @@ async function initializeDatabase() {
     // (recalc honors it instead of recomputing), so the invoice appears in the target month's
     // report/stub/payroll as a normal commission line. Cleared on undo. See commission_adjustments.
     await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS payable_override DATE`);
+    // Admin manually refused commission on this invoice → recalc forces commission 0 / status
+    // 'excluded'. Reversible (clear the flag). Per-invoice override of the model.
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS commission_excluded BOOLEAN DEFAULT false`);
     // One-time migration: convert OLD-style adjustments (source invoice marked paid in its
     // original month) to the new re-home model (move the unlock month to the target, keep
     // pending). Idempotent — after conversion the payout note is cleared so it won't re-match.
@@ -9044,6 +9047,43 @@ app.post('/api/commissions/unapprove', authenticateToken, async (req, res) => {
   }
 });
 
+// POST /api/commissions/invoice/:number/commission-excluded { excluded } — refuse/restore
+// commission on ONE invoice. excluded=true: flag it + immediately zero (status 'excluded').
+// excluded=false: clear the flag + recompute (background recalc) so its commission comes back.
+// Admin / report:mark_paid. Refuses if the invoice is already paid (unapprove it first).
+app.post('/api/commissions/invoice/:number/commission-excluded', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const number = req.params.number;
+  const excluded = req.body.excluded !== false;
+  try {
+    const inv = (await pool.query(
+      `SELECT approval_status FROM invoices WHERE invoice_number = $1 AND organization_id = $2`,
+      [number, process.env.ZOHO_ORG_ID]
+    )).rows[0];
+    if (!inv) return res.status(404).json({ error: 'Invoice not found' });
+    if (inv.approval_status === 'paid') return res.status(409).json({ error: 'Invoice is already paid — unapprove it first' });
+    if (excluded) {
+      await pool.query(
+        `UPDATE invoices SET commission_excluded = true, commission = 0, commission_status = 'excluded',
+           commission_payable_date = NULL, updated_at = CURRENT_TIMESTAMP
+         WHERE invoice_number = $1 AND organization_id = $2`,
+        [number, process.env.ZOHO_ORG_ID]
+      );
+      return res.json({ success: true, excluded: true });
+    }
+    // Restore: clear the flag, then a background recalc recomputes the real commission.
+    await pool.query(
+      `UPDATE invoices SET commission_excluded = false, updated_at = CURRENT_TIMESTAMP
+       WHERE invoice_number = $1 AND organization_id = $2`,
+      [number, process.env.ZOHO_ORG_ID]
+    );
+    runRecalcV2('exclude-restore').catch(e => console.error('exclude-restore recalc error:', e));
+    res.json({ success: true, excluded: false, note: 'recalc-v2 starting — commission recomputes in ~1-3 min' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update commission exclusion', details: error.message });
+  }
+});
+
 // POST /api/commissions/mark-paid — final step in the workflow.
 // Flips approval_status 'approved' → 'paid' and stamps payout actor + timestamp.
 // Also flips legacy commission_paid=true for backward-compatibility with any code
@@ -10495,7 +10535,7 @@ async function runRecalcV2(source = 'manual') {
     source,
     processed: 0, total: 0,
     message: `Starting (${source})...`,
-    stats: { hardware: 0, saas_first: 0, saas_annual: 0, saas_renewal: 0, too_late: 0, pending_saas: 0, pending_payment: 0, not_eligible: 0, quota_not_met: 0, frozen_paid: 0, total_commission: 0 },
+    stats: { hardware: 0, saas_first: 0, saas_annual: 0, saas_renewal: 0, too_late: 0, pending_saas: 0, pending_payment: 0, not_eligible: 0, quota_not_met: 0, excluded: 0, frozen_paid: 0, total_commission: 0 },
   };
   try {
       // Load rep rates + quota-gate config (plan v7.7)
@@ -10538,7 +10578,7 @@ async function runRecalcV2(source = 'manual') {
         SELECT id, invoice_number, salesperson_name, customer_name, total,
                hardware_amount, saas_amount, subscription_activation_date,
                paid_date, commission_status, status, approval_status, commission,
-               sub_total, discount_total, gross_line_total, payable_override
+               sub_total, discount_total, gross_line_total, payable_override, commission_excluded
         FROM invoices
         WHERE organization_id = $1
         ORDER BY date ASC
@@ -10838,6 +10878,14 @@ async function runRecalcV2(source = 'manual') {
         // in the target month's report/stub/payroll). Only when it still earns a commission.
         if (commission > 0 && inv.payable_override) {
           payableDate = toDate(inv.payable_override);
+        }
+
+        // EXCLUDED: admin manually refused commission on this invoice → force 0. Wins over
+        // everything (always last before freeze).
+        if (inv.commission_excluded) {
+          commission = 0;
+          bucket = 'excluded';
+          payableDate = null;
         }
 
         // FREEZE: once a commission has been PAID (import or mark-paid/pay-stub commit), the
