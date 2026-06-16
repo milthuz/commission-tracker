@@ -9259,6 +9259,7 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
         period:      `${year}-${mm}`,
         importId:    imp.id,
         filename:    imp.filename,
+        appGenerated: String(imp.filename || '').startsWith('app-generated'),  // undoable via uncommit
         lines:       outLines,
         bonuses,
         total:       (parseFloat(imp.total_amount) || 0) + procExtraTotal,
@@ -9759,6 +9760,49 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
     res.status(500).json({ error: 'Failed to commit pay stub', details: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /api/commissions/pay-stub/uncommit — UNDO a "mark paid" (app-generated commit) for a
+// rep+period: revert the invoices it marked paid back to pending and delete the app-generated
+// import (cascades its lines + bonuses). Only touches app-generated stubs — never a real
+// imported pay file. Admin / report:mark_paid only.
+app.post('/api/commissions/pay-stub/uncommit', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const { repName, year, month } = req.body;
+  if (!repName || !year || !month) return res.status(400).json({ error: 'repName, year, month required' });
+  const periodDate = `${year}-${String(month).padStart(2, '0')}-01`;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const imp = (await client.query(
+      `SELECT id FROM commission_payment_imports
+       WHERE rep_name = $1 AND paid_for_period = $2::date AND filename LIKE 'app-generated%'
+       ORDER BY imported_at DESC LIMIT 1`,
+      [repName, periodDate]
+    )).rows[0];
+    if (!imp) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'No app-generated payment to undo for this rep/period' });
+    }
+    // Revert the invoices this commit marked paid (its payment lines) back to pending.
+    const reverted = await client.query(
+      `UPDATE invoices SET approval_status = 'pending', commission_paid = false,
+         approved_by = NULL, approved_at = NULL, payout_paid_by = NULL, payout_paid_at = NULL,
+         updated_at = CURRENT_TIMESTAMP
+       WHERE organization_id = $1
+         AND invoice_number IN (SELECT invoice_number FROM commission_payment_lines WHERE import_id = $2)`,
+      [process.env.ZOHO_ORG_ID, imp.id]
+    );
+    // Delete the import row → cascades commission_payment_lines + commission_bonuses.
+    await client.query(`DELETE FROM commission_payment_imports WHERE id = $1`, [imp.id]);
+    await client.query('COMMIT');
+    res.json({ success: true, reverted: reverted.rowCount });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ error: 'Failed to undo pay stub', details: e.message });
   } finally {
     client.release();
   }
