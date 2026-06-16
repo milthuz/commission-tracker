@@ -7919,7 +7919,7 @@ async function runEnrichInvoices({ onlyMissing = true, source = 'manual', extraW
         // Classify line items (3-way: saas / hardware / noncommission)
         let saasLines = 0, hardwareLines = 0;
         const classified = (det.line_items || []).map(li => {
-          const sku = (li.sku || li.item_code || '').trim();
+          const sku = String(li.sku || li.item_code || '').trim();
           const lineType = classifyLineType(li.name, sku, planCodes, planNames);
           if (lineType === 'saas') saasLines++; else if (lineType === 'hardware') hardwareLines++;
           const matchedBySku = sku && planCodes.has(sku.toLowerCase());
@@ -8100,7 +8100,7 @@ app.post('/api/admin/reenrich-invoices', async (req, res) => {
       const det = detail.data?.invoice;
       if (!det) { out.push({ number, error: 'no detail' }); continue; }
       const classified = (det.line_items || []).map(li => {
-        const sku = (li.sku || li.item_code || '').trim();
+        const sku = String(li.sku || li.item_code || '').trim();
         const lineType = classifyLineType(li.name, sku, planCodes, planNames);
         const matchedBySku = sku && planCodes.has(sku.toLowerCase());
         const it = parseFloat(li.item_total);
@@ -8233,7 +8233,7 @@ app.get('/api/invoices/enrich-preview/:invoiceNumber', authenticateToken, async 
     let hardwareLineCount = 0;
     let earliestSubActivation = null;
     const classified = (inv.line_items || []).map(li => {
-      const sku = (li.sku || li.item_code || '').trim();
+      const sku = String(li.sku || li.item_code || '').trim();
       const m = matchPlan(sku, li.name);
       // Stored line carries the net `amount` already (incl. 0 for free lines) — prefer it;
       // fall back to item_total / rate*qty only when absent. Treats 0 as a valid amount.
