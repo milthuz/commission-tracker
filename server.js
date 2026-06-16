@@ -9155,17 +9155,24 @@ app.post('/api/commissions/missing-report', authenticateToken, async (req, res) 
 // GET ?year=&month= → all manual bonuses for that period (optionally ?repName=).
 app.get('/api/commissions/manual-bonus', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
-  const year = parseInt(req.query.year), month = parseInt(req.query.month);
-  if (!year || month < 1 || month > 12) return res.status(400).json({ error: 'year + month required' });
-  const period = `${year}-${String(month).padStart(2, '0')}-01`;
+  const select = `SELECT id, rep_name, period::date AS period, amount::float AS amount, description, created_by, created_at FROM manual_bonuses`;
   try {
+    // history mode (?all=true): every manual bonus across all periods (admin console history),
+    // optionally filtered by rep. Otherwise: just the requested year+month period.
+    if (req.query.all === 'true' || req.query.all === '1') {
+      const params = [];
+      let where = '';
+      if (req.query.repName) { params.push(req.query.repName); where = ` WHERE rep_name = $1`; }
+      const rows = (await pool.query(`${select}${where} ORDER BY period DESC, created_at DESC`, params)).rows;
+      return res.json({ bonuses: rows });
+    }
+    const year = parseInt(req.query.year), month = parseInt(req.query.month);
+    if (!year || month < 1 || month > 12) return res.status(400).json({ error: 'year + month required' });
+    const period = `${year}-${String(month).padStart(2, '0')}-01`;
     const params = [period];
     let where = 'period = $1::date';
     if (req.query.repName) { params.push(req.query.repName); where += ` AND rep_name = $2`; }
-    const rows = (await pool.query(
-      `SELECT id, rep_name, amount::float AS amount, description, created_by, created_at
-       FROM manual_bonuses WHERE ${where} ORDER BY created_at DESC`, params
-    )).rows;
+    const rows = (await pool.query(`${select} WHERE ${where} ORDER BY created_at DESC`, params)).rows;
     res.json({ bonuses: rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
