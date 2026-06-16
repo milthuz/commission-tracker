@@ -10344,6 +10344,16 @@ async function runRecalcV2(source = 'manual') {
           if (!payableDate) payableDate = invPaidDate;
         }
 
+        // ZERO-REVENUE GUARD: a $0 invoice total (fully discounted / comped) earns no
+        // commission, even when it carries hardware/SaaS lines. `total` is Zoho's actual
+        // invoice total (after discount, incl. tax), so total<=0 means nothing was billed.
+        // Catches cases the discount factor misses (e.g. sub_total never backfilled).
+        if (commission > 0 && (parseFloat(inv.total) || 0) <= 0) {
+          commission = 0;
+          bucket = 'not_eligible';
+          payableDate = null;
+        }
+
         // QUOTA GATE: from the platform era (PLAN_START_DATE), commissions whose unlock
         // month missed the rep's quota are forfeited (plan v7.7 §2 — base salary only).
         if (commission > 0 && payableDate && payableDate >= PLAN_START_DATE
