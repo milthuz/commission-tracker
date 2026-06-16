@@ -9723,10 +9723,79 @@ app.get('/api/admin/processing-bonus', (req, res, next) => {
     const result = await computeProcessingBonuses(year, month);
     const reps = [...result.byRep.entries()].map(([rep, v]) => ({ rep, total: v.total, accounts: v.accounts }))
       .sort((a, b) => b.total - a.total);
-    res.json({ year, month, grandTotal: Math.round(reps.reduce((a, r) => a + r.total, 0) * 100) / 100, reps });
+    // Already-committed (platform payout) for this period: bonus_type='processing', import_id NULL
+    // (imports carry an import_id), paid_for_period = the payout month.
+    const period = `${year}-${String(month).padStart(2, '0')}-01`;
+    const committed = (await pool.query(
+      `SELECT COUNT(*)::int AS count, COALESCE(SUM(amount),0)::float AS total
+         FROM commission_bonuses
+        WHERE bonus_type = 'processing' AND import_id IS NULL AND paid_for_period = $1::date`,
+      [period]
+    )).rows[0];
+    res.json({
+      year, month,
+      grandTotal: Math.round(reps.reduce((a, r) => a + r.total, 0) * 100) / 100,
+      reps,
+      committed: { count: committed.count, total: Math.round(committed.total * 100) / 100 },
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// POST /api/commissions/processing-bonus/commit  body { year, month }
+// Records the current bi-annual payout as PAID: inserts a 'processing' bonus row per eligible
+// account (with matched_zentact_id), which keeps the history AND excludes those accounts from
+// all future bi-annual computations ("paid once"). computeProcessingBonuses already skips
+// already-recorded accounts, so re-committing only adds newly-eligible ones (idempotent).
+app.post('/api/commissions/processing-bonus/commit', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const year = parseInt(req.body.year), month = parseInt(req.body.month);
+  if (!year || (month !== 6 && month !== 12)) return res.status(400).json({ error: 'year + month (6 or 12) required' });
+  const period = `${year}-${String(month).padStart(2, '0')}-01`;
+  const client = await pool.connect();
+  try {
+    const result = await computeProcessingBonuses(year, month);
+    await client.query('BEGIN');
+    let count = 0, total = 0;
+    for (const [rep, v] of result.byRep.entries()) {
+      for (const a of v.accounts) {
+        await client.query(
+          `INSERT INTO commission_bonuses
+             (import_id, rep_name, bonus_type, merchant_name, matched_zentact_id, amount, paid_for_period, report_date)
+           VALUES (NULL, $1, 'processing', $2, $3, $4, $5::date, $5::date)`,
+          [rep, a.business_name, a.merchant_account_id, a.bonus, period]
+        );
+        count++; total += a.bonus;
+      }
+    }
+    await client.query('COMMIT');
+    res.json({ committed: true, accounts: count, total: Math.round(total * 100) / 100 });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /api/commissions/processing-bonus/uncommit  body { year, month }
+// Reverses a platform commit for the period (deletes the import_id-NULL 'processing' rows
+// for that paid_for_period), making those accounts eligible again. Does NOT touch imported
+// (import_id NOT NULL) processing bonuses.
+app.post('/api/commissions/processing-bonus/uncommit', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const year = parseInt(req.body.year), month = parseInt(req.body.month);
+  if (!year || (month !== 6 && month !== 12)) return res.status(400).json({ error: 'year + month (6 or 12) required' });
+  const period = `${year}-${String(month).padStart(2, '0')}-01`;
+  try {
+    const r = await pool.query(
+      `DELETE FROM commission_bonuses
+        WHERE bonus_type = 'processing' AND import_id IS NULL AND paid_for_period = $1::date`,
+      [period]
+    );
+    res.json({ uncommitted: r.rowCount });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // GET /api/admin/processing-bonus/debug?secret=&q=<merchant name>
