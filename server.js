@@ -355,6 +355,10 @@ async function initializeDatabase() {
     // halves (10%→5%) when the discount is ≥ 25%. NULL = not captured yet.
     await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS sub_total NUMERIC(12,2)`);
     await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS discount_total NUMERIC(12,2)`);
+    // Adjustment carry-forward: when set, the commission's "unlock month" is forced to this date
+    // (recalc honors it instead of recomputing), so the invoice appears in the target month's
+    // report/stub/payroll as a normal commission line. Cleared on undo. See commission_adjustments.
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS payable_override DATE`);
     // Sum of ALL line amounts (hw + saas + noncommission), pre-discount. The discount factor
     // = (sub_total - discount_total) / gross_line_total, because Zoho sometimes bakes the
     // discount into sub_total (discount_total=0, sub_total < line sum) and sometimes reports it
@@ -9099,23 +9103,6 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
       return rows.map(r => ({ bonus_type: 'processing', merchant_name: r.merchant_name, amount: r.amount, report_date: r.report_date }));
     };
 
-    // Commission adjustments carried forward TO this month (e.g. a missed March invoice paid in
-    // May). Shown as an "adjustment" line; the source invoice was marked settled when created.
-    const adjustmentsFor = async () => {
-      const rows = (await pool.query(
-        `SELECT invoice_number, customer, amount::float AS amount, source_period::date AS source_period, description
-           FROM commission_adjustments
-          WHERE rep_name = $1 AND target_period >= $2::date AND target_period < $3::date
-          ORDER BY amount DESC`,
-        [targetRep, periodStart, periodEnd]
-      )).rows;
-      return rows.map(r => ({
-        bonus_type: 'adjustment',
-        merchant_name: r.description || `${r.invoice_number || ''}${r.source_period ? ' (' + String(r.source_period).slice(0, 7) + ')' : ''}`.trim() || '—',
-        amount: r.amount, report_date: r.source_period,
-      }));
-    };
-
     // App-generated signup bonuses: Zentact merchants this rep activated in the period.
     const genBonuses = async () => {
       const rows = (await pool.query(
@@ -9166,8 +9153,6 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
       }
       // Accepted bi-annual processing payout for this month (June/December).
       bonuses.push(...(await committedProcessing()));
-      // Adjustments carried forward to this month.
-      bonuses.push(...(await adjustmentsFor()));
       return bonuses;
     };
 
@@ -9194,9 +9179,7 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
       // to this import row, but still belongs on the period's stub — append it + add to total.
       const procExtra = await committedProcessing();
       bonuses.push(...procExtra);
-      const adjExtra = await adjustmentsFor();
-      bonuses.push(...adjExtra);
-      const procExtraTotal = procExtra.reduce((a, b) => a + b.amount, 0) + adjExtra.reduce((a, b) => a + b.amount, 0);
+      const procExtraTotal = procExtra.reduce((a, b) => a + b.amount, 0);
       const linesStored = lines.length > 0;
       // "Missed" = earned (unlocked) in this period per the app's model but still NOT paid —
       // i.e. invoices the pay file didn't cover. This is the user's forgot-to-pay radar.
@@ -9470,9 +9453,10 @@ app.get('/api/commissions/adjustments', authenticateToken, async (req, res) => {
 });
 
 // POST /api/commissions/adjustments  body { repName, year, month, invoiceNumbers[], description? }
-// Carries the selected unpaid invoices' commissions to the (year,month) target pay period:
-// records an adjustment per invoice + marks the source invoice settled (approval_status='paid',
-// payout note 'adjustment') so it leaves the radar. The amount is paid via the target month's stub.
+// Carries the selected invoices' commissions to the (year,month) target pay period by forcing
+// their unlock month (commission_payable_date + payable_override) to that month. The invoice
+// LEAVES its original month and appears in the target month's report/stub/payroll as a normal
+// (still-pending) commission line. recalc honors payable_override; undo clears it.
 app.post('/api/commissions/adjustments', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
   const { repName, year, month, invoiceNumbers, description } = req.body;
@@ -9500,11 +9484,12 @@ app.post('/api/commissions/adjustments', authenticateToken, async (req, res) => 
         [repName, target, inv.invoice_number, inv.customer_name || null, inv.commission,
          inv.payable_date, (description || '').toString().slice(0, 300), actor]
       );
+      // Move the unlock month to the target (kept pending; paid when the target month is paid).
       await client.query(
-        `UPDATE invoices SET approval_status = 'paid', commission_paid = true,
-           payout_paid_by = $2, payout_paid_at = $3::date, updated_at = CURRENT_TIMESTAMP
-         WHERE invoice_number = $1 AND organization_id = $4`,
-        [inv.invoice_number, `adjustment:${target.slice(0, 7)}`, target, process.env.ZOHO_ORG_ID]
+        `UPDATE invoices SET commission_payable_date = $2::date, payable_override = $2::date,
+           updated_at = CURRENT_TIMESTAMP
+         WHERE invoice_number = $1 AND organization_id = $3`,
+        [inv.invoice_number, target, process.env.ZOHO_ORG_ID]
       );
       created.push({ invoice_number: inv.invoice_number, amount: inv.commission });
     }
@@ -9516,19 +9501,19 @@ app.post('/api/commissions/adjustments', authenticateToken, async (req, res) => 
   } finally { client.release(); }
 });
 
-// DELETE /api/commissions/adjustments/:id  — undo: re-open the source invoice (back to the radar).
+// DELETE /api/commissions/adjustments/:id  — undo: move the invoice back to its original month.
 app.delete('/api/commissions/adjustments/:id', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const adj = (await client.query(`SELECT invoice_number FROM commission_adjustments WHERE id = $1`, [parseInt(req.params.id)])).rows[0];
+    const adj = (await client.query(`SELECT invoice_number, source_period::date AS source_period FROM commission_adjustments WHERE id = $1`, [parseInt(req.params.id)])).rows[0];
     if (adj && adj.invoice_number) {
       await client.query(
-        `UPDATE invoices SET approval_status = 'pending', commission_paid = false,
-           payout_paid_by = NULL, payout_paid_at = NULL, updated_at = CURRENT_TIMESTAMP
-         WHERE invoice_number = $1 AND organization_id = $2 AND payout_paid_by LIKE 'adjustment:%'`,
-        [adj.invoice_number, process.env.ZOHO_ORG_ID]
+        `UPDATE invoices SET payable_override = NULL, commission_payable_date = COALESCE($3::date, commission_payable_date),
+           updated_at = CURRENT_TIMESTAMP
+         WHERE invoice_number = $1 AND organization_id = $2 AND payable_override IS NOT NULL`,
+        [adj.invoice_number, process.env.ZOHO_ORG_ID, adj.source_period]
       );
     }
     await client.query(`DELETE FROM commission_adjustments WHERE id = $1`, [parseInt(req.params.id)]);
@@ -9772,15 +9757,6 @@ async function payrollDataForMonth(year, month) {
       [rep, periodStart, periodEnd]
     )).rows.map(p => ({ bonus_type: 'processing', merchant_name: p.merchant_name, amount: p.amount }));
     const committedProcTotal = committedProc.reduce((s, b) => s + b.amount, 0);
-    // Adjustments carried forward to this month (e.g. a missed March invoice paid in May).
-    const adjustments = (await pool.query(
-      `SELECT invoice_number, amount::float AS amount, source_period::date AS source_period, description
-         FROM commission_adjustments WHERE rep_name = $1 AND target_period >= $2::date AND target_period < $3::date`,
-      [rep, periodStart, periodEnd]
-    )).rows.map(a => ({ bonus_type: 'adjustment',
-      merchant_name: a.description || `${a.invoice_number || ''}${a.source_period ? ' (' + String(a.source_period).slice(0, 7) + ')' : ''}`.trim() || '—',
-      amount: a.amount }));
-    const adjustmentsTotal = adjustments.reduce((s, b) => s + b.amount, 0);
     let lines = [], bonuses = [], total = 0, source;
     if (imp) {
       source = 'imported';
@@ -9790,8 +9766,8 @@ async function payrollDataForMonth(year, month) {
       bonuses = (await pool.query(
         `SELECT bonus_type, merchant_name, amount::float AS amount FROM commission_bonuses
          WHERE import_id = $1 ORDER BY bonus_type`, [imp.id])).rows;
-      bonuses.push(...committedProc, ...adjustments);
-      total = (parseFloat(imp.total_amount) || 0) + committedProcTotal + adjustmentsTotal;
+      bonuses.push(...committedProc);
+      total = (parseFloat(imp.total_amount) || 0) + committedProcTotal;
     } else {
       source = 'generated';
       lines = (await pool.query(
@@ -9818,7 +9794,7 @@ async function payrollDataForMonth(year, month) {
       )).rows;
       for (const m of manual) bonuses.push({ bonus_type: 'manual', merchant_name: m.description, amount: m.amount });
       // Accepted bi-annual processing payout (June/December) — same rows the stub shows.
-      bonuses.push(...committedProc, ...adjustments);
+      bonuses.push(...committedProc);
       total = lines.reduce((s, l) => s + (l.paid_amount || 0), 0) + bonuses.reduce((s, b) => s + (b.amount || 0), 0);
     }
     total = Math.round(total * 100) / 100;
@@ -10392,7 +10368,7 @@ async function runRecalcV2(source = 'manual') {
         SELECT id, invoice_number, salesperson_name, customer_name, total,
                hardware_amount, saas_amount, subscription_activation_date,
                paid_date, commission_status, status, approval_status, commission,
-               sub_total, discount_total, gross_line_total
+               sub_total, discount_total, gross_line_total, payable_override
         FROM invoices
         WHERE organization_id = $1
         ORDER BY date ASC
@@ -10680,11 +10656,18 @@ async function runRecalcV2(source = 'manual') {
 
         // QUOTA GATE: from the platform era (PLAN_START_DATE), commissions whose unlock
         // month missed the rep's quota are forfeited (plan v7.7 §2 — base salary only).
+        // Carried-forward adjustments (payable_override) are NOT re-gated — already earned.
         if (commission > 0 && payableDate && payableDate >= PLAN_START_DATE
-            && !quotaGatePasses(inv.salesperson_name, payableDate)) {
+            && !inv.payable_override && !quotaGatePasses(inv.salesperson_name, payableDate)) {
           commission = 0;
           bucket = 'quota_not_met';
           payableDate = null;
+        }
+
+        // ADJUSTMENT CARRY-FORWARD: force the unlock month to the override (so the invoice lands
+        // in the target month's report/stub/payroll). Only when it still earns a commission.
+        if (commission > 0 && inv.payable_override) {
+          payableDate = toDate(inv.payable_override);
         }
 
         // FREEZE: once a commission has been PAID (import or mark-paid/pay-stub commit), the
