@@ -8019,6 +8019,47 @@ app.post('/api/invoices/enrich/stop', authenticateToken, (req, res) => {
   res.json({ success: true });
 });
 
+// GET /api/admin/zoho-invoice-raw?secret=&number=INV-xxxx  — raw Zoho line items for one invoice
+// (item_total, discount per line + invoice discount fields). Diagnostic to see how Zoho records
+// a discount (free line item_total=0 vs entity-level discount).
+app.get('/api/admin/zoho-invoice-raw', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const number = String(req.query.number || '').trim();
+  if (!number) return res.status(400).json({ error: 'number required' });
+  try {
+    const admin = (await pool.query(
+      'SELECT email, api_domain FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
+    )).rows[0];
+    if (!admin) return res.status(400).json({ error: 'No admin Zoho token' });
+    const tokenData = await ensureValidToken(admin.email);
+    const accessToken = typeof tokenData === 'string' ? tokenData : tokenData?.access_token;
+    const search = await axios.get(`${admin.api_domain}/books/v3/invoices`, {
+      params: { organization_id: process.env.ZOHO_ORG_ID, invoice_number: number },
+      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
+    });
+    const found = search.data?.invoices?.[0];
+    if (!found) return res.status(404).json({ error: 'Not found in Zoho' });
+    const detail = await axios.get(`${admin.api_domain}/books/v3/invoices/${found.invoice_id}`, {
+      params: { organization_id: process.env.ZOHO_ORG_ID },
+      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
+    });
+    const inv = detail.data?.invoice;
+    if (!inv) return res.status(500).json({ error: 'No detail', body: detail.data });
+    res.json({
+      invoice_number: inv.invoice_number,
+      sub_total: inv.sub_total, total: inv.total, discount: inv.discount,
+      discount_total: inv.discount_total, discount_type: inv.discount_type, is_discount_before_tax: inv.is_discount_before_tax,
+      line_items: (inv.line_items || []).map(li => ({
+        name: li.name, rate: li.rate, quantity: li.quantity,
+        item_total: li.item_total, discount: li.discount, discount_amount: li.discount_amount,
+      })),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /api/admin/reenrich-discounted?secret=&count=  — re-enrich ONLY "phantom discount"
 // invoices (sub_total < gross_line_total) so 100%-discounted/free lines, which the old parser
 // stored at full price (item_total=0 fell back to rate*qty), get their correct net amount (0).
