@@ -9089,6 +9089,83 @@ app.post('/api/commissions/invoice/:number/commission-excluded', authenticateTok
 // Also flips legacy commission_paid=true for backward-compatibility with any code
 // still reading that column.
 // Body: { repName, year, month } OR { invoiceNumbers: [...] }
+// Snapshot an app-generated pay-stub import for a rep+period from the invoices already marked
+// PAID there (+ signup/perf/manual bonuses), so the period shows as a proper "imported"/paid pay
+// stub and lands in payroll. Idempotent (replaces any prior app-generated import). Skips if a real
+// imported pay file covers the period. Called after the report's "Mark Paid" so that action and the
+// pay-stub "commit" converge on the same record.
+async function snapshotAppGeneratedStub(repName, year, month, actor) {
+  const mm = String(month).padStart(2, '0');
+  const periodStart = new Date(`${year}-${mm}-01`);
+  const periodEnd = new Date(periodStart); periodEnd.setMonth(periodEnd.getMonth() + 1);
+  const periodDate = `${year}-${mm}-01`;
+  const orgId = process.env.ZOHO_ORG_ID;
+  const real = (await pool.query(
+    `SELECT 1 FROM commission_payment_imports WHERE rep_name = $1 AND paid_for_period >= $2::date
+       AND paid_for_period < $3::date AND filename NOT LIKE 'app-generated%' LIMIT 1`,
+    [repName, periodStart, periodEnd])).rows[0];
+  if (real) return null; // a real pay file is the source of truth — don't overwrite
+  const invRows = (await pool.query(
+    `SELECT invoice_number, customer_name, commission::float AS commission FROM invoices
+     WHERE salesperson_name = $1 AND organization_id = $2 AND commission_payable_date >= $3
+       AND commission_payable_date < $4 AND commission > 0
+       AND commission_status IN ('hardware','saas_first','saas_annual') AND approval_status = 'paid'
+     ORDER BY commission DESC`,
+    [repName, orgId, periodStart, periodEnd])).rows;
+  const bonusRows = (await pool.query(
+    `SELECT merchant_account_id, business_name, bonus_amount::float AS bonus_amount, activated_at::date AS activated_at
+     FROM zentact_merchants WHERE LOWER(sales_rep_name) = LOWER($1) AND status = 'ACTIVE'
+       AND activated_at >= $2 AND activated_at < $3`,
+    [repName, periodStart, periodEnd])).rows;
+  if (!invRows.length && !bonusRows.length) return null; // nothing to record
+  const bonusTotal = bonusRows.reduce((a, r) => a + (r.bonus_amount || 0), 0);
+  let perfBonus = 0, perfPts = 0;
+  if (periodStart >= PLAN_START_DATE) {
+    const ptsMap = await getMonthlyPointsByRep(periodStart);
+    perfPts = ptsMap.get(`${repName}|${year}-${mm}`) || 0;
+    const spQ = await pool.query(`SELECT monthly_quota FROM salespeople WHERE name = $1`, [repName]);
+    const quota = spQ.rows[0]?.monthly_quota == null ? MONTHLY_QUOTA : parseInt(spQ.rows[0].monthly_quota);
+    perfBonus = perfPts >= quota ? ZohoCRMService.calculateMonthlyBonus(perfPts) : 0;
+  }
+  const manualRows = (await pool.query(
+    `SELECT amount::float AS amount, description FROM manual_bonuses WHERE rep_name = $1 AND period = $2::date`,
+    [repName, periodDate])).rows;
+  const manualTotal = manualRows.reduce((a, m) => a + (m.amount || 0), 0);
+  const total = invRows.reduce((a, r) => a + (r.commission || 0), 0) + bonusTotal + perfBonus + manualTotal;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `DELETE FROM commission_payment_imports WHERE rep_name = $1 AND paid_for_period = $2::date AND filename LIKE 'app-generated%'`,
+      [repName, periodDate]);
+    const filename = `app-generated:${repName}:${year}-${mm}`;
+    const imp = (await client.query(
+      `INSERT INTO commission_payment_imports
+         (filename, rep_name, paid_for_period, imported_by, invoices_marked, invoices_skipped,
+          invoices_not_found, signup_bonuses_count, signup_bonuses_amount, monthly_bonus_amount, total_amount, raw_summary)
+       VALUES ($1, $2, $3::date, $4, $5, 0, 0, $6, $7, $8, $9, $10::jsonb) RETURNING id`,
+      [filename, repName, periodDate, actor, invRows.length, bonusRows.length, bonusTotal, perfBonus + manualTotal, total,
+       JSON.stringify({ source: 'app-generated', via: 'mark-paid', period: `${year}-${mm}`, performance_points: perfPts })])).rows[0];
+    for (const r of invRows) {
+      await client.query(`INSERT INTO commission_payment_lines (import_id, invoice_number, customer, paid_amount, app_commission) VALUES ($1,$2,$3,$4,$4)`,
+        [imp.id, r.invoice_number, r.customer_name || null, r.commission || 0]);
+    }
+    for (const b of bonusRows) {
+      await client.query(`INSERT INTO commission_bonuses (import_id, rep_name, bonus_type, merchant_name, matched_zentact_id, amount, paid_for_period, report_date) VALUES ($1,$2,'signup',$3,$4,$5,$6::date,$7::date)`,
+        [imp.id, repName, b.business_name || null, b.merchant_account_id || null, b.bonus_amount || 0, periodDate, b.activated_at || null]);
+    }
+    if (perfBonus > 0) await client.query(`INSERT INTO commission_bonuses (import_id, rep_name, bonus_type, merchant_name, amount, paid_for_period) VALUES ($1,$2,'monthly_performance',$3,$4,$5::date)`,
+      [imp.id, repName, `${perfPts} pts`, perfBonus, periodDate]);
+    for (const m of manualRows) await client.query(`INSERT INTO commission_bonuses (import_id, rep_name, bonus_type, merchant_name, amount, paid_for_period) VALUES ($1,$2,'manual',$3,$4,$5::date)`,
+      [imp.id, repName, m.description || null, m.amount, periodDate]);
+    await client.query('COMMIT');
+    return { importId: imp.id, total, invoices: invRows.length };
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally { client.release(); }
+}
+
 app.post('/api/commissions/mark-paid', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
   const { repName, year, month, invoiceNumbers } = req.body;
@@ -9124,6 +9201,10 @@ app.post('/api/commissions/mark-paid', authenticateToken, async (req, res) => {
          RETURNING invoice_number`,
         [repName, process.env.ZOHO_ORG_ID, startDate, endDate, payerEmail]
       );
+      // Record the pay stub so the period shows as paid AND lands in payroll (converges with
+      // the pay-stub "commit"). Best-effort — marking paid already succeeded.
+      try { await snapshotAppGeneratedStub(repName, parseInt(year), parseInt(month), payerEmail); }
+      catch (e) { console.error('snapshotAppGeneratedStub error:', e.message); }
     } else {
       return res.status(400).json({ error: 'Provide repName+year+month or invoiceNumbers' });
     }
