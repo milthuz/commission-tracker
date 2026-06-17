@@ -5127,6 +5127,33 @@ app.get('/api/admin/invoice-lookup', async (req, res) => {
   }
 });
 
+// GET /api/admin/customer-invoices?secret=&q=<name>  — all invoices for customers matching q,
+// oldest first, with annual-plan line names. Used to check whether an "annual sub (10%)" is a
+// genuine first occurrence or a renewal that should be 0%.
+app.get('/api/admin/customer-invoices', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.status(400).json({ error: 'q (customer name) required' });
+  try {
+    const rows = (await pool.query(
+      `SELECT invoice_number, customer_name, salesperson_name, date::date AS date,
+              status, approval_status, commission::float AS commission, commission_status,
+              subscription_activation_date::date AS sub_activation,
+              (SELECT string_agg(li->>'name', ' | ') FROM jsonb_array_elements(line_items) li
+                WHERE li->>'name' ~* 'year|annual|annuel') AS annual_lines
+       FROM invoices WHERE organization_id = $1 AND customer_name ILIKE '%' || $2 || '%'
+       ORDER BY customer_name, date`,
+      [process.env.ZOHO_ORG_ID, q]
+    )).rows;
+    res.json({ count: rows.length, rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /api/admin/backfill-subtotals?secret=<shared>&from=YYYY-MM-DD
 // Maintenance: fetch sub_total/discount_total from Zoho for paid invoices that don't
 // have them yet (column added 2026-06-11). 2 Zoho calls/invoice — scoped by `from`
