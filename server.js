@@ -10751,22 +10751,21 @@ async function runRecalcV2(source = 'manual') {
         (li.plan_code && annualPlanCodes.has(String(li.plan_code).toLowerCase().trim())) ||
         ANNUAL_NAME_RE.test(String(li.name || ''));
 
-      // Customers who already had a MONTHLY SaaS — earliest such invoice date per customer. Used
-      // so that switching monthly→annual is NOT a new sale: the annual pays 0% when the customer
-      // had a prior monthly sub before the annual invoice (user rule 2026-06-16).
-      const firstMonthlyByCustomer = new Map(); // customer_name → earliest monthly-SaaS date (ms)
+      // Earliest SaaS invoice date per customer (ANY SaaS — monthly OR annual). The annual 10%
+      // only goes to a customer's genuinely FIRST SaaS invoice; if the customer already had ANY
+      // SaaS before (a prior monthly, or a prior annual sub, or another annual add-on), the new
+      // annual is an upgrade/add-on to an EXISTING customer → 0% (user rule 2026-06-17).
+      const firstSaasByCustomer = new Map(); // customer_name → earliest SaaS invoice date (ms)
       {
-        const monthlyRows = (await pool.query(
+        const saasRows = (await pool.query(
           `SELECT i.customer_name, MIN(i.date) AS first_date
            FROM invoices i CROSS JOIN LATERAL jsonb_array_elements(i.line_items) AS li
            WHERE i.organization_id = $1 AND i.line_items IS NOT NULL AND i.status NOT IN ('void','deleted')
              AND li->>'type' = 'saas'
-             AND LOWER(TRIM(li->>'plan_code')) NOT IN (SELECT LOWER(plan_code) FROM zoho_plans WHERE interval_unit ILIKE 'year%')
-             AND COALESCE(li->>'name','') !~* '(annual|annuel|yearly|par ann)'
            GROUP BY i.customer_name`,
           [process.env.ZOHO_ORG_ID]
         )).rows;
-        for (const r of monthlyRows) if (r.first_date) firstMonthlyByCustomer.set(r.customer_name, new Date(r.first_date).getTime());
+        for (const r of saasRows) if (r.first_date) firstSaasByCustomer.set(r.customer_name, new Date(r.first_date).getTime());
       }
 
       const annualByInvoice = new Map(); // invoice id → { total, firstTotal }
@@ -10796,16 +10795,18 @@ async function runRecalcV2(source = 'manual') {
           if (!claimedBy.has(key)) claimedBy.set(key, r.id);
           if (claimedBy.get(key) === r.id) {
             // Grant the 10% "first annual" ONLY when it's truly a NEW annual sale:
-            //   (a) the customer had no prior MONTHLY sub (monthly→annual = migration, 0%), and
-            //   (b) the annual sub wasn't activated long before this invoice (>~9 months ⇒ it's a
-            //       renewal cycle; the real first + its commission predate our data — e.g. a sub
-            //       activated in 2024 whose first in-DB annual invoice is 2025).
-            const firstMonthly = firstMonthlyByCustomer.get(r.customer_name);
+            //   (a) it's the customer's FIRST SaaS invoice (no prior SaaS of any kind — a prior
+            //       monthly, a prior annual sub, or an earlier annual add-on all disqualify it:
+            //       an existing customer adding/switching to annual is not a new sale → 0%), and
+            //   (b) the annual sub wasn't activated long before this invoice (>~9 months ⇒ a
+            //       renewal cycle whose real first + commission predate our data — e.g. activated
+            //       in 2024, first in-DB annual invoice 2025).
+            const firstSaas = firstSaasByCustomer.get(r.customer_name);
             const annualDate = r.date ? new Date(r.date).getTime() : Infinity;
             const act = r.subscription_activation_date ? new Date(r.subscription_activation_date).getTime() : null;
-            const migratedFromMonthly = firstMonthly && firstMonthly < annualDate;
+            const hadPriorSaas = firstSaas && firstSaas < annualDate;
             const preExistingSub = act != null && (annualDate - act) > 270 * 86400000;
-            if (!migratedFromMonthly && !preExistingSub) rec.firstTotal += r.amount;
+            if (!hadPriorSaas && !preExistingSub) rec.firstTotal += r.amount;
           }
           annualByInvoice.set(r.id, rec);
         }
