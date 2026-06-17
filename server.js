@@ -10772,7 +10772,7 @@ async function runRecalcV2(source = 'manual') {
       const annualByInvoice = new Map(); // invoice id → { total, firstTotal }
       {
         const annualRows = (await pool.query(
-          `SELECT i.id, i.customer_name, i.date,
+          `SELECT i.id, i.customer_name, i.date, i.subscription_activation_date,
                   LOWER(COALESCE(NULLIF(TRIM(li->>'plan_code'), ''), TRIM(li->>'name'), '')) AS line_key,
                   COALESCE((li->>'amount')::float, 0) AS amount
            FROM invoices i
@@ -10795,11 +10795,17 @@ async function runRecalcV2(source = 'manual') {
           const key = `${r.customer_name}|${r.line_key}`;
           if (!claimedBy.has(key)) claimedBy.set(key, r.id);
           if (claimedBy.get(key) === r.id) {
-            // Grant the 10% "first annual" ONLY if the customer had no prior monthly sub. A
-            // monthly→annual migration (monthly invoice dated before this annual) earns 0%.
+            // Grant the 10% "first annual" ONLY when it's truly a NEW annual sale:
+            //   (a) the customer had no prior MONTHLY sub (monthly→annual = migration, 0%), and
+            //   (b) the annual sub wasn't activated long before this invoice (>~9 months ⇒ it's a
+            //       renewal cycle; the real first + its commission predate our data — e.g. a sub
+            //       activated in 2024 whose first in-DB annual invoice is 2025).
             const firstMonthly = firstMonthlyByCustomer.get(r.customer_name);
             const annualDate = r.date ? new Date(r.date).getTime() : Infinity;
-            if (!(firstMonthly && firstMonthly < annualDate)) rec.firstTotal += r.amount;
+            const act = r.subscription_activation_date ? new Date(r.subscription_activation_date).getTime() : null;
+            const migratedFromMonthly = firstMonthly && firstMonthly < annualDate;
+            const preExistingSub = act != null && (annualDate - act) > 270 * 86400000;
+            if (!migratedFromMonthly && !preExistingSub) rec.firstTotal += r.amount;
           }
           annualByInvoice.set(r.id, rec);
         }
