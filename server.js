@@ -10751,10 +10751,28 @@ async function runRecalcV2(source = 'manual') {
         (li.plan_code && annualPlanCodes.has(String(li.plan_code).toLowerCase().trim())) ||
         ANNUAL_NAME_RE.test(String(li.name || ''));
 
+      // Customers who already had a MONTHLY SaaS — earliest such invoice date per customer. Used
+      // so that switching monthly→annual is NOT a new sale: the annual pays 0% when the customer
+      // had a prior monthly sub before the annual invoice (user rule 2026-06-16).
+      const firstMonthlyByCustomer = new Map(); // customer_name → earliest monthly-SaaS date (ms)
+      {
+        const monthlyRows = (await pool.query(
+          `SELECT i.customer_name, MIN(i.date) AS first_date
+           FROM invoices i CROSS JOIN LATERAL jsonb_array_elements(i.line_items) AS li
+           WHERE i.organization_id = $1 AND i.line_items IS NOT NULL AND i.status NOT IN ('void','deleted')
+             AND li->>'type' = 'saas'
+             AND LOWER(TRIM(li->>'plan_code')) NOT IN (SELECT LOWER(plan_code) FROM zoho_plans WHERE interval_unit ILIKE 'year%')
+             AND COALESCE(li->>'name','') !~* '(annual|annuel|yearly|par ann)'
+           GROUP BY i.customer_name`,
+          [process.env.ZOHO_ORG_ID]
+        )).rows;
+        for (const r of monthlyRows) if (r.first_date) firstMonthlyByCustomer.set(r.customer_name, new Date(r.first_date).getTime());
+      }
+
       const annualByInvoice = new Map(); // invoice id → { total, firstTotal }
       {
         const annualRows = (await pool.query(
-          `SELECT i.id, i.customer_name,
+          `SELECT i.id, i.customer_name, i.date,
                   LOWER(COALESCE(NULLIF(TRIM(li->>'plan_code'), ''), TRIM(li->>'name'), '')) AS line_key,
                   COALESCE((li->>'amount')::float, 0) AS amount
            FROM invoices i
@@ -10776,7 +10794,13 @@ async function runRecalcV2(source = 'manual') {
           rec.total += r.amount;
           const key = `${r.customer_name}|${r.line_key}`;
           if (!claimedBy.has(key)) claimedBy.set(key, r.id);
-          if (claimedBy.get(key) === r.id) rec.firstTotal += r.amount;
+          if (claimedBy.get(key) === r.id) {
+            // Grant the 10% "first annual" ONLY if the customer had no prior monthly sub. A
+            // monthly→annual migration (monthly invoice dated before this annual) earns 0%.
+            const firstMonthly = firstMonthlyByCustomer.get(r.customer_name);
+            const annualDate = r.date ? new Date(r.date).getTime() : Infinity;
+            if (!(firstMonthly && firstMonthly < annualDate)) rec.firstTotal += r.amount;
+          }
           annualByInvoice.set(r.id, rec);
         }
       }
