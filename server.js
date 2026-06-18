@@ -2800,12 +2800,16 @@ app.get('/api/admin/zoho-deal-raw', async (req, res) => {
     return res.status(401).json({ error: 'invalid secret' });
   }
   const q = String(req.query.q || '').trim();
-  if (!q) return res.status(400).json({ error: 'q required' });
+  const byId = String(req.query.id || '').trim();
+  if (!q && !byId) return res.status(400).json({ error: 'q or id required' });
   try {
     const crmToken = await ensureValidCrmToken();
     if (!crmToken) return res.status(400).json({ error: 'CRM not connected' });
-    const searchUrl = `https://www.zohoapis.com/crm/v2/Deals/search?criteria=(Deal_Name:starts_with:${encodeURIComponent(q)})`;
-    const crmRes = await axios.get(searchUrl, {
+    // Direct GET by id is REAL-TIME; Zoho's /search endpoint is an index that lags edits by minutes.
+    const url = byId
+      ? `https://www.zohoapis.com/crm/v2/Deals/${encodeURIComponent(byId)}`
+      : `https://www.zohoapis.com/crm/v2/Deals/search?criteria=(Deal_Name:starts_with:${encodeURIComponent(q)})`;
+    const crmRes = await axios.get(url, {
       headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true,
     });
     const raw = (crmRes.data?.data || []).map(d => {
@@ -2814,8 +2818,10 @@ app.get('/api/admin/zoho-deal-raw', async (req, res) => {
       return { id: d.id, Deal_Name: d.Deal_Name, Stage: d.Stage, Modified_Time: d.Modified_Time, source_lead_fields: fields };
     });
     const stored = (await pool.query(
-      `SELECT deal_id, deal_name, lead_source_group, lead_source_group_override, updated_at FROM crm_sold_deals WHERE deal_name ILIKE '%'||$1||'%'`,
-      [q]
+      byId
+        ? `SELECT deal_id, deal_name, lead_source_group, lead_source_group_override, updated_at FROM crm_sold_deals WHERE deal_id = $1`
+        : `SELECT deal_id, deal_name, lead_source_group, lead_source_group_override, updated_at FROM crm_sold_deals WHERE deal_name ILIKE '%'||$1||'%'`,
+      [byId || q]
     )).rows;
     res.json({ zoho_status: crmRes.status, zoho: raw, stored });
   } catch (e) { res.status(500).json({ error: e.message }); }
