@@ -1923,13 +1923,16 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     // Team assignment per rep (for quota grouping). rep name → team or null.
     const teamRows = (await pool.query(`
       SELECT s.name AS rep, t.id AS team_id, t.name AS team_name,
-             t.monthly_quota_override AS override, t.counts_toward_quota AS counts
+             t.monthly_quota_override AS override, t.counts_toward_quota AS counts,
+             t.include_deals, t.include_payments
       FROM salespeople s LEFT JOIN teams t ON t.id = s.team_id
     `)).rows;
     const teamByRep = new Map(teamRows.map(r => [String(r.rep).toLowerCase(), r.team_id ? {
       id: r.team_id, name: r.team_name,
       override: r.override == null ? null : parseInt(r.override),
       countsTowardQuota: r.counts !== false,
+      includeDeals: r.include_deals !== false,
+      includePayments: r.include_payments !== false,
     } : null]));
     const teamFor = (name) => teamByRep.get(String(name || '').toLowerCase()) || null;
 
@@ -1941,24 +1944,32 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       // Reflect the rep's signup config on each merchant row too (0 when disabled).
       const zentactMerchantsOut = zentactMerchants.map(m => ({ ...m, bonus_amount: cfg.enabled ? cfg.amount : 0 }));
       const repQuota = quotaFor(rep.repName);
-      const quotaMet = rep.totalPoints >= repQuota;
-      const monthlyBonus = ZohoCRMService.calculateMonthlyBonus(rep.totalPoints);
       const team = teamFor(rep.repName);
+      // The rep's team can exclude a point source (e.g. "Payment conversion" counts payments
+      // only). Honour it at the REP level too — not just in the team card — so the rep's points,
+      // quota badge, and bonus reflect only the sources that count for them.
+      const includeDeals    = team ? team.includeDeals    : true;
+      const includePayments = team ? team.includePayments : true;
+      const effectivePoints = (includeDeals ? (rep.crmPoints || 0) : 0) + (includePayments ? zentactPoints : 0);
+      const quotaMet = effectivePoints >= repQuota;
+      const monthlyBonus = ZohoCRMService.calculateMonthlyBonus(effectivePoints);
       return {
         repName:             rep.repName,
         team:                team ? { id: team.id, name: team.name } : null,
         countsTowardQuota:   team ? team.countsTowardQuota : true,
-        totalPoints:         rep.totalPoints,   // CRM + Zentact combined
-        crmPoints:           rep.crmPoints || 0,
-        zentactPoints,
+        includeDeals,        // false → this rep's CRM deals are shown but don't count
+        includePayments,     // false → this rep's payment activations don't count
+        totalPoints:         effectivePoints,   // only the sources that count for this rep
+        crmPoints:           rep.crmPoints || 0,   // RAW (team card applies its own include flags)
+        zentactPoints,                             // RAW (idem)
         zentactActivations:  zentactMerchants.length,
         zentactBonus,
         quota:               repQuota,
         quotaMet,
-        pointsToQuota:       Math.max(0, repQuota - rep.totalPoints),
+        pointsToQuota:       Math.max(0, repQuota - effectivePoints),
         monthlyBonus,
-        bonusTier:     MONTHLY_BONUS_TIERS.find(t => rep.totalPoints >= t.points) || null,
-        nextBonusTier: MONTHLY_BONUS_TIERS.slice().reverse().find(t => rep.totalPoints < t.points) || null,
+        bonusTier:     MONTHLY_BONUS_TIERS.find(t => effectivePoints >= t.points) || null,
+        nextBonusTier: MONTHLY_BONUS_TIERS.slice().reverse().find(t => effectivePoints < t.points) || null,
         dealsCount:          rep.deals.length,  // survives privacy stripping
         deals:               rep.deals,
         zentactMerchants:    zentactMerchantsOut,
@@ -2001,7 +2012,8 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     summary = summary.map(rep => {
       const crmAnnual     = annualByRep[rep.repName]         || 0;
       const zentactAnnual = annualZentactByRep[rep.repName]  || { points: 0, activations: 0, bonus: 0 };
-      const totalAnnual   = crmAnnual + zentactAnnual.points;
+      // Same source-inclusion rules as the monthly view.
+      const totalAnnual   = (rep.includeDeals ? crmAnnual : 0) + (rep.includePayments ? zentactAnnual.points : 0);
       const cfg           = signupFor(rep.repName);
       return {
         ...rep,
