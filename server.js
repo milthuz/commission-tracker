@@ -2792,6 +2792,35 @@ app.get('/api/admin/impersonation-debug', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/zoho-deal-raw?secret=&q=<name>  — current RAW Zoho deal(s) matching a name,
+// exposing every source/lead field + the stored value, to diagnose a stale lead source.
+app.get('/api/admin/zoho-deal-raw', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.status(400).json({ error: 'q required' });
+  try {
+    const crmToken = await ensureValidCrmToken();
+    if (!crmToken) return res.status(400).json({ error: 'CRM not connected' });
+    const searchUrl = `https://www.zohoapis.com/crm/v2/Deals/search?criteria=(Deal_Name:starts_with:${encodeURIComponent(q)})`;
+    const crmRes = await axios.get(searchUrl, {
+      headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true,
+    });
+    const raw = (crmRes.data?.data || []).map(d => {
+      const fields = {};
+      Object.keys(d).filter(k => /source|lead/i.test(k)).forEach(k => { fields[k] = d[k]; });
+      return { id: d.id, Deal_Name: d.Deal_Name, Stage: d.Stage, Modified_Time: d.Modified_Time, source_lead_fields: fields };
+    });
+    const stored = (await pool.query(
+      `SELECT deal_id, deal_name, lead_source_group, lead_source_group_override, updated_at FROM crm_sold_deals WHERE deal_name ILIKE '%'||$1||'%'`,
+      [q]
+    )).rows;
+    res.json({ zoho_status: crmRes.status, zoho: raw, stored });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/crm-deals?secret=&q=<name>  — stored CRM deals matching a name (diagnostic).
 app.get('/api/admin/crm-deals', async (req, res) => {
   const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
