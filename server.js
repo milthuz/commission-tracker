@@ -10804,6 +10804,10 @@ async function runRecalcV2(source = 'manual') {
         )).rows;
         for (const r of saasRows) if (r.first_date) firstSaasByCustomer.set(r.customer_name, new Date(r.first_date).getTime());
       }
+      // Data floor = earliest invoice date we have. A sub activated BEFORE it means its first
+      // annual cycle (and commission) predate our data → any in-DB annual = renewal → 0%.
+      const dataFloor = (await pool.query(`SELECT MIN(date) AS d FROM invoices WHERE organization_id = $1`, [process.env.ZOHO_ORG_ID])).rows[0]?.d;
+      const dataFloorTs = dataFloor ? new Date(dataFloor).getTime() : 0;
 
       const annualByInvoice = new Map(); // invoice id → { total, firstTotal }
       {
@@ -10842,7 +10846,9 @@ async function runRecalcV2(source = 'manual') {
             const annualDate = r.date ? new Date(r.date).getTime() : Infinity;
             const act = r.subscription_activation_date ? new Date(r.subscription_activation_date).getTime() : null;
             const hadPriorSaas = firstSaas && firstSaas < annualDate;
-            const preExistingSub = act != null && (annualDate - act) > 270 * 86400000;
+            // Pre-existing sub: activated before our data floor (its first cycle/commission is
+            // out-of-system, e.g. 2024) OR activated >~9 months before this invoice (renewal cycle).
+            const preExistingSub = act != null && ((dataFloorTs && act < dataFloorTs) || (annualDate - act) > 270 * 86400000);
             if (!hadPriorSaas && !preExistingSub) rec.firstTotal += r.amount;
           }
           annualByInvoice.set(r.id, rec);
