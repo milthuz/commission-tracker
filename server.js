@@ -10312,6 +10312,14 @@ app.get('/api/commissions/payroll/preview', authenticateToken, async (req, res) 
   }
 });
 
+// GET /api/commissions/payroll/recipients — the saved payroll recipient list.
+app.get('/api/commissions/payroll/recipients', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  try {
+    res.json({ recipients: await getPayrollRecipients() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // PUT /api/commissions/payroll/recipients { emails:[...] }
 app.put('/api/commissions/payroll/recipients', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
