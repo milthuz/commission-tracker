@@ -342,6 +342,19 @@ async function initializeDatabase() {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_adjustment_target ON commission_adjustments(rep_name, target_period)`);
+    // Payroll send log: one row per (rep, pay month) each time payroll is emailed, so the
+    // preview can show a "Sent" badge. Latest sent_at per rep+period is what's displayed.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS payroll_sends (
+        id        SERIAL PRIMARY KEY,
+        rep_name  VARCHAR(255) NOT NULL,
+        period    DATE NOT NULL,
+        sent_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        sent_to   TEXT,
+        sent_by   VARCHAR(255)
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_payroll_sends ON payroll_sends(period, rep_name)`);
     // Comp plan v7.7: hire_date drives the 90-day ramp (quota gate waived);
     // quota_gate_enabled=false exempts a rep from the gate entirely (house
     // accounts, resellers, execs not on the rep plan).
@@ -10301,11 +10314,18 @@ app.get('/api/commissions/payroll/preview', authenticateToken, async (req, res) 
     // Deadline = the "commission due by" of the LAST pay period whose end falls in the month.
     const inMonth = PAY_CALENDAR.filter(p => p[1].startsWith(`${year}-${mm}`));
     const dueBy = inMonth.length ? inMonth[inMonth.length - 1][2] : null;
+    // Latest payroll-send timestamp per rep for this period (for the "Sent" badge).
+    const sentMap = new Map(
+      (await pool.query(
+        `SELECT rep_name, MAX(sent_at) AS sent_at FROM payroll_sends WHERE period = $1::date GROUP BY rep_name`,
+        [`${year}-${mm}-01`]
+      )).rows.map(r => [r.rep_name, r.sent_at])
+    );
     res.json({
       year, month, dueBy,
       recipients: await getPayrollRecipients(),
       grandTotal: Math.round(reps.reduce((s, r) => s + r.total, 0) * 100) / 100,
-      reps: reps.map(r => ({ rep: r.rep, source: r.source, total: r.total, lineCount: r.lines.length, bonusCount: r.bonuses.length })),
+      reps: reps.map(r => ({ rep: r.rep, source: r.source, total: r.total, lineCount: r.lines.length, bonusCount: r.bonuses.length, sentAt: sentMap.get(r.rep) || null })),
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -10382,6 +10402,15 @@ app.post('/api/commissions/payroll/send', authenticateToken, async (req, res) =>
       html,
       attachments: [{ filename: `Commissions_${periodLabel}.pdf`, content: pdf }],
     });
+    // Log the send per rep so the preview can show a "Sent" badge.
+    const periodDate = `${year}-${mm}-01`;
+    const sentBy = req.user.realAdminEmail || req.user.email || 'unknown';
+    for (const r of reps) {
+      await pool.query(
+        `INSERT INTO payroll_sends (rep_name, period, sent_to, sent_by) VALUES ($1, $2::date, $3, $4)`,
+        [r.rep, periodDate, recipients.join(', '), sentBy]
+      );
+    }
     res.json({ sent: true, recipients: recipients.length, reps: reps.length, grandTotal: grand });
   } catch (e) {
     res.status(500).json({ error: 'Failed to send payroll', details: e.message });
