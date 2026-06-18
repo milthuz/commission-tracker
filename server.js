@@ -2794,6 +2794,21 @@ app.get('/api/admin/impersonation-debug', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/payroll-sends-dump?secret=  — raw rows from payroll_sends (diagnostic).
+app.get('/api/admin/payroll-sends-dump', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const rows = (await pool.query(
+      `SELECT id, rep_name, period::date AS period, sent_at, sent_by, sent_to, total
+         FROM payroll_sends ORDER BY sent_at DESC LIMIT 200`
+    )).rows;
+    res.json({ count: rows.length, rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/zoho-deal-raw?secret=&q=<name>  — current RAW Zoho deal(s) matching a name,
 // exposing every source/lead field + the stored value, to diagnose a stale lead source.
 app.get('/api/admin/zoho-deal-raw', async (req, res) => {
