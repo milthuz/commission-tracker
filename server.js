@@ -1005,12 +1005,16 @@ app.get('/api/auth/callback', async (req, res) => {
     // Auto-assign the default 'Sales Rep' role IF this login is an ACTIVE salesperson and
     // has no roles yet (so new reps get access without manual setup — but NOT every new
     // user: admins/non-reps are unaffected since they don't match an active salesperson).
+    // Match by EITHER the Zoho display name = salesperson name, OR the login email = the
+    // salesperson's "Courriel de connexion" (card email) — the email match is robust to
+    // name/accents/format mismatches between Zoho and the salespeople table.
     try {
       await pool.query(
         `INSERT INTO user_roles (user_email, role_id)
          SELECT $1, r.id FROM roles r
          WHERE r.name = 'Sales Rep'
-           AND EXISTS (SELECT 1 FROM salespeople s WHERE s.is_active = true AND LOWER(s.name) = LOWER($2))
+           AND EXISTS (SELECT 1 FROM salespeople s WHERE s.is_active = true
+                       AND (LOWER(s.name) = LOWER($2) OR LOWER(s.email) = LOWER($1)))
            AND NOT EXISTS (SELECT 1 FROM user_roles ur WHERE LOWER(ur.user_email) = LOWER($1))
          ON CONFLICT DO NOTHING`,
         [userEmail, userName]
