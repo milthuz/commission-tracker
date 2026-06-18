@@ -2742,6 +2742,27 @@ app.get('/api/crm/sync-debug', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/admin/crm-deals?secret=&q=<name>  — stored CRM deals matching a name (diagnostic).
+app.get('/api/admin/crm-deals', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.status(400).json({ error: 'q required' });
+  try {
+    const rows = (await pool.query(
+      `SELECT deal_id, deal_name, account_name, owner_name, lead_source_group,
+              lead_source_group_override, points, sold_date::date AS sold_date,
+              closing_date_crm::date AS closing_date_crm, amount::float AS amount, first_seen_at
+       FROM crm_sold_deals WHERE deal_name ILIKE '%'||$1||'%' OR account_name ILIKE '%'||$1||'%'
+       ORDER BY sold_date DESC, deal_id`,
+      [q]
+    )).rows;
+    res.json({ count: rows.length, rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/crm/sold-deals-db — show everything in the crm_sold_deals table
 // Useful to audit what sold_date each deal was stamped with
 app.get('/api/crm/sold-deals-db', authenticateToken, async (req, res) => {
