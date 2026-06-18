@@ -5127,6 +5127,43 @@ app.get('/api/admin/invoice-lookup', async (req, res) => {
   }
 });
 
+// GET /api/admin/annual-audit?secret=  — every saas_annual invoice still paying 10%, flagged
+// with whether the customer had an EARLIER SaaS invoice (had_prior_saas=true ⇒ should be 0%).
+app.get('/api/admin/annual-audit', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const rows = (await pool.query(
+      `WITH first_saas AS (
+         SELECT i.customer_name, MIN(i.date) AS first_date
+         FROM invoices i CROSS JOIN LATERAL jsonb_array_elements(i.line_items) li
+         WHERE i.organization_id = $1 AND i.line_items IS NOT NULL AND i.status NOT IN ('void','deleted')
+           AND li->>'type' = 'saas'
+         GROUP BY i.customer_name
+       )
+       SELECT inv.invoice_number, inv.customer_name, inv.date::date AS date, inv.commission::float AS commission,
+              inv.subscription_activation_date::date AS sub_activation, fs.first_date::date AS first_saas,
+              (fs.first_date < inv.date) AS had_prior_saas
+       FROM invoices inv JOIN first_saas fs ON fs.customer_name = inv.customer_name
+       WHERE inv.organization_id = $1 AND inv.commission_status = 'saas_annual' AND inv.commission > 0
+       ORDER BY had_prior_saas DESC, inv.commission DESC`,
+      [process.env.ZOHO_ORG_ID]
+    )).rows;
+    const leaks = rows.filter(r => r.had_prior_saas);
+    res.json({
+      total_paying_annual: rows.length,
+      total_amount: Math.round(rows.reduce((s, r) => s + r.commission, 0) * 100) / 100,
+      potential_leaks: leaks.length,
+      leaks,
+      all: rows,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/admin/customer-invoices?secret=&q=<name>  — all invoices for customers matching q,
 // oldest first, with annual-plan line names. Used to check whether an "annual sub (10%)" is a
 // genuine first occurrence or a renewal that should be 0%.
