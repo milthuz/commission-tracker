@@ -2742,6 +2742,36 @@ app.get('/api/crm/sync-debug', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/admin/impersonation-debug?secret=&name=<rep>  — why does impersonating <rep> show
+// (or not show) menus? Mirrors the impersonation email-resolution + returns the effective perms.
+app.get('/api/admin/impersonation-debug', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const name = String(req.query.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'name required' });
+  try {
+    const sp = (await pool.query(`SELECT name, email, is_active FROM salespeople WHERE LOWER(name) = LOWER($1) LIMIT 1`, [name])).rows[0]
+      || (await pool.query(`SELECT name, email, is_active FROM salespeople WHERE name ILIKE '%'||$1||'%' LIMIT 1`, [name])).rows[0];
+    if (!sp) return res.json({ found: false, note: 'no salesperson matches that name' });
+    const tokenByDisplay = (await pool.query(`SELECT email, display_name, is_admin FROM user_tokens WHERE LOWER(display_name) = LOWER($1) LIMIT 1`, [sp.name])).rows[0] || null;
+    const resolvedEmail = tokenByDisplay?.email || sp.email || null;
+    const perms = resolvedEmail ? [...(await getUserPermissions(resolvedEmail))] : [];
+    const roles = resolvedEmail ? (await pool.query(`SELECT r.name FROM roles r JOIN user_roles ur ON ur.role_id = r.id WHERE LOWER(ur.user_email) = LOWER($1)`, [resolvedEmail])).rows.map(r => r.name) : [];
+    // Any token whose display_name merely contains the name (to spot a casing/format mismatch)
+    const tokenLike = (await pool.query(`SELECT email, display_name FROM user_tokens WHERE display_name ILIKE '%'||$1||'%'`, [name.split(' ')[0]])).rows;
+    res.json({
+      salesperson: { name: sp.name, card_email: sp.email, is_active: sp.is_active },
+      token_exact_display_match: tokenByDisplay,
+      resolved_email: resolvedEmail,
+      roles, permissions: perms,
+      would_see_menus: perms.length > 0,
+      tokens_matching_first_name: tokenLike,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/crm-deals?secret=&q=<name>  — stored CRM deals matching a name (diagnostic).
 app.get('/api/admin/crm-deals', async (req, res) => {
   const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
