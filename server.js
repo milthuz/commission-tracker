@@ -1793,6 +1793,7 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     let dealsQuery = `
       SELECT c.deal_id, c.deal_name, c.account_name, c.owner_name,
              COALESCE(c.lead_source_group_override, c.lead_source_group) AS lead_source_group,
+             c.lead_source_group AS synced_source, c.lead_source_group_override AS source_override,
              c.points, c.sold_date
       FROM crm_sold_deals c
       WHERE c.sold_date >= $1 AND c.sold_date <= $2
@@ -1854,6 +1855,8 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
         deal_name:         deal.deal_name,
         account_name:      deal.account_name,
         lead_source_group: deal.lead_source_group,
+        source_overridden: !!(deal.source_override && String(deal.source_override).trim()),
+        synced_source:     deal.synced_source || null,
         points:            pts,
         close_date:        deal.sold_date,
       });
