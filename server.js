@@ -2030,6 +2030,14 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     // line-item details of their OWN row. Strip deals[] and zentactMerchants[]
     // from other reps' rows.
     const isAdmin = req.user.isAdmin === true;
+    // Managers (tracker:view_all_details) get full cross-team VISIBILITY here — but not the
+    // admin EDIT controls (those are frontend-gated on the real isAdmin from /api/auth/verify,
+    // which stays false for them). Reps lack this perm → still restricted to their own team.
+    let canViewAll = isAdmin;
+    if (!canViewAll && req.user.email) {
+      try { canViewAll = (await getUserPermissions(req.user.email)).has('tracker:view_all_details'); }
+      catch { /* default: own team only */ }
+    }
     let viewerName = (req.user.name || '').trim().toLowerCase();
     // Resolve viewer's salesperson name via user_tokens.display_name (in case
     // the JWT name differs from the CRM display name)
@@ -2056,10 +2064,11 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       ORDER BY t.sort_order, t.name
     `)).rows;
 
-    // PRIVACY: a non-admin sees ONLY their own team — both the rep rows AND the team cards.
-    // (Enforced server-side so other teams' data never leaves the API.) Within their team they
-    // see teammates' totals but not line-item details (deals/merchants stripped on non-own rows).
-    if (!isAdmin) {
+    // PRIVACY: a rep without full-visibility sees ONLY their own team — both the rep rows AND the
+    // team cards. (Enforced server-side so other teams' data never leaves the API.) Within their
+    // team they see teammates' totals but not line-item details (stripped on non-own rows).
+    // Managers/admins (canViewAll) skip this and see every team with full detail.
+    if (!canViewAll) {
       const myTeam = teamFor(viewerName);
       const myTeamId = myTeam ? myTeam.id : null;
       summary = summary
@@ -2099,8 +2108,9 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       };
     }); // order preserved from teamMetaRows (manual sort_order)
 
-    // Company totals: admins exclude non-counting teams; a non-admin just sees their own team.
-    const countingTeams = isAdmin ? teams.filter(t => t.countsTowardQuota) : teams;
+    // Company totals: full-visibility viewers exclude non-counting teams; a restricted rep just
+    // sees their own team (already the only team in `teams`).
+    const countingTeams = canViewAll ? teams.filter(t => t.countsTowardQuota) : teams;
     const companyPoints = countingTeams.reduce((s, t) => s + t.totalPoints, 0);
     const companyTarget = countingTeams.reduce((s, t) => s + t.quotaTarget, 0);
 
@@ -2121,6 +2131,7 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       totalDeals:              deals.length,
       totalZentactActivations,
       isAdmin,
+      canViewAll,
       viewerName,
       reps:                    summary,
       teams,
