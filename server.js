@@ -2763,6 +2763,37 @@ app.get('/api/admin/crm-deals', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST /api/admin/prune-deleted-deal?secret=&q=<name>  — remove stored CRM deals (matching q)
+// that NO LONGER exist in Zoho (deleted there). The regular sync only upserts, so a deal deleted
+// in Zoho lingers as a stale row + phantom point. This prunes ONLY the gone ones (preserves
+// lead-source overrides on everything else, unlike the full TRUNCATE reset).
+app.post('/api/admin/prune-deleted-deal', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.status(400).json({ error: 'q required' });
+  try {
+    const crmToken = await ensureValidCrmToken();
+    if (!crmToken) return res.status(400).json({ error: 'CRM not connected' });
+    const searchUrl = `https://www.zohoapis.com/crm/v2/Deals/search?criteria=(Deal_Name:starts_with:${encodeURIComponent(q)})`;
+    const crmRes = await axios.get(searchUrl, {
+      headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true,
+    });
+    const zohoIds = new Set((crmRes.data?.data || []).map(d => String(d.id)));
+    // Safety: if Zoho returned nothing (search hiccup), don't delete anything.
+    if (zohoIds.size === 0) return res.status(409).json({ error: 'Zoho returned 0 deals for that query — aborting to avoid wrong deletes', zohoCount: 0 });
+    const stored = (await pool.query(
+      `SELECT deal_id, deal_name FROM crm_sold_deals WHERE deal_name ILIKE '%'||$1||'%' OR account_name ILIKE '%'||$1||'%'`,
+      [q]
+    )).rows;
+    const toDelete = stored.filter(r => !zohoIds.has(String(r.deal_id)));
+    for (const r of toDelete) await pool.query(`DELETE FROM crm_sold_deals WHERE deal_id = $1`, [r.deal_id]);
+    res.json({ zohoDeals: zohoIds.size, storedMatched: stored.length, pruned: toDelete.length, prunedIds: toDelete.map(r => r.deal_id) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/crm/sold-deals-db — show everything in the crm_sold_deals table
 // Useful to audit what sold_date each deal was stamped with
 app.get('/api/crm/sold-deals-db', authenticateToken, async (req, res) => {
