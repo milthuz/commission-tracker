@@ -10484,7 +10484,8 @@ app.get('/api/commissions/payroll/sends', authenticateToken, async (req, res) =>
       SELECT period::date AS period, sent_at, sent_by, sent_to,
              COUNT(*)::int AS rep_count,
              COALESCE(SUM(total), 0)::float AS total,
-             ARRAY_AGG(rep_name ORDER BY rep_name) AS reps
+             ARRAY_AGG(rep_name ORDER BY rep_name) AS reps,
+             ARRAY_AGG(id) AS ids
         FROM payroll_sends
        GROUP BY period, sent_at, sent_by, sent_to
        ORDER BY sent_at DESC
@@ -10500,10 +10501,26 @@ app.get('/api/commissions/payroll/sends', authenticateToken, async (req, res) =>
       repCount: r.rep_count,
       total: r.total,
       reps: r.reps || [],
+      ids: r.ids || [],                              // row ids of this batch (for delete)
     }));
     res.json({ sends });
   } catch (e) {
     res.status(500).json({ error: 'Failed to load payroll history', details: e.message });
+  }
+});
+
+// DELETE /api/commissions/payroll/sends { ids: [..] } — remove one send-history batch.
+// Deletes only the given payroll_sends rows (a batch = the rep rows from one send).
+// This only erases the history entry; it does NOT un-send the email already delivered.
+app.delete('/api/commissions/payroll/sends', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const ids = Array.isArray(req.body.ids) ? req.body.ids.map(n => parseInt(n)).filter(Number.isFinite) : [];
+  if (!ids.length) return res.status(400).json({ error: 'ids required' });
+  try {
+    const result = await pool.query(`DELETE FROM payroll_sends WHERE id = ANY($1::int[])`, [ids]);
+    res.json({ deleted: result.rowCount });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to delete payroll history', details: e.message });
   }
 });
 
