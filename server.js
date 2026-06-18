@@ -355,6 +355,8 @@ async function initializeDatabase() {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_payroll_sends ON payroll_sends(period, rep_name)`);
+    // Record the $ amount sent per rep so the send-history can show totals as they were at send time.
+    await pool.query(`ALTER TABLE payroll_sends ADD COLUMN IF NOT EXISTS total NUMERIC`);
     // Comp plan v7.7: hire_date drives the 90-day ramp (quota gate waived);
     // quota_gate_enabled=false exempts a rep from the gate entirely (house
     // accounts, resellers, execs not on the rep plan).
@@ -10437,18 +10439,56 @@ app.post('/api/commissions/payroll/send', authenticateToken, async (req, res) =>
       html,
       attachments: [{ filename: `Commissions_${periodLabel}.pdf`, content: pdf }],
     });
-    // Log the send per rep so the preview can show a "Sent" badge.
+    // Log the send per rep so the preview can show a "Sent" badge + the history can list batches.
+    // Single multi-row INSERT → all rows share one CURRENT_TIMESTAMP, so a batch groups cleanly by sent_at.
     const periodDate = `${year}-${mm}-01`;
     const sentBy = req.user.realAdminEmail || req.user.email || 'unknown';
-    for (const r of reps) {
-      await pool.query(
-        `INSERT INTO payroll_sends (rep_name, period, sent_to, sent_by) VALUES ($1, $2::date, $3, $4)`,
-        [r.rep, periodDate, recipients.join(', '), sentBy]
-      );
-    }
+    const sentTo = recipients.join(', ');
+    const values = [], params = [];
+    reps.forEach((r, i) => {
+      const b = i * 5;
+      values.push(`($${b + 1}, $${b + 2}::date, $${b + 3}, $${b + 4}, $${b + 5})`);
+      params.push(r.rep, periodDate, sentTo, sentBy, Math.round((Number(r.total) || 0) * 100) / 100);
+    });
+    await pool.query(
+      `INSERT INTO payroll_sends (rep_name, period, sent_to, sent_by, total) VALUES ${values.join(', ')}`,
+      params
+    );
     res.json({ sent: true, recipients: recipients.length, reps: reps.length, grandTotal: grand });
   } catch (e) {
     res.status(500).json({ error: 'Failed to send payroll', details: e.message });
+  }
+});
+
+// GET /api/commissions/payroll/sends — history of payroll send batches (most recent first).
+// One batch = all rows that share (period, sent_at, sent_by) from a single multi-row insert.
+app.get('/api/commissions/payroll/sends', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  try {
+    const rows = (await pool.query(`
+      SELECT period::date AS period, sent_at, sent_by, sent_to,
+             COUNT(*)::int AS rep_count,
+             COALESCE(SUM(total), 0)::float AS total,
+             ARRAY_AGG(rep_name ORDER BY rep_name) AS reps
+        FROM payroll_sends
+       GROUP BY period, sent_at, sent_by, sent_to
+       ORDER BY sent_at DESC
+       LIMIT 200
+    `)).rows;
+    const sends = rows.map(r => ({
+      period: r.period,                              // YYYY-MM-01 (the pay month)
+      year: new Date(r.period).getUTCFullYear(),
+      month: new Date(r.period).getUTCMonth() + 1,
+      sentAt: r.sent_at,
+      sentBy: r.sent_by,
+      recipients: (r.sent_to || '').split(',').map(s => s.trim()).filter(Boolean),
+      repCount: r.rep_count,
+      total: r.total,
+      reps: r.reps || [],
+    }));
+    res.json({ sends });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load payroll history', details: e.message });
   }
 });
 
