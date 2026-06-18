@@ -10259,8 +10259,30 @@ async function payrollDataForMonth(year, month) {
   return out;
 }
 
+// All payroll email + PDF labels, by language. lang follows the admin's UI at send time;
+// anything other than 'en' falls back to French (the default).
+function payrollI18n(lang) {
+  const en = String(lang || '').toLowerCase().startsWith('en');
+  return en ? {
+    emailSubject: 'Commissions payable', emailFooter: 'Detailed pay stubs attached (PDF). Gross amounts, before taxes and deductions.',
+    payStubTitle: 'PAY STUB', rep: 'REP', period: 'PERIOD', status: 'STATUS', paid: 'Paid', pending: 'Pending approval',
+    commissions: 'COMMISSIONS', invoice: 'INVOICE', customer: 'CUSTOMER', amount: 'AMOUNT', subtotalCommissions: 'Commissions subtotal',
+    bonus: 'BONUSES', type: 'TYPE', detail: 'DETAIL', subtotalBonus: 'Bonus subtotal',
+    totalPaid: 'TOTAL PAID', grossNote: 'Gross amounts, before taxes and deductions.',
+    blSignup: 'Signup bonus', blMonthly: 'Monthly bonus', blProcessing: 'Processing bonus', blAdjustment: 'Adjustment',
+  } : {
+    emailSubject: 'Commissions à verser', emailFooter: 'Bulletins détaillés en pièce jointe (PDF). Montants bruts, avant impôts et retenues.',
+    payStubTitle: 'BULLETIN DE PAIE', rep: 'VENDEUR', period: 'PÉRIODE', status: 'STATUT', paid: 'Payé', pending: "En attente d'approbation",
+    commissions: 'COMMISSIONS', invoice: 'FACTURE', customer: 'CLIENT', amount: 'MONTANT', subtotalCommissions: 'Sous-total commissions',
+    bonus: 'BONUS', type: 'TYPE', detail: 'DÉTAIL', subtotalBonus: 'Sous-total bonus',
+    totalPaid: 'TOTAL VERSÉ', grossNote: 'Montants bruts, avant impôts et retenues.',
+    blSignup: "Bonus d'inscription", blMonthly: 'Bonus mensuel', blProcessing: 'Bonus de processing', blAdjustment: 'Ajustement',
+  };
+}
+
 // Build a single combined PDF (one rep per page) with pdfkit. Returns a Buffer.
-function buildPayrollPdf(periodLabel, reps) {
+function buildPayrollPdf(periodLabel, reps, lang) {
+  const T = payrollI18n(lang);
   return new Promise((resolve, reject) => {
     try {
       const doc = new PDFDocument({ size: 'LETTER', margin: 40 });
@@ -10268,7 +10290,7 @@ function buildPayrollPdf(periodLabel, reps) {
       doc.on('data', c => chunks.push(c));
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      const bl = (t) => t === 'signup' ? 'Bonus d\'inscription' : (t === 'monthly' || t === 'monthly_performance') ? 'Bonus mensuel' : t === 'processing' ? 'Bonus de processing' : t === 'adjustment' ? 'Ajustement' : t;
+      const bl = (t) => t === 'signup' ? T.blSignup : (t === 'monthly' || t === 'monthly_performance') ? T.blMonthly : t === 'processing' ? T.blProcessing : t === 'adjustment' ? T.blAdjustment : t;
       const L = 40, R = 572, W = R - L, AMT_X = R - 96;     // content area + amount column
       const C = { dark: '#1c2434', orange: '#f2682c', gray: '#475569', light: '#94a3b8', zebra: '#fafbfd', line: '#e8edf3' };
       const ensure = (h) => { if (doc.y + h > 748) doc.addPage(); };
@@ -10278,11 +10300,11 @@ function buildPayrollPdf(periodLabel, reps) {
         doc.rect(0, 6, 612, 74).fill(C.dark);
         doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(21).text('Sales Hub', L, 24);
         doc.fillColor('#8a99af').font('Helvetica').fontSize(9).text('by Cluster Systems', L, 50);
-        doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text('BULLETIN DE PAIE', L, 26, { width: W, align: 'right', characterSpacing: 1.5 });
+        doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text(T.payStubTitle, L, 26, { width: W, align: 'right', characterSpacing: 1.5 });
         doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(17).text(periodLabel, L, 42, { width: W, align: 'right' });
         // meta row
         const my = 96;
-        const meta = [['VENDEUR', r.rep], ['PÉRIODE', periodLabel], ['STATUT', r.source === 'imported' ? 'Payé' : 'En attente d\'approbation']];
+        const meta = [[T.rep, r.rep], [T.period, periodLabel], [T.status, r.source === 'imported' ? T.paid : T.pending]];
         const cw = W / 3;
         meta.forEach((m, i) => {
           const x = L + i * cw;
@@ -10302,7 +10324,7 @@ function buildPayrollPdf(periodLabel, reps) {
         doc.fillColor(C.light).font('Helvetica-Bold').fontSize(7);
         doc.text(c0, L + 2, hy, { characterSpacing: 0.5 });
         doc.text(c1, L + 130, hy, { characterSpacing: 0.5 });
-        doc.text('MONTANT', AMT_X, hy, { width: 92, align: 'right', characterSpacing: 0.5 });
+        doc.text(T.amount, AMT_X, hy, { width: 92, align: 'right', characterSpacing: 0.5 });
         doc.y = hy + 11;
         doc.moveTo(L, doc.y).lineTo(R, doc.y).strokeColor(C.dark).lineWidth(1).stroke();
         doc.y += 5;
@@ -10329,25 +10351,25 @@ function buildPayrollPdf(periodLabel, reps) {
         if (idx > 0) doc.addPage();
         header(r);
         if (r.lines.length) {
-          sectionHead('COMMISSIONS', 'FACTURE', 'CLIENT');
+          sectionHead(T.commissions, T.invoice, T.customer);
           r.lines.forEach((l, i) => row(l.invoice_number, l.customer, money(l.paid_amount), i));
-          subtotal('Sous-total commissions', money(r.lines.reduce((s, l) => s + (l.paid_amount || 0), 0)));
+          subtotal(T.subtotalCommissions, money(r.lines.reduce((s, l) => s + (l.paid_amount || 0), 0)));
         }
         if (r.bonuses.length) {
           doc.y += 8;
-          sectionHead('BONUS', 'TYPE', 'DÉTAIL');
+          sectionHead(T.bonus, T.type, T.detail);
           r.bonuses.forEach((b, i) => row(bl(b.bonus_type), b.merchant_name, money(b.amount), i));
-          subtotal('Sous-total bonus', money(r.bonuses.reduce((s, b) => s + (b.amount || 0), 0)));
+          subtotal(T.subtotalBonus, money(r.bonuses.reduce((s, b) => s + (b.amount || 0), 0)));
         }
         // TOTAL box
         ensure(60);
         doc.y += 12;
         const by = doc.y, bx = R - 268;
         doc.roundedRect(bx, by, 268, 40, 9).fillAndStroke('#fff4ec', '#f7c8ab');
-        doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text('TOTAL VERSÉ', bx + 16, by + 15, { characterSpacing: 1 });
+        doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text(T.totalPaid, bx + 16, by + 15, { characterSpacing: 1 });
         doc.fillColor(C.dark).font('Helvetica-Bold').fontSize(18).text(money(r.total), bx + 16, by + 11, { width: 236, align: 'right' });
         doc.y = by + 56;
-        doc.fillColor(C.light).font('Helvetica-Oblique').fontSize(7.5).text('Montants bruts, avant impôts et retenues.', L, doc.y, { continued: true })
+        doc.fillColor(C.light).font('Helvetica-Oblique').fontSize(7.5).text(T.grossNote, L, doc.y, { continued: true })
           .font('Helvetica').text('     Sales Hub · saleshub.clusterpos.com', { align: 'left' });
       });
       doc.end();
@@ -10426,6 +10448,7 @@ app.post('/api/commissions/payroll/send', authenticateToken, async (req, res) =>
     if (!reps.length) return res.status(400).json({ error: 'nothing to send for this period' });
     const mm = String(month).padStart(2, '0');
     const periodLabel = `${year}-${mm}`;
+    const T = payrollI18n(req.body.lang);   // language follows the admin's UI at send time
     const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     const grand = Math.round(reps.reduce((s, r) => s + r.total, 0) * 100) / 100;
     const rowsHtml = reps.map(r =>
@@ -10436,21 +10459,21 @@ app.post('/api/commissions/payroll/send', authenticateToken, async (req, res) =>
         <table width="560" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:10px;overflow:hidden">
           <tr><td style="background:#1c2434;padding:20px 28px"><span style="color:#fff;font-size:19px;font-weight:bold">Sales Hub</span></td></tr>
           <tr><td style="padding:24px 28px">
-            <h2 style="margin:0 0 12px;color:#1c2434;font-size:18px">Commissions à verser — ${periodLabel}</h2>
+            <h2 style="margin:0 0 12px;color:#1c2434;font-size:18px">${T.emailSubject} — ${periodLabel}</h2>
             <table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434">
               <tr><th style="text-align:left;padding:6px 10px;color:#94a3b8;font-size:11px">REP</th><th style="text-align:right;padding:6px 10px;color:#94a3b8;font-size:11px">TOTAL</th></tr>
               ${rowsHtml}
               <tr><td style="padding:10px;border-top:2px solid #1c2434;font-weight:bold">Total</td><td style="padding:10px;border-top:2px solid #1c2434;text-align:right;font-weight:bold;color:#f97316">${money(grand)}</td></tr>
             </table>
-            <p style="margin:18px 0 0;color:#94a3b8;font-size:11px">Bulletins détaillés en pièce jointe (PDF). Montants bruts, avant impôts et retenues.</p>
+            <p style="margin:18px 0 0;color:#94a3b8;font-size:11px">${T.emailFooter}</p>
           </td></tr></table></td></tr></table></body></html>`;
-    const pdf = await buildPayrollPdf(periodLabel, reps);
+    const pdf = await buildPayrollPdf(periodLabel, reps, req.body.lang);
     const t = getMailer();
     if (!t) return res.status(502).json({ error: 'smtp_not_configured' });
     await t.sendMail({
       from: process.env.SMTP_FROM || process.env.SMTP_USER,
       to: recipients.join(','),
-      subject: `Commissions à verser — ${periodLabel}`,
+      subject: `${T.emailSubject} — ${periodLabel}`,
       html,
       attachments: [{ filename: `Commissions_${periodLabel}.pdf`, content: pdf }],
     });
