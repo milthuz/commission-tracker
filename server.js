@@ -2794,6 +2794,26 @@ app.get('/api/admin/impersonation-debug', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/rep-config?secret=&name=  — a rep's toggles + team settings (diagnostic).
+app.get('/api/admin/rep-config', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const name = String(req.query.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'name required' });
+  try {
+    const rows = (await pool.query(`
+      SELECT s.name, s.is_active, s.team_id, s.monthly_quota, s.quota_gate_enabled,
+             s.processing_bonus_enabled, s.signup_bonus_enabled,
+             t.name AS team_name, t.counts_toward_quota, t.include_deals, t.include_payments,
+             t.monthly_quota_override
+        FROM salespeople s LEFT JOIN teams t ON t.id = s.team_id
+       WHERE s.name ILIKE '%'||$1||'%'`, [name])).rows;
+    res.json({ rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/payroll-sends-dump?secret=  — raw rows from payroll_sends (diagnostic).
 app.get('/api/admin/payroll-sends-dump', async (req, res) => {
   const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
