@@ -2869,6 +2869,32 @@ app.get('/api/admin/impersonation-debug', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/customer-lookup?secret=&q=  — distinct customer names matching q, with
+// invoice count + whether they're in excluded_customers (diagnose exact-match exclusion).
+app.get('/api/admin/customer-lookup', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.status(400).json({ error: 'q required' });
+  try {
+    const rows = (await pool.query(`
+      SELECT i.customer_name,
+             COUNT(*)::int AS invoices,
+             COALESCE(SUM(i.total),0)::float AS total,
+             EXISTS (SELECT 1 FROM excluded_customers e
+                     WHERE e.organization_id = $2 AND e.customer_name = i.customer_name) AS excluded
+        FROM invoices i
+       WHERE i.organization_id = $2 AND i.customer_name ILIKE '%'||$1||'%'
+       GROUP BY i.customer_name ORDER BY total DESC`, [q, process.env.ZOHO_ORG_ID])).rows;
+    const excludedRows = (await pool.query(
+      `SELECT customer_name FROM excluded_customers WHERE organization_id = $1 AND customer_name ILIKE '%'||$2||'%'`,
+      [process.env.ZOHO_ORG_ID, q])).rows.map(r => r.customer_name);
+    res.json({ matches: rows, excludedEntries: excludedRows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/rep-config?secret=&name=  — a rep's toggles + team settings (diagnostic).
 app.get('/api/admin/rep-config', async (req, res) => {
   const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
