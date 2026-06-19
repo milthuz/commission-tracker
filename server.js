@@ -74,6 +74,10 @@ const PERMISSION_CATALOG = [
 
   // Revenue (Zentact transaction profit)
   { key: 'revenue:view',               label: 'View merchant revenue (Transaction Profit by rep / reseller)',    category: 'Revenue' },
+
+  // Resources (sales document library)
+  { key: 'resources:view',             label: 'View the Resources library (sales documents)',                   category: 'Resources' },
+  { key: 'resources:manage',           label: 'Add, edit and delete resources',                                 category: 'Resources' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -432,6 +436,25 @@ async function initializeDatabase() {
       for (const t of ANNUAL_BONUS_TIERS)  await pool.query(`INSERT INTO bonus_tiers (kind, points, bonus) VALUES ('annual',  $1, $2)`, [t.points, t.bonus]);
     }
     await refreshBonusTiers();
+    // Sales resources library — documents uploaded by admins, stored in-DB (bytea). file_data is
+    // only ever fetched on the download endpoint; listings select metadata columns only.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS resources (
+        id          SERIAL PRIMARY KEY,
+        title       VARCHAR(300) NOT NULL,
+        description TEXT,
+        category    VARCHAR(150) DEFAULT '',
+        tags        TEXT[] DEFAULT '{}',
+        file_name   VARCHAR(400) NOT NULL,
+        mime_type   VARCHAR(150),
+        file_size   INT,
+        file_data   BYTEA NOT NULL,
+        uploaded_by VARCHAR(255),
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_resources_category ON resources(category)`);
     // Invoice-level (entity) discount facts — captured by enrich from the Zoho detail.
     // Comp plan v7.7: commission base = pre-tax value AFTER discount; hardware rate
     // halves (10%→5%) when the discount is ≥ 25%. NULL = not captured yet.
@@ -524,6 +547,11 @@ async function initializeDatabase() {
     await pool.query(`
       UPDATE roles SET permissions = permissions || '["report:view_paystub"]'::jsonb
       WHERE name = 'Sales Rep' AND NOT (permissions ? 'report:view_paystub')
+    `);
+    // Resources library can be viewed by Sales Rep + Manager out of the box (admins adjust per role).
+    await pool.query(`
+      UPDATE roles SET permissions = permissions || '["resources:view"]'::jsonb
+      WHERE name IN ('Sales Rep', 'Manager') AND NOT (permissions ? 'resources:view')
     `);
     // Auto-assign 'Administrator' role to existing is_admin users
     await pool.query(`
@@ -7470,6 +7498,92 @@ app.put('/api/bonus-tiers', authenticateToken, async (req, res) => {
     await pool.query('ROLLBACK');
     res.status(500).json({ error: error.message });
   }
+});
+
+// ============================================================================
+// RESOURCES — sales document library (files stored in-DB, RBAC-gated)
+// ============================================================================
+const uploadResource = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } }); // 25 MB
+
+const parseTags = (raw) => {
+  if (Array.isArray(raw)) return raw.map(s => String(s).trim()).filter(Boolean);
+  return String(raw || '').split(',').map(s => s.trim()).filter(Boolean);
+};
+
+// GET /api/resources?q=&category= — metadata only (never the blob). Returns the distinct categories too.
+app.get('/api/resources', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'resources:view'))) return;
+  const q = String(req.query.q || '').trim();
+  const category = String(req.query.category || '').trim();
+  try {
+    const where = [], params = [];
+    if (q) { params.push(`%${q}%`); where.push(`(title ILIKE $${params.length} OR description ILIKE $${params.length} OR array_to_string(tags, ',') ILIKE $${params.length})`); }
+    if (category) { params.push(category); where.push(`category = $${params.length}`); }
+    const sql = `
+      SELECT id, title, description, category, tags, file_name, mime_type, file_size, uploaded_by, created_at, updated_at
+        FROM resources ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+       ORDER BY category NULLS LAST, title`;
+    const rows = (await pool.query(sql, params)).rows;
+    const categories = (await pool.query(`SELECT DISTINCT category FROM resources WHERE COALESCE(category,'') <> '' ORDER BY category`)).rows.map(r => r.category);
+    res.json({ resources: rows, categories });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/resources/:id/download — stream the file inline (view perm is enough to download).
+app.get('/api/resources/:id/download', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'resources:view'))) return;
+  try {
+    const r = (await pool.query(`SELECT file_name, mime_type, file_data FROM resources WHERE id = $1`, [req.params.id])).rows[0];
+    if (!r) return res.status(404).json({ error: 'not found' });
+    res.setHeader('Content-Type', r.mime_type || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(r.file_name)}"`);
+    res.send(r.file_data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/resources — upload a new resource (multipart: file + title/description/category/tags).
+app.post('/api/resources', authenticateToken, uploadResource.single('file'), async (req, res) => {
+  if (!(await requirePerm(req, res, 'resources:manage'))) return;
+  const file = req.file;
+  const title = String(req.body.title || '').trim();
+  if (!file) return res.status(400).json({ error: 'file required (multipart field "file")' });
+  if (!title) return res.status(400).json({ error: 'title required' });
+  try {
+    const r = await pool.query(
+      `INSERT INTO resources (title, description, category, tags, file_name, mime_type, file_size, file_data, uploaded_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+      [title, String(req.body.description || '').trim(), String(req.body.category || '').trim(),
+       parseTags(req.body.tags), file.originalname, file.mimetype, file.size, file.buffer,
+       req.user.realAdminEmail || req.user.email || 'unknown']
+    );
+    res.json({ success: true, id: r.rows[0].id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/resources/:id — edit metadata; optionally replace the file.
+app.put('/api/resources/:id', authenticateToken, uploadResource.single('file'), async (req, res) => {
+  if (!(await requirePerm(req, res, 'resources:manage'))) return;
+  try {
+    const sets = ['title = $2', 'description = $3', 'category = $4', 'tags = $5', 'updated_at = CURRENT_TIMESTAMP'];
+    const params = [req.params.id, String(req.body.title || '').trim(), String(req.body.description || '').trim(),
+                    String(req.body.category || '').trim(), parseTags(req.body.tags)];
+    if (req.file) {
+      params.push(req.file.originalname, req.file.mimetype, req.file.size, req.file.buffer);
+      sets.push(`file_name = $${params.length - 3}`, `mime_type = $${params.length - 2}`, `file_size = $${params.length - 1}`, `file_data = $${params.length}`);
+    }
+    const r = await pool.query(`UPDATE resources SET ${sets.join(', ')} WHERE id = $1 RETURNING id`, params);
+    if (!r.rowCount) return res.status(404).json({ error: 'not found' });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/resources/:id
+app.delete('/api/resources/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'resources:manage'))) return;
+  try {
+    await pool.query(`DELETE FROM resources WHERE id = $1`, [req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // PUT /api/salespeople/:name/email — the rep's Zoho login email (null/empty clears it).
