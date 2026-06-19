@@ -45,6 +45,7 @@ const PERMISSION_CATALOG = [
   { key: 'report:approve',             label: 'Approve / unapprove commissions',             category: 'Commission Report' },
   { key: 'report:mark_paid',           label: 'Mark approved commissions as paid to rep',    category: 'Commission Report' },
   { key: 'report:view_paystub',        label: 'View pay stubs (own + per role)',             category: 'Commission Report' },
+  { key: 'report:view_salary',         label: 'View base salary & total compensation',       category: 'Commission Report' },
 
   // Invoices
   { key: 'invoices:view_own',          label: 'View own invoices',                           category: 'Invoices' },
@@ -103,6 +104,32 @@ async function getManagedTeamIds(email) {
     const r = await pool.query(`SELECT team_id FROM team_managers WHERE LOWER(user_email) = LOWER($1)`, [email]);
     return r.rows.map(x => parseInt(x.team_id)).filter(Number.isFinite);
   } catch { return []; }
+}
+
+// Salesperson names in the team(s) a manager oversees (who they may view reports for).
+async function getManagedRepNames(email) {
+  const ids = await getManagedTeamIds(email);
+  if (!ids.length) return [];
+  try {
+    const r = await pool.query(`SELECT name FROM salespeople WHERE team_id = ANY($1::int[])`, [ids]);
+    return r.rows.map(x => x.name);
+  } catch { return []; }
+}
+
+// Resolve which rep's data a viewer may read for a rep-scoped endpoint:
+//   • Admin            → any requested rep
+//   • Manager (report:view_others) → self, or a rep in their managed team(s)
+//   • else             → self only (a disallowed request silently falls back to self)
+async function resolveTargetRep(req, requestedRep, myName) {
+  if (req.user.isAdmin === true) return requestedRep || myName;
+  const requested = String(requestedRep || '').trim();
+  if (!requested || requested.toLowerCase() === String(myName).toLowerCase()) return myName;
+  const perms = await getUserPermissions(req.user.email);
+  if (userHasPermission(perms, 'report:view_others')) {
+    const allowed = await getManagedRepNames(req.user.email);
+    if (allowed.some(n => n.toLowerCase() === requested.toLowerCase())) return requested;
+  }
+  return myName;
 }
 
 // Endpoint-level helper: resolve current user, check perm, respond 403 if missing.
@@ -9069,6 +9096,31 @@ app.get('/api/sync/all-status', authenticateToken, async (req, res) => {
 // COMMISSIONS REPORT
 // ============================================================================
 
+// GET /api/commissions/viewable-reps — rep names the viewer may open a report for.
+// Admin → all active reps; manager (report:view_others) → their managed team(s); else → just self.
+app.get('/api/commissions/viewable-reps', authenticateToken, async (req, res) => {
+  const { email, isAdmin, name: jwtName } = req.user;
+  try {
+    if (isAdmin) {
+      const r = await pool.query(`SELECT name FROM salespeople WHERE is_active = true ORDER BY name`);
+      return res.json({ reps: r.rows.map(x => x.name), canViewOthers: true });
+    }
+    const tokenResult = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
+    const myName = tokenResult.rows[0]?.display_name || jwtName || email;
+    const perms = await getUserPermissions(email);
+    if (userHasPermission(perms, 'report:view_others')) {
+      const names = await getManagedRepNames(email);
+      const set = new Set(names.map(n => n.toLowerCase()));
+      set.add(String(myName).toLowerCase());
+      const reps = [...new Set([myName, ...names])].sort((a, b) => a.localeCompare(b));
+      return res.json({ reps, canViewOthers: reps.length > 1 });
+    }
+    return res.json({ reps: [myName], canViewOthers: false });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // GET /api/commissions/report?year=&repName=&month=
 app.get('/api/commissions/report', authenticateToken, async (req, res) => {
   const { email, isAdmin, name: jwtName } = req.user;
@@ -9082,11 +9134,17 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
   try {
     const tokenResult = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
     const myName    = tokenResult.rows[0]?.display_name || jwtName || email;
-    const targetRep = isAdmin ? (repName || myName) : myName;
+    const targetRep = await resolveTargetRep(req, repName, myName);
+
+    // Salary/total-compensation is gated: visible to admins, to a rep viewing their OWN report,
+    // or to anyone with report:view_salary. A team manager without it sees commissions but not pay.
+    const isOwnReport = String(targetRep).toLowerCase() === String(myName).toLowerCase();
+    let canViewSalary = isAdmin || isOwnReport;
+    if (!canViewSalary) canViewSalary = userHasPermission(await getUserPermissions(email), 'report:view_salary');
 
     const spResult = await pool.query('SELECT commission_rate, base_salary FROM salespeople WHERE name = $1', [targetRep]);
     const commissionRate = parseFloat(spResult.rows[0]?.commission_rate) || 10;
-    const baseSalary = parseFloat(spResult.rows[0]?.base_salary) || 0; // annual base salary
+    const baseSalary = canViewSalary ? (parseFloat(spResult.rows[0]?.base_salary) || 0) : null; // annual base salary (null = hidden)
 
     const startDate = new Date(`${targetYear}-01-01`);
     const endDate   = new Date(`${targetYear}-12-31T23:59:59.999`);
@@ -9176,6 +9234,7 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
       repName: targetRep,
       commissionRate,
       baseSalary,
+      canViewSalary,
       year: targetYear,
       groupBy,
       months,
@@ -9211,7 +9270,7 @@ app.get('/api/commissions/invoices', authenticateToken, async (req, res) => {
   try {
     const tokenResult = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
     const myName    = tokenResult.rows[0]?.display_name || jwtName || email;
-    const targetRep = isAdmin ? (repName || myName) : myName;
+    const targetRep = await resolveTargetRep(req, repName, myName);
     const targetYear = year || new Date().getFullYear().toString();
 
     let startDate, endDate;
