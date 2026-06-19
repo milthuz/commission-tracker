@@ -2895,6 +2895,30 @@ app.get('/api/admin/customer-lookup', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/exclude-add?secret=&name=  — replicate the exclude-customer INSERT at the DB
+// level (diagnose why the UI add doesn't persist) AND actually exclude the customer.
+app.get('/api/admin/exclude-add', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const name = String(req.query.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'name required' });
+  try {
+    const orgId = process.env.ZOHO_ORG_ID || null;
+    const before = (await pool.query(`SELECT COUNT(*)::int AS c FROM excluded_customers`)).rows[0].c;
+    const ins = await pool.query(
+      `INSERT INTO excluded_customers (customer_name, excluded_by, organization_id)
+       VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING id`,
+      [name, 'diagnostic', orgId]
+    );
+    const all = (await pool.query(
+      `SELECT id, customer_name, organization_id FROM excluded_customers ORDER BY id DESC LIMIT 20`
+    )).rows;
+    res.json({ orgIdUsed: orgId, before, insertedRowCount: ins.rowCount, insertedId: ins.rows[0]?.id || null, rows: all });
+  } catch (e) { res.status(500).json({ error: e.message, code: e.code, detail: e.detail }); }
+});
+
 // GET /api/admin/rep-config?secret=&name=  — a rep's toggles + team settings (diagnostic).
 app.get('/api/admin/rep-config', async (req, res) => {
   const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
