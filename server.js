@@ -516,6 +516,13 @@ async function initializeDatabase() {
     `);
     await pool.query(`ALTER TABLE excluded_customers ADD COLUMN IF NOT EXISTS organization_id VARCHAR(255)`);
     await pool.query(`ALTER TABLE excluded_customers ADD COLUMN IF NOT EXISTS excluded_by VARCHAR(255)`);
+    // Backfill legacy exclusions saved with a NULL org (Adyen, First Data, UEAT, …): the org-scoped
+    // GET + dashboard filter query `organization_id = $org`, so NULL-org rows were invisible — the
+    // list showed empty and the dashboard never excluded them. Single-org app → safe to claim them.
+    if (process.env.ZOHO_ORG_ID) {
+      await pool.query(`UPDATE excluded_customers SET organization_id = $1 WHERE organization_id IS NULL`, [process.env.ZOHO_ORG_ID]);
+    }
+    await pool.query(`DELETE FROM excluded_customers WHERE customer_name = '__probe__'`);
 
     // Releases table
     await pool.query(`
