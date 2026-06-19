@@ -2926,6 +2926,47 @@ app.get('/api/admin/exclude-add', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message, code: e.code, detail: e.detail }); }
 });
 
+// GET /api/admin/rep-commission-debug?secret=&name=&year=  — explain a rep's dashboard money:
+// payable commission per month, what's pending (not yet unlocked), and this-month invoices.
+app.get('/api/admin/rep-commission-debug', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const name = String(req.query.name || '').trim();
+  const year = parseInt(req.query.year) || new Date().getFullYear();
+  if (!name) return res.status(400).json({ error: 'name required' });
+  const org = process.env.ZOHO_ORG_ID;
+  try {
+    const payableByMonth = (await pool.query(`
+      SELECT EXTRACT(MONTH FROM commission_payable_date)::int AS m,
+             COUNT(*)::int AS invoices, COALESCE(SUM(commission),0)::float AS commission
+        FROM invoices
+       WHERE salesperson_name = $1 AND organization_id = $2
+         AND commission_payable_date >= $3 AND commission_payable_date <= $4
+       GROUP BY m ORDER BY m`,
+      [name, org, new Date(year,0,1), new Date(year,11,31,23,59,59)])).rows;
+    const pending = (await pool.query(`
+      SELECT commission_status, COUNT(*)::int AS invoices,
+             COALESCE(SUM(commission),0)::float AS commission,
+             COALESCE(SUM(hardware_amount),0)::float AS hardware_amount
+        FROM invoices
+       WHERE salesperson_name = $1 AND organization_id = $2
+         AND commission_status IN ('pending_saas','pending_payment')
+       GROUP BY commission_status`, [name, org])).rows;
+    const thisMonthInvoices = (await pool.query(`
+      SELECT invoice_number, customer_name, date::date AS date, total::float,
+             commission::float, commission_status, status,
+             commission_payable_date::date AS payable_date
+        FROM invoices
+       WHERE salesperson_name = $1 AND organization_id = $2
+         AND date >= $3 AND date < $4
+       ORDER BY date DESC LIMIT 40`,
+      [name, org, new Date(year, new Date().getMonth(), 1), new Date(year, new Date().getMonth()+1, 1)])).rows;
+    res.json({ name, year, payableByMonth, pending, thisMonthInvoices });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/rep-config?secret=&name=  — a rep's toggles + team settings (diagnostic).
 app.get('/api/admin/rep-config', async (req, res) => {
   const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
