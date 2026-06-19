@@ -9397,7 +9397,13 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
       };
     });
 
-    // Customers — only invoices with earned commission (hardware or saas_first with commission > 0)
+    // Customers — only invoices with earned commission (hardware or saas_first with commission > 0).
+    // Scope to the selected month (when given) so it matches the subtitle + the drill-down; else YTD.
+    let custStart = startDate, custEnd = endDate, custEndOp = '<=';
+    if (month && month !== 'all') {
+      custStart = new Date(`${targetYear}-${String(month).padStart(2, '0')}-01`);
+      custEnd = new Date(custStart); custEnd.setMonth(custEnd.getMonth() + 1); custEndOp = '<';
+    }
     const customerResult = await pool.query(`
       SELECT COALESCE(customer_name, 'Unknown') AS customer_name,
              COUNT(*) AS invoices,
@@ -9405,10 +9411,10 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
              COALESCE(SUM(commission), 0) AS commission
       FROM invoices
       WHERE salesperson_name = $1 AND organization_id = $2
-        AND ${dateCol} >= $3 AND ${dateCol} <= $4
+        AND ${dateCol} >= $3 AND ${dateCol} ${custEndOp} $4
         AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual')
       GROUP BY customer_name ORDER BY commission DESC LIMIT 50
-    `, [targetRep, process.env.ZOHO_ORG_ID, startDate, endDate]);
+    `, [targetRep, process.env.ZOHO_ORG_ID, custStart, custEnd]);
 
     const currentMonthNum  = new Date().getMonth();  // 0-indexed
     const currentMonthData = months[currentMonthNum];
@@ -9483,6 +9489,9 @@ app.get('/api/commissions/invoices', authenticateToken, async (req, res) => {
           ? `(${dateCol} IS NULL OR (${dateCol} >= $3 AND ${dateCol} <= $4))`
           : `${dateCol} >= $3 AND ${dateCol} <= $4`);
 
+    // Optional customer filter — used by the "Commission by customer" drill-down so it shows
+    // ONLY that customer's invoices (previously this param was ignored → it returned everyone's).
+    const customer = (req.query.customer || '').toString().trim();
     const result = await pool.query(`
       SELECT invoice_number, customer_name, date, total, commission, status,
              commission_paid, commission_status, commission_payable_date,
@@ -9490,8 +9499,9 @@ app.get('/api/commissions/invoices', authenticateToken, async (req, res) => {
              approval_status, approved_by, approved_at, payout_paid_by, payout_paid_at
       FROM invoices
       WHERE salesperson_name = $1 AND organization_id = $2 AND ${whereDate}
+        AND ($5::text IS NULL OR COALESCE(customer_name, 'Unknown') = $5)
       ORDER BY COALESCE(commission_payable_date, date) DESC, date DESC
-    `, [targetRep, process.env.ZOHO_ORG_ID, startDate, endDate]);
+    `, [targetRep, process.env.ZOHO_ORG_ID, startDate, endDate, customer || null]);
 
     res.json({
       invoices: result.rows.map(r => ({
