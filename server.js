@@ -2913,6 +2913,30 @@ app.get('/api/admin/impersonation-debug', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/zentact-attrs?secret=  — distinct custom-attribute keys across all Zentact
+// merchants + a sample, to find which attribute holds the Adyen ID.
+app.get('/api/admin/zentact-attrs', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    // raw_attributes is a JSONB array of objects; surface each object's keys + the 'name' values.
+    const keyRows = (await pool.query(`
+      SELECT DISTINCT elem->>'name' AS attr_name
+        FROM zentact_merchants, jsonb_array_elements(raw_attributes) AS elem
+       WHERE raw_attributes IS NOT NULL AND jsonb_typeof(raw_attributes) = 'array'
+       ORDER BY 1`)).rows.map(r => r.attr_name).filter(Boolean);
+    const sample = (await pool.query(`
+      SELECT merchant_account_id, business_name, raw_attributes
+        FROM zentact_merchants
+       WHERE raw_attributes IS NOT NULL AND jsonb_typeof(raw_attributes) = 'array'
+         AND jsonb_array_length(raw_attributes) > 0
+       ORDER BY updated_at DESC LIMIT 3`)).rows;
+    res.json({ attributeNames: keyRows, sampleMerchants: sample });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/customer-lookup?secret=&q=  — distinct customer names matching q, with
 // invoice count + whether they're in excluded_customers (diagnose exact-match exclusion).
 app.get('/api/admin/customer-lookup', async (req, res) => {
@@ -3059,9 +3083,11 @@ app.get('/api/admin/zoho-deal-raw', async (req, res) => {
     const crmRes = await axios.get(url, {
       headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true,
     });
+    const showAll = req.query.all === '1' || req.query.all === 'true';
+    const fieldRe = req.query.field ? new RegExp(String(req.query.field), 'i') : /source|lead/i;
     const raw = (crmRes.data?.data || []).map(d => {
       const fields = {};
-      Object.keys(d).filter(k => /source|lead/i.test(k)).forEach(k => { fields[k] = d[k]; });
+      Object.keys(d).filter(k => showAll || fieldRe.test(k)).forEach(k => { fields[k] = d[k]; });
       return { id: d.id, Deal_Name: d.Deal_Name, Stage: d.Stage, Modified_Time: d.Modified_Time, source_lead_fields: fields };
     });
     const stored = (await pool.query(
