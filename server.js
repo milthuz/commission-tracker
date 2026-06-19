@@ -1649,6 +1649,8 @@ app.post('/api/assistant/chat', authenticateToken, async (req, res) => {
   if (rateLimited(`assistant:${userKey}`, 30)) {
     return res.status(429).json({ error: 'Too many messages — try again in a few minutes' });
   }
+  // App UI language (FR/EN) so replies follow the user's chosen language, not just what they type.
+  const uiLang = String(req.body.lang || '').toLowerCase().startsWith('fr') ? 'French' : 'English';
   // Sanitize the client-sent history: cap turns and length, force roles.
   const raw = Array.isArray(req.body.messages) ? req.body.messages : [];
   const history = raw.slice(-12)
@@ -1680,6 +1682,7 @@ app.post('/api/assistant/chat', authenticateToken, async (req, res) => {
       system: [
         { type: 'text', text: ASSISTANT_SYSTEM + (isAdmin ? ASSISTANT_SYSTEM_ADMIN : ASSISTANT_SYSTEM_NONADMIN) },
         { type: 'text', text: `Current user: ${req.user.name || req.user.email || 'unknown'}${isAdmin ? ' (administrator)' : ' (regular user, not an administrator)'}.` },
+        { type: 'text', text: `The user's app language is set to ${uiLang}. Reply in ${uiLang} unless the user clearly writes in another language.` },
       ],
       messages: history,
     });
