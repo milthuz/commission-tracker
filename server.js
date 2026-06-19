@@ -96,6 +96,15 @@ async function getUserPermissions(email) {
   }
 }
 
+// Team ids a (manager) user oversees. Empty array = manages no team.
+async function getManagedTeamIds(email) {
+  if (!email) return [];
+  try {
+    const r = await pool.query(`SELECT team_id FROM team_managers WHERE LOWER(user_email) = LOWER($1)`, [email]);
+    return r.rows.map(x => parseInt(x.team_id)).filter(Number.isFinite);
+  } catch { return []; }
+}
+
 // Endpoint-level helper: resolve current user, check perm, respond 403 if missing.
 // Returns true if allowed (and you should proceed), false if it sent a 403 response.
 // Admins always pass. While impersonating, the request is evaluated as the
@@ -428,6 +437,16 @@ async function initializeDatabase() {
         role_id     INT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
         assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (user_email, role_id)
+      );
+    `);
+    // Team-scoped managers: which team(s) a (manager) user oversees. Many-to-many — a manager
+    // can manage several teams and a team can have several managers. Drives the Manager dashboard
+    // + /api/crm/points visibility (they see ONLY their assigned teams, with full detail).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS team_managers (
+        user_email VARCHAR(255) NOT NULL,
+        team_id    INT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+        PRIMARY KEY (user_email, team_id)
       );
     `);
     // Seed preset roles (only inserted once if name not already present)
@@ -2030,14 +2049,14 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     // line-item details of their OWN row. Strip deals[] and zentactMerchants[]
     // from other reps' rows.
     const isAdmin = req.user.isAdmin === true;
-    // Managers (tracker:view_all_details) get full cross-team VISIBILITY here — but not the
-    // admin EDIT controls (those are frontend-gated on the real isAdmin from /api/auth/verify,
-    // which stays false for them). Reps lack this perm → still restricted to their own team.
-    let canViewAll = isAdmin;
-    if (!canViewAll && req.user.email) {
-      try { canViewAll = (await getUserPermissions(req.user.email)).has('tracker:view_all_details'); }
-      catch { /* default: own team only */ }
-    }
+    // Visibility tiers (no admin EDIT controls leak — those are frontend-gated on the real
+    // isAdmin from /api/auth/verify, which stays false for non-admins):
+    //   • Admin            → ALL teams (canViewAll)
+    //   • Team manager     → ONLY their assigned team(s), with full detail (managedTeamIds)
+    //   • Rep (else)       → own team only, teammates' line-items stripped
+    const canViewAll = isAdmin;
+    const managedTeamIds = (!isAdmin && req.user.email) ? await getManagedTeamIds(req.user.email) : [];
+    const isManagerScoped = managedTeamIds.length > 0;
     let viewerName = (req.user.name || '').trim().toLowerCase();
     // Resolve viewer's salesperson name via user_tokens.display_name (in case
     // the JWT name differs from the CRM display name)
@@ -2064,11 +2083,17 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       ORDER BY t.sort_order, t.name
     `)).rows;
 
-    // PRIVACY: a rep without full-visibility sees ONLY their own team — both the rep rows AND the
-    // team cards. (Enforced server-side so other teams' data never leaves the API.) Within their
-    // team they see teammates' totals but not line-item details (stripped on non-own rows).
-    // Managers/admins (canViewAll) skip this and see every team with full detail.
-    if (!canViewAll) {
+    // PRIVACY. Admins (canViewAll) skip all of this and see every team with full detail.
+    // Team managers see ONLY their assigned team(s), with full detail. Reps see only their own
+    // team, with teammates' line-items stripped. Enforced server-side so out-of-scope data
+    // never leaves the API.
+    if (canViewAll) {
+      /* no restriction */
+    } else if (isManagerScoped) {
+      const set = new Set(managedTeamIds);
+      summary = summary.filter(rep => { const rt = teamFor(rep.repName); return !!rt && set.has(rt.id); });
+      teamMetaRows = teamMetaRows.filter(tr => set.has(tr.id));
+    } else {
       const myTeam = teamFor(viewerName);
       const myTeamId = myTeam ? myTeam.id : null;
       summary = summary
@@ -2108,9 +2133,9 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       };
     }); // order preserved from teamMetaRows (manual sort_order)
 
-    // Company totals: full-visibility viewers exclude non-counting teams; a restricted rep just
-    // sees their own team (already the only team in `teams`).
-    const countingTeams = canViewAll ? teams.filter(t => t.countsTowardQuota) : teams;
+    // Company/scope totals: admins + managers exclude non-counting teams across their visible
+    // set; a restricted rep just sees their own team (already the only team in `teams`).
+    const countingTeams = (canViewAll || isManagerScoped) ? teams.filter(t => t.countsTowardQuota) : teams;
     const companyPoints = countingTeams.reduce((s, t) => s + t.totalPoints, 0);
     const companyTarget = countingTeams.reduce((s, t) => s + t.quotaTarget, 0);
 
@@ -7667,6 +7692,39 @@ app.put('/api/users/:email/roles', authenticateToken, async (req, res) => {
     }
     await pool.query('COMMIT');
     res.json({ success: true, assigned: roleIds.length });
+  } catch (error) {
+    await pool.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/users/:email/managed-teams — team ids this (manager) user oversees.
+app.get('/api/users/:email/managed-teams', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    res.json({ teamIds: await getManagedTeamIds(req.params.email) });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT /api/users/:email/managed-teams { teamIds:[..] } — replace the user's managed-team set.
+app.put('/api/users/:email/managed-teams', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const teamIds = Array.isArray(req.body?.teamIds) ? req.body.teamIds.map(Number).filter(n => !isNaN(n)) : null;
+  if (teamIds === null) return res.status(400).json({ error: 'teamIds array required' });
+  const email = req.params.email;
+  try {
+    await pool.query('BEGIN');
+    await pool.query('DELETE FROM team_managers WHERE LOWER(user_email) = LOWER($1)', [email]);
+    for (const teamId of teamIds) {
+      await pool.query(
+        'INSERT INTO team_managers (user_email, team_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+        [email, teamId]
+      );
+    }
+    await pool.query('COMMIT');
+    res.json({ success: true, assigned: teamIds.length });
   } catch (error) {
     await pool.query('ROLLBACK');
     res.status(500).json({ error: error.message });
