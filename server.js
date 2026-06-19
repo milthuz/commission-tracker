@@ -2913,6 +2913,22 @@ app.get('/api/admin/impersonation-debug', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/zentact-raw?secret=  — dump the FULL raw merchant object from the Zentact API
+// (top-level fields, not just custom attributes) to find an Adyen/PSP identifier.
+app.get('/api/admin/zentact-raw', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const zentact = new ZentactService(process.env.ZENTACT_API_KEY);
+    const merchants = await zentact.getMerchantAccounts({ status: 'ACTIVE' });
+    const sample = merchants.slice(0, 2);
+    const allKeys = [...new Set(merchants.flatMap(m => Object.keys(m || {})))].sort();
+    res.json({ count: merchants.length, allKeys, sample });
+  } catch (e) { res.status(500).json({ error: e.message, detail: e.response?.data }); }
+});
+
 // GET /api/admin/zentact-attrs?secret=  — distinct custom-attribute keys across all Zentact
 // merchants + a sample, to find which attribute holds the Adyen ID.
 app.get('/api/admin/zentact-attrs', async (req, res) => {
