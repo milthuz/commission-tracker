@@ -97,6 +97,19 @@ async function getUserPermissions(email) {
   }
 }
 
+// Load bonus tiers from DB into the in-memory arrays the (sync) calculate*Bonus + tier-find
+// code uses. Kept fresh on a 60s interval so edits propagate across both web dynos.
+async function refreshBonusTiers() {
+  try {
+    const rows = (await pool.query(`SELECT kind, points, bonus FROM bonus_tiers ORDER BY points DESC`)).rows;
+    const monthly = rows.filter(r => r.kind === 'monthly').map(r => ({ points: parseInt(r.points), bonus: parseFloat(r.bonus) }));
+    const annual  = rows.filter(r => r.kind === 'annual').map(r => ({ points: parseInt(r.points), bonus: parseFloat(r.bonus) }));
+    if (monthly.length) { MONTHLY_BONUS_TIERS.length = 0; MONTHLY_BONUS_TIERS.push(...monthly); }
+    if (annual.length)  { ANNUAL_BONUS_TIERS.length = 0;  ANNUAL_BONUS_TIERS.push(...annual); }
+  } catch (e) { /* keep last-known tiers on error */ }
+}
+setInterval(() => { refreshBonusTiers(); }, 60000);
+
 // Team ids a (manager) user oversees. Empty array = manages no team.
 async function getManagedTeamIds(email) {
   if (!email) return [];
@@ -401,6 +414,24 @@ async function initializeDatabase() {
     // processing_bonus_enabled=false excludes an ACTIVE rep from the bi-annual processing/volume
     // bonus (e.g. someone not entitled to it). Inactive reps are already excluded entirely.
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS processing_bonus_enabled BOOLEAN DEFAULT true`);
+    // annual_bonus_enabled=false excludes a rep from the year-end annual points bonus.
+    await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS annual_bonus_enabled BOOLEAN DEFAULT true`);
+    // Configurable bonus tiers (monthly + annual). Seeded once from the code defaults; editable in
+    // Admin → Salespeople → Bonuses. calculate*Bonus read the in-memory arrays kept in sync below.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bonus_tiers (
+        id     SERIAL PRIMARY KEY,
+        kind   VARCHAR(10) NOT NULL,
+        points INT NOT NULL,
+        bonus  NUMERIC NOT NULL
+      );
+    `);
+    const tierCount = (await pool.query(`SELECT COUNT(*)::int AS c FROM bonus_tiers`)).rows[0].c;
+    if (tierCount === 0) {
+      for (const t of MONTHLY_BONUS_TIERS) await pool.query(`INSERT INTO bonus_tiers (kind, points, bonus) VALUES ('monthly', $1, $2)`, [t.points, t.bonus]);
+      for (const t of ANNUAL_BONUS_TIERS)  await pool.query(`INSERT INTO bonus_tiers (kind, points, bonus) VALUES ('annual',  $1, $2)`, [t.points, t.bonus]);
+    }
+    await refreshBonusTiers();
     // Invoice-level (entity) discount facts — captured by enrich from the Zoho detail.
     // Comp plan v7.7: commission base = pre-tax value AFTER discount; hardware rate
     // halves (10%→5%) when the discount is ≥ 25%. NULL = not captured yet.
@@ -1963,12 +1994,15 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     }
 
     // Per-salesperson signup-bonus config (amount per activation + on/off). Default $100, on.
-    const spCfgRows = (await pool.query(`SELECT name, signup_bonus_amount, signup_bonus_enabled, monthly_quota FROM salespeople`)).rows;
+    const spCfgRows = (await pool.query(`SELECT name, signup_bonus_amount, signup_bonus_enabled, monthly_quota, annual_bonus_enabled FROM salespeople`)).rows;
     const signupByRep = new Map(spCfgRows.map(s => [String(s.name).toLowerCase(), {
       amount: s.signup_bonus_amount == null ? 100 : parseFloat(s.signup_bonus_amount),
       enabled: s.signup_bonus_enabled !== false,
     }]));
     const signupFor = (name) => signupByRep.get(String(name || '').toLowerCase()) || { amount: 100, enabled: true };
+    // Per-rep annual-bonus on/off (default on).
+    const annualEnabledByRep = new Map(spCfgRows.map(s => [String(s.name).toLowerCase(), s.annual_bonus_enabled !== false]));
+    const annualEnabledFor = (name) => annualEnabledByRep.get(String(name || '').toLowerCase()) !== false;
     // Per-rep monthly quota (override or default).
     const quotaByRep = new Map(spCfgRows.map(s => [String(s.name).toLowerCase(), s.monthly_quota == null ? MONTHLY_QUOTA : parseInt(s.monthly_quota)]));
     const quotaFor = (name) => quotaByRep.get(String(name || '').toLowerCase()) || MONTHLY_QUOTA;
@@ -2071,7 +2105,8 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       return {
         ...rep,
         annualPoints:             totalAnnual,
-        annualBonus:              ZohoCRMService.calculateAnnualBonus(totalAnnual),
+        annualBonus:              annualEnabledFor(rep.repName) ? ZohoCRMService.calculateAnnualBonus(totalAnnual) : 0,
+        annualBonusEnabled:       annualEnabledFor(rep.repName),
         annualZentactActivations: zentactAnnual.activations,
         annualZentactBonus:       cfg.enabled ? zentactAnnual.activations * cfg.amount : 0,
       };
@@ -2303,8 +2338,9 @@ app.get('/api/crm/points/annual', authenticateToken, async (req, res) => {
     const annualCrm     = parseInt(crmAnn.rows[0]?.pts)       || 0;
     const annualZentact = parseInt(zentactAnn.rows[0]?.pts)    || 0;
     const annualTotal   = annualCrm + annualZentact;
-    const annualBonus   = ZohoCRMService.calculateAnnualBonus(annualTotal);
-    const nextTier      = ANNUAL_BONUS_TIERS.slice().reverse().find(t => annualTotal < t.points) || null;
+    const annualEnabled = (await pool.query(`SELECT annual_bonus_enabled FROM salespeople WHERE LOWER(name) = LOWER($1)`, [repName])).rows[0]?.annual_bonus_enabled !== false;
+    const annualBonus   = annualEnabled ? ZohoCRMService.calculateAnnualBonus(annualTotal) : 0;
+    const nextTier      = annualEnabled ? (ANNUAL_BONUS_TIERS.slice().reverse().find(t => annualTotal < t.points) || null) : null;
 
     res.json({
       repName,
@@ -2316,6 +2352,7 @@ app.get('/api/crm/points/annual', authenticateToken, async (req, res) => {
         zentactPoints:  annualZentact,
         zentactBonus:   parseFloat(zentactAnn.rows[0]?.bonus) || 0,
         annualBonus,
+        annualBonusEnabled: annualEnabled,
         nextTier,
         ptsToNextTier: nextTier ? nextTier.points - annualTotal : 0,
         tiers: ANNUAL_BONUS_TIERS,
@@ -7203,7 +7240,7 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
     const result = await pool.query(
       `SELECT s.name, s.is_active, s.commission_rate, s.base_salary, s.invoice_count, s.aliases,
               s.signup_bonus_amount, s.signup_bonus_enabled, s.monthly_quota, s.team_id, s.email,
-              s.hire_date, s.quota_gate_enabled, s.processing_bonus_enabled, t.name AS team_name,
+              s.hire_date, s.quota_gate_enabled, s.processing_bonus_enabled, s.annual_bonus_enabled, t.name AS team_name,
               (SELECT ut.email FROM user_tokens ut WHERE LOWER(ut.display_name) = LOWER(s.name) LIMIT 1) AS resolved_login_email
        FROM salespeople s LEFT JOIN teams t ON t.id = s.team_id
        ORDER BY s.name`
@@ -7223,6 +7260,7 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
         hireDate:           r.hire_date ? new Date(r.hire_date).toISOString().slice(0, 10) : null,
         quotaGateEnabled:   r.quota_gate_enabled !== false,
         processingBonusEnabled: r.processing_bonus_enabled !== false,
+        annualBonusEnabled: r.annual_bonus_enabled !== false,
         resolvedLoginEmail: r.resolved_login_email || null,  // actual Zoho login (by name) when no manual override
         teamId:             r.team_id || null,
         teamName:           r.team_name || null,
@@ -7312,6 +7350,54 @@ app.put('/api/salespeople/:name/processing-bonus', authenticateToken, async (req
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update processing bonus', details: error.message });
+  }
+});
+
+// PUT /api/salespeople/:name/annual-bonus — exclude a rep from the year-end annual bonus.
+app.put('/api/salespeople/:name/annual-bonus', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const enabled = req.body.enabled !== false;
+  try {
+    const r = await pool.query(
+      `UPDATE salespeople SET annual_bonus_enabled = $1, updated_at = CURRENT_TIMESTAMP WHERE name = $2 RETURNING name`,
+      [enabled, req.params.name]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Salesperson not found' });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update annual bonus', details: error.message });
+  }
+});
+
+// GET /api/bonus-tiers — current monthly + annual bonus tiers (config).
+app.get('/api/bonus-tiers', authenticateToken, async (req, res) => {
+  try {
+    const rows = (await pool.query(`SELECT kind, points::int, bonus::float FROM bonus_tiers ORDER BY points DESC`)).rows;
+    res.json({
+      monthly: rows.filter(r => r.kind === 'monthly').map(r => ({ points: r.points, bonus: r.bonus })),
+      annual:  rows.filter(r => r.kind === 'annual').map(r => ({ points: r.points, bonus: r.bonus })),
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// PUT /api/bonus-tiers { monthly:[{points,bonus}], annual:[...] } — replace all tiers (admin).
+app.put('/api/bonus-tiers', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const clean = (arr) => (Array.isArray(arr) ? arr : [])
+    .map(t => ({ points: parseInt(t.points), bonus: parseFloat(t.bonus) }))
+    .filter(t => Number.isFinite(t.points) && Number.isFinite(t.bonus) && t.points > 0 && t.bonus >= 0);
+  const monthly = clean(req.body.monthly), annual = clean(req.body.annual);
+  try {
+    await pool.query('BEGIN');
+    await pool.query(`DELETE FROM bonus_tiers`);
+    for (const t of monthly) await pool.query(`INSERT INTO bonus_tiers (kind, points, bonus) VALUES ('monthly', $1, $2)`, [t.points, t.bonus]);
+    for (const t of annual)  await pool.query(`INSERT INTO bonus_tiers (kind, points, bonus) VALUES ('annual',  $1, $2)`, [t.points, t.bonus]);
+    await pool.query('COMMIT');
+    await refreshBonusTiers();
+    res.json({ success: true, monthly: monthly.length, annual: annual.length });
+  } catch (error) {
+    await pool.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
   }
 });
 
