@@ -4712,6 +4712,9 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
     const startDate = new Date(year, 0, 1);
     const endDate   = new Date(year, 11, 31, 23, 59, 59, 999);
+    // Drop admin-excluded customers (e.g. Adyen payout pseudo-customers) from every figure.
+    // NULL-named invoices are kept (they aren't a named, excludable customer).
+    const excl = `AND (customer_name IS NULL OR customer_name NOT IN (SELECT customer_name FROM excluded_customers WHERE organization_id = $1))`;
 
     const cardsResult = await pool.query(`
       SELECT
@@ -4722,7 +4725,7 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
         COUNT(CASE WHEN status = 'paid'    THEN 1 END)                       AS paid_count,
         COUNT(CASE WHEN status = 'overdue' THEN 1 END)                       AS overdue_count
       FROM invoices
-      WHERE organization_id = $1 AND date >= $2 AND date <= $3
+      WHERE organization_id = $1 AND date >= $2 AND date <= $3 ${excl}
     `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
 
     const monthlyResult = await pool.query(`
@@ -4733,7 +4736,7 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
         COALESCE(SUM(CASE WHEN status = 'overdue' THEN total ELSE 0 END), 0) AS overdue,
         COALESCE(SUM(CASE WHEN status = 'paid'    THEN commission ELSE 0 END), 0) AS commission
       FROM invoices
-      WHERE organization_id = $1 AND date >= $2 AND date <= $3
+      WHERE organization_id = $1 AND date >= $2 AND date <= $3 ${excl}
       GROUP BY TO_CHAR(date, 'Mon'), EXTRACT(MONTH FROM date)
       ORDER BY month_num
     `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
@@ -4754,13 +4757,13 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
              COALESCE(SUM(total), 0) AS sales,
              COALESCE(SUM(commission), 0) AS commission
       FROM invoices
-      WHERE organization_id = $1 AND status = 'paid' AND date >= $2 AND date <= $3
+      WHERE organization_id = $1 AND status = 'paid' AND date >= $2 AND date <= $3 ${excl}
       GROUP BY salesperson_name ORDER BY commission DESC LIMIT 10
     `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
 
     const statusResult = await pool.query(`
       SELECT status, COUNT(*) AS count, COALESCE(SUM(total), 0) AS total
-      FROM invoices WHERE organization_id = $1 AND date >= $2 AND date <= $3
+      FROM invoices WHERE organization_id = $1 AND date >= $2 AND date <= $3 ${excl}
       GROUP BY status
     `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
 
@@ -4770,7 +4773,7 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
         COUNT(*) AS invoices,
         COALESCE(SUM(total), 0) AS total
       FROM invoices
-      WHERE organization_id = $1 AND status = 'paid' AND date >= $2 AND date <= $3
+      WHERE organization_id = $1 AND status = 'paid' AND date >= $2 AND date <= $3 ${excl}
         AND COALESCE(NULLIF(TRIM(customer_name), ''), '') != ''
       GROUP BY COALESCE(NULLIF(TRIM(customer_name), ''), 'Unknown')
       ORDER BY total DESC LIMIT 10
@@ -4779,7 +4782,7 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
     const recentResult = await pool.query(`
       SELECT invoice_number, customer_name, salesperson_name, total, commission, status, date
       FROM invoices
-      WHERE organization_id = $1 AND date >= $2 AND date <= $3
+      WHERE organization_id = $1 AND date >= $2 AND date <= $3 ${excl}
       ORDER BY date DESC LIMIT 20
     `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
 
