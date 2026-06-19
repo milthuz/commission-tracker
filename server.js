@@ -455,6 +455,28 @@ async function initializeDatabase() {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_resources_category ON resources(category)`);
+    // Admin-managed category structure for the resources library.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS resource_categories (
+        id         SERIAL PRIMARY KEY,
+        name       VARCHAR(150) UNIQUE NOT NULL,
+        sort_order INT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    // Audit journal — one row per resource added or deleted (who, what, when).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS resource_audit (
+        id          SERIAL PRIMARY KEY,
+        action      VARCHAR(20) NOT NULL,
+        resource_id INT,
+        title       VARCHAR(300),
+        file_name   VARCHAR(400),
+        category    VARCHAR(150),
+        actor       VARCHAR(255),
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
     // Invoice-level (entity) discount facts — captured by enrich from the Zoho detail.
     // Comp plan v7.7: commission base = pre-tax value AFTER discount; hardware rate
     // halves (10%→5%) when the discount is ≥ 25%. NULL = not captured yet.
@@ -7510,6 +7532,14 @@ const parseTags = (raw) => {
   return String(raw || '').split(',').map(s => s.trim()).filter(Boolean);
 };
 
+const logResourceAudit = async (action, r, actor) => {
+  try {
+    await pool.query(
+      `INSERT INTO resource_audit (action, resource_id, title, file_name, category, actor) VALUES ($1,$2,$3,$4,$5,$6)`,
+      [action, r.id || null, r.title || null, r.file_name || null, r.category || null, actor]);
+  } catch (_e) { /* never block the main action on logging */ }
+};
+
 // GET /api/resources?q=&category= — metadata only (never the blob). Returns the distinct categories too.
 app.get('/api/resources', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'resources:view'))) return;
@@ -7524,7 +7554,11 @@ app.get('/api/resources', authenticateToken, async (req, res) => {
         FROM resources ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
        ORDER BY category NULLS LAST, title`;
     const rows = (await pool.query(sql, params)).rows;
-    const categories = (await pool.query(`SELECT DISTINCT category FROM resources WHERE COALESCE(category,'') <> '' ORDER BY category`)).rows.map(r => r.category);
+    // Prefer the admin-managed category structure; fall back to categories actually in use.
+    let categories = (await pool.query(`SELECT name FROM resource_categories ORDER BY sort_order, name`)).rows.map(r => r.name);
+    if (!categories.length) {
+      categories = (await pool.query(`SELECT DISTINCT category FROM resources WHERE COALESCE(category,'') <> '' ORDER BY category`)).rows.map(r => r.category);
+    }
     res.json({ resources: rows, categories });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -7549,14 +7583,39 @@ app.post('/api/resources', authenticateToken, uploadResource.single('file'), asy
   if (!file) return res.status(400).json({ error: 'file required (multipart field "file")' });
   if (!title) return res.status(400).json({ error: 'title required' });
   try {
+    const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+    const category = String(req.body.category || '').trim();
     const r = await pool.query(
       `INSERT INTO resources (title, description, category, tags, file_name, mime_type, file_size, file_data, uploaded_by)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-      [title, String(req.body.description || '').trim(), String(req.body.category || '').trim(),
-       parseTags(req.body.tags), file.originalname, file.mimetype, file.size, file.buffer,
-       req.user.realAdminEmail || req.user.email || 'unknown']
+      [title, String(req.body.description || '').trim(), category,
+       parseTags(req.body.tags), file.originalname, file.mimetype, file.size, file.buffer, actor]
     );
+    await logResourceAudit('add', { id: r.rows[0].id, title, file_name: file.originalname, category }, actor);
     res.json({ success: true, id: r.rows[0].id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/resources/bulk — upload many files at once (shared category/tags; title = file name).
+app.post('/api/resources/bulk', authenticateToken, uploadResource.array('files', 50), async (req, res) => {
+  if (!(await requirePerm(req, res, 'resources:manage'))) return;
+  const files = req.files || [];
+  if (!files.length) return res.status(400).json({ error: 'files required (multipart field "files")' });
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  const category = String(req.body.category || '').trim();
+  const tags = parseTags(req.body.tags);
+  try {
+    let added = 0;
+    for (const f of files) {
+      const title = f.originalname.replace(/\.[^.]+$/, '');
+      const r = await pool.query(
+        `INSERT INTO resources (title, description, category, tags, file_name, mime_type, file_size, file_data, uploaded_by)
+         VALUES ($1, '', $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+        [title, category, tags, f.originalname, f.mimetype, f.size, f.buffer, actor]);
+      await logResourceAudit('add', { id: r.rows[0].id, title, file_name: f.originalname, category }, actor);
+      added++;
+    }
+    res.json({ success: true, added });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -7577,12 +7636,55 @@ app.put('/api/resources/:id', authenticateToken, uploadResource.single('file'), 
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// DELETE /api/resources/:id
+// DELETE /api/resources/:id — ADMIN ONLY (managers can add/edit but not delete). Audited.
 app.delete('/api/resources/:id', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'resources:manage'))) return;
+  if (!(req.user.isAdmin === true && !req.user.impersonating)) {
+    return res.status(403).json({ error: 'Admin required to delete resources' });
+  }
   try {
-    await pool.query(`DELETE FROM resources WHERE id = $1`, [req.params.id]);
+    const r = (await pool.query(`DELETE FROM resources WHERE id = $1 RETURNING id, title, file_name, category`, [req.params.id])).rows[0];
+    if (!r) return res.status(404).json({ error: 'not found' });
+    await logResourceAudit('delete', r, req.user.realAdminEmail || req.user.email || 'unknown');
     res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- Category structure (admin-managed) ---
+app.get('/api/resource-categories', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'resources:view'))) return;
+  try {
+    const rows = (await pool.query(`SELECT id, name, sort_order FROM resource_categories ORDER BY sort_order, name`)).rows;
+    res.json({ categories: rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/resource-categories', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'resources:manage'))) return;
+  const name = String(req.body.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'name required' });
+  try {
+    const r = await pool.query(
+      `INSERT INTO resource_categories (name, sort_order) VALUES ($1, COALESCE((SELECT MAX(sort_order)+1 FROM resource_categories), 0))
+       ON CONFLICT (name) DO NOTHING RETURNING id`, [name]);
+    res.json({ success: true, id: r.rows[0]?.id || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Delete a category (admin only). Resources keep their category string; they just become "uncategorized" in the managed list.
+app.delete('/api/resource-categories/:id', authenticateToken, async (req, res) => {
+  if (!(req.user.isAdmin === true && !req.user.impersonating)) return res.status(403).json({ error: 'Admin required' });
+  try {
+    await pool.query(`DELETE FROM resource_categories WHERE id = $1`, [req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/resources/audit — the add/delete journal (admin only).
+app.get('/api/resources/audit', authenticateToken, async (req, res) => {
+  if (!(req.user.isAdmin === true && !req.user.impersonating)) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const rows = (await pool.query(
+      `SELECT id, action, resource_id, title, file_name, category, actor, created_at
+         FROM resource_audit ORDER BY created_at DESC LIMIT 200`)).rows;
+    res.json({ events: rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
