@@ -2913,6 +2913,32 @@ app.get('/api/admin/impersonation-debug', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/zoho-account-raw?secret=&id=&q=  — dump all fields of a Zoho Account record
+// (by id, real-time) or accounts matching a name, to find where the Adyen ID lives.
+app.get('/api/admin/zoho-account-raw', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const id = String(req.query.id || '').trim();
+  const q = String(req.query.q || '').trim();
+  if (!id && !q) return res.status(400).json({ error: 'id or q required' });
+  try {
+    const crmToken = await ensureValidCrmToken();
+    if (!crmToken) return res.status(400).json({ error: 'CRM not connected' });
+    const url = id
+      ? `https://www.zohoapis.com/crm/v2/Accounts/${encodeURIComponent(id)}`
+      : `https://www.zohoapis.com/crm/v2/Accounts/search?criteria=(Account_Name:starts_with:${encodeURIComponent(q)})`;
+    const r = await axios.get(url, { headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true });
+    const accounts = (r.data?.data || []).map(a => {
+      const nonNull = {};
+      Object.keys(a).forEach(k => { if (a[k] !== null && a[k] !== '' && !k.startsWith('$')) nonNull[k] = a[k]; });
+      return { id: a.id, Account_Name: a.Account_Name, fields: nonNull };
+    });
+    res.json({ status: r.status, accounts });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/zentact-raw?secret=  — dump the FULL raw merchant object from the Zentact API
 // (top-level fields, not just custom attributes) to find an Adyen/PSP identifier.
 app.get('/api/admin/zentact-raw', async (req, res) => {
