@@ -7746,6 +7746,22 @@ app.delete('/api/resources/:id', authenticateToken, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST /api/resources/delete-all — wipe the ENTIRE library (all files + categories). ADMIN ONLY.
+// Requires { confirm: 'DELETE ALL' } in the body as a safety latch. Audited (one summary row).
+app.post('/api/resources/delete-all', authenticateToken, async (req, res) => {
+  if (!(req.user.isAdmin === true && !req.user.impersonating)) {
+    return res.status(403).json({ error: 'Admin required' });
+  }
+  if (req.body.confirm !== 'DELETE ALL') return res.status(400).json({ error: 'confirmation phrase required' });
+  try {
+    const n = (await pool.query(`SELECT COUNT(*)::int c FROM resources`)).rows[0].c;
+    await pool.query(`DELETE FROM resources`);
+    await pool.query(`DELETE FROM resource_categories`);
+    await logResourceAudit('delete_all', { title: `ALL RESOURCES (${n})`, file_name: '', category: '' }, req.user.realAdminEmail || req.user.email || 'unknown');
+    res.json({ success: true, deleted: n });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // --- Category structure (admin-managed) ---
 app.get('/api/resource-categories', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'resources:view'))) return;
