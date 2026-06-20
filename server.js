@@ -3033,6 +3033,24 @@ app.get('/api/admin/zentact-attrs', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/resources-count?secret=  — confirm the library + key tables are intact (diagnostic).
+app.get('/api/admin/resources-count', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const resources = (await pool.query(`SELECT COUNT(*)::int c, COALESCE(SUM(file_size),0)::bigint bytes FROM resources`)).rows[0];
+    const byCat = (await pool.query(`SELECT COALESCE(NULLIF(category,''),'(none)') cat, COUNT(*)::int c FROM resources GROUP BY 1 ORDER BY c DESC LIMIT 30`)).rows;
+    const others = {
+      invoices: (await pool.query(`SELECT COUNT(*)::int c FROM invoices`)).rows[0].c,
+      salespeople: (await pool.query(`SELECT COUNT(*)::int c FROM salespeople`)).rows[0].c,
+      crm_deals: (await pool.query(`SELECT COUNT(*)::int c FROM crm_sold_deals`)).rows[0].c,
+    };
+    res.json({ resources: resources.c, totalBytes: Number(resources.bytes), byCategory: byCat, otherTables: others });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/customer-lookup?secret=&q=  — distinct customer names matching q, with
 // invoice count + whether they're in excluded_customers (diagnose exact-match exclusion).
 app.get('/api/admin/customer-lookup', async (req, res) => {
@@ -7632,13 +7650,15 @@ const EXT_MIME = {
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
   svg: 'image/svg+xml', txt: 'text/plain', mp4: 'video/mp4', zip: 'application/zip',
 };
-// 300 MB archive cap. Higher is risky on Heroku: the whole zip is held in RAM (dyno ~512 MB) and
-// the 30s request timeout limits how many files we can INSERT cross-cloud — split very large sets.
-const uploadZip = multer({ storage: multer.memoryStorage(), limits: { fileSize: 300 * 1024 * 1024 } });
+// 60 MB archive cap. The whole zip sits in RAM and adm-zip decompresses into RAM too; on a ~512 MB
+// dyno a bigger archive can blow the memory quota (R14) and take the whole app down. Keep it small
+// and split large sets into several imports.
+const MAX_ZIP_FILES = 400;
+const uploadZip = multer({ storage: multer.memoryStorage(), limits: { fileSize: 60 * 1024 * 1024 } });
 // Wrap multer so its errors (esp. file-too-large) come back as clear JSON instead of a generic 500.
 const zipUpload = (req, res, next) => uploadZip.single('file')(req, res, (err) => {
   if (err) {
-    if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'ZIP too large (max 300 MB). Split it into smaller archives.' });
+    if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'ZIP too large (max 60 MB). Split it into smaller archives.' });
     return res.status(400).json({ error: 'Upload error: ' + err.message });
   }
   next();
@@ -7657,7 +7677,7 @@ app.post('/api/resources/import-zip', authenticateToken, zipUpload, async (req, 
     const path = e.entryName.replace(/\\/g, '/');
     const base = path.split('/').pop() || '';
     return !(path.includes('__MACOSX/') || base === '.DS_Store' || base.startsWith('.') || !base);
-  });
+  }).slice(0, MAX_ZIP_FILES); // bound the work so one import can't run away
 
   // Respond immediately, then import in the background — avoids Heroku's 30s request timeout on
   // large archives (each bytea INSERT to Railway is slow cross-cloud). Files appear as they land;
@@ -7665,7 +7685,11 @@ app.post('/api/resources/import-zip', authenticateToken, zipUpload, async (req, 
   res.json({ success: true, queued: candidates.length, background: true });
   (async () => {
     const seenCats = new Set();
+    let i = 0;
     for (const entry of candidates) {
+      // Yield every 10 files so the import never monopolises the event loop / DB pool (keeps the
+      // rest of the app responsive during a big import).
+      if (++i % 10 === 0) await new Promise(r => setTimeout(r, 30));
       try {
         const path = entry.entryName.replace(/\\/g, '/');
         const base = path.split('/').pop() || '';
