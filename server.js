@@ -7632,7 +7632,9 @@ const EXT_MIME = {
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
   svg: 'image/svg+xml', txt: 'text/plain', mp4: 'video/mp4', zip: 'application/zip',
 };
-const uploadZip = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 } }); // 150 MB archive
+// 300 MB archive cap. Higher is risky on Heroku: the whole zip is held in RAM (dyno ~512 MB) and
+// the 30s request timeout limits how many files we can INSERT cross-cloud — split very large sets.
+const uploadZip = multer({ storage: multer.memoryStorage(), limits: { fileSize: 300 * 1024 * 1024 } });
 app.post('/api/resources/import-zip', authenticateToken, uploadZip.single('file'), async (req, res) => {
   if (!(await requirePerm(req, res, 'resources:manage'))) return;
   if (!req.file) return res.status(400).json({ error: 'file required (a .zip)' });
