@@ -13,6 +13,7 @@ const jwt = require('jsonwebtoken');
 const bodyParser = require('body-parser');
 const multer = require('multer');
 const xlsx = require('xlsx');
+const AdmZip = require('adm-zip');
 const PDFDocument = require('pdfkit');
 const { Pool } = require('pg');
 const crypto = require('crypto');
@@ -7617,6 +7618,59 @@ app.post('/api/resources/bulk', authenticateToken, uploadResource.array('files',
     }
     res.json({ success: true, added });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/resources/import-zip — unzip an uploaded archive into resources. The zip's TOP-LEVEL
+// folders become categories; each file becomes a resource (title = file name). Files >25MB and
+// junk entries (__MACOSX, .DS_Store, dotfiles) are skipped and reported.
+const EXT_MIME = {
+  pdf: 'application/pdf', doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  csv: 'text/csv', ppt: 'application/vnd.ms-powerpoint',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
+  svg: 'image/svg+xml', txt: 'text/plain', mp4: 'video/mp4', zip: 'application/zip',
+};
+const uploadZip = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 } }); // 150 MB archive
+app.post('/api/resources/import-zip', authenticateToken, uploadZip.single('file'), async (req, res) => {
+  if (!(await requirePerm(req, res, 'resources:manage'))) return;
+  if (!req.file) return res.status(400).json({ error: 'file required (a .zip)' });
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  try {
+    const zip = new AdmZip(req.file.buffer);
+    const entries = zip.getEntries();
+    let added = 0; const skipped = [];
+    const seenCats = new Set();
+    for (const entry of entries) {
+      if (entry.isDirectory) continue;
+      const path = entry.entryName.replace(/\\/g, '/');
+      const base = path.split('/').pop() || '';
+      // Skip OS/junk + hidden files.
+      if (path.includes('__MACOSX/') || base === '.DS_Store' || base.startsWith('.') || !base) continue;
+      const parts = path.split('/').filter(Boolean);
+      const category = parts.length > 1 ? parts[0] : '';
+      const data = entry.getData();
+      if (!data || data.length === 0) { skipped.push(`${base} (empty)`); continue; }
+      if (data.length > 25 * 1024 * 1024) { skipped.push(`${base} (>25MB)`); continue; }
+      const ext = (base.split('.').pop() || '').toLowerCase();
+      const title = base.replace(/\.[^.]+$/, '');
+      const r = await pool.query(
+        `INSERT INTO resources (title, description, category, tags, file_name, mime_type, file_size, file_data, uploaded_by)
+         VALUES ($1, '', $2, '{}', $3, $4, $5, $6, $7) RETURNING id`,
+        [title, category, base, EXT_MIME[ext] || 'application/octet-stream', data.length, data, actor]);
+      await logResourceAudit('add', { id: r.rows[0].id, title, file_name: base, category }, actor);
+      added++;
+      // Register the top-level folder as a managed category.
+      if (category && !seenCats.has(category)) {
+        seenCats.add(category);
+        await pool.query(
+          `INSERT INTO resource_categories (name, sort_order) VALUES ($1, COALESCE((SELECT MAX(sort_order)+1 FROM resource_categories),0)) ON CONFLICT (name) DO NOTHING`,
+          [category]);
+      }
+    }
+    res.json({ success: true, added, skipped, categories: [...seenCats] });
+  } catch (e) { res.status(500).json({ error: 'Failed to import zip: ' + e.message }); }
 });
 
 // PUT /api/resources/:id — edit metadata; optionally replace the file.
