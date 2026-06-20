@@ -7635,44 +7635,61 @@ const EXT_MIME = {
 // 300 MB archive cap. Higher is risky on Heroku: the whole zip is held in RAM (dyno ~512 MB) and
 // the 30s request timeout limits how many files we can INSERT cross-cloud — split very large sets.
 const uploadZip = multer({ storage: multer.memoryStorage(), limits: { fileSize: 300 * 1024 * 1024 } });
-app.post('/api/resources/import-zip', authenticateToken, uploadZip.single('file'), async (req, res) => {
+// Wrap multer so its errors (esp. file-too-large) come back as clear JSON instead of a generic 500.
+const zipUpload = (req, res, next) => uploadZip.single('file')(req, res, (err) => {
+  if (err) {
+    if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'ZIP too large (max 300 MB). Split it into smaller archives.' });
+    return res.status(400).json({ error: 'Upload error: ' + err.message });
+  }
+  next();
+});
+app.post('/api/resources/import-zip', authenticateToken, zipUpload, async (req, res) => {
   if (!(await requirePerm(req, res, 'resources:manage'))) return;
   if (!req.file) return res.status(400).json({ error: 'file required (a .zip)' });
   const actor = req.user.realAdminEmail || req.user.email || 'unknown';
-  try {
-    const zip = new AdmZip(req.file.buffer);
-    const entries = zip.getEntries();
-    let added = 0; const skipped = [];
+  let entries;
+  try { entries = new AdmZip(req.file.buffer).getEntries(); }
+  catch (e) { return res.status(400).json({ error: 'Not a valid .zip file.' }); }
+
+  // Candidate files (cheap name filter only — defer getData() to the background loop).
+  const candidates = entries.filter(e => {
+    if (e.isDirectory) return false;
+    const path = e.entryName.replace(/\\/g, '/');
+    const base = path.split('/').pop() || '';
+    return !(path.includes('__MACOSX/') || base === '.DS_Store' || base.startsWith('.') || !base);
+  });
+
+  // Respond immediately, then import in the background — avoids Heroku's 30s request timeout on
+  // large archives (each bytea INSERT to Railway is slow cross-cloud). Files appear as they land;
+  // every add is in the Journal.
+  res.json({ success: true, queued: candidates.length, background: true });
+  (async () => {
     const seenCats = new Set();
-    for (const entry of entries) {
-      if (entry.isDirectory) continue;
-      const path = entry.entryName.replace(/\\/g, '/');
-      const base = path.split('/').pop() || '';
-      // Skip OS/junk + hidden files.
-      if (path.includes('__MACOSX/') || base === '.DS_Store' || base.startsWith('.') || !base) continue;
-      const parts = path.split('/').filter(Boolean);
-      const category = parts.length > 1 ? parts[0] : '';
-      const data = entry.getData();
-      if (!data || data.length === 0) { skipped.push(`${base} (empty)`); continue; }
-      if (data.length > 25 * 1024 * 1024) { skipped.push(`${base} (>25MB)`); continue; }
-      const ext = (base.split('.').pop() || '').toLowerCase();
-      const title = base.replace(/\.[^.]+$/, '');
-      const r = await pool.query(
-        `INSERT INTO resources (title, description, category, tags, file_name, mime_type, file_size, file_data, uploaded_by)
-         VALUES ($1, '', $2, '{}', $3, $4, $5, $6, $7) RETURNING id`,
-        [title, category, base, EXT_MIME[ext] || 'application/octet-stream', data.length, data, actor]);
-      await logResourceAudit('add', { id: r.rows[0].id, title, file_name: base, category }, actor);
-      added++;
-      // Register the top-level folder as a managed category.
-      if (category && !seenCats.has(category)) {
-        seenCats.add(category);
-        await pool.query(
-          `INSERT INTO resource_categories (name, sort_order) VALUES ($1, COALESCE((SELECT MAX(sort_order)+1 FROM resource_categories),0)) ON CONFLICT (name) DO NOTHING`,
-          [category]);
-      }
+    for (const entry of candidates) {
+      try {
+        const path = entry.entryName.replace(/\\/g, '/');
+        const base = path.split('/').pop() || '';
+        const parts = path.split('/').filter(Boolean);
+        const category = parts.length > 1 ? parts[0] : '';
+        const data = entry.getData();
+        if (!data || data.length === 0 || data.length > 25 * 1024 * 1024) continue; // skip empty / >25MB
+        const ext = (base.split('.').pop() || '').toLowerCase();
+        const title = base.replace(/\.[^.]+$/, '');
+        const r = await pool.query(
+          `INSERT INTO resources (title, description, category, tags, file_name, mime_type, file_size, file_data, uploaded_by)
+           VALUES ($1, '', $2, '{}', $3, $4, $5, $6, $7) RETURNING id`,
+          [title, category, base, EXT_MIME[ext] || 'application/octet-stream', data.length, data, actor]);
+        await logResourceAudit('add', { id: r.rows[0].id, title, file_name: base, category }, actor);
+        if (category && !seenCats.has(category)) {
+          seenCats.add(category);
+          await pool.query(
+            `INSERT INTO resource_categories (name, sort_order) VALUES ($1, COALESCE((SELECT MAX(sort_order)+1 FROM resource_categories),0)) ON CONFLICT (name) DO NOTHING`,
+            [category]);
+        }
+      } catch (e) { console.warn('[import-zip] entry failed:', entry.entryName, e.message); }
     }
-    res.json({ success: true, added, skipped, categories: [...seenCats] });
-  } catch (e) { res.status(500).json({ error: 'Failed to import zip: ' + e.message }); }
+    console.log(`[import-zip] done — processed ${candidates.length} candidate file(s) for ${actor}`);
+  })().catch(e => console.warn('[import-zip] background error:', e.message));
 });
 
 // PUT /api/resources/:id — edit metadata; optionally replace the file.
