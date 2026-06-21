@@ -1707,6 +1707,35 @@ ADMINISTRATOR CONTEXT — this user IS an administrator, so you may also explain
 const ASSISTANT_SYSTEM_NONADMIN = `
 IMPORTANT — this user is NOT an administrator. Do not describe, explain, or walk them through admin-only features (the Admin Panel, imports, approving/marking commissions paid, managing salespeople/teams/roles/users, impersonation, configuration). If they ask about those, briefly say that it's handled by administrators and suggest contacting their administrator or saleshub@clustersystems.com — without detailing how the admin feature works.`;
 
+// Recently published release notes, fed to Cleo so it AUTOMATICALLY learns about new
+// features the moment an admin publishes a release — no prompt edits needed. Cached in
+// memory for a few minutes (releases change rarely) to avoid a DB hit on every message.
+let _assistantUpdatesCache = { text: '', at: 0 };
+async function getAssistantUpdatesContext() {
+  const now = Date.now();
+  if (_assistantUpdatesCache.text !== null && now - _assistantUpdatesCache.at < 5 * 60 * 1000) {
+    return _assistantUpdatesCache.text;
+  }
+  try {
+    const rows = (await pool.query(
+      `SELECT version, name, date, notes FROM releases ORDER BY date DESC LIMIT 12`
+    )).rows;
+    if (!rows.length) { _assistantUpdatesCache = { text: '', at: now }; return ''; }
+    const lines = rows.map(r => {
+      const d = r.date ? new Date(r.date).toISOString().slice(0, 10) : '';
+      const notes = String(r.notes || '').replace(/\s+/g, ' ').trim().slice(0, 600);
+      return `- v${r.version}${r.name ? ` "${r.name}"` : ''}${d ? ` (${d})` : ''}: ${notes || '(no notes)'}`;
+    });
+    let text = `RECENT UPDATES — the app's published release notes, newest first. Treat these as authoritative for which features exist and what changed recently. If the user asks "what's new", what changed, or about a recently added capability, answer from this list (in the user's language). Don't read them out verbatim unless asked; summarize what's relevant.\n${lines.join('\n')}`;
+    if (text.length > 7000) text = text.slice(0, 7000);
+    _assistantUpdatesCache = { text, at: now };
+    return text;
+  } catch (e) {
+    console.warn('[ASSISTANT] updates context error:', e.message);
+    return _assistantUpdatesCache.text || '';
+  }
+}
+
 app.post('/api/assistant/chat', authenticateToken, async (req, res) => {
   const client = getAnthropic();
   if (!client) return res.status(503).json({ error: 'assistant_not_configured' });
@@ -1739,6 +1768,7 @@ app.post('/api/assistant/chat', authenticateToken, async (req, res) => {
       isAdmin = row && row.is_admin != null ? !!row.is_admin : !!req.user.isAdmin && !!row;
     }
 
+    const updates = await getAssistantUpdatesContext();
     const response = await client.messages.create({
       model: 'claude-opus-4-8',
       max_tokens: 1024,
@@ -1746,6 +1776,7 @@ app.post('/api/assistant/chat', authenticateToken, async (req, res) => {
       output_config: { effort: 'low' },
       system: [
         { type: 'text', text: ASSISTANT_SYSTEM + (isAdmin ? ASSISTANT_SYSTEM_ADMIN : ASSISTANT_SYSTEM_NONADMIN) },
+        ...(updates ? [{ type: 'text', text: updates }] : []),
         { type: 'text', text: `Current user: ${req.user.name || req.user.email || 'unknown'}${isAdmin ? ' (administrator)' : ' (regular user, not an administrator)'}.` },
         { type: 'text', text: `The user's app language is set to ${uiLang}. Reply in ${uiLang} unless the user clearly writes in another language.` },
       ],
