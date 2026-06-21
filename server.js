@@ -7861,9 +7861,9 @@ app.post('/api/resources/bulk', authenticateToken, uploadResource.array('files',
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/resources/import-zip — unzip an uploaded archive into resources. The zip's TOP-LEVEL
-// folders become categories; each file becomes a resource (title = file name). Files >25MB and
-// junk entries (__MACOSX, .DS_Store, dotfiles) are skipped and reported.
+// POST /api/resources/import-zip — unzip an uploaded archive into resources. Each file's FULL
+// folder path becomes its category (browsed as nested folders in the UI); each file becomes a
+// resource (title = file name). Files >25MB and junk (__MACOSX, .DS_Store, dotfiles) are skipped.
 const EXT_MIME = {
   pdf: 'application/pdf', doc: 'application/msword',
   docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -7921,7 +7921,9 @@ app.post('/api/resources/import-zip', authenticateToken, zipUpload, async (req, 
         const path = entry.entryName.replace(/\\/g, '/');
         const base = path.split('/').pop() || '';
         const parts = path.split('/').filter(Boolean);
-        const category = parts.length > 1 ? parts[0] : '';
+        // Keep the FULL folder path (all segments except the file) as the category, so the zip's
+        // nested structure is preserved (browsed as nested folders in the UI), not flattened to top-level.
+        const category = parts.slice(0, -1).join('/');
         const data = entry.getData();
         if (!data || data.length === 0 || data.length > 25 * 1024 * 1024) continue; // skip empty / >25MB
         const ext = (base.split('.').pop() || '').toLowerCase();
