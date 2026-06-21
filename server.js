@@ -548,6 +548,15 @@ async function initializeDatabase() {
         PRIMARY KEY (user_email, role_id)
       );
     `);
+    // Per-role storage quota for the resources library. A user's effective cap is their
+    // explicit per-user limit if set, else the most generous limit among their roles.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS role_storage_limits (
+        role_id     INT PRIMARY KEY REFERENCES roles(id) ON DELETE CASCADE,
+        limit_bytes BIGINT NOT NULL,
+        updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
     // Team-scoped managers: which team(s) a (manager) user oversees. Many-to-many — a manager
     // can manage several teams and a team can have several managers. Drives the Manager dashboard
     // + /api/crm/points visibility (they see ONLY their assigned teams, with full detail).
@@ -7582,6 +7591,25 @@ async function getUserStorageLimit(email) {
     return Number.isFinite(n) && n > 0 ? n : null;
   } catch { return null; }
 }
+// Most generous storage limit among the email's assigned roles (null = no role cap).
+async function getRoleStorageLimit(email) {
+  if (!email) return null;
+  try {
+    const v = (await pool.query(`
+      SELECT MAX(rsl.limit_bytes) AS b
+        FROM user_roles ur
+        JOIN role_storage_limits rsl ON rsl.role_id = ur.role_id
+       WHERE LOWER(ur.user_email) = LOWER($1)`, [email])).rows[0]?.b;
+    const n = parseInt(v);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch { return null; }
+}
+// A user's effective personal cap: explicit per-user limit wins, else the role-derived cap.
+async function getEffectiveUserLimit(email) {
+  const u = await getUserStorageLimit(email);
+  if (u != null) return u;
+  return await getRoleStorageLimit(email);
+}
 async function getUserStorageUsed(email) {
   if (!email) return 0;
   return parseInt((await pool.query(`SELECT COALESCE(SUM(file_size),0)::bigint AS b FROM resources WHERE LOWER(uploaded_by)=LOWER($1)`, [email])).rows[0].b) || 0;
@@ -7595,7 +7623,7 @@ async function ensureResourceRoom(res, addBytes, uploaderEmail) {
     res.status(413).json({ error: `Library storage limit reached (${(limit / GB_).toFixed(1)} GB cap). Delete files or raise the limit in Admin → Resources.` });
     return false;
   }
-  const userLimit = await getUserStorageLimit(uploaderEmail);
+  const userLimit = await getEffectiveUserLimit(uploaderEmail);
   if (userLimit != null && (await getUserStorageUsed(uploaderEmail)) + addBytes > userLimit) {
     res.status(413).json({ error: `Your personal storage limit is reached (${(userLimit / GB_).toFixed(1)} GB). Ask an admin to raise it.` });
     return false;
@@ -7649,20 +7677,81 @@ app.put('/api/resources/storage', authenticateToken, async (req, res) => {
 });
 
 // GET /api/resources/user-storage — per-user usage + limits (admin). Lists everyone who has
-// uploaded or has a limit set, plus all known account emails for the "add a limit" picker.
+// uploaded, has a limit, or holds a role — each row carries its role(s), explicit per-user
+// limit, role-derived limit and the resulting effective cap, so the table can be edited inline.
 app.get('/api/resources/user-storage', authenticateToken, async (req, res) => {
   if (!(req.user.isAdmin === true && !req.user.impersonating)) return res.status(403).json({ error: 'Admin required' });
   try {
+    // Usage by uploader.
+    const usedRows = (await pool.query(`SELECT LOWER(uploaded_by) AS email, SUM(file_size)::bigint AS used FROM resources WHERE uploaded_by IS NOT NULL GROUP BY 1`)).rows;
+    const usedByEmail = Object.fromEntries(usedRows.map(r => [r.email, parseInt(r.used) || 0]));
+    // Explicit per-user limits.
+    const userLimitRows = (await pool.query(`SELECT LOWER(email) AS email, limit_bytes FROM user_storage_limits`)).rows;
+    const userLimitByEmail = Object.fromEntries(userLimitRows.map(r => [r.email, parseInt(r.limit_bytes) || null]));
+    // Roles + role limits per user. roleLimit = most generous limit among the user's roles.
+    const roleRows = (await pool.query(`
+      SELECT LOWER(ur.user_email) AS email, r.name AS role_name, rsl.limit_bytes
+        FROM user_roles ur
+        JOIN roles r ON r.id = ur.role_id
+        LEFT JOIN role_storage_limits rsl ON rsl.role_id = r.id`)).rows;
+    const rolesByEmail = {};   // email -> [role names]
+    const roleLimitByEmail = {}; // email -> max role limit
+    for (const r of roleRows) {
+      (rolesByEmail[r.email] = rolesByEmail[r.email] || []).push(r.role_name);
+      const lim = parseInt(r.limit_bytes);
+      if (Number.isFinite(lim) && lim > 0) roleLimitByEmail[r.email] = Math.max(roleLimitByEmail[r.email] || 0, lim);
+    }
+    // Union of every known email so the list is auto-populated.
+    const knownRows = (await pool.query(`
+      SELECT LOWER(email) AS email FROM user_tokens WHERE email IS NOT NULL
+      UNION SELECT LOWER(email) FROM salespeople WHERE email IS NOT NULL
+      UNION SELECT LOWER(email) FROM local_users WHERE email IS NOT NULL`)).rows.map(r => r.email);
+    const emails = [...new Set([...knownRows, ...Object.keys(usedByEmail), ...Object.keys(userLimitByEmail), ...Object.keys(rolesByEmail)])].filter(Boolean);
+    const users = emails.map(email => {
+      const userLimit = userLimitByEmail[email] || null;
+      const roleLimit = roleLimitByEmail[email] || null;
+      const effective = userLimit != null ? userLimit : roleLimit;
+      return {
+        email,
+        used: usedByEmail[email] || 0,
+        roles: rolesByEmail[email] || [],
+        userLimit,
+        roleLimit,
+        effectiveLimit: effective,
+        source: userLimit != null ? 'user' : (roleLimit != null ? 'role' : 'none'),
+      };
+    }).sort((a, b) => b.used - a.used || a.email.localeCompare(b.email));
+    res.json({ users });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/resources/role-storage — every role with its configured storage cap (admin).
+app.get('/api/resources/role-storage', authenticateToken, async (req, res) => {
+  if (!(req.user.isAdmin === true && !req.user.impersonating)) return res.status(403).json({ error: 'Admin required' });
+  try {
     const rows = (await pool.query(`
-      SELECT COALESCE(u.email, l.email) AS email,
-             COALESCE(u.used, 0)::bigint AS used,
-             l.limit_bytes
-        FROM (SELECT LOWER(uploaded_by) AS email, SUM(file_size) AS used FROM resources WHERE uploaded_by IS NOT NULL GROUP BY 1) u
-        FULL OUTER JOIN user_storage_limits l ON LOWER(l.email) = u.email
-       ORDER BY used DESC NULLS LAST, email`)).rows;
-    const users = rows.filter(r => r.email).map(r => ({ email: r.email, used: parseInt(r.used) || 0, limit: r.limit_bytes ? parseInt(r.limit_bytes) : null }));
-    const known = (await pool.query(`SELECT email FROM user_tokens UNION SELECT email FROM salespeople WHERE email IS NOT NULL`)).rows.map(r => r.email).filter(Boolean);
-    res.json({ users, knownEmails: [...new Set(known.map(e => e.toLowerCase()))].sort() });
+      SELECT r.id, r.name, r.is_system, rsl.limit_bytes
+        FROM roles r
+        LEFT JOIN role_storage_limits rsl ON rsl.role_id = r.id
+       ORDER BY r.is_system DESC, r.name`)).rows;
+    res.json({ roles: rows.map(r => ({ id: r.id, name: r.name, isSystem: r.is_system, limit: r.limit_bytes ? parseInt(r.limit_bytes) : null })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/resources/role-storage { roleId, limitBytes } — set/clear a role's quota (admin; 0 = clear).
+app.put('/api/resources/role-storage', authenticateToken, async (req, res) => {
+  if (!(req.user.isAdmin === true && !req.user.impersonating)) return res.status(403).json({ error: 'Admin required' });
+  const roleId = parseInt(req.body.roleId);
+  if (!Number.isFinite(roleId)) return res.status(400).json({ error: 'roleId required' });
+  const bytes = (req.body.limitBytes == null || Number(req.body.limitBytes) <= 0) ? 0 : Math.round(Number(req.body.limitBytes));
+  try {
+    if (bytes > 0) {
+      await pool.query(`INSERT INTO role_storage_limits (role_id, limit_bytes, updated_at) VALUES ($1,$2,CURRENT_TIMESTAMP)
+                        ON CONFLICT (role_id) DO UPDATE SET limit_bytes=$2, updated_at=CURRENT_TIMESTAMP`, [roleId, bytes]);
+    } else {
+      await pool.query(`DELETE FROM role_storage_limits WHERE role_id=$1`, [roleId]);
+    }
+    res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
