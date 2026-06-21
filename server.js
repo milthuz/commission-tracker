@@ -79,6 +79,9 @@ const PERMISSION_CATALOG = [
   // Resources (sales document library)
   { key: 'resources:view',             label: 'View the Resources library (sales documents)',                   category: 'Resources' },
   { key: 'resources:manage',           label: 'Add, edit and delete resources',                                 category: 'Resources' },
+
+  // Demo (AppStream-streamed Kaizen POS for sales demos)
+  { key: 'demo:kaizen',                label: 'Access the Kaizen POS demo (streamed POS)',                      category: 'Demo' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -1799,6 +1802,58 @@ app.post('/api/assistant/chat', authenticateToken, async (req, res) => {
   } catch (e) {
     console.warn('[ASSISTANT] error:', e.message);
     res.status(502).json({ error: 'assistant_error' });
+  }
+});
+
+// ============================================================================
+// KAIZEN POS DEMO — AppStream 2.0 streamed POS for sales reps
+// Requires Heroku config vars: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+// AWS_REGION (default us-east-1), APPSTREAM_STACK, APPSTREAM_FLEET, and
+// optionally APPSTREAM_APP_ID (the app Name from Image Assistant, to auto-launch it).
+// Returns 503 'demo_not_configured' until those are set.
+// ============================================================================
+let _appstream = null;
+function getAppStream() {
+  if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY ||
+      !process.env.APPSTREAM_STACK || !process.env.APPSTREAM_FLEET) return null;
+  if (!_appstream) {
+    const { AppStreamClient } = require('@aws-sdk/client-appstream');
+    _appstream = new AppStreamClient({
+      region: process.env.AWS_REGION || 'us-east-1',
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+      },
+    });
+  }
+  return _appstream;
+}
+// A stable AppStream UserId per Sales Hub user (charset [\w+=,.@-], 2-32 chars).
+function appstreamUserId(req) {
+  const raw = (req.user.realAdminEmail || req.user.email || req.user.name || 'demo-user').toLowerCase();
+  const clean = raw.replace(/[^\w+=,.@-]/g, '-').slice(0, 32);
+  return clean.length >= 2 ? clean : 'demo-user';
+}
+
+// POST /api/demo/kaizen-url — mint a temporary AppStream streaming URL (embedded in an iframe client-side).
+app.post('/api/demo/kaizen-url', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'demo:kaizen'))) return;
+  const client = getAppStream();
+  if (!client) return res.status(503).json({ error: 'demo_not_configured' });
+  try {
+    const { CreateStreamingURLCommand } = require('@aws-sdk/client-appstream');
+    const params = {
+      StackName: process.env.APPSTREAM_STACK,
+      FleetName: process.env.APPSTREAM_FLEET,
+      UserId: appstreamUserId(req),
+      Validity: 3600, // the URL must be USED within 60 min; the session itself lasts per the fleet config
+    };
+    if (process.env.APPSTREAM_APP_ID) params.ApplicationId = process.env.APPSTREAM_APP_ID; // auto-launch the POS
+    const out = await client.send(new CreateStreamingURLCommand(params));
+    res.json({ url: out.StreamingURL });
+  } catch (e) {
+    console.warn('[DEMO] createStreamingURL error:', e.name, e.message);
+    res.status(502).json({ error: 'demo_error', detail: e.message });
   }
 });
 
