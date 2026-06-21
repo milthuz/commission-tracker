@@ -459,6 +459,8 @@ async function initializeDatabase() {
     // Generic app settings (key/value). Used for the configurable resources storage quota.
     await pool.query(`CREATE TABLE IF NOT EXISTS app_settings (key VARCHAR(100) PRIMARY KEY, value TEXT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
     await pool.query(`INSERT INTO app_settings (key, value) VALUES ('resources_storage_limit_bytes', '5368709120') ON CONFLICT DO NOTHING`); // default 5 GB
+    // Per-user storage quota for resources (by uploader email). No row = no personal limit.
+    await pool.query(`CREATE TABLE IF NOT EXISTS user_storage_limits (email VARCHAR(255) PRIMARY KEY, limit_bytes BIGINT NOT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
     // Admin-managed category structure for the resources library.
     await pool.query(`
       CREATE TABLE IF NOT EXISTS resource_categories (
@@ -7572,13 +7574,30 @@ async function getResourcesLimit() {
 async function getResourcesUsed() {
   return parseInt((await pool.query(`SELECT COALESCE(SUM(file_size),0)::bigint AS b FROM resources`)).rows[0].b) || 0;
 }
-// Returns true if the upload fits; otherwise sends a 413 and returns false.
-async function ensureResourceRoom(res, addBytes) {
+async function getUserStorageLimit(email) {
+  if (!email) return null;
+  try {
+    const v = (await pool.query(`SELECT limit_bytes FROM user_storage_limits WHERE LOWER(email)=LOWER($1)`, [email])).rows[0]?.limit_bytes;
+    const n = parseInt(v);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch { return null; }
+}
+async function getUserStorageUsed(email) {
+  if (!email) return 0;
+  return parseInt((await pool.query(`SELECT COALESCE(SUM(file_size),0)::bigint AS b FROM resources WHERE LOWER(uploaded_by)=LOWER($1)`, [email])).rows[0].b) || 0;
+}
+const GB_ = 1073741824;
+// Returns true if the upload fits BOTH the global cap and the uploader's personal cap;
+// otherwise sends a 413 and returns false.
+async function ensureResourceRoom(res, addBytes, uploaderEmail) {
   const limit = await getResourcesLimit();
-  if (limit == null) return true;
-  const used = await getResourcesUsed();
-  if (used + addBytes > limit) {
-    res.status(413).json({ error: `Storage limit reached (${(limit / 1073741824).toFixed(1)} GB used of cap). Delete files or raise the limit in the Storage settings.` });
+  if (limit != null && (await getResourcesUsed()) + addBytes > limit) {
+    res.status(413).json({ error: `Library storage limit reached (${(limit / GB_).toFixed(1)} GB cap). Delete files or raise the limit in Admin → Resources.` });
+    return false;
+  }
+  const userLimit = await getUserStorageLimit(uploaderEmail);
+  if (userLimit != null && (await getUserStorageUsed(uploaderEmail)) + addBytes > userLimit) {
+    res.status(413).json({ error: `Your personal storage limit is reached (${(userLimit / GB_).toFixed(1)} GB). Ask an admin to raise it.` });
     return false;
   }
   return true;
@@ -7629,6 +7648,41 @@ app.put('/api/resources/storage', authenticateToken, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/resources/user-storage — per-user usage + limits (admin). Lists everyone who has
+// uploaded or has a limit set, plus all known account emails for the "add a limit" picker.
+app.get('/api/resources/user-storage', authenticateToken, async (req, res) => {
+  if (!(req.user.isAdmin === true && !req.user.impersonating)) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const rows = (await pool.query(`
+      SELECT COALESCE(u.email, l.email) AS email,
+             COALESCE(u.used, 0)::bigint AS used,
+             l.limit_bytes
+        FROM (SELECT LOWER(uploaded_by) AS email, SUM(file_size) AS used FROM resources WHERE uploaded_by IS NOT NULL GROUP BY 1) u
+        FULL OUTER JOIN user_storage_limits l ON LOWER(l.email) = u.email
+       ORDER BY used DESC NULLS LAST, email`)).rows;
+    const users = rows.filter(r => r.email).map(r => ({ email: r.email, used: parseInt(r.used) || 0, limit: r.limit_bytes ? parseInt(r.limit_bytes) : null }));
+    const known = (await pool.query(`SELECT email FROM user_tokens UNION SELECT email FROM salespeople WHERE email IS NOT NULL`)).rows.map(r => r.email).filter(Boolean);
+    res.json({ users, knownEmails: [...new Set(known.map(e => e.toLowerCase()))].sort() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/resources/user-storage { email, limitBytes } — set/clear a user's quota (admin; 0 = clear).
+app.put('/api/resources/user-storage', authenticateToken, async (req, res) => {
+  if (!(req.user.isAdmin === true && !req.user.impersonating)) return res.status(403).json({ error: 'Admin required' });
+  const email = String(req.body.email || '').trim().toLowerCase();
+  if (!email) return res.status(400).json({ error: 'email required' });
+  const bytes = (req.body.limitBytes == null || Number(req.body.limitBytes) <= 0) ? 0 : Math.round(Number(req.body.limitBytes));
+  try {
+    if (bytes > 0) {
+      await pool.query(`INSERT INTO user_storage_limits (email, limit_bytes, updated_at) VALUES ($1,$2,CURRENT_TIMESTAMP)
+                        ON CONFLICT (email) DO UPDATE SET limit_bytes=$2, updated_at=CURRENT_TIMESTAMP`, [email, bytes]);
+    } else {
+      await pool.query(`DELETE FROM user_storage_limits WHERE LOWER(email)=LOWER($1)`, [email]);
+    }
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/resources/:id/download — stream the file inline (view perm is enough to download).
 app.get('/api/resources/:id/download', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'resources:view'))) return;
@@ -7648,7 +7702,7 @@ app.post('/api/resources', authenticateToken, uploadResource.single('file'), asy
   const title = String(req.body.title || '').trim();
   if (!file) return res.status(400).json({ error: 'file required (multipart field "file")' });
   if (!title) return res.status(400).json({ error: 'title required' });
-  if (!(await ensureResourceRoom(res, file.size))) return;
+  if (!(await ensureResourceRoom(res, file.size, req.user.realAdminEmail || req.user.email))) return;
   try {
     const actor = req.user.realAdminEmail || req.user.email || 'unknown';
     const category = String(req.body.category || '').trim();
@@ -7668,7 +7722,7 @@ app.post('/api/resources/bulk', authenticateToken, uploadResource.array('files',
   if (!(await requirePerm(req, res, 'resources:manage'))) return;
   const files = req.files || [];
   if (!files.length) return res.status(400).json({ error: 'files required (multipart field "files")' });
-  if (!(await ensureResourceRoom(res, files.reduce((s, f) => s + f.size, 0)))) return;
+  if (!(await ensureResourceRoom(res, files.reduce((s, f) => s + f.size, 0), req.user.realAdminEmail || req.user.email))) return;
   const actor = req.user.realAdminEmail || req.user.email || 'unknown';
   const category = String(req.body.category || '').trim();
   const tags = parseTags(req.body.tags);
@@ -7730,7 +7784,7 @@ app.post('/api/resources/import-zip', authenticateToken, zipUpload, async (req, 
 
   // Enforce the storage quota upfront using uncompressed sizes (header.size) before we commit.
   const incoming = candidates.reduce((s, e) => s + (e.header?.size || 0), 0);
-  if (!(await ensureResourceRoom(res, incoming))) return;
+  if (!(await ensureResourceRoom(res, incoming, req.user.realAdminEmail || req.user.email))) return;
 
   // Respond immediately, then import in the background — avoids Heroku's 30s request timeout on
   // large archives (each bytea INSERT to Railway is slow cross-cloud). Files appear as they land;
