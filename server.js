@@ -8095,6 +8095,34 @@ app.post('/api/resources/folder/delete', authenticateToken, async (req, res) => 
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST /api/resources/folder/move { zone, path, destParent } — move a folder (and its subtree)
+// under another parent ('' = root), re-pathing everything. Shared = resources:manage; personal = owner.
+app.post('/api/resources/folder/move', authenticateToken, async (req, res) => {
+  const w = await resolveResourceWrite(req, res); if (!w) return;
+  const path = String(req.body.path || '').trim().replace(/^\/+|\/+$/g, '');
+  const dest = String(req.body.destParent || '').trim().replace(/^\/+|\/+$/g, ''); // '' = root
+  if (!path) return res.status(400).json({ error: 'path required' });
+  const name = path.split('/').pop();
+  const newPath = dest ? `${dest}/${name}` : name;
+  if (newPath === path) return res.json({ success: true, updated: 0, newPath }); // already there
+  if (dest === path || dest.startsWith(path + '/')) return res.status(400).json({ error: 'cannot move a folder into itself' });
+  const lenPlus1 = path.length + 1;
+  const params = [newPath, path];
+  let ownerCond = `owner_email IS NULL`;
+  if (w.owner) { params.push(w.owner); ownerCond = `LOWER(owner_email) = $3`; }
+  try {
+    const upd = await pool.query(
+      `UPDATE resources SET category = $1 || SUBSTRING(category FROM ${lenPlus1}), updated_at = CURRENT_TIMESTAMP
+        WHERE (category = $2 OR category LIKE $2 || '/%') AND ${ownerCond}`, params);
+    if (!w.owner) {
+      try { await pool.query(`UPDATE resource_categories SET name = $1 || SUBSTRING(name FROM ${lenPlus1}) WHERE name = $2 OR name LIKE $2 || '/%'`, [newPath, path]); }
+      catch (e) { console.warn('[folder/move] category sync skipped:', e.message); }
+    }
+    await logResourceAudit('move_folder', { title: `${path} → ${newPath}`, file_name: '', category: newPath }, req.user.realAdminEmail || req.user.email || 'unknown');
+    res.json({ success: true, updated: upd.rowCount, newPath });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // --- Category structure (admin-managed) ---
 app.get('/api/resource-categories', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'resources:view'))) return;
