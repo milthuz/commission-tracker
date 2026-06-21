@@ -456,6 +456,9 @@ async function initializeDatabase() {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_resources_category ON resources(category)`);
+    // Generic app settings (key/value). Used for the configurable resources storage quota.
+    await pool.query(`CREATE TABLE IF NOT EXISTS app_settings (key VARCHAR(100) PRIMARY KEY, value TEXT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
+    await pool.query(`INSERT INTO app_settings (key, value) VALUES ('resources_storage_limit_bytes', '5368709120') ON CONFLICT DO NOTHING`); // default 5 GB
     // Admin-managed category structure for the resources library.
     await pool.query(`
       CREATE TABLE IF NOT EXISTS resource_categories (
@@ -7559,6 +7562,28 @@ const logResourceAudit = async (action, r, actor) => {
   } catch (_e) { /* never block the main action on logging */ }
 };
 
+// Configurable storage quota for the resources library.
+async function getResourcesLimit() {
+  try {
+    const v = parseInt((await pool.query(`SELECT value FROM app_settings WHERE key = 'resources_storage_limit_bytes'`)).rows[0]?.value);
+    return Number.isFinite(v) && v > 0 ? v : null; // null = unlimited
+  } catch { return null; }
+}
+async function getResourcesUsed() {
+  return parseInt((await pool.query(`SELECT COALESCE(SUM(file_size),0)::bigint AS b FROM resources`)).rows[0].b) || 0;
+}
+// Returns true if the upload fits; otherwise sends a 413 and returns false.
+async function ensureResourceRoom(res, addBytes) {
+  const limit = await getResourcesLimit();
+  if (limit == null) return true;
+  const used = await getResourcesUsed();
+  if (used + addBytes > limit) {
+    res.status(413).json({ error: `Storage limit reached (${(limit / 1073741824).toFixed(1)} GB used of cap). Delete files or raise the limit in the Storage settings.` });
+    return false;
+  }
+  return true;
+}
+
 // GET /api/resources?q=&category= — metadata only (never the blob). Returns the distinct categories too.
 app.get('/api/resources', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'resources:view'))) return;
@@ -7582,6 +7607,28 @@ app.get('/api/resources', authenticateToken, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/resources/storage — current usage + configured limit.
+app.get('/api/resources/storage', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'resources:view'))) return;
+  try {
+    res.json({ used: await getResourcesUsed(), limit: await getResourcesLimit() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/resources/storage { limitBytes } — set the quota (admin only; null/0 = unlimited).
+app.put('/api/resources/storage', authenticateToken, async (req, res) => {
+  if (!(req.user.isAdmin === true && !req.user.impersonating)) return res.status(403).json({ error: 'Admin required' });
+  const raw = req.body.limitBytes;
+  const limit = (raw == null || raw === '' || Number(raw) <= 0) ? 0 : Math.round(Number(raw));
+  if (!Number.isFinite(limit)) return res.status(400).json({ error: 'invalid limit' });
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('resources_storage_limit_bytes', $1, CURRENT_TIMESTAMP)
+       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = CURRENT_TIMESTAMP`, [String(limit)]);
+    res.json({ success: true, limit: limit > 0 ? limit : null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/resources/:id/download — stream the file inline (view perm is enough to download).
 app.get('/api/resources/:id/download', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'resources:view'))) return;
@@ -7601,6 +7648,7 @@ app.post('/api/resources', authenticateToken, uploadResource.single('file'), asy
   const title = String(req.body.title || '').trim();
   if (!file) return res.status(400).json({ error: 'file required (multipart field "file")' });
   if (!title) return res.status(400).json({ error: 'title required' });
+  if (!(await ensureResourceRoom(res, file.size))) return;
   try {
     const actor = req.user.realAdminEmail || req.user.email || 'unknown';
     const category = String(req.body.category || '').trim();
@@ -7620,6 +7668,7 @@ app.post('/api/resources/bulk', authenticateToken, uploadResource.array('files',
   if (!(await requirePerm(req, res, 'resources:manage'))) return;
   const files = req.files || [];
   if (!files.length) return res.status(400).json({ error: 'files required (multipart field "files")' });
+  if (!(await ensureResourceRoom(res, files.reduce((s, f) => s + f.size, 0)))) return;
   const actor = req.user.realAdminEmail || req.user.email || 'unknown';
   const category = String(req.body.category || '').trim();
   const tags = parseTags(req.body.tags);
@@ -7678,6 +7727,10 @@ app.post('/api/resources/import-zip', authenticateToken, zipUpload, async (req, 
     const base = path.split('/').pop() || '';
     return !(path.includes('__MACOSX/') || base === '.DS_Store' || base.startsWith('.') || !base);
   }).slice(0, MAX_ZIP_FILES); // bound the work so one import can't run away
+
+  // Enforce the storage quota upfront using uncompressed sizes (header.size) before we commit.
+  const incoming = candidates.reduce((s, e) => s + (e.header?.size || 0), 0);
+  if (!(await ensureResourceRoom(res, incoming))) return;
 
   // Respond immediately, then import in the background — avoids Heroku's 30s request timeout on
   // large archives (each bytea INSERT to Railway is slow cross-cloud). Files appear as they land;
