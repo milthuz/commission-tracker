@@ -476,6 +476,12 @@ async function initializeDatabase() {
       );
     `);
     await pool.query(`ALTER TABLE resource_categories ALTER COLUMN name TYPE VARCHAR(500)`);
+    // Categories belong to a zone too: NULL owner = shared library folder; set = that user's personal folder.
+    await pool.query(`ALTER TABLE resource_categories ADD COLUMN IF NOT EXISTS owner_email VARCHAR(255)`);
+    // Drop the old UNIQUE(name) so the same folder name can exist in shared + a user's personal zone;
+    // uniqueness is now per (owner, name).
+    await pool.query(`ALTER TABLE resource_categories DROP CONSTRAINT IF EXISTS resource_categories_name_key`);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_resource_categories_owner_name ON resource_categories ((COALESCE(owner_email,'')), name)`);
     // Audit journal — one row per resource added or deleted (who, what, when).
     await pool.query(`
       CREATE TABLE IF NOT EXISTS resource_audit (
@@ -7690,16 +7696,17 @@ app.get('/api/resources', authenticateToken, async (req, res) => {
         FROM resources WHERE ${where.join(' AND ')}
        ORDER BY category NULLS LAST, title`;
     const rows = (await pool.query(sql, params)).rows;
-    let categories;
+    // Managed/empty folders for this zone (resource_categories) + categories actually in use by files,
+    // so freshly-created empty folders show up too.
+    let managed, used;
     if (zone === 'personal') {
-      categories = (await pool.query(`SELECT DISTINCT category FROM resources WHERE LOWER(owner_email)=$1 AND COALESCE(category,'')<>'' ORDER BY category`, [me || ''])).rows.map(r => r.category);
+      managed = (await pool.query(`SELECT name FROM resource_categories WHERE LOWER(owner_email)=$1 ORDER BY sort_order, name`, [me || ''])).rows.map(r => r.name);
+      used = (await pool.query(`SELECT DISTINCT category FROM resources WHERE LOWER(owner_email)=$1 AND COALESCE(category,'')<>'' ORDER BY category`, [me || ''])).rows.map(r => r.category);
     } else {
-      // Prefer the admin-managed category structure; fall back to shared categories actually in use.
-      categories = (await pool.query(`SELECT name FROM resource_categories ORDER BY sort_order, name`)).rows.map(r => r.name);
-      if (!categories.length) {
-        categories = (await pool.query(`SELECT DISTINCT category FROM resources WHERE owner_email IS NULL AND COALESCE(category,'') <> '' ORDER BY category`)).rows.map(r => r.category);
-      }
+      managed = (await pool.query(`SELECT name FROM resource_categories WHERE owner_email IS NULL ORDER BY sort_order, name`)).rows.map(r => r.name);
+      used = (await pool.query(`SELECT DISTINCT category FROM resources WHERE owner_email IS NULL AND COALESCE(category,'')<>'' ORDER BY category`)).rows.map(r => r.category);
     }
+    const categories = Array.from(new Set([...managed, ...used]));
     res.json({ resources: rows, categories, zone });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -7966,12 +7973,14 @@ app.post('/api/resources/import-zip', authenticateToken, zipUpload, async (req, 
            VALUES ($1, '', $2, '{}', $3, $4, $5, $6, $7, $8) RETURNING id`,
           [title, category, base, EXT_MIME[ext] || 'application/octet-stream', data.length, data, actor, w.owner]);
         await logResourceAudit('add', { id: r.rows[0].id, title, file_name: base, category }, actor);
-        // Register the managed category only for the SHARED library (personal folders are derived from files).
-        if (category && w.owner == null && !seenCats.has(category)) {
+        // Register the managed category in the zone it was imported into.
+        if (category && !seenCats.has(category)) {
           seenCats.add(category);
           await pool.query(
-            `INSERT INTO resource_categories (name, sort_order) VALUES ($1, COALESCE((SELECT MAX(sort_order)+1 FROM resource_categories),0)) ON CONFLICT (name) DO NOTHING`,
-            [category]);
+            `INSERT INTO resource_categories (name, owner_email, sort_order)
+             SELECT $1, $2, COALESCE((SELECT MAX(sort_order)+1 FROM resource_categories),0)
+             WHERE NOT EXISTS (SELECT 1 FROM resource_categories WHERE name=$1 AND COALESCE(owner_email,'')=COALESCE($2,''))`,
+            [category, w.owner]);
         }
       } catch (e) { console.warn('[import-zip] entry failed:', entry.entryName, e.message); }
     }
@@ -8027,18 +8036,18 @@ app.delete('/api/resources/:id', authenticateToken, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/resources/delete-all — wipe the ENTIRE library (all files + categories). ADMIN ONLY.
-// Requires { confirm: 'DELETE ALL' } in the body as a safety latch. Audited (one summary row).
+// POST /api/resources/delete-all — wipe the SHARED library (files + categories). ADMIN ONLY.
+// Personal "My files" zones are NOT touched. Requires { confirm: 'DELETE ALL' } as a safety latch.
 app.post('/api/resources/delete-all', authenticateToken, async (req, res) => {
   if (!(req.user.isAdmin === true && !req.user.impersonating)) {
     return res.status(403).json({ error: 'Admin required' });
   }
   if (req.body.confirm !== 'DELETE ALL') return res.status(400).json({ error: 'confirmation phrase required' });
   try {
-    const n = (await pool.query(`SELECT COUNT(*)::int c FROM resources`)).rows[0].c;
-    await pool.query(`DELETE FROM resources`);
-    await pool.query(`DELETE FROM resource_categories`);
-    await logResourceAudit('delete_all', { title: `ALL RESOURCES (${n})`, file_name: '', category: '' }, req.user.realAdminEmail || req.user.email || 'unknown');
+    const n = (await pool.query(`SELECT COUNT(*)::int c FROM resources WHERE owner_email IS NULL`)).rows[0].c;
+    await pool.query(`DELETE FROM resources WHERE owner_email IS NULL`);
+    await pool.query(`DELETE FROM resource_categories WHERE owner_email IS NULL`);
+    await logResourceAudit('delete_all', { title: `ALL SHARED RESOURCES (${n})`, file_name: '', category: '' }, req.user.realAdminEmail || req.user.email || 'unknown');
     res.json({ success: true, deleted: n });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -8064,12 +8073,10 @@ app.post('/api/resources/folder/rename', authenticateToken, async (req, res) => 
     const upd = await pool.query(
       `UPDATE resources SET category = $1 || SUBSTRING(category FROM ${lenPlus1}), updated_at = CURRENT_TIMESTAMP
         WHERE (category = $2 OR category LIKE $2 || '/%') AND ${ownerCond}`, params);
-    if (!w.owner) {
-      // Keep the managed-category names in sync (best-effort — a name collision just no-ops).
-      try {
-        await pool.query(`UPDATE resource_categories SET name = $1 || SUBSTRING(name FROM ${lenPlus1}) WHERE name = $2 OR name LIKE $2 || '/%'`, [newPath, path]);
-      } catch (e) { console.warn('[folder/rename] category sync skipped:', e.message); }
-    }
+    // Keep the managed-category names in sync within the same zone (best-effort).
+    try {
+      await pool.query(`UPDATE resource_categories SET name = $1 || SUBSTRING(name FROM ${lenPlus1}) WHERE (name = $2 OR name LIKE $2 || '/%') AND COALESCE(owner_email,'') = COALESCE($3,'')`, [newPath, path, w.owner]);
+    } catch (e) { console.warn('[folder/rename] category sync skipped:', e.message); }
     await logResourceAudit('rename_folder', { title: `${path} → ${newPath}`, file_name: '', category: newPath }, req.user.realAdminEmail || req.user.email || 'unknown');
     res.json({ success: true, updated: upd.rowCount, newPath });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -8087,9 +8094,7 @@ app.post('/api/resources/folder/delete', authenticateToken, async (req, res) => 
   try {
     const del = await pool.query(
       `DELETE FROM resources WHERE (category = $1 OR category LIKE $1 || '/%') AND ${ownerCond} RETURNING id`, params);
-    if (!w.owner) {
-      await pool.query(`DELETE FROM resource_categories WHERE name = $1 OR name LIKE $1 || '/%'`, [path]);
-    }
+    await pool.query(`DELETE FROM resource_categories WHERE (name = $1 OR name LIKE $1 || '/%') AND COALESCE(owner_email,'') = COALESCE($2,'')`, [path, w.owner]);
     await logResourceAudit('delete_folder', { title: `${path} (${del.rowCount})`, file_name: '', category: path }, req.user.realAdminEmail || req.user.email || 'unknown');
     res.json({ success: true, deleted: del.rowCount });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -8114,12 +8119,28 @@ app.post('/api/resources/folder/move', authenticateToken, async (req, res) => {
     const upd = await pool.query(
       `UPDATE resources SET category = $1 || SUBSTRING(category FROM ${lenPlus1}), updated_at = CURRENT_TIMESTAMP
         WHERE (category = $2 OR category LIKE $2 || '/%') AND ${ownerCond}`, params);
-    if (!w.owner) {
-      try { await pool.query(`UPDATE resource_categories SET name = $1 || SUBSTRING(name FROM ${lenPlus1}) WHERE name = $2 OR name LIKE $2 || '/%'`, [newPath, path]); }
-      catch (e) { console.warn('[folder/move] category sync skipped:', e.message); }
-    }
+    try { await pool.query(`UPDATE resource_categories SET name = $1 || SUBSTRING(name FROM ${lenPlus1}) WHERE (name = $2 OR name LIKE $2 || '/%') AND COALESCE(owner_email,'') = COALESCE($3,'')`, [newPath, path, w.owner]); }
+    catch (e) { console.warn('[folder/move] category sync skipped:', e.message); }
     await logResourceAudit('move_folder', { title: `${path} → ${newPath}`, file_name: '', category: newPath }, req.user.realAdminEmail || req.user.email || 'unknown');
     res.json({ success: true, updated: upd.rowCount, newPath });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/resources/folder/create { zone, path, name } — create an empty folder at `path` (a managed
+// category in that zone). Shared = resources:manage; personal = owner. Idempotent.
+app.post('/api/resources/folder/create', authenticateToken, async (req, res) => {
+  const w = await resolveResourceWrite(req, res); if (!w) return;
+  const parent = String(req.body.path || '').trim().replace(/^\/+|\/+$/g, '');
+  const name = String(req.body.name || '').trim();
+  if (!name || name.includes('/')) return res.status(400).json({ error: 'invalid folder name' });
+  const full = parent ? `${parent}/${name}` : name;
+  try {
+    await pool.query(
+      `INSERT INTO resource_categories (name, owner_email, sort_order)
+       SELECT $1, $2, COALESCE((SELECT MAX(sort_order)+1 FROM resource_categories),0)
+       WHERE NOT EXISTS (SELECT 1 FROM resource_categories WHERE name=$1 AND COALESCE(owner_email,'')=COALESCE($2,''))`,
+      [full, w.owner]);
+    res.json({ success: true, path: full });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -8127,7 +8148,7 @@ app.post('/api/resources/folder/move', authenticateToken, async (req, res) => {
 app.get('/api/resource-categories', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'resources:view'))) return;
   try {
-    const rows = (await pool.query(`SELECT id, name, sort_order FROM resource_categories ORDER BY sort_order, name`)).rows;
+    const rows = (await pool.query(`SELECT id, name, sort_order FROM resource_categories WHERE owner_email IS NULL ORDER BY sort_order, name`)).rows;
     res.json({ categories: rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -8137,8 +8158,10 @@ app.post('/api/resource-categories', authenticateToken, async (req, res) => {
   if (!name) return res.status(400).json({ error: 'name required' });
   try {
     const r = await pool.query(
-      `INSERT INTO resource_categories (name, sort_order) VALUES ($1, COALESCE((SELECT MAX(sort_order)+1 FROM resource_categories), 0))
-       ON CONFLICT (name) DO NOTHING RETURNING id`, [name]);
+      `INSERT INTO resource_categories (name, owner_email, sort_order)
+       SELECT $1, NULL, COALESCE((SELECT MAX(sort_order)+1 FROM resource_categories), 0)
+       WHERE NOT EXISTS (SELECT 1 FROM resource_categories WHERE name=$1 AND owner_email IS NULL)
+       RETURNING id`, [name]);
     res.json({ success: true, id: r.rows[0]?.id || null });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
