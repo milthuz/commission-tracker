@@ -456,6 +456,11 @@ async function initializeDatabase() {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_resources_category ON resources(category)`);
+    // owner_email: NULL = the shared/common library; non-NULL = that user's private "My files" zone.
+    await pool.query(`ALTER TABLE resources ADD COLUMN IF NOT EXISTS owner_email VARCHAR(255)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_resources_owner ON resources(owner_email)`);
+    // Nested folder paths (e.g. "A/B/C") can exceed the original 150 chars — widen the path columns.
+    await pool.query(`ALTER TABLE resources ALTER COLUMN category TYPE VARCHAR(500)`);
     // Generic app settings (key/value). Used for the configurable resources storage quota.
     await pool.query(`CREATE TABLE IF NOT EXISTS app_settings (key VARCHAR(100) PRIMARY KEY, value TEXT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
     await pool.query(`INSERT INTO app_settings (key, value) VALUES ('resources_storage_limit_bytes', '5368709120') ON CONFLICT DO NOTHING`); // default 5 GB
@@ -470,6 +475,7 @@ async function initializeDatabase() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    await pool.query(`ALTER TABLE resource_categories ALTER COLUMN name TYPE VARCHAR(500)`);
     // Audit journal — one row per resource added or deleted (who, what, when).
     await pool.query(`
       CREATE TABLE IF NOT EXISTS resource_audit (
@@ -7662,28 +7668,55 @@ async function ensureResourceRoom(res, addBytes, uploaderEmail) {
   return true;
 }
 
-// GET /api/resources?q=&category= — metadata only (never the blob). Returns the distinct categories too.
+// Two zones: the shared/common library (owner_email IS NULL) and each user's private
+// "My files" (owner_email = their email). Helpers below keep the scoping in one place.
+const resourceZone = (req) => (String(req.query.zone || req.body?.zone || 'shared').toLowerCase() === 'personal' ? 'personal' : 'shared');
+const resourceMe = (req) => (req.user.realAdminEmail || req.user.email || '').toLowerCase() || null;
+
+// GET /api/resources?q=&zone= — metadata only (never the blob). Returns the distinct categories too.
 app.get('/api/resources', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'resources:view'))) return;
   const q = String(req.query.q || '').trim();
-  const category = String(req.query.category || '').trim();
+  const zone = resourceZone(req);
+  const me = resourceMe(req);
   try {
     const where = [], params = [];
+    // Zone scope. Personal = ONLY my own files (private); shared = the common library.
+    if (zone === 'personal') { params.push(me || ''); where.push(`LOWER(owner_email) = $${params.length}`); }
+    else { where.push(`owner_email IS NULL`); }
     if (q) { params.push(`%${q}%`); where.push(`(title ILIKE $${params.length} OR description ILIKE $${params.length} OR array_to_string(tags, ',') ILIKE $${params.length})`); }
-    if (category) { params.push(category); where.push(`category = $${params.length}`); }
     const sql = `
       SELECT id, title, description, category, tags, file_name, mime_type, file_size, uploaded_by, created_at, updated_at
-        FROM resources ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+        FROM resources WHERE ${where.join(' AND ')}
        ORDER BY category NULLS LAST, title`;
     const rows = (await pool.query(sql, params)).rows;
-    // Prefer the admin-managed category structure; fall back to categories actually in use.
-    let categories = (await pool.query(`SELECT name FROM resource_categories ORDER BY sort_order, name`)).rows.map(r => r.name);
-    if (!categories.length) {
-      categories = (await pool.query(`SELECT DISTINCT category FROM resources WHERE COALESCE(category,'') <> '' ORDER BY category`)).rows.map(r => r.category);
+    let categories;
+    if (zone === 'personal') {
+      categories = (await pool.query(`SELECT DISTINCT category FROM resources WHERE LOWER(owner_email)=$1 AND COALESCE(category,'')<>'' ORDER BY category`, [me || ''])).rows.map(r => r.category);
+    } else {
+      // Prefer the admin-managed category structure; fall back to shared categories actually in use.
+      categories = (await pool.query(`SELECT name FROM resource_categories ORDER BY sort_order, name`)).rows.map(r => r.name);
+      if (!categories.length) {
+        categories = (await pool.query(`SELECT DISTINCT category FROM resources WHERE owner_email IS NULL AND COALESCE(category,'') <> '' ORDER BY category`)).rows.map(r => r.category);
+      }
     }
-    res.json({ resources: rows, categories });
+    res.json({ resources: rows, categories, zone });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// Resolve the write zone + enforce its permission. Shared needs resources:manage; personal only
+// needs resources:view (it's the user's own space). Returns {zone, owner} or null (403 already sent).
+async function resolveResourceWrite(req, res) {
+  const zone = resourceZone(req);
+  const me = resourceMe(req);
+  if (zone === 'personal') {
+    if (!me) { res.status(400).json({ error: 'no user identity' }); return null; }
+    if (!(await requirePerm(req, res, 'resources:view'))) return null;
+    return { zone, owner: me };
+  }
+  if (!(await requirePerm(req, res, 'resources:manage'))) return null;
+  return { zone, owner: null };
+}
 
 // GET /api/resources/storage — current usage + configured limit.
 app.get('/api/resources/storage', authenticateToken, async (req, res) => {
@@ -7817,7 +7850,7 @@ app.get('/api/resources/:id/download', authenticateToken, async (req, res) => {
 
 // POST /api/resources — upload a new resource (multipart: file + title/description/category/tags).
 app.post('/api/resources', authenticateToken, uploadResource.single('file'), async (req, res) => {
-  if (!(await requirePerm(req, res, 'resources:manage'))) return;
+  const w = await resolveResourceWrite(req, res); if (!w) return;
   const file = req.file;
   const title = String(req.body.title || '').trim();
   if (!file) return res.status(400).json({ error: 'file required (multipart field "file")' });
@@ -7827,10 +7860,10 @@ app.post('/api/resources', authenticateToken, uploadResource.single('file'), asy
     const actor = req.user.realAdminEmail || req.user.email || 'unknown';
     const category = String(req.body.category || '').trim();
     const r = await pool.query(
-      `INSERT INTO resources (title, description, category, tags, file_name, mime_type, file_size, file_data, uploaded_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+      `INSERT INTO resources (title, description, category, tags, file_name, mime_type, file_size, file_data, uploaded_by, owner_email)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
       [title, String(req.body.description || '').trim(), category,
-       parseTags(req.body.tags), file.originalname, file.mimetype, file.size, file.buffer, actor]
+       parseTags(req.body.tags), file.originalname, file.mimetype, file.size, file.buffer, actor, w.owner]
     );
     await logResourceAudit('add', { id: r.rows[0].id, title, file_name: file.originalname, category }, actor);
     res.json({ success: true, id: r.rows[0].id });
@@ -7839,7 +7872,7 @@ app.post('/api/resources', authenticateToken, uploadResource.single('file'), asy
 
 // POST /api/resources/bulk — upload many files at once (shared category/tags; title = file name).
 app.post('/api/resources/bulk', authenticateToken, uploadResource.array('files', 50), async (req, res) => {
-  if (!(await requirePerm(req, res, 'resources:manage'))) return;
+  const w = await resolveResourceWrite(req, res); if (!w) return;
   const files = req.files || [];
   if (!files.length) return res.status(400).json({ error: 'files required (multipart field "files")' });
   if (!(await ensureResourceRoom(res, files.reduce((s, f) => s + f.size, 0), req.user.realAdminEmail || req.user.email))) return;
@@ -7851,9 +7884,9 @@ app.post('/api/resources/bulk', authenticateToken, uploadResource.array('files',
     for (const f of files) {
       const title = f.originalname.replace(/\.[^.]+$/, '');
       const r = await pool.query(
-        `INSERT INTO resources (title, description, category, tags, file_name, mime_type, file_size, file_data, uploaded_by)
-         VALUES ($1, '', $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
-        [title, category, tags, f.originalname, f.mimetype, f.size, f.buffer, actor]);
+        `INSERT INTO resources (title, description, category, tags, file_name, mime_type, file_size, file_data, uploaded_by, owner_email)
+         VALUES ($1, '', $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+        [title, category, tags, f.originalname, f.mimetype, f.size, f.buffer, actor, w.owner]);
       await logResourceAudit('add', { id: r.rows[0].id, title, file_name: f.originalname, category }, actor);
       added++;
     }
@@ -7887,7 +7920,7 @@ const zipUpload = (req, res, next) => uploadZip.single('file')(req, res, (err) =
   next();
 });
 app.post('/api/resources/import-zip', authenticateToken, zipUpload, async (req, res) => {
-  if (!(await requirePerm(req, res, 'resources:manage'))) return;
+  const w = await resolveResourceWrite(req, res); if (!w) return;
   if (!req.file) return res.status(400).json({ error: 'file required (a .zip)' });
   const actor = req.user.realAdminEmail || req.user.email || 'unknown';
   let entries;
@@ -7929,11 +7962,12 @@ app.post('/api/resources/import-zip', authenticateToken, zipUpload, async (req, 
         const ext = (base.split('.').pop() || '').toLowerCase();
         const title = base.replace(/\.[^.]+$/, '');
         const r = await pool.query(
-          `INSERT INTO resources (title, description, category, tags, file_name, mime_type, file_size, file_data, uploaded_by)
-           VALUES ($1, '', $2, '{}', $3, $4, $5, $6, $7) RETURNING id`,
-          [title, category, base, EXT_MIME[ext] || 'application/octet-stream', data.length, data, actor]);
+          `INSERT INTO resources (title, description, category, tags, file_name, mime_type, file_size, file_data, uploaded_by, owner_email)
+           VALUES ($1, '', $2, '{}', $3, $4, $5, $6, $7, $8) RETURNING id`,
+          [title, category, base, EXT_MIME[ext] || 'application/octet-stream', data.length, data, actor, w.owner]);
         await logResourceAudit('add', { id: r.rows[0].id, title, file_name: base, category }, actor);
-        if (category && !seenCats.has(category)) {
+        // Register the managed category only for the SHARED library (personal folders are derived from files).
+        if (category && w.owner == null && !seenCats.has(category)) {
           seenCats.add(category);
           await pool.query(
             `INSERT INTO resource_categories (name, sort_order) VALUES ($1, COALESCE((SELECT MAX(sort_order)+1 FROM resource_categories),0)) ON CONFLICT (name) DO NOTHING`,
@@ -7945,9 +7979,29 @@ app.post('/api/resources/import-zip', authenticateToken, zipUpload, async (req, 
   })().catch(e => console.warn('[import-zip] background error:', e.message));
 });
 
+// Load a resource and authorize a mutation on it. Personal files (owner_email set) can only be
+// touched by their owner (private). Shared files require `sharedPerm` ('resources:manage' or the
+// literal 'admin'). Returns the row, or null after sending the right 403/404.
+async function authorizeResourceMutation(req, res, sharedPerm) {
+  const me = resourceMe(req);
+  const row = (await pool.query(`SELECT id, title, file_name, category, owner_email FROM resources WHERE id=$1`, [req.params.id])).rows[0];
+  if (!row) { res.status(404).json({ error: 'not found' }); return null; }
+  const owner = (row.owner_email || '').toLowerCase();
+  if (owner) {
+    if (owner !== me) { res.status(403).json({ error: 'forbidden' }); return null; } // someone else's private file
+    return row;
+  }
+  if (sharedPerm === 'admin') {
+    if (!(req.user.isAdmin === true && !req.user.impersonating)) { res.status(403).json({ error: 'Admin required' }); return null; }
+    return row;
+  }
+  if (!(await requirePerm(req, res, sharedPerm))) return null;
+  return row;
+}
+
 // PUT /api/resources/:id — edit metadata; optionally replace the file.
 app.put('/api/resources/:id', authenticateToken, uploadResource.single('file'), async (req, res) => {
-  if (!(await requirePerm(req, res, 'resources:manage'))) return;
+  if (!(await authorizeResourceMutation(req, res, 'resources:manage'))) return;
   try {
     const sets = ['title = $2', 'description = $3', 'category = $4', 'tags = $5', 'updated_at = CURRENT_TIMESTAMP'];
     const params = [req.params.id, String(req.body.title || '').trim(), String(req.body.description || '').trim(),
@@ -7962,11 +8016,9 @@ app.put('/api/resources/:id', authenticateToken, uploadResource.single('file'), 
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// DELETE /api/resources/:id — ADMIN ONLY (managers can add/edit but not delete). Audited.
+// DELETE /api/resources/:id — shared library = ADMIN ONLY; personal file = its owner. Audited.
 app.delete('/api/resources/:id', authenticateToken, async (req, res) => {
-  if (!(req.user.isAdmin === true && !req.user.impersonating)) {
-    return res.status(403).json({ error: 'Admin required to delete resources' });
-  }
+  if (!(await authorizeResourceMutation(req, res, 'admin'))) return;
   try {
     const r = (await pool.query(`DELETE FROM resources WHERE id = $1 RETURNING id, title, file_name, category`, [req.params.id])).rows[0];
     if (!r) return res.status(404).json({ error: 'not found' });
@@ -7988,6 +8040,58 @@ app.post('/api/resources/delete-all', authenticateToken, async (req, res) => {
     await pool.query(`DELETE FROM resource_categories`);
     await logResourceAudit('delete_all', { title: `ALL RESOURCES (${n})`, file_name: '', category: '' }, req.user.realAdminEmail || req.user.email || 'unknown');
     res.json({ success: true, deleted: n });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/resources/folder/rename { zone, path, newName } — rename a folder (its last segment),
+// re-pathing every file beneath it. Shared = resources:manage; personal = owner only.
+app.post('/api/resources/folder/rename', authenticateToken, async (req, res) => {
+  const w = await resolveResourceWrite(req, res); if (!w) return;
+  const path = String(req.body.path || '').trim().replace(/^\/+|\/+$/g, '');
+  const newName = String(req.body.newName || '').trim();
+  if (!path) return res.status(400).json({ error: 'path required' });
+  if (!newName || newName.includes('/')) return res.status(400).json({ error: 'invalid folder name' });
+  const parent = path.split('/').slice(0, -1).join('/');
+  const newPath = parent ? `${parent}/${newName}` : newName;
+  if (newPath === path) return res.json({ success: true, updated: 0 });
+  const lenPlus1 = path.length + 1; // integer (derived from input length) — safe to inline
+  const params = [newPath, path];
+  let ownerCond = `owner_email IS NULL`;
+  if (w.owner) { params.push(w.owner); ownerCond = `LOWER(owner_email) = $3`; }
+  try {
+    // Re-path the folder + everything under it. SUBSTRING keeps each row's trailing remainder
+    // ('' for the folder itself, '/sub/file' for descendants).
+    const upd = await pool.query(
+      `UPDATE resources SET category = $1 || SUBSTRING(category FROM ${lenPlus1}), updated_at = CURRENT_TIMESTAMP
+        WHERE (category = $2 OR category LIKE $2 || '/%') AND ${ownerCond}`, params);
+    if (!w.owner) {
+      // Keep the managed-category names in sync (best-effort — a name collision just no-ops).
+      try {
+        await pool.query(`UPDATE resource_categories SET name = $1 || SUBSTRING(name FROM ${lenPlus1}) WHERE name = $2 OR name LIKE $2 || '/%'`, [newPath, path]);
+      } catch (e) { console.warn('[folder/rename] category sync skipped:', e.message); }
+    }
+    await logResourceAudit('rename_folder', { title: `${path} → ${newPath}`, file_name: '', category: newPath }, req.user.realAdminEmail || req.user.email || 'unknown');
+    res.json({ success: true, updated: upd.rowCount, newPath });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/resources/folder/delete { zone, path } — delete a folder + everything under it.
+// Shared = resources:manage; personal = owner only. Audited (one summary row).
+app.post('/api/resources/folder/delete', authenticateToken, async (req, res) => {
+  const w = await resolveResourceWrite(req, res); if (!w) return;
+  const path = String(req.body.path || '').trim().replace(/^\/+|\/+$/g, '');
+  if (!path) return res.status(400).json({ error: 'path required' });
+  const params = [path];
+  let ownerCond = `owner_email IS NULL`;
+  if (w.owner) { params.push(w.owner); ownerCond = `LOWER(owner_email) = $2`; }
+  try {
+    const del = await pool.query(
+      `DELETE FROM resources WHERE (category = $1 OR category LIKE $1 || '/%') AND ${ownerCond} RETURNING id`, params);
+    if (!w.owner) {
+      await pool.query(`DELETE FROM resource_categories WHERE name = $1 OR name LIKE $1 || '/%'`, [path]);
+    }
+    await logResourceAudit('delete_folder', { title: `${path} (${del.rowCount})`, file_name: '', category: path }, req.user.realAdminEmail || req.user.email || 'unknown');
+    res.json({ success: true, deleted: del.rowCount });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
