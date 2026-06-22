@@ -5616,16 +5616,18 @@ function isDarkHex(hex) {
 // Pick the right language out of a {fr,en} value (falls back across languages, accepts plain strings).
 const deckTxt = (v, lang) => (v && typeof v === 'object') ? String(v[lang] || v.fr || v.en || '') : String(v || '');
 
-// Render the saved deck into `out` (adds one page per slide).
+// Render the saved deck into `out` (adds one page per slide). Each slide is a FREE CANVAS of
+// absolutely-positioned elements (text / image / rect) in PDF points with a TOP-LEFT origin —
+// the exact same coordinate model the on-screen editor uses, so what you see is what you get.
 async function renderCustomDeck(out, deck, lang) {
   const { rgb, StandardFonts } = require('pdf-lib');
-  const W = 792, H = 612, PAD = 54;
+  const W = 792, H = 612;
   const helv = await out.embedFont(StandardFonts.Helvetica);
   const helvB = await out.embedFont(StandardFonts.HelveticaBold);
-  const orange = rgb(0xfe / 255, 0x65 / 255, 0x23 / 255);
+  const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
   const assetCache = new Map();
   const loadAsset = async (id) => {
-    if (!id && id !== 0) return null;
+    if (id == null) return null;
     if (assetCache.has(id)) return assetCache.get(id);
     let img = null;
     try {
@@ -5639,65 +5641,39 @@ async function renderCustomDeck(out, deck, lang) {
     assetCache.set(id, img);
     return img;
   };
-  const xFor = (align, w, contentW) => align === 'center' ? PAD + (contentW - w) / 2 : align === 'right' ? PAD + contentW - w : PAD;
 
   for (const slide of deck.slides) {
     const page = out.addPage([W, H]);
     page.drawRectangle({ x: 0, y: 0, width: W, height: H, color: hexToPdfRgb(slide.bg, rgb(1, 1, 1)) });
-    const defColor = isDarkHex(slide.bg) ? rgb(1, 1, 1) : rgb(0x1c / 255, 0x24 / 255, 0x34 / 255);
-    const contentW = W - PAD * 2;
-    let y = H - PAD;
-    for (const b of (Array.isArray(slide.blocks) ? slide.blocks : [])) {
-      if (y < PAD) break; // ran past the bottom — clip the rest (editor warns about overflow)
-      const color = b.color ? hexToPdfRgb(b.color, defColor) : defColor;
-      if (b.type === 'heading' || b.type === 'text') {
-        const isH = b.type === 'heading';
-        const size = b.size || (isH ? 26 : 13);
-        const font = isH ? helvB : helv;
-        const lh = size * (isH ? 1.25 : 1.5);
-        for (const line of wrapPdfLines(font, deckTxt(b.text, lang), size, contentW)) {
-          if (y < PAD) break;
-          page.drawText(line, { x: xFor(b.align, font.widthOfTextAtSize(line, size), contentW), y: y - size, size, font, color });
-          y -= lh;
+    // optional full-page background image (cover-fit, centered)
+    if (slide.bgImageId != null) {
+      const img = await loadAsset(slide.bgImageId);
+      if (img) {
+        const s = Math.max(W / img.width, H / img.height);
+        const iw = img.width * s, ih = img.height * s;
+        page.drawImage(img, { x: (W - iw) / 2, y: (H - ih) / 2, width: iw, height: ih });
+      }
+    }
+    for (const el of (Array.isArray(slide.elements) ? slide.elements : [])) {
+      const x = num(el.x), y = num(el.y), w = num(el.w), h = num(el.h);
+      if (el.type === 'rect') {
+        page.drawRectangle({ x, y: H - y - h, width: w, height: h, color: hexToPdfRgb(el.color, rgb(0.88, 0.9, 0.94)) });
+      } else if (el.type === 'image') {
+        const img = await loadAsset(el.assetId);
+        if (img) page.drawImage(img, { x, y: H - y - h, width: w, height: h });
+      } else if (el.type === 'text') {
+        const size = Math.max(4, num(el.size) || 16);
+        const font = el.bold ? helvB : helv;
+        const color = hexToPdfRgb(el.color, rgb(0x1c / 255, 0x24 / 255, 0x34 / 255));
+        const boxW = w || (W - x);
+        const lh = size * 1.3;
+        let ty = y; // top of the text box (top-left origin); convert per line to pdf-lib's bottom-left
+        for (const line of wrapPdfLines(font, deckTxt(el.text, lang), size, boxW)) {
+          const lw = font.widthOfTextAtSize(line, size);
+          const lx = el.align === 'center' ? x + (boxW - lw) / 2 : el.align === 'right' ? x + boxW - lw : x;
+          page.drawText(line, { x: lx, y: H - ty - size, size, font, color });
+          ty += lh;
         }
-        y -= 6;
-      } else if (b.type === 'bullets') {
-        const size = b.size || 13;
-        for (const it of (Array.isArray(b.items) ? b.items : [])) {
-          const lines = wrapPdfLines(helv, deckTxt(it, lang), size, contentW - 18);
-          lines.forEach((line, i) => {
-            if (y < PAD) return;
-            if (i === 0) page.drawCircle({ x: PAD + 3, y: y - size / 2 - 1, size: 2.5, color: orange });
-            page.drawText(line, { x: PAD + 18, y: y - size, size, font: helv, color });
-            y -= size * 1.5;
-          });
-        }
-        y -= 6;
-      } else if (b.type === 'stats') {
-        const items = Array.isArray(b.items) ? b.items : [];
-        const colW = contentW / Math.max(1, items.length);
-        let sx = PAD;
-        for (const it of items) {
-          page.drawText(winAnsiSafe(deckTxt(it.value, lang)), { x: sx, y: y - 26, size: 26, font: helvB, color: orange });
-          page.drawText(winAnsiSafe(deckTxt(it.label, lang)), { x: sx, y: y - 42, size: 10, font: helv, color: defColor });
-          sx += colW;
-        }
-        y -= 58;
-      } else if (b.type === 'image') {
-        const img = await loadAsset(b.assetId);
-        if (img) {
-          const pct = Math.min(100, Math.max(10, b.widthPct || 60)) / 100;
-          let iw = contentW * pct, ih = iw * (img.height / img.width);
-          const maxH = y - PAD;
-          if (ih > maxH && maxH > 0) { ih = maxH; iw = ih * (img.width / img.height); }
-          page.drawImage(img, { x: xFor(b.align, iw, contentW), y: y - ih, width: iw, height: ih });
-          y -= ih + 12;
-        }
-      } else if (b.type === 'divider') {
-        page.drawRectangle({ x: PAD, y: y - 1, width: contentW, height: 1.2, color: b.color ? hexToPdfRgb(b.color, defColor) : rgb(0.82, 0.85, 0.9) });
-        y -= 14;
-      } else if (b.type === 'spacer') {
-        y -= Math.max(2, Math.min(300, b.height || 16));
       }
     }
   }
