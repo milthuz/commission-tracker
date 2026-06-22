@@ -5596,38 +5596,54 @@ async function fetchRenderedPresentation(clientName, lang) {
 // Presentation source, in order of preference: (1) the rendered Claude Design document from the
 // Puppeteer service (PROPOSAL_RENDER_URL) — personalized + branded, REPLACES cover+deck;
 // (2) generated pdf-lib cover + in-app custom deck; (3) cover + committed company_{lang}.pdf.
-async function buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes }) {
+// Returns { bytes, presentationPageCount, estimatePageCount }.
+// selectedPages: optional 1-based indices into the PRESENTATION to include (null/empty = all).
+// includeEstimate: append the Zoho estimate PDF (default true).
+async function buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes, selectedPages, includeEstimate = true }) {
   const fs = require('fs');
   const { PDFDocument } = require('pdf-lib');
   const out = await PDFDocument.create();
 
-  // (1) External design-render service — the whole presentation (it has its own cover).
+  // (1) Build the full presentation in its own doc (so we can pick pages from it).
+  let presDoc = null;
   const rendered = await fetchRenderedPresentation(clientName, lang);
   if (rendered) {
-    try { const rd = await PDFDocument.load(rendered); (await out.copyPages(rd, rd.getPageIndices())).forEach(p => out.addPage(p)); }
-    catch (e) { console.warn('[proposal] rendered presentation merge failed, falling back:', e.message); }
+    try { presDoc = await PDFDocument.load(rendered); }
+    catch (e) { console.warn('[proposal] rendered presentation load failed, falling back:', e.message); }
   }
-
-  // Fallback (only if the render service produced nothing): pdf-lib cover + committed company deck.
-  if (out.getPageCount() === 0) {
+  if (!presDoc) {
+    // Fallback (render service unavailable): pdf-lib cover + committed company deck.
+    presDoc = await PDFDocument.create();
     const dateStr = new Date().toLocaleDateString(lang === 'en' ? 'en-CA' : 'fr-CA', { year: 'numeric', month: 'long', day: 'numeric' });
     const photoBytes = fs.readFileSync(require('path').join(PROPOSAL_ASSETS, 'product_shot.png'));
     let brandLogoBytes = null;
     try { brandLogoBytes = fs.readFileSync(require('path').join(PROPOSAL_ASSETS, 'cluster_logo.png')); } catch (_e) { /* optional */ }
-    await addProposalCover(out, { lang, clientName, repName, title, dateStr, photoBytes, logoBytes, brandLogoBytes });
+    await addProposalCover(presDoc, { lang, clientName, repName, title, dateStr, photoBytes, logoBytes, brandLogoBytes });
     const compBytes = fs.readFileSync(require('path').join(PROPOSAL_ASSETS, lang === 'en' ? 'company_en.pdf' : 'company_fr.pdf'));
     const comp = await PDFDocument.load(compBytes);
-    (await out.copyPages(comp, comp.getPageIndices())).forEach(p => out.addPage(p));
+    (await presDoc.copyPages(comp, comp.getPageIndices())).forEach(p => presDoc.addPage(p));
   }
-  // the Zoho estimate (best-effort — skip if unreadable)
-  if (estimateId) {
+
+  const presentationPageCount = presDoc.getPageCount();
+  // Pick the presentation pages to include (all if no valid selection given).
+  let idxs = presDoc.getPageIndices();
+  if (Array.isArray(selectedPages) && selectedPages.length) {
+    const want = new Set(selectedPages.map(n => Number(n) - 1));
+    const filtered = idxs.filter(i => want.has(i));
+    if (filtered.length) idxs = filtered;
+  }
+  (await out.copyPages(presDoc, idxs)).forEach(p => out.addPage(p));
+
+  // (2) The Zoho estimate (best-effort), unless the rep excluded it.
+  let estimatePageCount = 0;
+  if (includeEstimate && estimateId) {
     const est = await fetchEstimatePdfBytes(estimateId);
     if (est && est.buffer) {
-      try { const ed = await PDFDocument.load(est.buffer); (await out.copyPages(ed, ed.getPageIndices())).forEach(p => out.addPage(p)); }
+      try { const ed = await PDFDocument.load(est.buffer); estimatePageCount = ed.getPageCount(); (await out.copyPages(ed, ed.getPageIndices())).forEach(p => out.addPage(p)); }
       catch (e) { console.warn('[proposal] estimate PDF merge skipped:', e.message); }
     }
   }
-  return await out.save();
+  return { bytes: await out.save(), presentationPageCount, estimatePageCount };
 }
 
 // Customer name + email for an estimate (used to prefill the email draft).
@@ -5707,12 +5723,18 @@ app.post('/api/proposals/prepare', authenticateToken, async (req, res) => {
     const det = await getEstimateDetail(estimateId);
     const clientName = (req.body.clientName || '').trim() || (det && det.customerName) || (lang === 'en' ? 'your business' : 'votre entreprise');
     const repName = req.user.name || req.user.email || '';
-    const pdf = await buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64) });
+    const selectedPages = Array.isArray(req.body.selectedPages) ? req.body.selectedPages.map(Number).filter(Boolean) : null;
+    const includeEstimate = req.body.includeEstimate !== false;
+    const built = await buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64), selectedPages, includeEstimate });
     const subject = lang === 'en' ? `Cluster POS proposal — ${clientName}` : `Proposition Cluster POS — ${clientName}`;
     const body = lang === 'en'
       ? `Hello,\n\nThank you for your interest in Cluster POS. Please find attached our proposal prepared for ${clientName}, including your quote.\n\nI'd be glad to walk you through it — just reply to this email.\n\nBest regards,\n${repName}\nCluster Systems`
       : `Bonjour,\n\nMerci de votre intérêt envers Cluster POS. Vous trouverez ci-joint notre proposition préparée pour ${clientName}, incluant votre soumission.\n\nJe me ferai un plaisir de vous la présenter — répondez simplement à ce courriel.\n\nCordialement,\n${repName}\nCluster Systems`;
-    res.json({ pdfBase64: Buffer.from(pdf).toString('base64'), fileName: proposalFileName(clientName), email: { to: (det && det.email) || '', subject, body } });
+    res.json({
+      pdfBase64: Buffer.from(built.bytes).toString('base64'), fileName: proposalFileName(clientName),
+      presentationPageCount: built.presentationPageCount, estimatePageCount: built.estimatePageCount,
+      email: { to: (det && det.email) || '', subject, body },
+    });
   } catch (e) { console.warn('[proposal/prepare]', e.message); res.status(500).json({ error: e.message }); }
 });
 
@@ -5730,7 +5752,10 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
     const det = await getEstimateDetail(estimateId);
     const clientName = (req.body.clientName || '').trim() || (det && det.customerName) || '';
     const repName = req.user.name || req.user.email || '';
-    const pdf = await buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64) });
+    const selectedPages = Array.isArray(req.body.selectedPages) ? req.body.selectedPages.map(Number).filter(Boolean) : null;
+    const includeEstimate = req.body.includeEstimate !== false;
+    const built = await buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64), selectedPages, includeEstimate });
+    const pdf = built.bytes;
     // Mark the estimate "sent" in Zoho (enables client acceptance + viewed/accepted tracking),
     // then try to surface its accept link to add as a button in our email.
     await markEstimateSent(estimateId);
