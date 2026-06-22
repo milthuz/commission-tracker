@@ -82,6 +82,9 @@ const PERMISSION_CATALOG = [
 
   // Demo (AppStream-streamed Kaizen POS for sales demos)
   { key: 'demo:kaizen',                label: 'Access the Kaizen POS demo (streamed POS)',                      category: 'Demo' },
+
+  // Proposals (build + send a client proposal from a Zoho Books estimate)
+  { key: 'proposals:send',             label: 'Build & send client proposals (from Zoho estimates)',            category: 'Proposals' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -5396,6 +5399,56 @@ async function fetchInvoicePdfBytes(invoiceNumber) {
   }
   return { buffer: Buffer.from(r.data), contentType: r.headers['content-type'] || 'application/pdf' };
 }
+
+// Fetch the rendered PDF bytes of a Zoho Books ESTIMATE (devis) by its id.
+async function fetchEstimatePdfBytes(estimateId) {
+  const { accessToken, apiDomain } = await getAdminBooksAuth();
+  const r = await axios.get(`${apiDomain}/books/v3/estimates/${estimateId}`, {
+    params: { organization_id: process.env.ZOHO_ORG_ID, accept: 'pdf' },
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+    responseType: 'arraybuffer',
+    validateStatus: () => true,
+  });
+  if (r.status !== 200) {
+    const text = Buffer.isBuffer(r.data) ? r.data.toString('utf8').slice(0, 500) : JSON.stringify(r.data).slice(0, 500);
+    return { error: 'zoho_error', status: r.status, body: text };
+  }
+  return { buffer: Buffer.from(r.data), contentType: r.headers['content-type'] || 'application/pdf' };
+}
+
+// GET /api/proposals/estimates?q= — list recent Zoho Books estimates (devis) for the rep to pick from.
+// (Phase 1 of the proposal builder.) Returns light metadata; the PDF + customer email are fetched at prepare time.
+app.get('/api/proposals/estimates', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'proposals:send'))) return;
+  try {
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    const params = { organization_id: process.env.ZOHO_ORG_ID, sort_column: 'date', sort_order: 'D', per_page: 50 };
+    const q = String(req.query.q || '').trim();
+    if (q) params.search_text = q;
+    const mine = String(req.query.mine || '') === '1';
+    // Best-effort rep scoping: filter by the rep's salesperson name when we can resolve it.
+    if (mine && req.user.name) params.salesperson_name = req.user.name;
+    const r = await axios.get(`${apiDomain}/books/v3/estimates`, {
+      params, headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
+    });
+    if (r.status !== 200) {
+      const detail = typeof r.data === 'string' ? r.data.slice(0, 300) : JSON.stringify(r.data).slice(0, 300);
+      return res.status(502).json({ error: 'zoho_error', detail });
+    }
+    const estimates = (r.data.estimates || []).map(e => ({
+      estimateId: e.estimate_id,
+      number: e.estimate_number,
+      customerName: e.customer_name,
+      total: e.total,
+      currency: e.currency_code,
+      date: e.date,
+      status: e.status,
+      salesperson: e.salesperson_name || '',
+      reference: e.reference_number || '',
+    }));
+    res.json({ estimates });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // GET /api/invoices/:invoiceNumber/pdf — download
 app.get('/api/invoices/:invoiceNumber/pdf', authenticateToken, async (req, res) => {
