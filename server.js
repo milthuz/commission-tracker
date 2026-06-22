@@ -5956,6 +5956,90 @@ app.delete('/api/proposals/deck/assets/:id', authenticateToken, async (req, res)
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Make sure a brand image (shipped in assets/proposals) exists as a deck asset; return its id.
+async function ensureBrandAsset(markerName, diskName) {
+  const r = await pool.query(`SELECT id FROM proposal_deck_assets WHERE filename = $1 ORDER BY id LIMIT 1`, [markerName]);
+  if (r.rows[0]) return r.rows[0].id;
+  const fs = require('fs'), path = require('path');
+  const buf = fs.readFileSync(path.join(PROPOSAL_ASSETS, diskName));
+  const ins = await pool.query(`INSERT INTO proposal_deck_assets (filename, mime_type, data, created_by) VALUES ($1,'image/png',$2,'system') RETURNING id`, [markerName, buf]);
+  return ins.rows[0].id;
+}
+
+// GET /api/proposals/deck/starter — a ready-made deck matching the existing Cluster company pages,
+// rebuilt as editable elements (the rep can then tweak everything). Does NOT save — the editor
+// loads it, the user reviews and Saves.
+app.get('/api/proposals/deck/starter', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'proposals:manage'))) return;
+  try {
+    const productId = await ensureBrandAsset('__cluster_product_shot.png', 'product_shot.png');
+    const NAVY = '#1c2434', BAND = '#12192d', ORANGE = '#fe6523', WHITE = '#ffffff', GREY = '#c7cfdb', GREYD = '#9fb0c4', PANEL = '#222d3d';
+    let n = 0; const id = () => `seed_${++n}`;
+    const T = (x, y, w, fr, en, o = {}) => ({ id: id(), type: 'text', x, y, w, h: 40, text: { fr, en }, size: o.size || 14, color: o.color || GREY, align: o.align || 'left', bold: !!o.bold });
+    const R = (x, y, w, h, color) => ({ id: id(), type: 'rect', x, y, w, h, color });
+    const IMG = (x, y, w, h, assetId) => ({ id: id(), type: 'image', x, y, w, h, assetId });
+    const kicker = (fr, en) => T(54, 46, 680, fr, en, { size: 11, color: ORANGE, bold: true });
+    const headline = (fr, en) => T(54, 70, 684, fr, en, { size: 30, color: WHITE, bold: true });
+    const body = (fr, en) => T(54, 128, 660, fr, en, { size: 14, color: GREY });
+    const band = () => [
+      R(0, 566, 792, 46, BAND),
+      T(54, 582, 520, '3 800+ Marchands  ·  5 500+ Systèmes PDV  ·  16+ ans', '3,800+ Merchants  ·  5,500+ POS systems  ·  16+ years', { size: 11, color: GREY }),
+      T(520, 584, 218, 'clusterpos.com  ·  CONFIDENTIEL', 'clusterpos.com  ·  CONFIDENTIAL', { size: 10, color: ORANGE, bold: true, align: 'right' }),
+    ];
+    const slide = (els) => ({ id: id(), bg: NAVY, bgImageId: null, elements: els });
+    const slides = [
+      slide([
+        kicker('QUI SOMMES-NOUS', 'ABOUT US'),
+        headline('Bâti pour les restaurants. Bâti pour durer.', 'Built for restaurants. Built to last.'),
+        body('Fondé en 2009 à Montréal, Cluster est un leader du PDV au Canada — pionnier du PDV mobile, au service des restaurateurs de toutes tailles.', 'Founded in Montreal in 2009, Cluster is a Canadian POS leader — a mobile-POS pioneer serving restaurateurs of every size.'),
+        T(54, 226, 684, '2009 Fondé à Montréal   ·   2011 Premier PDV sur iPod Touch   ·   2018 Première grande chaîne   ·   2023 Marché américain   ·   2026 3 800+ marchands', '2009 Founded in Montreal   ·   2011 First POS on iPod Touch   ·   2018 First major chain   ·   2023 US market   ·   2026 3,800+ merchants', { size: 12, color: WHITE }),
+        T(54, 296, 684, '2 G$+ traités par année        4,6 ★  (200+ avis Google)', '$2B+ processed yearly        4.6 ★  (200+ Google reviews)', { size: 16, color: ORANGE, bold: true }),
+        T(54, 360, 684, '« Bâti par des gens du métier, pour les restaurateurs — fièrement montréalais. »', '"Built by industry people, for restaurateurs — proudly Montreal-based."', { size: 16, color: GREY }),
+        ...band(),
+      ]),
+      slide([
+        kicker('APERÇU DU PRODUIT', 'PRODUCT OVERVIEW'),
+        headline('Conçu pour chaque type de restaurant.', 'Designed for every kind of restaurant.'),
+        R(427, 150, 311, 200, ORANGE),
+        IMG(430, 153, 305, 194, productId),
+        T(54, 165, 340, 'Service Rapide — flux optimisés QSR & fast-casual.', 'Quick Service — streamlined flows for QSR & fast-casual.', { size: 14, color: WHITE, bold: true }),
+        T(54, 205, 340, 'Paiements intégrés, tarifs compétitifs. Rapports : ventes & inventaire en temps réel.', 'Integrated payments, competitive rates. Reports: real-time sales & inventory.', { size: 13, color: GREY }),
+        T(54, 280, 340, 'Service aux Tables — plan de salle complet, outils RH (pointage, horaires, paie).', 'Table Service — full floor-plan management, HR tools (time clock, scheduling, payroll).', { size: 14, color: WHITE, bold: true }),
+        T(54, 320, 340, 'Commandes en ligne web & mobile, directement dans le PDV.', 'Online ordering — web & mobile, straight into the POS.', { size: 13, color: GREY }),
+        ...band(),
+      ]),
+      slide([
+        kicker('SUPPORT & SLA', 'SUPPORT & SLA'),
+        headline('Niveaux de service & escalade', 'Service levels & escalation'),
+        T(54, 150, 684, 'P1 — Critique  ·  Panne bloquant les opérations  ·  Réponse < 7 min  ·  Résolution 1 heure', 'P1 — Critical  ·  Outage blocking operations  ·  Response < 7 min  ·  Resolution 1 hour', { size: 13, color: WHITE }),
+        T(54, 182, 684, 'P2 — Élevée  ·  Fonction majeure défaillante  ·  Réponse 30 min  ·  Résolution 4 heures', 'P2 — High  ·  Major feature down  ·  Response 30 min  ·  Resolution 4 hours', { size: 13, color: GREY }),
+        T(54, 214, 684, 'P3 — Moyenne  ·  Impact mineur, contournement  ·  Réponse 1 heure  ·  Résolution 8 h ouvrables', 'P3 — Medium  ·  Minor impact, workaround  ·  Response 1 hour  ·  Resolution 8 business hrs', { size: 13, color: WHITE }),
+        T(54, 246, 684, 'P4 — Faible  ·  Demande courante  ·  Réponse 4 heures  ·  Résolution 3 j ouvrables', 'P4 — Low  ·  Routine request  ·  Response 4 hours  ·  Resolution 3 business days', { size: 13, color: GREY }),
+        T(54, 360, 684, 'Escalade : N1 Support (Helpdesk) → N2 Spécialistes senior → N3 Gestionnaire TI → N4 Direction', 'Escalation: L1 Support (Helpdesk) → L2 Senior specialists → L3 IT Manager → L4 Leadership', { size: 13, color: ORANGE, bold: true }),
+        ...band(),
+      ]),
+      slide([
+        kicker('NOS CLIENTS', 'OUR CLIENTS'),
+        headline('Ils nous font confiance', 'Trusted by restaurateurs'),
+        body('Leur choix de Cluster témoigne de notre engagement à offrir une solution PDV fiable et performante pour les entreprises de toutes tailles.', 'Their choice of Cluster reflects our commitment to a reliable, high-performance POS for businesses of every size.'),
+        R(54, 220, 684, 150, PANEL),
+        T(64, 285, 664, 'Logos clients — remplace ce bloc par tes images.', 'Client logos — replace this block with your images.', { size: 13, color: GREYD, align: 'center' }),
+        T(54, 400, 684, '« De la cantine de quartier à la chaîne nationale — une plateforme qui grandit avec eux. »', '"From the corner café to the national chain — a platform that grows with them."', { size: 15, color: GREY }),
+        ...band(),
+      ]),
+      slide([
+        kicker('À VENIR EN 2026', 'COMING IN 2026'),
+        headline("L'avenir est proche.", 'The future is near.'),
+        body('PDV nouvelle génération — repensé de zéro pour les restaurateurs d\'aujourd\'hui et de demain.', "Next-generation POS — rebuilt from the ground up for today's and tomorrow's restaurateurs."),
+        T(54, 210, 330, 'Analytiques temps réel — ventes & performance à portée de main. Gestion à distance — menus & rapports depuis tout appareil.', 'Real-time analytics — sales & performance at your fingertips. Remote management — menus & reports from any device.', { size: 13, color: GREY }),
+        T(408, 210, 330, 'Ultra-rapide — 99,9 % de disponibilité, matériel abordable. Expérience repensée — interface modernisée, flux optimisés.', 'Lightning-fast — 99.9% uptime, affordable hardware. Reimagined experience — modernized UI, streamlined flows.', { size: 13, color: GREY }),
+        ...band(),
+      ]),
+    ];
+    res.json({ deck: { slides } });
+  } catch (e) { console.warn('[proposal/deck/starter]', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/proposals/deck/preview?lang=fr — render cover + the saved deck to a PDF (no estimate).
 app.get('/api/proposals/deck/preview', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'proposals:manage'))) return;
