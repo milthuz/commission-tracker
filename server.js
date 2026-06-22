@@ -472,6 +472,17 @@ async function initializeDatabase() {
     await pool.query(`INSERT INTO app_settings (key, value) VALUES ('resources_storage_limit_bytes', '5368709120') ON CONFLICT DO NOTHING`); // default 5 GB
     // Per-user storage quota for resources (by uploader email). No row = no personal limit.
     await pool.query(`CREATE TABLE IF NOT EXISTS user_storage_limits (email VARCHAR(255) PRIMARY KEY, limit_bytes BIGINT NOT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
+    // Proposals sent to clients (status board: who sent what; live status read from Zoho).
+    await pool.query(`CREATE TABLE IF NOT EXISTS proposals_sent (
+      id SERIAL PRIMARY KEY,
+      estimate_id VARCHAR(64) NOT NULL,
+      estimate_number VARCHAR(100),
+      customer_name VARCHAR(300),
+      rep_email VARCHAR(255),
+      to_email VARCHAR(255),
+      lang VARCHAR(5),
+      sent_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
     // Admin-managed category structure for the resources library.
     await pool.query(`
       CREATE TABLE IF NOT EXISTS resource_categories (
@@ -5603,6 +5614,54 @@ async function getEstimateDetail(estimateId) {
   return { customerName: e.customer_name || '', email, number: e.estimate_number || '' };
 }
 
+// Mark an estimate "sent" in Zoho (activates client tracking + acceptance). Best-effort.
+async function markEstimateSent(estimateId) {
+  try {
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    await axios.post(`${apiDomain}/books/v3/estimates/${estimateId}/status/sent`, null, {
+      params: { organization_id: process.env.ZOHO_ORG_ID },
+      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
+    });
+  } catch (e) { console.warn('[proposal] markSent:', e.message); }
+}
+
+// Best-effort accept/portal URL for an estimate. Zoho doesn't document a single field, so we scan
+// the estimate detail for a url-ish field, then the composed email content for a books.zoho link.
+async function getEstimateAcceptUrl(estimateId) {
+  try {
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    const headers = { Authorization: `Zoho-oauthtoken ${accessToken}` };
+    const params = { organization_id: process.env.ZOHO_ORG_ID };
+    const det = await axios.get(`${apiDomain}/books/v3/estimates/${estimateId}`, { params, headers, validateStatus: () => true });
+    const e = det.status === 200 ? (det.data.estimate || {}) : {};
+    for (const k of Object.keys(e)) {
+      if (/url|link/i.test(k) && typeof e[k] === 'string' && /^https?:\/\//.test(e[k])) return e[k];
+    }
+    const em = await axios.get(`${apiDomain}/books/v3/estimates/${estimateId}/email`, { params, headers, validateStatus: () => true });
+    const blob = JSON.stringify(em.data || '');
+    const m = blob.match(/https:\\?\/\\?\/[^"'\\ ]*(?:accept|secure|portal|ShowEstimate|estimates)[^"'\\ ]*/i);
+    if (m) return m[0].replace(/\\\//g, '/');
+  } catch (e) { console.warn('[proposal] acceptUrl:', e.message); }
+  return null;
+}
+
+// Live status of an estimate for the sent-proposals board.
+async function getEstimateStatus(estimateId) {
+  try {
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    const r = await axios.get(`${apiDomain}/books/v3/estimates/${estimateId}`, {
+      params: { organization_id: process.env.ZOHO_ORG_ID },
+      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
+    });
+    if (r.status !== 200) return null;
+    const e = r.data.estimate || {};
+    return {
+      status: e.status || '', viewed: !!e.is_viewed_by_client, viewedTime: e.client_viewed_time || '',
+      acceptedDate: e.accepted_date || '', declinedDate: e.declined_date || '', total: e.total, currency: e.currency_code,
+    };
+  } catch { return null; }
+}
+
 const proposalFileName = (clientName) => `Proposition_ClusterPOS_${String(clientName || 'client').replace(/[^a-z0-9]+/gi, '_').slice(0, 40)}.pdf`;
 const logoFromBody = (b) => (b ? Buffer.from(String(b).replace(/^data:[^,]+,/, ''), 'base64') : null);
 
@@ -5642,15 +5701,56 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
     const clientName = (req.body.clientName || '').trim() || (det && det.customerName) || '';
     const repName = req.user.name || req.user.email || '';
     const pdf = await buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64) });
+    // Mark the estimate "sent" in Zoho (enables client acceptance + viewed/accepted tracking),
+    // then try to surface its accept link to add as a button in our email.
+    await markEstimateSent(estimateId);
+    const acceptUrl = await getEstimateAcceptUrl(estimateId);
     const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    const html = `<div style="font-family:Arial,Helvetica,sans-serif;white-space:pre-wrap;font-size:14px;color:#1c2434;line-height:1.5">${esc(bodyText)}</div>`;
+    const acceptBtn = acceptUrl
+      ? `<div style="margin:22px 0"><a href="${esc(acceptUrl)}" style="display:inline-block;background:#fe6523;color:#fff;text-decoration:none;font-weight:700;font-family:Arial,Helvetica,sans-serif;font-size:14px;padding:13px 26px;border-radius:8px">${lang === 'en' ? 'Review & accept the quote online →' : 'Voir et accepter le devis en ligne →'}</a></div>`
+      : '';
+    const html = `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#1c2434;line-height:1.5"><div style="white-space:pre-wrap">${esc(bodyText)}</div>${acceptBtn}</div>`;
     const r = await sendMail(to, subject, html, {
       cc: req.body.cc ? String(req.body.cc).trim() : undefined,
       attachments: [{ filename: proposalFileName(clientName), content: Buffer.from(pdf), contentType: 'application/pdf' }],
     });
     if (!r.sent) return res.status(502).json({ error: r.reason === 'smtp_not_configured' ? 'smtp_not_configured' : 'mail_failed', reason: r.reason });
-    res.json({ success: true });
+    // Record the send for the status board (best-effort).
+    try {
+      await pool.query(
+        `INSERT INTO proposals_sent (estimate_id, estimate_number, customer_name, rep_email, to_email, lang) VALUES ($1,$2,$3,$4,$5,$6)`,
+        [estimateId, (det && det.number) || '', clientName, (req.user.realAdminEmail || req.user.email || ''), to, lang]);
+    } catch (e) { console.warn('[proposal/send] record:', e.message); }
+    res.json({ success: true, acceptLinkIncluded: !!acceptUrl });
   } catch (e) { console.warn('[proposal/send]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/proposals/sent — status board: proposals this user (or all, for admins) has sent,
+// enriched with the live Zoho estimate status (sent / viewed / accepted / declined).
+app.get('/api/proposals/sent', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'proposals:send'))) return;
+  try {
+    let effAdmin = false;
+    if (!req.user.impersonating && req.user.email) {
+      const row = (await pool.query('SELECT is_admin FROM user_tokens WHERE email = $1', [req.user.email])).rows[0];
+      effAdmin = row ? !!row.is_admin : false;
+    }
+    const me = (req.user.realAdminEmail || req.user.email || '').toLowerCase();
+    const rows = effAdmin
+      ? (await pool.query(`SELECT * FROM proposals_sent ORDER BY sent_at DESC LIMIT 100`)).rows
+      : (await pool.query(`SELECT * FROM proposals_sent WHERE LOWER(rep_email) = $1 ORDER BY sent_at DESC LIMIT 100`, [me])).rows;
+    const out = [];
+    for (const r0 of rows.slice(0, 40)) {
+      const st = await getEstimateStatus(r0.estimate_id);
+      out.push({
+        id: r0.id, estimateId: r0.estimate_id, number: r0.estimate_number, customerName: r0.customer_name,
+        repEmail: r0.rep_email, toEmail: r0.to_email, sentAt: r0.sent_at,
+        status: (st && st.status) || '', viewed: (st && st.viewed) || false, viewedTime: (st && st.viewedTime) || '',
+        acceptedDate: (st && st.acceptedDate) || '', declinedDate: (st && st.declinedDate) || '',
+      });
+    }
+    res.json({ proposals: out });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // GET /api/invoices/:invoiceNumber/pdf — download
