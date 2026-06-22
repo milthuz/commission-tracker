@@ -85,6 +85,7 @@ const PERMISSION_CATALOG = [
 
   // Proposals (build + send a client proposal from a Zoho Books estimate)
   { key: 'proposals:send',             label: 'Build & send client proposals (from Zoho estimates)',            category: 'Proposals' },
+  { key: 'proposals:manage',           label: 'Edit the proposal deck template (in-app deck editor)',           category: 'Proposals' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -482,6 +483,15 @@ async function initializeDatabase() {
       to_email VARCHAR(255),
       lang VARCHAR(5),
       sent_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    // Images uploaded for the in-app proposal deck editor (stored in DB — no object storage).
+    await pool.query(`CREATE TABLE IF NOT EXISTS proposal_deck_assets (
+      id         SERIAL PRIMARY KEY,
+      filename   VARCHAR(300),
+      mime_type  VARCHAR(100),
+      data       BYTEA NOT NULL,
+      created_by VARCHAR(255),
+      created_at TIMESTAMPTZ DEFAULT NOW()
     )`);
     // Admin-managed category structure for the resources library.
     await pool.query(`
@@ -5575,7 +5585,142 @@ async function addProposalCover(doc, { lang, clientName, repName, title, dateStr
   page.drawText(lang === 'en' ? 'Confidential' : 'Confidentiel', { x: W - padX - 70, y: bandH / 2 - 3, size: 8, font: helv, color: greyD });
 }
 
-// Merge: generated cover + fixed company deck (lang) + the Zoho estimate PDF → one PDF (Uint8Array).
+// ---- In-app proposal deck (block-based editor) ----------------------------------------------
+// The deck (the pages between the cover and the estimate) can be edited in-app and is stored as
+// JSON in app_settings.proposal_deck = { slides:[ { id, bg, blocks:[...] } ] }. Each text block
+// carries {fr,en}. It's rendered with pdf-lib (no headless browser) to 792×612 landscape pages —
+// single-column vertical flow, one slide = one page. If no deck is saved we fall back to the
+// committed company_{lang}.pdf, so existing behavior is unchanged until a deck is created.
+async function getProposalDeck() {
+  try {
+    const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'proposal_deck'`);
+    if (!r.rows[0] || !r.rows[0].value) return null;
+    const deck = JSON.parse(r.rows[0].value);
+    if (!deck || !Array.isArray(deck.slides) || deck.slides.length === 0) return null;
+    return deck;
+  } catch (_e) { return null; }
+}
+function hexToPdfRgb(hex, fallback) {
+  const { rgb } = require('pdf-lib');
+  const m = /^#?([0-9a-fA-F]{6})$/.exec(String(hex || '').trim());
+  if (!m) return fallback;
+  const n = parseInt(m[1], 16);
+  return rgb(((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255);
+}
+function isDarkHex(hex) {
+  const m = /^#?([0-9a-fA-F]{6})$/.exec(String(hex || '').trim());
+  if (!m) return false;
+  const n = parseInt(m[1], 16);
+  return (0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) < 140;
+}
+// Pick the right language out of a {fr,en} value (falls back across languages, accepts plain strings).
+const deckTxt = (v, lang) => (v && typeof v === 'object') ? String(v[lang] || v.fr || v.en || '') : String(v || '');
+
+// Render the saved deck into `out` (adds one page per slide).
+async function renderCustomDeck(out, deck, lang) {
+  const { rgb, StandardFonts } = require('pdf-lib');
+  const W = 792, H = 612, PAD = 54;
+  const helv = await out.embedFont(StandardFonts.Helvetica);
+  const helvB = await out.embedFont(StandardFonts.HelveticaBold);
+  const orange = rgb(0xfe / 255, 0x65 / 255, 0x23 / 255);
+  const assetCache = new Map();
+  const loadAsset = async (id) => {
+    if (!id && id !== 0) return null;
+    if (assetCache.has(id)) return assetCache.get(id);
+    let img = null;
+    try {
+      const r = await pool.query('SELECT data, mime_type FROM proposal_deck_assets WHERE id = $1', [id]);
+      if (r.rows[0]) {
+        const buf = r.rows[0].data, mt = r.rows[0].mime_type || '';
+        try { img = mt.includes('png') ? await out.embedPng(buf) : await out.embedJpg(buf); }
+        catch { try { img = await out.embedPng(buf); } catch { img = null; } }
+      }
+    } catch (_e) { img = null; }
+    assetCache.set(id, img);
+    return img;
+  };
+  const xFor = (align, w, contentW) => align === 'center' ? PAD + (contentW - w) / 2 : align === 'right' ? PAD + contentW - w : PAD;
+
+  for (const slide of deck.slides) {
+    const page = out.addPage([W, H]);
+    page.drawRectangle({ x: 0, y: 0, width: W, height: H, color: hexToPdfRgb(slide.bg, rgb(1, 1, 1)) });
+    const defColor = isDarkHex(slide.bg) ? rgb(1, 1, 1) : rgb(0x1c / 255, 0x24 / 255, 0x34 / 255);
+    const contentW = W - PAD * 2;
+    let y = H - PAD;
+    for (const b of (Array.isArray(slide.blocks) ? slide.blocks : [])) {
+      if (y < PAD) break; // ran past the bottom — clip the rest (editor warns about overflow)
+      const color = b.color ? hexToPdfRgb(b.color, defColor) : defColor;
+      if (b.type === 'heading' || b.type === 'text') {
+        const isH = b.type === 'heading';
+        const size = b.size || (isH ? 26 : 13);
+        const font = isH ? helvB : helv;
+        const lh = size * (isH ? 1.25 : 1.5);
+        for (const line of wrapPdfLines(font, deckTxt(b.text, lang), size, contentW)) {
+          if (y < PAD) break;
+          page.drawText(line, { x: xFor(b.align, font.widthOfTextAtSize(line, size), contentW), y: y - size, size, font, color });
+          y -= lh;
+        }
+        y -= 6;
+      } else if (b.type === 'bullets') {
+        const size = b.size || 13;
+        for (const it of (Array.isArray(b.items) ? b.items : [])) {
+          const lines = wrapPdfLines(helv, deckTxt(it, lang), size, contentW - 18);
+          lines.forEach((line, i) => {
+            if (y < PAD) return;
+            if (i === 0) page.drawCircle({ x: PAD + 3, y: y - size / 2 - 1, size: 2.5, color: orange });
+            page.drawText(line, { x: PAD + 18, y: y - size, size, font: helv, color });
+            y -= size * 1.5;
+          });
+        }
+        y -= 6;
+      } else if (b.type === 'stats') {
+        const items = Array.isArray(b.items) ? b.items : [];
+        const colW = contentW / Math.max(1, items.length);
+        let sx = PAD;
+        for (const it of items) {
+          page.drawText(winAnsiSafe(deckTxt(it.value, lang)), { x: sx, y: y - 26, size: 26, font: helvB, color: orange });
+          page.drawText(winAnsiSafe(deckTxt(it.label, lang)), { x: sx, y: y - 42, size: 10, font: helv, color: defColor });
+          sx += colW;
+        }
+        y -= 58;
+      } else if (b.type === 'image') {
+        const img = await loadAsset(b.assetId);
+        if (img) {
+          const pct = Math.min(100, Math.max(10, b.widthPct || 60)) / 100;
+          let iw = contentW * pct, ih = iw * (img.height / img.width);
+          const maxH = y - PAD;
+          if (ih > maxH && maxH > 0) { ih = maxH; iw = ih * (img.width / img.height); }
+          page.drawImage(img, { x: xFor(b.align, iw, contentW), y: y - ih, width: iw, height: ih });
+          y -= ih + 12;
+        }
+      } else if (b.type === 'divider') {
+        page.drawRectangle({ x: PAD, y: y - 1, width: contentW, height: 1.2, color: b.color ? hexToPdfRgb(b.color, defColor) : rgb(0.82, 0.85, 0.9) });
+        y -= 14;
+      } else if (b.type === 'spacer') {
+        y -= Math.max(2, Math.min(300, b.height || 16));
+      }
+    }
+  }
+}
+
+// Cover (placeholder client) + the saved deck — used by the in-app editor's "Preview PDF".
+async function buildDeckPreviewPdf(deck, lang) {
+  const fs = require('fs'); const path = require('path');
+  const { PDFDocument } = require('pdf-lib');
+  const out = await PDFDocument.create();
+  const dateStr = new Date().toLocaleDateString(lang === 'en' ? 'en-CA' : 'fr-CA', { year: 'numeric', month: 'long', day: 'numeric' });
+  let photoBytes = null, brandLogoBytes = null;
+  try { photoBytes = fs.readFileSync(path.join(PROPOSAL_ASSETS, 'product_shot.png')); } catch (_e) { /* optional */ }
+  try { brandLogoBytes = fs.readFileSync(path.join(PROPOSAL_ASSETS, 'cluster_logo.png')); } catch (_e) { /* optional */ }
+  await addProposalCover(out, {
+    lang, clientName: lang === 'en' ? 'Sample Client' : 'Client exemple', repName: '',
+    title: lang === 'en' ? 'Your proposal title' : 'Titre de votre proposition', dateStr, photoBytes, brandLogoBytes,
+  });
+  await renderCustomDeck(out, deck, lang);
+  return await out.save();
+}
+
+// Merge: generated cover + company deck (custom in-app deck if saved, else fixed PDF) + the Zoho estimate PDF → one PDF (Uint8Array).
 async function buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes }) {
   const fs = require('fs');
   const { PDFDocument } = require('pdf-lib');
@@ -5585,10 +5730,15 @@ async function buildProposalPdf({ estimateId, lang, clientName, repName, title, 
   let brandLogoBytes = null;
   try { brandLogoBytes = fs.readFileSync(require('path').join(PROPOSAL_ASSETS, 'cluster_logo.png')); } catch (_e) { /* optional */ }
   await addProposalCover(out, { lang, clientName, repName, title, dateStr, photoBytes, logoBytes, brandLogoBytes });
-  // company deck
-  const compBytes = fs.readFileSync(require('path').join(PROPOSAL_ASSETS, lang === 'en' ? 'company_en.pdf' : 'company_fr.pdf'));
-  const comp = await PDFDocument.load(compBytes);
-  (await out.copyPages(comp, comp.getPageIndices())).forEach(p => out.addPage(p));
+  // company deck — the in-app custom deck if one is saved, else the committed fixed PDF.
+  const customDeck = await getProposalDeck();
+  if (customDeck) {
+    await renderCustomDeck(out, customDeck, lang);
+  } else {
+    const compBytes = fs.readFileSync(require('path').join(PROPOSAL_ASSETS, lang === 'en' ? 'company_en.pdf' : 'company_fr.pdf'));
+    const comp = await PDFDocument.load(compBytes);
+    (await out.copyPages(comp, comp.getPageIndices())).forEach(p => out.addPage(p));
+  }
   // the Zoho estimate (best-effort — skip if unreadable)
   if (estimateId) {
     const est = await fetchEstimatePdfBytes(estimateId);
@@ -5765,6 +5915,81 @@ app.delete('/api/proposals/sent/:id', authenticateToken, async (req, res) => {
   try {
     await pool.query('DELETE FROM proposals_sent WHERE id = $1', [req.params.id]);
     res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ---- Proposal deck editor (block-based template, gated by proposals:manage) -----------------
+const uploadDeckImage = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // 10 MB
+
+// GET /api/proposals/deck — the saved deck JSON (or null) + the list of uploaded images.
+app.get('/api/proposals/deck', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'proposals:manage'))) return;
+  try {
+    const deck = await getProposalDeck();
+    const assets = (await pool.query(`SELECT id, filename, mime_type FROM proposal_deck_assets ORDER BY id DESC`)).rows
+      .map(a => ({ id: a.id, filename: a.filename, mime: a.mime_type }));
+    res.json({ deck, assets });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/proposals/deck — save the deck JSON.
+app.put('/api/proposals/deck', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'proposals:manage'))) return;
+  const deck = req.body && req.body.deck;
+  if (!deck || !Array.isArray(deck.slides)) return res.status(400).json({ error: 'deck.slides required' });
+  if (deck.slides.length > 40) return res.status(400).json({ error: 'Too many slides (max 40)' });
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('proposal_deck', $1, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()`,
+      [JSON.stringify({ slides: deck.slides })]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/proposals/deck/assets — upload an image for use in deck blocks.
+app.post('/api/proposals/deck/assets', authenticateToken, uploadDeckImage.single('file'), async (req, res) => {
+  if (!(await requirePerm(req, res, 'proposals:manage'))) return;
+  if (!req.file) return res.status(400).json({ error: 'No file' });
+  const mt = req.file.mimetype || '';
+  if (!/png|jpe?g/i.test(mt)) return res.status(400).json({ error: 'PNG or JPG only' });
+  try {
+    const r = await pool.query(
+      `INSERT INTO proposal_deck_assets (filename, mime_type, data, created_by) VALUES ($1,$2,$3,$4) RETURNING id`,
+      [req.file.originalname || 'image', mt, req.file.buffer, (req.user.realAdminEmail || req.user.email || '')]);
+    res.json({ id: r.rows[0].id, filename: req.file.originalname || 'image', mime: mt });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/proposals/deck/assets/:id — stream an uploaded image (for the editor preview).
+app.get('/api/proposals/deck/assets/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'proposals:manage'))) return;
+  try {
+    const r = await pool.query(`SELECT data, mime_type FROM proposal_deck_assets WHERE id = $1`, [req.params.id]);
+    if (!r.rows[0]) return res.status(404).end();
+    res.setHeader('Content-Type', r.rows[0].mime_type || 'image/png');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.end(r.rows[0].data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/proposals/deck/assets/:id
+app.delete('/api/proposals/deck/assets/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'proposals:manage'))) return;
+  try { await pool.query(`DELETE FROM proposal_deck_assets WHERE id = $1`, [req.params.id]); res.json({ success: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/proposals/deck/preview?lang=fr — render cover + the saved deck to a PDF (no estimate).
+app.get('/api/proposals/deck/preview', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'proposals:manage'))) return;
+  const lang = String(req.query.lang || 'fr').toLowerCase() === 'en' ? 'en' : 'fr';
+  try {
+    const deck = await getProposalDeck() || { slides: [] };
+    const pdf = await buildDeckPreviewPdf(deck, lang);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline; filename="deck-preview.pdf"');
+    res.end(Buffer.from(pdf));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
