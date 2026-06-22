@@ -5696,24 +5696,53 @@ async function buildDeckPreviewPdf(deck, lang) {
   return await out.save();
 }
 
-// Merge: generated cover + company deck (custom in-app deck if saved, else fixed PDF) + the Zoho estimate PDF → one PDF (Uint8Array).
+// Render the Claude Design proposal document (personalized) via the external Puppeteer service.
+// Returns a PDF Buffer, or null if the service isn't configured / fails (caller falls back).
+async function fetchRenderedPresentation(clientName, lang) {
+  const url = process.env.PROPOSAL_RENDER_URL;
+  if (!url) return null;
+  try {
+    const r = await axios.get(url, {
+      params: { clientName: clientName || '', lang, token: process.env.PROPOSAL_RENDER_TOKEN || '' },
+      responseType: 'arraybuffer', timeout: 90000, validateStatus: () => true,
+    });
+    if (r.status === 200 && r.data && r.data.byteLength > 1000) return Buffer.from(r.data);
+    console.warn('[proposal] render service returned', r.status);
+  } catch (e) { console.warn('[proposal] render service failed:', e.message); }
+  return null;
+}
+
+// Merge: the proposal presentation + the Zoho estimate PDF → one PDF (Uint8Array).
+// Presentation source, in order of preference: (1) the rendered Claude Design document from the
+// Puppeteer service (PROPOSAL_RENDER_URL) — personalized + branded, REPLACES cover+deck;
+// (2) generated pdf-lib cover + in-app custom deck; (3) cover + committed company_{lang}.pdf.
 async function buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes }) {
   const fs = require('fs');
   const { PDFDocument } = require('pdf-lib');
   const out = await PDFDocument.create();
-  const dateStr = new Date().toLocaleDateString(lang === 'en' ? 'en-CA' : 'fr-CA', { year: 'numeric', month: 'long', day: 'numeric' });
-  const photoBytes = fs.readFileSync(require('path').join(PROPOSAL_ASSETS, 'product_shot.png'));
-  let brandLogoBytes = null;
-  try { brandLogoBytes = fs.readFileSync(require('path').join(PROPOSAL_ASSETS, 'cluster_logo.png')); } catch (_e) { /* optional */ }
-  await addProposalCover(out, { lang, clientName, repName, title, dateStr, photoBytes, logoBytes, brandLogoBytes });
-  // company deck — the in-app custom deck if one is saved, else the committed fixed PDF.
-  const customDeck = await getProposalDeck();
-  if (customDeck) {
-    await renderCustomDeck(out, customDeck, lang);
-  } else {
-    const compBytes = fs.readFileSync(require('path').join(PROPOSAL_ASSETS, lang === 'en' ? 'company_en.pdf' : 'company_fr.pdf'));
-    const comp = await PDFDocument.load(compBytes);
-    (await out.copyPages(comp, comp.getPageIndices())).forEach(p => out.addPage(p));
+
+  // (1) External design-render service — the whole presentation (it has its own cover).
+  const rendered = await fetchRenderedPresentation(clientName, lang);
+  if (rendered) {
+    try { const rd = await PDFDocument.load(rendered); (await out.copyPages(rd, rd.getPageIndices())).forEach(p => out.addPage(p)); }
+    catch (e) { console.warn('[proposal] rendered presentation merge failed, falling back:', e.message); }
+  }
+
+  // (2)/(3) Fallback: pdf-lib cover + deck (only if the service produced nothing).
+  if (out.getPageCount() === 0) {
+    const dateStr = new Date().toLocaleDateString(lang === 'en' ? 'en-CA' : 'fr-CA', { year: 'numeric', month: 'long', day: 'numeric' });
+    const photoBytes = fs.readFileSync(require('path').join(PROPOSAL_ASSETS, 'product_shot.png'));
+    let brandLogoBytes = null;
+    try { brandLogoBytes = fs.readFileSync(require('path').join(PROPOSAL_ASSETS, 'cluster_logo.png')); } catch (_e) { /* optional */ }
+    await addProposalCover(out, { lang, clientName, repName, title, dateStr, photoBytes, logoBytes, brandLogoBytes });
+    const customDeck = await getProposalDeck();
+    if (customDeck) {
+      await renderCustomDeck(out, customDeck, lang);
+    } else {
+      const compBytes = fs.readFileSync(require('path').join(PROPOSAL_ASSETS, lang === 'en' ? 'company_en.pdf' : 'company_fr.pdf'));
+      const comp = await PDFDocument.load(compBytes);
+      (await out.copyPages(comp, comp.getPageIndices())).forEach(p => out.addPage(p));
+    }
   }
   // the Zoho estimate (best-effort — skip if unreadable)
   if (estimateId) {
