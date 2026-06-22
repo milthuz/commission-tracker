@@ -1339,11 +1339,14 @@ function getMailer() {
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
   });
 }
-async function sendMail(to, subject, html) {
+async function sendMail(to, subject, html, opts = {}) {
   const t = getMailer();
   if (!t) return { sent: false, reason: 'smtp_not_configured' };
   try {
-    await t.sendMail({ from: process.env.SMTP_FROM || process.env.SMTP_USER, to, subject, html });
+    const msg = { from: process.env.SMTP_FROM || process.env.SMTP_USER, to, subject, html };
+    if (opts.cc) msg.cc = opts.cc;
+    if (opts.attachments) msg.attachments = opts.attachments; // [{ filename, content(Buffer), contentType }]
+    await t.sendMail(msg);
     return { sent: true };
   } catch (e) {
     console.warn('[MAIL] send failed:', e.message);
@@ -5448,6 +5451,187 @@ app.get('/api/proposals/estimates', authenticateToken, async (req, res) => {
     }));
     res.json({ estimates });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ===== Proposal builder (Phase 2): generated cover + fixed company deck + Zoho estimate, merged =====
+const PROPOSAL_ASSETS = require('path').join(__dirname, 'assets', 'proposals');
+// Keep text WinAnsi-safe for pdf-lib standard fonts (strip emoji / smart-quote → ascii).
+const winAnsiSafe = (s) => String(s || '')
+  .replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/[–—]/g, '-')
+  .replace(/[\x80-\x9F]/g, '').replace(/[^\x09\x0A\x0D\x20-\xFF]/g, '');
+function wrapPdfLines(font, text, size, maxWidth) {
+  const words = winAnsiSafe(text).split(/\s+/).filter(Boolean);
+  const lines = []; let cur = '';
+  for (const w of words) {
+    const test = cur ? cur + ' ' + w : w;
+    if (font.widthOfTextAtSize(test, size) > maxWidth && cur) { lines.push(cur); cur = w; } else cur = test;
+  }
+  if (cur) lines.push(cur);
+  return lines;
+}
+
+// Build the personalized cover page (792×612 landscape, matching the company deck pages).
+async function addProposalCover(doc, { lang, clientName, repName, title, dateStr, photoBytes, logoBytes }) {
+  const { rgb, StandardFonts } = require('pdf-lib');
+  const W = 792, H = 612, padX = 46;
+  const page = doc.addPage([W, H]);
+  const helv = await doc.embedFont(StandardFonts.Helvetica);
+  const helvB = await doc.embedFont(StandardFonts.HelveticaBold);
+  const navy = rgb(0x1c / 255, 0x24 / 255, 0x34 / 255);
+  const bandc = rgb(0x12 / 255, 0x19 / 255, 0x26 / 255);
+  const orange = rgb(0xfe / 255, 0x65 / 255, 0x23 / 255);
+  const white = rgb(1, 1, 1);
+  const grey = rgb(0xc7 / 255, 0xcf / 255, 0xdb / 255);
+  const greyD = rgb(0x9f / 255, 0xb0 / 255, 0xc4 / 255);
+  page.drawRectangle({ x: 0, y: 0, width: W, height: H, color: navy });
+
+  // Right-side photo (kept undistorted)
+  let photoX = W;
+  try {
+    const img = await doc.embedPng(photoBytes);
+    const pw = 320, ph = Math.round(pw * (img.height / img.width));
+    photoX = W - padX - pw;
+    page.drawImage(img, { x: photoX, y: (H - ph) / 2 + 6, width: pw, height: ph });
+  } catch (_e) { photoX = W - padX; }
+
+  const colW = photoX - 24 - padX;
+  let y = H - 66;
+  page.drawText(lang === 'en' ? 'IN PARTNERSHIP WITH' : 'EN PARTENARIAT AVEC', { x: padX, y, size: 9, font: helvB, color: greyD });
+  // optional client logo under the label
+  if (logoBytes) {
+    try {
+      let lg; try { lg = await doc.embedPng(logoBytes); } catch { lg = await doc.embedJpg(logoBytes); }
+      const lw = 96, lh = Math.min(40, Math.round(lw * (lg.height / lg.width)));
+      page.drawImage(lg, { x: padX, y: y - 8 - lh, width: lw * (lh / (lw * (lg.height / lg.width))) || lw, height: lh });
+      y -= (lh + 16);
+    } catch (_e) { /* skip */ }
+  }
+  y -= 22;
+  page.drawText(winAnsiSafe(lang === 'en' ? 'Proudly Canadian since 2009' : 'Fièrement canadien depuis 2009'), { x: padX, y, size: 11, font: helv, color: grey });
+  y -= 36;
+  for (const line of wrapPdfLines(helvB, title, 30, colW)) { page.drawText(line, { x: padX, y, size: 30, font: helvB, color: white }); y -= 34; }
+  y -= 8;
+  const sub = lang === 'en'
+    ? `A smooth, high-performance platform for ${clientName}, across Canada.`
+    : `Une plateforme fluide et performante pour ${clientName}, partout au Canada.`;
+  for (const line of wrapPdfLines(helv, sub, 13, colW)) { page.drawText(line, { x: padX, y, size: 13, font: helv, color: grey }); y -= 18; }
+
+  // meta row
+  const metaY = 96;
+  const cols = [
+    [lang === 'en' ? 'Prepared for' : 'Préparé pour', clientName],
+    [lang === 'en' ? 'By' : 'Par', repName],
+    ['Date', dateStr],
+  ];
+  let mx = padX;
+  for (const [lab, val] of cols) {
+    page.drawText(winAnsiSafe(lab), { x: mx, y: metaY + 14, size: 8.5, font: helv, color: greyD });
+    page.drawText(winAnsiSafe(val || '-'), { x: mx, y: metaY, size: 12, font: helvB, color: white });
+    mx += Math.max(150, helvB.widthOfTextAtSize(winAnsiSafe(val || '-'), 12) + 40);
+  }
+
+  // bottom stats band
+  const bandH = 46;
+  page.drawRectangle({ x: 0, y: 0, width: W, height: bandH, color: bandc });
+  page.drawCircle({ x: padX + 6, y: bandH / 2, size: 6, color: orange });
+  let bx = padX + 24;
+  const stats = lang === 'en'
+    ? [['3,800+', 'Merchants served'], ['5,500+', 'POS systems'], ['16+', 'Years of innovation']]
+    : [['3 800+', 'Marchands servis'], ['5 500+', 'Systèmes PDV'], ['16+', "Ans d'innovation"]];
+  for (const [n, l] of stats) {
+    page.drawText(winAnsiSafe(n), { x: bx, y: bandH / 2 + 1, size: 13, font: helvB, color: white });
+    page.drawText(winAnsiSafe(l), { x: bx, y: bandH / 2 - 12, size: 8, font: helv, color: greyD });
+    bx += Math.max(120, helvB.widthOfTextAtSize(winAnsiSafe(n), 13) + 70);
+  }
+  page.drawText('clusterpos.com', { x: W - padX - 150, y: bandH / 2 - 3, size: 10, font: helvB, color: rgb(0xff / 255, 0xb3 / 255, 0x8f / 255) });
+  page.drawText(lang === 'en' ? 'Confidential' : 'Confidentiel', { x: W - padX - 70, y: bandH / 2 - 3, size: 8, font: helv, color: greyD });
+}
+
+// Merge: generated cover + fixed company deck (lang) + the Zoho estimate PDF → one PDF (Uint8Array).
+async function buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes }) {
+  const fs = require('fs');
+  const { PDFDocument } = require('pdf-lib');
+  const out = await PDFDocument.create();
+  const dateStr = new Date().toLocaleDateString(lang === 'en' ? 'en-CA' : 'fr-CA', { year: 'numeric', month: 'long', day: 'numeric' });
+  const photoBytes = fs.readFileSync(require('path').join(PROPOSAL_ASSETS, 'cover_photo.png'));
+  await addProposalCover(out, { lang, clientName, repName, title, dateStr, photoBytes, logoBytes });
+  // company deck
+  const compBytes = fs.readFileSync(require('path').join(PROPOSAL_ASSETS, lang === 'en' ? 'company_en.pdf' : 'company_fr.pdf'));
+  const comp = await PDFDocument.load(compBytes);
+  (await out.copyPages(comp, comp.getPageIndices())).forEach(p => out.addPage(p));
+  // the Zoho estimate (best-effort — skip if unreadable)
+  if (estimateId) {
+    const est = await fetchEstimatePdfBytes(estimateId);
+    if (est && est.buffer) {
+      try { const ed = await PDFDocument.load(est.buffer); (await out.copyPages(ed, ed.getPageIndices())).forEach(p => out.addPage(p)); }
+      catch (e) { console.warn('[proposal] estimate PDF merge skipped:', e.message); }
+    }
+  }
+  return await out.save();
+}
+
+// Customer name + email for an estimate (used to prefill the email draft).
+async function getEstimateDetail(estimateId) {
+  const { accessToken, apiDomain } = await getAdminBooksAuth();
+  const r = await axios.get(`${apiDomain}/books/v3/estimates/${estimateId}`, {
+    params: { organization_id: process.env.ZOHO_ORG_ID },
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
+  });
+  if (r.status !== 200) return null;
+  const e = r.data.estimate || {};
+  let email = e.email || '';
+  if (!email && Array.isArray(e.contact_persons)) { const cp = e.contact_persons.find(c => c.email); email = cp ? cp.email : ''; }
+  return { customerName: e.customer_name || '', email, number: e.estimate_number || '' };
+}
+
+const proposalFileName = (clientName) => `Proposition_ClusterPOS_${String(clientName || 'client').replace(/[^a-z0-9]+/gi, '_').slice(0, 40)}.pdf`;
+const logoFromBody = (b) => (b ? Buffer.from(String(b).replace(/^data:[^,]+,/, ''), 'base64') : null);
+
+// POST /api/proposals/prepare — build the merged PDF + a prefilled email draft (rep reviews before sending).
+app.post('/api/proposals/prepare', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'proposals:send'))) return;
+  const lang = String(req.body.lang || 'fr').toLowerCase() === 'en' ? 'en' : 'fr';
+  const estimateId = String(req.body.estimateId || '').trim();
+  const title = String(req.body.title || '').trim();
+  if (!estimateId) return res.status(400).json({ error: 'estimateId required' });
+  if (!title) return res.status(400).json({ error: lang === 'en' ? 'A cover title is required' : 'Un titre de couverture est requis' });
+  try {
+    const det = await getEstimateDetail(estimateId);
+    const clientName = (req.body.clientName || '').trim() || (det && det.customerName) || (lang === 'en' ? 'your business' : 'votre entreprise');
+    const repName = req.user.name || req.user.email || '';
+    const pdf = await buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64) });
+    const subject = lang === 'en' ? `Cluster POS proposal — ${clientName}` : `Proposition Cluster POS — ${clientName}`;
+    const body = lang === 'en'
+      ? `Hello,\n\nThank you for your interest in Cluster POS. Please find attached our proposal prepared for ${clientName}, including your quote.\n\nI'd be glad to walk you through it — just reply to this email.\n\nBest regards,\n${repName}\nCluster Systems`
+      : `Bonjour,\n\nMerci de votre intérêt envers Cluster POS. Vous trouverez ci-joint notre proposition préparée pour ${clientName}, incluant votre soumission.\n\nJe me ferai un plaisir de vous la présenter — répondez simplement à ce courriel.\n\nCordialement,\n${repName}\nCluster Systems`;
+    res.json({ pdfBase64: Buffer.from(pdf).toString('base64'), fileName: proposalFileName(clientName), email: { to: (det && det.email) || '', subject, body } });
+  } catch (e) { console.warn('[proposal/prepare]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/proposals/send — rebuild + email the proposal to the client (rep-reviewed fields).
+app.post('/api/proposals/send', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'proposals:send'))) return;
+  const lang = String(req.body.lang || 'fr').toLowerCase() === 'en' ? 'en' : 'fr';
+  const estimateId = String(req.body.estimateId || '').trim();
+  const title = String(req.body.title || '').trim();
+  const to = String(req.body.to || '').trim();
+  const subject = String(req.body.subject || '').trim();
+  const bodyText = String(req.body.body || '');
+  if (!estimateId || !to || !subject) return res.status(400).json({ error: 'estimateId, to and subject are required' });
+  try {
+    const det = await getEstimateDetail(estimateId);
+    const clientName = (req.body.clientName || '').trim() || (det && det.customerName) || '';
+    const repName = req.user.name || req.user.email || '';
+    const pdf = await buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64) });
+    const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const html = `<div style="font-family:Arial,Helvetica,sans-serif;white-space:pre-wrap;font-size:14px;color:#1c2434;line-height:1.5">${esc(bodyText)}</div>`;
+    const r = await sendMail(to, subject, html, {
+      cc: req.body.cc ? String(req.body.cc).trim() : undefined,
+      attachments: [{ filename: proposalFileName(clientName), content: Buffer.from(pdf), contentType: 'application/pdf' }],
+    });
+    if (!r.sent) return res.status(502).json({ error: r.reason === 'smtp_not_configured' ? 'smtp_not_configured' : 'mail_failed', reason: r.reason });
+    res.json({ success: true });
+  } catch (e) { console.warn('[proposal/send]', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // GET /api/invoices/:invoiceNumber/pdf — download
