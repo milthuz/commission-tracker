@@ -5753,6 +5753,21 @@ app.get('/api/proposals/sent', authenticateToken, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// DELETE /api/proposals/sent/:id — remove a sent-proposal record from the board. ADMIN ONLY.
+// (Only deletes our tracking record; does not touch the Zoho estimate.)
+app.delete('/api/proposals/sent/:id', authenticateToken, async (req, res) => {
+  let effAdmin = false;
+  if (!req.user.impersonating && req.user.email) {
+    const row = (await pool.query('SELECT is_admin FROM user_tokens WHERE email = $1', [req.user.email])).rows[0];
+    effAdmin = row ? !!row.is_admin : false;
+  }
+  if (!effAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    await pool.query('DELETE FROM proposals_sent WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/invoices/:invoiceNumber/pdf — download
 app.get('/api/invoices/:invoiceNumber/pdf', authenticateToken, async (req, res) => {
   try {
