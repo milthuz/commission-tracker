@@ -5428,9 +5428,14 @@ app.get('/api/proposals/estimates', authenticateToken, async (req, res) => {
     const params = { organization_id: process.env.ZOHO_ORG_ID, sort_column: 'date', sort_order: 'D', per_page: 50 };
     const q = String(req.query.q || '').trim();
     if (q) params.search_text = q;
-    const mine = String(req.query.mine || '') === '1';
-    // Best-effort rep scoping: filter by the rep's salesperson name when we can resolve it.
-    if (mine && req.user.name) params.salesperson_name = req.user.name;
+    // Scoping: admins see ALL estimates; reps see only their own (by Zoho Books salesperson name).
+    // Effective admin is resolved from user_tokens.is_admin (not the JWT flag; impersonation = not admin).
+    let effAdmin = false;
+    if (!req.user.impersonating && req.user.email) {
+      const row = (await pool.query('SELECT is_admin FROM user_tokens WHERE email = $1', [req.user.email])).rows[0];
+      effAdmin = row ? !!row.is_admin : false;
+    }
+    if (!effAdmin && req.user.name) params.salesperson_name = req.user.name;
     const r = await axios.get(`${apiDomain}/books/v3/estimates`, {
       params, headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
     });
@@ -5471,7 +5476,7 @@ function wrapPdfLines(font, text, size, maxWidth) {
 }
 
 // Build the personalized cover page (792×612 landscape, matching the company deck pages).
-async function addProposalCover(doc, { lang, clientName, repName, title, dateStr, photoBytes, logoBytes }) {
+async function addProposalCover(doc, { lang, clientName, repName, title, dateStr, photoBytes, logoBytes, brandLogoBytes }) {
   const { rgb, StandardFonts } = require('pdf-lib');
   const W = 792, H = 612, padX = 46;
   const page = doc.addPage([W, H]);
@@ -5485,31 +5490,43 @@ async function addProposalCover(doc, { lang, clientName, repName, title, dateStr
   const greyD = rgb(0x9f / 255, 0xb0 / 255, 0xc4 / 255);
   page.drawRectangle({ x: 0, y: 0, width: W, height: H, color: navy });
 
-  // Right-side photo (kept undistorted)
-  let photoX = W;
+  // Right-side Cluster product screenshot, in a thin orange frame (undistorted)
+  let photoX = W - padX;
   try {
     const img = await doc.embedPng(photoBytes);
-    const pw = 320, ph = Math.round(pw * (img.height / img.width));
+    const pw = 330, ph = Math.round(pw * (img.height / img.width));
     photoX = W - padX - pw;
-    page.drawImage(img, { x: photoX, y: (H - ph) / 2 + 6, width: pw, height: ph });
+    const py = Math.round((H - ph) / 2) + 8;
+    page.drawRectangle({ x: photoX - 3, y: py - 3, width: pw + 6, height: ph + 6, color: orange });
+    page.drawImage(img, { x: photoX, y: py, width: pw, height: ph });
   } catch (_e) { photoX = W - padX; }
 
   const colW = photoX - 24 - padX;
-  let y = H - 66;
+
+  // Cluster brand logo, top-left
+  let y = H - 34;
+  try {
+    const bl = await doc.embedPng(brandLogoBytes);
+    const lw = 168, lh = Math.round(lw * (bl.height / bl.width));
+    page.drawImage(bl, { x: padX, y: y - lh, width: lw, height: lh });
+    y -= (lh + 26);
+  } catch (_e) { y -= 16; }
+
   page.drawText(lang === 'en' ? 'IN PARTNERSHIP WITH' : 'EN PARTENARIAT AVEC', { x: padX, y, size: 9, font: helvB, color: greyD });
   // optional client logo under the label
   if (logoBytes) {
     try {
       let lg; try { lg = await doc.embedPng(logoBytes); } catch { lg = await doc.embedJpg(logoBytes); }
-      const lw = 96, lh = Math.min(40, Math.round(lw * (lg.height / lg.width)));
-      page.drawImage(lg, { x: padX, y: y - 8 - lh, width: lw * (lh / (lw * (lg.height / lg.width))) || lw, height: lh });
-      y -= (lh + 16);
+      let lw = 110, lh = Math.round(lw * (lg.height / lg.width));
+      if (lh > 46) { lh = 46; lw = Math.round(lh * (lg.width / lg.height)); }
+      page.drawImage(lg, { x: padX, y: y - 10 - lh, width: lw, height: lh });
+      y -= (lh + 18);
     } catch (_e) { /* skip */ }
   }
   y -= 22;
   page.drawText(winAnsiSafe(lang === 'en' ? 'Proudly Canadian since 2009' : 'Fièrement canadien depuis 2009'), { x: padX, y, size: 11, font: helv, color: grey });
-  y -= 36;
-  for (const line of wrapPdfLines(helvB, title, 30, colW)) { page.drawText(line, { x: padX, y, size: 30, font: helvB, color: white }); y -= 34; }
+  y -= 34;
+  for (const line of wrapPdfLines(helvB, title, 28, colW)) { page.drawText(line, { x: padX, y, size: 28, font: helvB, color: white }); y -= 32; }
   y -= 8;
   const sub = lang === 'en'
     ? `A smooth, high-performance platform for ${clientName}, across Canada.`
@@ -5553,8 +5570,10 @@ async function buildProposalPdf({ estimateId, lang, clientName, repName, title, 
   const { PDFDocument } = require('pdf-lib');
   const out = await PDFDocument.create();
   const dateStr = new Date().toLocaleDateString(lang === 'en' ? 'en-CA' : 'fr-CA', { year: 'numeric', month: 'long', day: 'numeric' });
-  const photoBytes = fs.readFileSync(require('path').join(PROPOSAL_ASSETS, 'cover_photo.png'));
-  await addProposalCover(out, { lang, clientName, repName, title, dateStr, photoBytes, logoBytes });
+  const photoBytes = fs.readFileSync(require('path').join(PROPOSAL_ASSETS, 'product_shot.png'));
+  let brandLogoBytes = null;
+  try { brandLogoBytes = fs.readFileSync(require('path').join(PROPOSAL_ASSETS, 'cluster_logo.png')); } catch (_e) { /* optional */ }
+  await addProposalCover(out, { lang, clientName, repName, title, dateStr, photoBytes, logoBytes, brandLogoBytes });
   // company deck
   const compBytes = fs.readFileSync(require('path').join(PROPOSAL_ASSETS, lang === 'en' ? 'company_en.pdf' : 'company_fr.pdf'));
   const comp = await PDFDocument.load(compBytes);
