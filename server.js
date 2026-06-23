@@ -5579,7 +5579,7 @@ async function addProposalCover(doc, { lang, clientName, repName, title, dateStr
 
 // Render the Claude Design proposal document (personalized) via the external Puppeteer service.
 // Returns a PDF Buffer, or null if the service isn't configured / fails (caller falls back).
-async function fetchRenderedPresentation(clientName, lang, logoDataUrl) {
+async function fetchRenderedPresentation(clientName, lang, logoDataUrl, pages) {
   const url = process.env.PROPOSAL_RENDER_URL;
   if (!url) return null;
   try {
@@ -5587,6 +5587,7 @@ async function fetchRenderedPresentation(clientName, lang, logoDataUrl) {
     const r = await axios.post(url, {
       clientName: clientName || '', lang, token: process.env.PROPOSAL_RENDER_TOKEN || '',
       logo: (typeof logoDataUrl === 'string' && logoDataUrl.startsWith('data:image')) ? logoDataUrl : undefined,
+      pages: (Array.isArray(pages) && pages.length) ? pages : undefined, // design pages to keep (renumbered by the service)
     }, {
       responseType: 'arraybuffer', timeout: 90000, validateStatus: () => true,
     });
@@ -5608,11 +5609,13 @@ async function buildProposalPdf({ estimateId, lang, clientName, repName, title, 
   const { PDFDocument } = require('pdf-lib');
   const out = await PDFDocument.create();
 
-  // (1) Build the full presentation in its own doc (so we can pick pages from it).
-  let presDoc = null;
-  const rendered = await fetchRenderedPresentation(clientName, lang, logoDataUrl);
+  // (1) Build the presentation. When the render service is used it already drops the unselected
+  // design pages AND renumbers the footers, so we must NOT re-filter it with pdf-lib afterwards.
+  const wantPages = (Array.isArray(selectedPages) && selectedPages.length) ? selectedPages.map(Number).filter(n => n > 0) : undefined;
+  let presDoc = null, fromService = false;
+  const rendered = await fetchRenderedPresentation(clientName, lang, logoDataUrl, wantPages);
   if (rendered) {
-    try { presDoc = await PDFDocument.load(rendered); }
+    try { presDoc = await PDFDocument.load(rendered); fromService = true; }
     catch (e) { console.warn('[proposal] rendered presentation load failed, falling back:', e.message); }
   }
   if (!presDoc) {
@@ -5629,10 +5632,11 @@ async function buildProposalPdf({ estimateId, lang, clientName, repName, title, 
   }
 
   const presentationPageCount = presDoc.getPageCount();
-  // Pick the presentation pages to include (all if no valid selection given).
+  // The service already applied the page selection (+ renumbered). Only the pdf-lib fallback
+  // needs to filter here (it can't renumber, but at least drops the unselected pages).
   let idxs = presDoc.getPageIndices();
-  if (Array.isArray(selectedPages) && selectedPages.length) {
-    const want = new Set(selectedPages.map(n => Number(n) - 1));
+  if (!fromService && wantPages) {
+    const want = new Set(wantPages.map(n => n - 1));
     const filtered = idxs.filter(i => want.has(i));
     if (filtered.length) idxs = filtered;
   }
