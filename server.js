@@ -62,6 +62,7 @@ const PERMISSION_CATALOG = [
   { key: 'admin:roles',                label: 'Manage roles and permissions',                category: 'Admin Panel' },
   { key: 'admin:releases',             label: 'Push new app releases',                       category: 'Admin Panel' },
   { key: 'admin:impersonate',          label: 'Use impersonation mode',                      category: 'Admin Panel' },
+  { key: 'admin:data_health',          label: 'View the "Needs attention" data-health page', category: 'Admin Panel' },
 
   // Syncs
   { key: 'sync:books',                 label: 'Trigger Zoho Books sync manually',            category: 'Syncs' },
@@ -7412,6 +7413,79 @@ app.get('/api/resellers/pos-activations', authenticateToken, async (req, res) =>
        GROUP BY 1 ORDER BY licenses DESC`
     )).rows;
     res.json({ connected: true, source: 'zoho_forms', activations: rows, byReseller });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================================
+// DATA HEALTH — "Needs attention" (À corriger): aggregated, count-only signals of
+// data that an admin should review/fix (unassigned activations/invoices/merchants,
+// reps with no role, unmapped reseller emails). Cached 60s to spare the (remote) DB.
+// ============================================================================
+let _dataHealthCache = { at: 0, data: null };
+async function computeDataHealth() {
+  const [resAct, unInv, zenMerch, repsNoRole, unEmails] = await Promise.all([
+    // 1. Reseller POS activations resolving to "(unassigned)" — no managed match, no name, no email.
+    pool.query(`
+      SELECT COUNT(*)::int AS count
+      FROM reseller_pos_activations a
+      LEFT JOIN LATERAL (
+        SELECT r.name FROM resellers r
+        WHERE r.emails @> to_jsonb(LOWER(a.reseller_email))
+           OR LOWER(r.name) = LOWER(NULLIF(a.reseller_name, ''))
+        LIMIT 1
+      ) rs ON true
+      WHERE COALESCE(rs.name, NULLIF(a.reseller_name, ''), NULLIF(a.reseller_email, '')) IS NULL`),
+    // 2. Invoices with commission but salesperson = 'Unassigned'.
+    pool.query(`
+      SELECT COUNT(*)::int AS count, COALESCE(SUM(commission), 0)::float AS total_commission
+      FROM invoices WHERE salesperson_name = 'Unassigned' AND commission > 0`),
+    // 3. Active Zentact merchants with no rep and not reseller-boarded.
+    pool.query(`
+      SELECT COUNT(*)::int AS count FROM zentact_merchants
+      WHERE status = 'ACTIVE'
+        AND (sales_rep_name IS NULL OR sales_rep_name = '')
+        AND (reseller_attribute IS NULL OR reseller_attribute = '')`),
+    // 4. Active salespeople with no resolvable role (no login email, or email with no role).
+    pool.query(`
+      WITH rep_email AS (
+        SELECT s.name,
+               COALESCE((SELECT email FROM user_tokens WHERE LOWER(display_name) = LOWER(s.name) LIMIT 1), s.email) AS email
+        FROM salespeople s WHERE s.is_active = true
+      )
+      SELECT COUNT(*)::int AS count, COALESCE(json_agg(name ORDER BY name), '[]'::json) AS names
+      FROM rep_email re
+      WHERE (re.email IS NULL OR re.email = '')
+         OR NOT EXISTS (SELECT 1 FROM user_roles ur WHERE LOWER(ur.user_email) = LOWER(re.email))`),
+    // 5. Reseller emails seen in activations but not mapped to any managed reseller.
+    pool.query(`
+      SELECT COUNT(DISTINCT LOWER(a.reseller_email))::int AS count
+      FROM reseller_pos_activations a
+      WHERE a.reseller_email IS NOT NULL AND a.reseller_email <> ''
+        AND NOT EXISTS (SELECT 1 FROM resellers rs WHERE rs.emails @> to_jsonb(LOWER(a.reseller_email)))`),
+  ]);
+  const issues = {
+    unassignedResellerActivations: resAct.rows[0].count,
+    unassignedInvoices: { count: unInv.rows[0].count, totalCommission: unInv.rows[0].total_commission },
+    unassignedZentactMerchants: zenMerch.rows[0].count,
+    repsNoRole: { count: repsNoRole.rows[0].count, names: repsNoRole.rows[0].names },
+    unmappedResellerEmails: unEmails.rows[0].count,
+  };
+  const totalIssues = issues.unassignedResellerActivations + issues.unassignedInvoices.count
+    + issues.unassignedZentactMerchants + issues.repsNoRole.count + issues.unmappedResellerEmails;
+  return { totalIssues, issues, generatedAt: new Date().toISOString() };
+}
+// GET /api/admin/data-health — the "À corriger" aggregate (?fresh=1 bypasses the 60s cache).
+app.get('/api/admin/data-health', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:data_health'))) return;
+  try {
+    if (req.query.fresh !== '1' && _dataHealthCache.data && (Date.now() - _dataHealthCache.at) < 60000) {
+      return res.json({ ..._dataHealthCache.data, cached: true });
+    }
+    const data = await computeDataHealth();
+    _dataHealthCache = { at: Date.now(), data };
+    res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
