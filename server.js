@@ -48,6 +48,9 @@ const PERMISSION_CATALOG = [
   { key: 'report:view_paystub',        label: 'View pay stubs (own + per role)',             category: 'Commission Report' },
   { key: 'report:view_salary',         label: 'View base salary & total compensation',       category: 'Commission Report' },
 
+  // Dashboard
+  { key: 'dashboard:view_admin',       label: 'View the Admin dashboard (company finance + action items)', category: 'Dashboard' },
+
   // Invoices
   { key: 'invoices:view_own',          label: 'View own invoices',                           category: 'Invoices' },
   { key: 'invoices:view_all',          label: "View all reps' invoices",                     category: 'Invoices' },
@@ -5129,8 +5132,14 @@ app.put('/api/user/preferences', authenticateToken, async (req, res) => {
 
 // GET /api/dashboard?year=
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
-  // Company-wide invoice/revenue stats — not for reps (gate matches the sidebar).
-  if (!(await requirePerm(req, res, 'invoices:view_all'))) return;
+  // Company-wide invoice/revenue stats. Allowed for admins, the company-invoices perm,
+  // OR the dedicated Admin-dashboard perm (so a non-admin "Management" role can see it).
+  if (req.user.isAdmin !== true) {
+    const perms = await getUserPermissions(req.user.email);
+    if (!userHasPermission(perms, 'invoices:view_all') && !userHasPermission(perms, 'dashboard:view_admin')) {
+      return res.status(403).json({ error: 'Permission required: dashboard:view_admin' });
+    }
+  }
   const year = parseInt(req.query.year) || new Date().getFullYear();
   try {
     const startDate = new Date(year, 0, 1);
