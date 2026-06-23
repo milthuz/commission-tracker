@@ -1392,12 +1392,12 @@ function mailShell(title, intro, ctaLabel, ctaUrl) {
       <tr><td style="padding:32px">
         <h2 style="margin:0 0 12px;color:#1c2434;font-size:19px">${title}</h2>
         <p style="margin:0 0 22px;color:#475569;font-size:14px;line-height:1.6">${intro}</p>
-        <table cellpadding="0" cellspacing="0"><tr><td style="border-radius:8px;background:#3c50e0">
+        ${(ctaUrl && ctaLabel) ? `<table cellpadding="0" cellspacing="0"><tr><td style="border-radius:8px;background:#3c50e0">
           <a href="${ctaUrl}" style="display:inline-block;padding:12px 28px;color:#ffffff;font-size:14px;font-weight:bold;text-decoration:none">${ctaLabel}</a>
         </td></tr></table>
         <p style="margin:22px 0 0;color:#94a3b8;font-size:12px;line-height:1.6">Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :<br>
         If the button doesn't work, copy this link into your browser:<br>
-        <a href="${ctaUrl}" style="color:#3c50e0;word-break:break-all">${ctaUrl}</a></p>
+        <a href="${ctaUrl}" style="color:#3c50e0;word-break:break-all">${ctaUrl}</a></p>` : ''}
       </td></tr>
       <tr><td style="padding:16px 32px;background:#f8fafc;color:#94a3b8;font-size:11px">© Cluster Systems — saleshub.clusterpos.com</td></tr>
     </table>
@@ -7443,7 +7443,7 @@ app.get('/api/resellers/pos-activations', authenticateToken, async (req, res) =>
 // ============================================================================
 let _dataHealthCache = { at: 0, data: null };
 async function computeDataHealth() {
-  const [resAct, unInv, zenMerch, repsNoRole, unEmails, openReports] = await Promise.all([
+  const [resAct, unInv, zenMerch, repsNoRole, unEmails, openReports, unInvList] = await Promise.all([
     // 1. Reseller POS activations resolving to "(unassigned)" — no managed match, no name, no email.
     pool.query(`
       SELECT COUNT(*)::int AS count
@@ -7488,10 +7488,15 @@ async function computeDataHealth() {
     pool.query(`
       SELECT id, report_type, reporter_email, reporter_name, reference, period, message, created_at
       FROM user_reports WHERE status = 'open' ORDER BY created_at DESC LIMIT 100`),
+    // 7. The actual unassigned-invoice rows (so the page can list them, not just count).
+    pool.query(`
+      SELECT invoice_number, customer_name, commission::float AS commission, date::date AS date
+      FROM invoices WHERE salesperson_name = 'Unassigned' AND commission > 0 AND date >= '2026-01-01'
+      ORDER BY commission DESC LIMIT 100`),
   ]);
   const issues = {
     unassignedResellerActivations: resAct.rows[0].count,
-    unassignedInvoices: { count: unInv.rows[0].count, totalCommission: unInv.rows[0].total_commission },
+    unassignedInvoices: { count: unInv.rows[0].count, totalCommission: unInv.rows[0].total_commission, items: unInvList.rows },
     unassignedZentactMerchants: zenMerch.rows[0].count,
     repsNoRole: { count: repsNoRole.rows[0].count, names: repsNoRole.rows[0].names },
     unmappedResellerEmails: unEmails.rows[0].count,
@@ -11543,16 +11548,13 @@ async function handleUserReport(reportType, req, res) {
       [reportType, email || null, repName, reference || null, period || null, message]
     );
     _dataHealthCache = { at: 0, data: null }; // bust the 60s cache so the badge updates now
-    const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    // Recipients: the configured list if any, else every admin (+ SMTP_FROM safety net).
-    const configured = await getReportRecipients();
-    let recipients;
-    if (configured.length) {
-      recipients = [...new Set(configured)];
-    } else {
-      const admins = (await pool.query('SELECT email FROM user_tokens WHERE is_admin = true AND email IS NOT NULL')).rows.map(r => r.email);
-      recipients = [...new Set([...admins, process.env.SMTP_FROM || process.env.SMTP_USER].filter(Boolean))];
+    // Email ONLY the configured recipient list. If none is set, the report lives in the
+    // "À corriger" dashboard only — no email is sent (per admin's choice).
+    const recipients = [...new Set(await getReportRecipients())];
+    if (recipients.length === 0) {
+      return res.json({ saved: true, sent: false, reason: 'no_recipients_configured', recipients: 0 });
     }
+    const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const refLabel = isPoints ? 'Marchand / dossier' : 'Facture';
     const html = mailShell(
       isPoints ? 'Signalement de points manquants' : 'Signalement de commission manquante',
@@ -11564,7 +11566,7 @@ async function handleUserReport(reportType, req, res) {
     );
     const subject = isPoints ? `Points manquants — ${repName}` : `Commission manquante — ${repName}`;
     const r = await sendMail(recipients.join(','), subject, html);
-    res.json({ sent: r.sent, reason: r.reason, recipients: recipients.length });
+    res.json({ saved: true, sent: r.sent, reason: r.reason, recipients: recipients.length });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
