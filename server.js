@@ -50,6 +50,7 @@ const PERMISSION_CATALOG = [
 
   // Dashboard
   { key: 'dashboard:view_admin',       label: 'View the Admin dashboard (company finance + action items)', category: 'Dashboard' },
+  { key: 'dashboard:view_own',         label: 'View the personal Sales Rep dashboard (home)',              category: 'Dashboard' },
 
   // Invoices
   { key: 'invoices:view_own',          label: 'View own invoices',                           category: 'Invoices' },
@@ -641,6 +642,11 @@ async function initializeDatabase() {
       UPDATE roles SET permissions = permissions || '["resources:view"]'::jsonb
       WHERE name IN ('Sales Rep', 'Manager') AND NOT (permissions ? 'resources:view')
     `);
+    // The personal home dashboard is on by default for Sales Rep + Manager (added after seed).
+    await pool.query(`
+      UPDATE roles SET permissions = permissions || '["dashboard:view_own"]'::jsonb
+      WHERE name IN ('Sales Rep', 'Manager') AND NOT (permissions ? 'dashboard:view_own')
+    `);
     // Auto-assign 'Administrator' role to existing is_admin users
     await pool.query(`
       INSERT INTO user_roles (user_email, role_id)
@@ -1046,30 +1052,45 @@ const authenticateToken = async (req, res, next) => {
     }
     req.user.isAdmin = realIsAdmin;
 
-    const impersonateName = req.headers['x-impersonate-as'];
-    if (impersonateName && realIsAdmin) {
-      const result = await pool.query(
-        'SELECT name FROM salespeople WHERE LOWER(name) = LOWER($1) LIMIT 1',
-        [String(impersonateName).trim()]
-      );
-      if (result.rows.length > 0) {
+    const impersonateVal = req.headers['x-impersonate-as'];
+    if (impersonateVal && realIsAdmin) {
+      const v = String(impersonateVal).trim();
+      let adoptEmail = null, adoptName = null;
+      if (v.includes('@')) {
+        // Email-based (works for ANY user — Zoho, external, or role-only): adopt this
+        // email's identity so their own permissions apply. Display name resolved from
+        // whichever table knows them, else the email itself.
+        const r = await pool.query(
+          `SELECT COALESCE(
+             (SELECT display_name FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1),
+             (SELECT display_name FROM local_users WHERE LOWER(email) = LOWER($1) LIMIT 1),
+             (SELECT name FROM salespeople WHERE LOWER(email) = LOWER($1) LIMIT 1),
+             $1
+           ) AS name`, [v]
+        );
+        adoptEmail = v.toLowerCase();
+        adoptName  = r.rows[0].name;
+      } else {
+        // Legacy name-based: match a salesperson, adopt their login account (or card email).
+        const result = await pool.query('SELECT name FROM salespeople WHERE LOWER(name) = LOWER($1) LIMIT 1', [v]);
+        if (result.rows.length > 0) {
+          adoptName = result.rows[0].name;
+          const acct = await pool.query(
+            `SELECT COALESCE(
+               (SELECT email FROM user_tokens WHERE LOWER(display_name) = LOWER($1) LIMIT 1),
+               (SELECT email FROM salespeople WHERE LOWER(name) = LOWER($1) LIMIT 1)
+             ) AS email`, [adoptName]
+          );
+          adoptEmail = acct.rows[0]?.email || null;
+        }
+      }
+      if (adoptName !== null) {
         req.user.realAdminEmail = user.email;
         req.user.realAdminName  = user.name;
-        req.user.name           = result.rows[0].name; // canonical casing from DB
+        req.user.name           = adoptName;
         req.user.isAdmin        = false;               // never admin while impersonating
         req.user.impersonating  = true;
-        // True "view as": adopt the impersonated salesperson's OWN login account
-        // (so their real permissions apply). Falls back to the email set on their
-        // salesperson card (Admin → Salespeople) so pre-assigned roles can be tested
-        // BEFORE the rep's first login. No account and no card email → no perms.
-        const acct = await pool.query(
-          `SELECT COALESCE(
-             (SELECT email FROM user_tokens WHERE LOWER(display_name) = LOWER($1) LIMIT 1),
-             (SELECT email FROM salespeople WHERE LOWER(name) = LOWER($1) LIMIT 1)
-           ) AS email`,
-          [result.rows[0].name]
-        );
-        req.user.email = acct.rows[0]?.email || null;
+        req.user.email          = adoptEmail;          // their own perms (or none)
       }
     }
     next();
@@ -9401,7 +9422,7 @@ app.get('/api/admin/users', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   try {
     const result = await pool.query(
-      `SELECT email, is_admin, created_at, updated_at AS last_login
+      `SELECT email, display_name, is_admin, created_at, updated_at AS last_login
        FROM user_tokens ORDER BY created_at DESC`
     );
     // Batch-fetch roles per user
@@ -9422,6 +9443,7 @@ app.get('/api/admin/users', authenticateToken, async (req, res) => {
     const seen = new Set(result.rows.map(r => r.email.toLowerCase()));
     const users = result.rows.map(r => ({
       email:     r.email,
+      displayName: r.display_name || null,
       isAdmin:   r.is_admin,
       createdAt: r.created_at,
       lastLogin: r.last_login,
@@ -9429,13 +9451,14 @@ app.get('/api/admin/users', authenticateToken, async (req, res) => {
       roles:     rolesByUser[r.email.toLowerCase()] || [],
     }));
     const localRes = await pool.query(
-      `SELECT email, status, created_at, last_login_at AS last_login FROM local_users ORDER BY created_at DESC`
+      `SELECT email, display_name, status, created_at, last_login_at AS last_login FROM local_users ORDER BY created_at DESC`
     );
     for (const r of localRes.rows) {
       if (seen.has(r.email.toLowerCase())) continue;
       seen.add(r.email.toLowerCase());
       users.push({
         email:     r.email,
+        displayName: r.display_name || null,
         isAdmin:   false,
         createdAt: r.created_at,
         lastLogin: r.last_login,
