@@ -5537,7 +5537,8 @@ async function addProposalCover(doc, { lang, clientName, repName, title, dateStr
   y -= 22;
   page.drawText(winAnsiSafe(lang === 'en' ? 'Proudly Canadian since 2009' : 'Fièrement canadien depuis 2009'), { x: padX, y, size: 11, font: helv, color: grey });
   y -= 34;
-  for (const line of wrapPdfLines(helvB, title, 28, colW)) { page.drawText(line, { x: padX, y, size: 28, font: helvB, color: white }); y -= 32; }
+  const headline = (title && title.trim()) || (lang === 'en' ? 'The POS built for the restaurants of tomorrow.' : 'Le PDV conçu pour la restauration de demain.');
+  for (const line of wrapPdfLines(helvB, headline, 28, colW)) { page.drawText(line, { x: padX, y, size: 28, font: helvB, color: white }); y -= 32; }
   y -= 8;
   const sub = lang === 'en'
     ? `A smooth, high-performance platform for ${clientName}, across Canada.`
@@ -5721,7 +5722,6 @@ app.post('/api/proposals/prepare', authenticateToken, async (req, res) => {
   const estimateId = String(req.body.estimateId || '').trim();
   const title = String(req.body.title || '').trim();
   if (!estimateId) return res.status(400).json({ error: 'estimateId required' });
-  if (!title) return res.status(400).json({ error: lang === 'en' ? 'A cover title is required' : 'Un titre de couverture est requis' });
   try {
     const det = await getEstimateDetail(estimateId);
     const clientName = (req.body.clientName || '').trim() || (det && det.customerName) || (lang === 'en' ? 'your business' : 'votre entreprise');
