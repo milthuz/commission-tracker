@@ -5578,12 +5578,15 @@ async function addProposalCover(doc, { lang, clientName, repName, title, dateStr
 
 // Render the Claude Design proposal document (personalized) via the external Puppeteer service.
 // Returns a PDF Buffer, or null if the service isn't configured / fails (caller falls back).
-async function fetchRenderedPresentation(clientName, lang) {
+async function fetchRenderedPresentation(clientName, lang, logoDataUrl) {
   const url = process.env.PROPOSAL_RENDER_URL;
   if (!url) return null;
   try {
-    const r = await axios.get(url, {
-      params: { clientName: clientName || '', lang, token: process.env.PROPOSAL_RENDER_TOKEN || '' },
+    // POST (not GET) so a client-logo data URL fits in the body.
+    const r = await axios.post(url, {
+      clientName: clientName || '', lang, token: process.env.PROPOSAL_RENDER_TOKEN || '',
+      logo: (typeof logoDataUrl === 'string' && logoDataUrl.startsWith('data:image')) ? logoDataUrl : undefined,
+    }, {
       responseType: 'arraybuffer', timeout: 90000, validateStatus: () => true,
     });
     if (r.status === 200 && r.data && r.data.byteLength > 1000) return Buffer.from(r.data);
@@ -5599,14 +5602,14 @@ async function fetchRenderedPresentation(clientName, lang) {
 // Returns { bytes, presentationPageCount, estimatePageCount }.
 // selectedPages: optional 1-based indices into the PRESENTATION to include (null/empty = all).
 // includeEstimate: append the Zoho estimate PDF (default true).
-async function buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes, selectedPages, includeEstimate = true }) {
+async function buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes, logoDataUrl, selectedPages, includeEstimate = true }) {
   const fs = require('fs');
   const { PDFDocument } = require('pdf-lib');
   const out = await PDFDocument.create();
 
   // (1) Build the full presentation in its own doc (so we can pick pages from it).
   let presDoc = null;
-  const rendered = await fetchRenderedPresentation(clientName, lang);
+  const rendered = await fetchRenderedPresentation(clientName, lang, logoDataUrl);
   if (rendered) {
     try { presDoc = await PDFDocument.load(rendered); }
     catch (e) { console.warn('[proposal] rendered presentation load failed, falling back:', e.message); }
@@ -5725,7 +5728,7 @@ app.post('/api/proposals/prepare', authenticateToken, async (req, res) => {
     const repName = req.user.name || req.user.email || '';
     const selectedPages = Array.isArray(req.body.selectedPages) ? req.body.selectedPages.map(Number).filter(Boolean) : null;
     const includeEstimate = req.body.includeEstimate !== false;
-    const built = await buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64), selectedPages, includeEstimate });
+    const built = await buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64), logoDataUrl: req.body.logoBase64, selectedPages, includeEstimate });
     const subject = lang === 'en' ? `Cluster POS proposal — ${clientName}` : `Proposition Cluster POS — ${clientName}`;
     const body = lang === 'en'
       ? `Hello,\n\nThank you for your interest in Cluster POS. Please find attached our proposal prepared for ${clientName}, including your quote.\n\nI'd be glad to walk you through it — just reply to this email.\n\nBest regards,\n${repName}\nCluster Systems`
@@ -5754,7 +5757,7 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
     const repName = req.user.name || req.user.email || '';
     const selectedPages = Array.isArray(req.body.selectedPages) ? req.body.selectedPages.map(Number).filter(Boolean) : null;
     const includeEstimate = req.body.includeEstimate !== false;
-    const built = await buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64), selectedPages, includeEstimate });
+    const built = await buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64), logoDataUrl: req.body.logoBase64, selectedPages, includeEstimate });
     const pdf = built.bytes;
     // Mark the estimate "sent" in Zoho (enables client acceptance + viewed/accepted tracking),
     // then try to surface its accept link to add as a button in our email.
