@@ -597,6 +597,24 @@ async function initializeDatabase() {
         PRIMARY KEY (user_email, team_id)
       );
     `);
+    // User-submitted reports (missing commission / missing points). Reps flag a gap from the
+    // Commission Report / Commission Tracker; admins see open ones in the "À corriger" page
+    // (and still get the email). 'open' until an admin resolves it.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_reports (
+        id             SERIAL PRIMARY KEY,
+        report_type    VARCHAR(30) NOT NULL,
+        reporter_email VARCHAR(255),
+        reporter_name  VARCHAR(255),
+        reference      VARCHAR(80),
+        period         VARCHAR(20),
+        message        TEXT NOT NULL,
+        status         VARCHAR(20) NOT NULL DEFAULT 'open',
+        created_at     TIMESTAMPTZ DEFAULT NOW(),
+        resolved_at    TIMESTAMPTZ,
+        resolved_by    VARCHAR(255)
+      );
+    `);
     // Seed preset roles (only inserted once if name not already present)
     await pool.query(`
       INSERT INTO roles (name, description, permissions, is_system)
@@ -7425,7 +7443,7 @@ app.get('/api/resellers/pos-activations', authenticateToken, async (req, res) =>
 // ============================================================================
 let _dataHealthCache = { at: 0, data: null };
 async function computeDataHealth() {
-  const [resAct, unInv, zenMerch, repsNoRole, unEmails] = await Promise.all([
+  const [resAct, unInv, zenMerch, repsNoRole, unEmails, openReports] = await Promise.all([
     // 1. Reseller POS activations resolving to "(unassigned)" — no managed match, no name, no email.
     pool.query(`
       SELECT COUNT(*)::int AS count
@@ -7464,6 +7482,11 @@ async function computeDataHealth() {
       FROM reseller_pos_activations a
       WHERE a.reseller_email IS NOT NULL AND a.reseller_email <> ''
         AND NOT EXISTS (SELECT 1 FROM resellers rs WHERE rs.emails @> to_jsonb(LOWER(a.reseller_email)))`),
+    // 6. Open user-submitted reports (missing commission / missing points) — full list so
+    //    the page can show + resolve them inline.
+    pool.query(`
+      SELECT id, report_type, reporter_email, reporter_name, reference, period, message, created_at
+      FROM user_reports WHERE status = 'open' ORDER BY created_at DESC LIMIT 100`),
   ]);
   const issues = {
     unassignedResellerActivations: resAct.rows[0].count,
@@ -7471,9 +7494,11 @@ async function computeDataHealth() {
     unassignedZentactMerchants: zenMerch.rows[0].count,
     repsNoRole: { count: repsNoRole.rows[0].count, names: repsNoRole.rows[0].names },
     unmappedResellerEmails: unEmails.rows[0].count,
+    userReports: { count: openReports.rows.length, items: openReports.rows },
   };
   const totalIssues = issues.unassignedResellerActivations + issues.unassignedInvoices.count
-    + issues.unassignedZentactMerchants + issues.repsNoRole.count + issues.unmappedResellerEmails;
+    + issues.unassignedZentactMerchants + issues.repsNoRole.count + issues.unmappedResellerEmails
+    + issues.userReports.count;
   return { totalIssues, issues, generatedAt: new Date().toISOString() };
 }
 // GET /api/admin/data-health — the "À corriger" aggregate (?fresh=1 bypasses the 60s cache).
@@ -7486,6 +7511,23 @@ app.get('/api/admin/data-health', authenticateToken, async (req, res) => {
     const data = await computeDataHealth();
     _dataHealthCache = { at: Date.now(), data };
     res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/user-reports/:id/resolve — mark a user report (missing commission/points) resolved.
+app.post('/api/admin/user-reports/:id/resolve', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:data_health'))) return;
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: 'invalid id' });
+    await pool.query(
+      `UPDATE user_reports SET status = 'resolved', resolved_at = NOW(), resolved_by = $2 WHERE id = $1`,
+      [id, req.user.email || req.user.name || 'admin']
+    );
+    _dataHealthCache = { at: 0, data: null };
+    res.json({ resolved: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -11447,35 +11489,51 @@ app.post('/api/feedback/feature-request', authenticateToken, async (req, res) =>
   }
 });
 
-// POST /api/commissions/missing-report — a rep flags a commission they think is missing.
-// Emails all admins (+ SMTP_FROM fallback). Body: { invoiceNumber?, period?, message }.
-app.post('/api/commissions/missing-report', authenticateToken, async (req, res) => {
+// Shared handler: a rep flags a missing commission OR missing points. Persists the report
+// to user_reports (so it shows in the admin "À corriger" page) AND emails all admins.
+// reportType: 'missing_commission' | 'missing_points'.
+async function handleUserReport(reportType, req, res) {
+  const isPoints = reportType === 'missing_points';
   const { email, name: jwtName } = req.user;
-  const invoiceNumber = (req.body.invoiceNumber || '').toString().trim().slice(0, 40);
-  const period        = (req.body.period || '').toString().trim().slice(0, 20);
-  const message       = (req.body.message || '').toString().trim().slice(0, 2000);
+  const reference = (req.body.reference || req.body.invoiceNumber || req.body.merchant || '').toString().trim().slice(0, 80);
+  const period    = (req.body.period || '').toString().trim().slice(0, 20);
+  const message   = (req.body.message || '').toString().trim().slice(0, 2000);
   if (!message) return res.status(400).json({ error: 'message required' });
   try {
     const tok = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
     const repName = tok.rows[0]?.display_name || jwtName || email || 'Unknown rep';
+    // Persist so admins see it in the data-health page.
+    await pool.query(
+      `INSERT INTO user_reports (report_type, reporter_email, reporter_name, reference, period, message)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [reportType, email || null, repName, reference || null, period || null, message]
+    );
+    _dataHealthCache = { at: 0, data: null }; // bust the 60s cache so the badge updates now
     const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    // Recipients: all admins, plus the configured from-address as a safety net.
     const admins = (await pool.query('SELECT email FROM user_tokens WHERE is_admin = true AND email IS NOT NULL')).rows.map(r => r.email);
     const recipients = [...new Set([...admins, process.env.SMTP_FROM || process.env.SMTP_USER].filter(Boolean))];
+    const refLabel = isPoints ? 'Marchand / dossier' : 'Facture';
     const html = mailShell(
-      'Signalement de commission manquante',
-      `<strong>${esc(repName)}</strong> (${esc(email || '—')}) signale une commission possiblement manquante.<br><br>`
-      + (invoiceNumber ? `<strong>Facture :</strong> ${esc(invoiceNumber)}<br>` : '')
+      isPoints ? 'Signalement de points manquants' : 'Signalement de commission manquante',
+      `<strong>${esc(repName)}</strong> (${esc(email || '—')}) signale ${isPoints ? 'des points possiblement manquants' : 'une commission possiblement manquante'}.<br><br>`
+      + (reference ? `<strong>${refLabel} :</strong> ${esc(reference)}<br>` : '')
       + (period ? `<strong>Période :</strong> ${esc(period)}<br>` : '')
       + `<strong>Message :</strong><br>${esc(message).replace(/\n/g, '<br>')}`,
       null, null
     );
-    const r = await sendMail(recipients.join(','), `Commission manquante — ${repName}`, html);
+    const subject = isPoints ? `Points manquants — ${repName}` : `Commission manquante — ${repName}`;
+    const r = await sendMail(recipients.join(','), subject, html);
     res.json({ sent: r.sent, reason: r.reason, recipients: recipients.length });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
-});
+}
+// POST /api/commissions/missing-report — flag a missing commission (Commission Report page).
+// Body: { invoiceNumber?|reference?, period?, message }.
+app.post('/api/commissions/missing-report', authenticateToken, (req, res) => handleUserReport('missing_commission', req, res));
+// POST /api/commissions/missing-points-report — flag missing points (Commission Tracker page).
+// Body: { reference?|merchant?, period?, message }.
+app.post('/api/commissions/missing-points-report', authenticateToken, (req, res) => handleUserReport('missing_points', req, res));
 
 // POST /api/commissions/quota-waiver — admin decision: pay a rep's month DESPITE the
 // missed quota (plan v7.7 exception). Body: { repName, year, month, waived }. Setting or
