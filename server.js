@@ -7517,6 +7517,39 @@ app.get('/api/admin/data-health', authenticateToken, async (req, res) => {
   }
 });
 
+// Recipients for the missing-commission / missing-points notification emails. Configured in
+// app_settings key 'report_recipients'; empty → falls back to all admins (+ SMTP_FROM).
+async function getReportRecipients() {
+  try {
+    const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'report_recipients'`);
+    const v = r.rows[0]?.value;
+    return Array.isArray(v) ? v.filter(e => typeof e === 'string') : [];
+  } catch { return []; }
+}
+// GET /api/admin/report-recipients — the configured recipient list (empty = all admins).
+app.get('/api/admin/report-recipients', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:data_health'))) return;
+  try { res.json({ recipients: await getReportRecipients() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+// PUT /api/admin/report-recipients { emails:[...] } — set who gets missing commission/points emails.
+app.put('/api/admin/report-recipients', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:data_health'))) return;
+  const emails = Array.isArray(req.body?.emails) ? req.body.emails.map(e => String(e).trim().toLowerCase()).filter(Boolean) : null;
+  if (!emails) return res.status(400).json({ error: 'emails array required' });
+  if (emails.some(e => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e))) return res.status(400).json({ error: 'invalid email' });
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('report_recipients', $1::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [JSON.stringify(emails)]
+    );
+    res.json({ recipients: emails });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /api/admin/user-reports/:id/resolve — mark a user report (missing commission/points) resolved.
 app.post('/api/admin/user-reports/:id/resolve', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'admin:data_health'))) return;
@@ -11511,8 +11544,15 @@ async function handleUserReport(reportType, req, res) {
     );
     _dataHealthCache = { at: 0, data: null }; // bust the 60s cache so the badge updates now
     const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    const admins = (await pool.query('SELECT email FROM user_tokens WHERE is_admin = true AND email IS NOT NULL')).rows.map(r => r.email);
-    const recipients = [...new Set([...admins, process.env.SMTP_FROM || process.env.SMTP_USER].filter(Boolean))];
+    // Recipients: the configured list if any, else every admin (+ SMTP_FROM safety net).
+    const configured = await getReportRecipients();
+    let recipients;
+    if (configured.length) {
+      recipients = [...new Set(configured)];
+    } else {
+      const admins = (await pool.query('SELECT email FROM user_tokens WHERE is_admin = true AND email IS NOT NULL')).rows.map(r => r.email);
+      recipients = [...new Set([...admins, process.env.SMTP_FROM || process.env.SMTP_USER].filter(Boolean))];
+    }
     const refLabel = isPoints ? 'Marchand / dossier' : 'Facture';
     const html = mailShell(
       isPoints ? 'Signalement de points manquants' : 'Signalement de commission manquante',
