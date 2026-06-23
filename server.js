@@ -7407,6 +7407,28 @@ app.get('/api/resellers/pos-activations', authenticateToken, async (req, res) =>
   }
 });
 
+// GET /api/admin/reseller-activation-raw?secret=<shared> — TEMP DIAGNOSTIC.
+// Dumps the raw webhook payload of recent POS activations (unassigned first) so we can see
+// exactly which field keys Zoho sends. Remove once the webhook mapping is confirmed/fixed.
+app.get('/api/admin/reseller-activation-raw', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const rows = (await pool.query(
+      `SELECT id, reseller_name, reseller_email, customer_name, quantity,
+              submitted_at, raw
+       FROM reseller_pos_activations
+       ORDER BY (reseller_email IS NULL OR reseller_email = '') DESC, submitted_at DESC
+       LIMIT 25`
+    )).rows;
+    res.json({ count: rows.length, activations: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/resellers/residuals — a reseller's Zentact SALES (merchants they activated),
 // matched by the reseller's zentact_key against zentact_merchants.sales_rep_name
 // (comma-separated, case-insensitive). Resellers don't get bonuses — this is their sales.
