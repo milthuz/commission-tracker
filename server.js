@@ -7346,11 +7346,13 @@ app.post('/api/webhooks/zoho-form/license-order',
     }
     try {
       const b = req.body || {};
-      const resellerName  = (b.reseller_name || b.resellerName || b.reseller || '').toString().trim() || null;
-      const resellerEmail = (b.reseller_email || b.resellerEmail || b.email || '').toString().trim().toLowerCase() || null;
+      // Tolerate both payload shapes: the clean keys the current form sends
+      // (reseller_name/customer_name/quantity) AND the full Zoho form's French field labels.
+      const resellerName  = (b.reseller_name || b.resellerName || b.reseller || b['Nom du revendeur (reseller)'] || '').toString().trim() || null;
+      const resellerEmail = (b.reseller_email || b.resellerEmail || b.email || b['Courriel du demandeur (revendeur)'] || '').toString().trim().toLowerCase() || null;
       const licenseType  = (b.license_type || b.licenseType || b.license || '').toString().trim() || null;
-      const quantity     = parseInt(b.quantity || b.qty || 1) || 1;
-      const customerName = (b.customer_name || b.customerName || b.customer || '').toString().trim() || null;
+      const quantity     = parseInt(b.quantity || b.qty || b['Nombre de Licenses requises'] || 1) || 1;
+      const customerName = (b.customer_name || b.customerName || b.customer || b['Nom Entreprise'] || '').toString().trim() || null;
       // Submission date: use the mapped form value if it parses, else now (the webhook fires
       // at submit time, so "now" is the submission moment). Parsed in JS to tolerate any format.
       let submittedDate = new Date();
@@ -7382,23 +7384,31 @@ app.post('/api/webhooks/zoho-form/license-order',
 app.get('/api/resellers/pos-activations', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'reseller:view'))) return;
   try {
-    // Resolve each activation's reseller_email to a managed reseller (by emails mapping);
-    // unassigned emails fall back to showing the raw email.
+    // Resolve each activation to a managed reseller by EMAIL (emails mapping) OR by NAME
+    // (the form now sends reseller_name, e.g. "Lirette"). Fall back to the raw captured name,
+    // then the raw email, then "(unassigned)". The LATERAL picks ONE reseller (email match
+    // preferred) so an OR-match never duplicates/inflates aggregate counts.
+    const RESELLER_JOIN = `
+       LEFT JOIN LATERAL (
+         SELECT r.name FROM resellers r
+         WHERE r.emails @> to_jsonb(LOWER(a.reseller_email))
+            OR LOWER(r.name) = LOWER(NULLIF(a.reseller_name, ''))
+         ORDER BY (r.emails @> to_jsonb(LOWER(a.reseller_email))) DESC
+         LIMIT 1
+       ) rs ON true`;
+    const RESELLER_LABEL = `COALESCE(rs.name, NULLIF(a.reseller_name, ''), NULLIF(a.reseller_email, ''), '(unassigned)')`;
     const rows = (await pool.query(
-      `SELECT a.id,
-              COALESCE(rs.name, a.reseller_email, '(unassigned)') AS reseller_name,
+      `SELECT a.id, ${RESELLER_LABEL} AS reseller_name,
               a.reseller_email, a.quantity, a.customer_name, a.submitted_at
-       FROM reseller_pos_activations a
-       LEFT JOIN resellers rs ON rs.emails @> to_jsonb(LOWER(a.reseller_email))
+       FROM reseller_pos_activations a${RESELLER_JOIN}
        ORDER BY a.submitted_at DESC LIMIT 2000`
     )).rows;
     const byReseller = (await pool.query(
-      `SELECT COALESCE(rs.name, a.reseller_email, '(unassigned)') AS reseller_name,
+      `SELECT ${RESELLER_LABEL} AS reseller_name,
               COUNT(DISTINCT a.customer_name)::int AS locations,
               COALESCE(SUM(a.quantity),0)::int AS licenses,
               COUNT(*)::int AS submissions
-       FROM reseller_pos_activations a
-       LEFT JOIN resellers rs ON rs.emails @> to_jsonb(LOWER(a.reseller_email))
+       FROM reseller_pos_activations a${RESELLER_JOIN}
        GROUP BY 1 ORDER BY licenses DESC`
     )).rows;
     res.json({ connected: true, source: 'zoho_forms', activations: rows, byReseller });
@@ -7417,10 +7427,19 @@ app.get('/api/admin/reseller-activation-raw', async (req, res) => {
   }
   try {
     const rows = (await pool.query(
-      `SELECT id, reseller_name, reseller_email, customer_name, quantity,
-              submitted_at, raw
-       FROM reseller_pos_activations
-       ORDER BY (reseller_email IS NULL OR reseller_email = '') DESC, submitted_at DESC
+      `SELECT a.id, a.reseller_name AS captured_name, a.reseller_email, a.customer_name,
+              a.quantity, a.submitted_at,
+              COALESCE(rs.name, NULLIF(a.reseller_name,''), NULLIF(a.reseller_email,''), '(unassigned)') AS resolved_reseller,
+              rs.name AS matched_managed_reseller
+       FROM reseller_pos_activations a
+       LEFT JOIN LATERAL (
+         SELECT r.name FROM resellers r
+         WHERE r.emails @> to_jsonb(LOWER(a.reseller_email))
+            OR LOWER(r.name) = LOWER(NULLIF(a.reseller_name, ''))
+         ORDER BY (r.emails @> to_jsonb(LOWER(a.reseller_email))) DESC
+         LIMIT 1
+       ) rs ON true
+       ORDER BY (a.reseller_email IS NULL OR a.reseller_email = '') DESC, a.submitted_at DESC
        LIMIT 25`
     )).rows;
     res.json({ count: rows.length, activations: rows });
