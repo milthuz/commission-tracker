@@ -7455,10 +7455,11 @@ async function computeDataHealth() {
         LIMIT 1
       ) rs ON true
       WHERE COALESCE(rs.name, NULLIF(a.reseller_name, ''), NULLIF(a.reseller_email, '')) IS NULL`),
-    // 2. Invoices with commission but salesperson = 'Unassigned'.
+    // 2. Invoices with commission but salesperson = 'Unassigned' (from 2026-01-01 onward).
     pool.query(`
       SELECT COUNT(*)::int AS count, COALESCE(SUM(commission), 0)::float AS total_commission
-      FROM invoices WHERE salesperson_name = 'Unassigned' AND commission > 0`),
+      FROM invoices WHERE salesperson_name = 'Unassigned' AND commission > 0
+        AND date >= '2026-01-01'`),
     // 3. Active Zentact merchants with no rep and not reseller-boarded.
     pool.query(`
       SELECT COUNT(*)::int AS count FROM zentact_merchants
