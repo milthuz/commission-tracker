@@ -1913,6 +1913,10 @@ app.post('/api/demo/kaizen-url', authenticateToken, async (req, res) => {
     res.json({ url: out.StreamingURL });
   } catch (e) {
     console.warn('[DEMO] createStreamingURL error:', e.name, e.message);
+    // Fleet stopped (off-hours auto-stop) → a friendly "operating hours" message client-side.
+    if (e.name === 'ResourceNotAvailableException' || /not running/i.test(e.message || '')) {
+      return res.status(503).json({ error: 'fleet_stopped' });
+    }
     res.status(502).json({ error: 'demo_error', detail: e.message });
   }
 });
