@@ -1408,24 +1408,44 @@ async function sendMail(to, subject, html, opts = {}) {
   }
 }
 function mailShell(title, intro, ctaLabel, ctaUrl) {
-  return `<!doctype html><html><body style="margin:0;padding:0;background:#f4f6fa;font-family:Arial,Helvetica,sans-serif">
-  <table width="100%" cellpadding="0" cellspacing="0" style="padding:32px 12px"><tr><td align="center">
-    <table width="560" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:10px;overflow:hidden">
-      <tr><td style="background:#1c2434;padding:22px 32px"><span style="color:#ffffff;font-size:20px;font-weight:bold">Sales Hub</span>
-        <span style="color:#8a99af;font-size:12px;margin-left:8px">by Cluster Systems</span></td></tr>
-      <tr><td style="padding:32px">
-        <h2 style="margin:0 0 12px;color:#1c2434;font-size:19px">${title}</h2>
-        <p style="margin:0 0 22px;color:#475569;font-size:14px;line-height:1.6">${intro}</p>
-        ${(ctaUrl && ctaLabel) ? `<table cellpadding="0" cellspacing="0"><tr><td style="border-radius:8px;background:#3c50e0">
-          <a href="${ctaUrl}" style="display:inline-block;padding:12px 28px;color:#ffffff;font-size:14px;font-weight:bold;text-decoration:none">${ctaLabel}</a>
-        </td></tr></table>
-        <p style="margin:22px 0 0;color:#94a3b8;font-size:12px;line-height:1.6">Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :<br>
-        If the button doesn't work, copy this link into your browser:<br>
-        <a href="${ctaUrl}" style="color:#3c50e0;word-break:break-all">${ctaUrl}</a></p>` : ''}
+  const year = new Date().getFullYear();
+  const preheader = String(title || '').replace(/<[^>]+>/g, '');
+  return `<!doctype html><html lang="fr"><head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light only"><meta name="supported-color-schemes" content="light">
+  </head>
+  <body style="margin:0;padding:0;background:#eef1f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased">
+    <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:#eef1f6;font-size:1px;line-height:1px">${preheader}</div>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f6;padding:32px 12px">
+      <tr><td align="center">
+        <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(16,23,34,.08),0 10px 28px rgba(16,23,34,.07)">
+          <tr><td style="background:#0f1722;padding:24px 36px">
+            <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-.3px">Sales&nbsp;Hub</span><span style="color:#f97316;font-size:22px;font-weight:700">.</span>
+            <span style="display:block;color:#8a99af;font-size:12px;margin-top:3px;letter-spacing:.2px">by Cluster Systems</span>
+          </td></tr>
+          <tr><td style="height:4px;background:#f97316;font-size:0;line-height:0">&nbsp;</td></tr>
+          <tr><td style="padding:34px 36px 6px">
+            <h1 style="margin:0 0 14px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${title}</h1>
+            <div style="color:#475569;font-size:14.5px;line-height:1.65">${intro}</div>
+            ${(ctaUrl && ctaLabel) ? `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:26px 0 4px"><tr><td style="border-radius:9px;background:#3c50e0">
+              <a href="${ctaUrl}" style="display:inline-block;padding:13px 30px;color:#ffffff;font-size:14px;font-weight:700;text-decoration:none;border-radius:9px">${ctaLabel}</a>
+            </td></tr></table>
+            <p style="margin:18px 0 0;color:#94a3b8;font-size:12px;line-height:1.6">Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :<br>
+            If the button doesn't work, copy this link into your browser:<br>
+            <a href="${ctaUrl}" style="color:#3c50e0;word-break:break-all">${ctaUrl}</a></p>` : ''}
+          </td></tr>
+          <tr><td style="padding:26px 36px 0"><div style="border-top:1px solid #eef1f6;font-size:0;line-height:0">&nbsp;</div></td></tr>
+          <tr><td style="padding:16px 36px 30px">
+            <p style="margin:0;color:#94a3b8;font-size:12px;line-height:1.7">
+              Une question ? / Questions? <a href="mailto:saleshub@clustersystems.com" style="color:#3c50e0;text-decoration:none">saleshub@clustersystems.com</a><br>
+              © ${year} Cluster Systems — <a href="https://saleshub.clusterpos.com" style="color:#94a3b8;text-decoration:none">saleshub.clusterpos.com</a>
+            </p>
+          </td></tr>
+        </table>
+        <p style="color:#aab4c4;font-size:11px;margin:18px 0 0">Sales Hub · Cluster Systems</p>
       </td></tr>
-      <tr><td style="padding:16px 32px;background:#f8fafc;color:#94a3b8;font-size:11px">© Cluster Systems — saleshub.clusterpos.com</td></tr>
     </table>
-  </td></tr></table></body></html>`;
+  </body></html>`;
 }
 
 // Simple in-memory rate limiter for credential endpoints (per dyno — good enough).
