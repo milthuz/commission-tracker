@@ -9491,6 +9491,28 @@ app.get('/api/admin/users', authenticateToken, async (req, res) => {
   }
 });
 
+// DELETE /api/admin/users/:email — remove a user's app access: their Zoho token,
+// external account, role assignments, managed teams and preferences. Does NOT touch the
+// salespeople table (commission data). A Zoho user can log back in (recreates a token).
+app.delete('/api/admin/users/:email', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const email = String(req.params.email || '').trim().toLowerCase();
+  if (!email) return res.status(400).json({ error: 'email required' });
+  if (email === String(req.user.email || '').toLowerCase()) {
+    return res.status(400).json({ error: 'cannot_delete_self' });
+  }
+  try {
+    const tok = await pool.query('DELETE FROM user_tokens WHERE LOWER(email) = $1', [email]);
+    const loc = await pool.query('DELETE FROM local_users WHERE LOWER(email) = $1', [email]);
+    await pool.query('DELETE FROM user_roles WHERE LOWER(user_email) = $1', [email]);
+    await pool.query('DELETE FROM team_managers WHERE LOWER(user_email) = $1', [email]);
+    await pool.query('DELETE FROM user_preferences WHERE LOWER(email) = $1', [email]);
+    res.json({ deleted: true, hadToken: tok.rowCount > 0, hadLocal: loc.rowCount > 0 });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // PUT /api/admin/users/:email/admin
 app.put('/api/admin/users/:email/admin', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
