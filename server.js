@@ -7699,6 +7699,79 @@ app.post('/api/savings/calculate', authenticateToken, async (req, res) => {
     res.json({ templateId: t.id, templateName: t.name, clusterResolved: cluster, results });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+// --- Phase 2: AI statement parsing (upload a competitor PDF → prefill the form) ---
+const uploadStatement = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
+const STATEMENT_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    merchantName: { type: 'string' },
+    currency: { type: 'string' },
+    period: { type: 'string' },
+    volumes: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        debit:  { type: 'object', additionalProperties: false, properties: { trx: { type: 'number' }, amount: { type: 'number' } }, required: ['trx', 'amount'] },
+        credit: { type: 'object', additionalProperties: false, properties: { trx: { type: 'number' }, amount: { type: 'number' } }, required: ['trx', 'amount'] },
+        amex:   { type: 'object', additionalProperties: false, properties: { trx: { type: 'number' }, amount: { type: 'number' } }, required: ['trx', 'amount'] },
+      }, required: ['debit', 'credit', 'amex'],
+    },
+    currentRates: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        debit:  { type: 'object', additionalProperties: false, properties: { ratePct: { type: 'number' }, perTrx: { type: 'number' } }, required: ['ratePct', 'perTrx'] },
+        credit: { type: 'object', additionalProperties: false, properties: { ratePct: { type: 'number' }, perTrx: { type: 'number' } }, required: ['ratePct', 'perTrx'] },
+        amex:   { type: 'object', additionalProperties: false, properties: { ratePct: { type: 'number' }, perTrx: { type: 'number' } }, required: ['ratePct', 'perTrx'] },
+      }, required: ['debit', 'credit', 'amex'],
+    },
+    interchange: { type: 'number' },
+    currentFixed: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { label: { type: 'string' }, qty: { type: 'number' }, unit: { type: 'number' } }, required: ['label', 'qty', 'unit'] } },
+    statementTotalMonthly: { type: 'number' },
+    notes: { type: 'string' },
+  },
+  required: ['merchantName', 'currency', 'period', 'volumes', 'currentRates', 'interchange', 'currentFixed', 'statementTotalMonthly', 'notes'],
+};
+const STATEMENT_PROMPT = `You are extracting data from a competitor merchant payment-processing statement (relevé marchand) to feed a savings calculator. The statement may be in French or English, from a Canadian/Québec processor (Moneris, Global Payments, Chase, TD, Square, Stripe, Elavon, Desjardins, etc.).
+
+Extract, as JSON matching the schema:
+- merchantName: the business name on the statement.
+- currency: e.g. "CAD".
+- period: the statement period (e.g. "2026-05" or "May 2026"), as text.
+- volumes: monthly transaction COUNT (trx) and dollar AMOUNT for three buckets — debit = Interac/debit; credit = Visa + Mastercard combined; amex = American Express + Discover combined.
+- currentRates: the processor's MARKUP per bucket when the statement is interchange-plus or shows a discount/markup rate — ratePct = percentage markup AS A PERCENT NUMBER (e.g. 0.15 means 0.15%), perTrx = per-transaction fee in dollars. If the statement is bundled/flat and the markup cannot be separated, set both to 0 and say so in notes.
+- interchange: total interchange + card-brand/assessment fees in dollars (pass-through). If not separable, set 0 and note it.
+- currentFixed: list of fixed monthly fees (terminal rental, PCI, monthly/statement fee, account fee, etc.) — each {label, qty, unit price}.
+- statementTotalMonthly: the statement's total monthly cost/fees if shown (for cross-check).
+- notes: what you could not determine, assumptions made, and your confidence (write in the statement's language).
+
+Rules: numbers only (no $ or % signs). Use 0 for anything you genuinely cannot find — do NOT invent values. Combine Visa+MC into credit, Amex+Discover into amex.`;
+
+// POST /api/savings/parse-statement — upload a competitor PDF → Claude extracts the inputs.
+app.post('/api/savings/parse-statement', authenticateToken, uploadStatement.single('file'), async (req, res) => {
+  if (!(await requirePerm(req, res, 'savings:use'))) return;
+  if (!req.file) return res.status(400).json({ error: 'file required' });
+  const client = getAnthropic();
+  if (!client) return res.status(503).json({ error: 'ai_not_configured' });
+  try {
+    const resp = await client.messages.create({
+      model: 'claude-opus-4-8',
+      max_tokens: 3000,
+      thinking: { type: 'adaptive' },
+      output_config: { format: { type: 'json_schema', schema: STATEMENT_SCHEMA }, effort: 'medium' },
+      messages: [{ role: 'user', content: [
+        { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: req.file.buffer.toString('base64') } },
+        { type: 'text', text: STATEMENT_PROMPT },
+      ] }],
+    });
+    if (resp.stop_reason === 'refusal') return res.status(422).json({ error: 'refused' });
+    const text = (resp.content.find(b => b.type === 'text') || {}).text || '{}';
+    let data; try { data = JSON.parse(text); } catch { return res.status(502).json({ error: 'parse_failed' }); }
+    res.json({ extracted: data });
+  } catch (e) {
+    console.warn('[savings/parse-statement]', e.name, e.message);
+    res.status(502).json({ error: 'ai_error', detail: e.message });
+  }
+});
+
 // --- Saved analyses ---
 app.post('/api/savings/analyses', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'savings:use'))) return;
