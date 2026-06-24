@@ -7732,6 +7732,80 @@ app.get('/api/savings/analyses/:id', authenticateToken, async (req, res) => {
     res.json({ analysis: r });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+// Standalone branded savings offer PDF (client-facing). pdfkit, one page, bilingual.
+function buildSavingsPdf({ merchant, lang, results, dateStr }) {
+  const fr = lang !== 'en';
+  const fmt = new Intl.NumberFormat(fr ? 'fr-CA' : 'en-CA', { style: 'currency', currency: 'CAD' });
+  const $ = (n) => fmt.format(n || 0);
+  const T = fr ? {
+    title: "Analyse d'économies — paiements", prepared: 'Préparé pour', save: "VOS ÉCONOMIES ESTIMÉES", mo: 'par mois', yr: 'par année',
+    comp: 'Comparaison mensuelle', cur: 'Processeur actuel', cl: 'Avec Cluster', txn: 'Frais de transaction', fix: 'Frais fixes', tax: 'Taxe', tot: 'Total mensuel',
+    disc: "Estimations basées sur le relevé fourni, avant taxes applicables sur certains frais. Montants indicatifs.",
+  } : {
+    title: 'Payment savings analysis', prepared: 'Prepared for', save: 'YOUR ESTIMATED SAVINGS', mo: 'per month', yr: 'per year',
+    comp: 'Monthly comparison', cur: 'Current processor', cl: 'With Cluster', txn: 'Transaction fees', fix: 'Fixed fees', tax: 'Tax', tot: 'Monthly total',
+    disc: 'Estimates based on the statement provided, before applicable taxes on certain fees. Indicative figures.',
+  };
+  const doc = new PDFDocument({ size: 'LETTER', margin: 0 });
+  const W = 612, M = 56;
+  // Header
+  doc.rect(0, 0, W, 92).fill('#0f1722');
+  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(22).text('Sales Hub', M, 30, { continued: true }).fillColor('#f97316').text('.');
+  doc.fillColor('#8a99af').font('Helvetica').fontSize(10).text('by Cluster Systems', M, 60);
+  doc.rect(0, 92, W, 4).fill('#f97316');
+  // Title + merchant
+  doc.fillColor('#0f1722').font('Helvetica-Bold').fontSize(18).text(T.title, M, 124);
+  doc.fillColor('#475569').font('Helvetica').fontSize(11).text(`${T.prepared}: ${merchant || '—'}   ·   ${dateStr}`, M, 150);
+  // Savings hero
+  const hy = 184;
+  doc.roundedRect(M, hy, W - 2 * M, 104, 10).fill('#e8f6ef');
+  doc.fillColor('#0f6e56').font('Helvetica-Bold').fontSize(11).text(T.save, M, hy + 16, { width: W - 2 * M, align: 'center' });
+  doc.fillColor('#0f6e56').font('Helvetica-Bold').fontSize(34).text($(results.savings.monthly), M, hy + 34, { width: W - 2 * M, align: 'center' });
+  doc.fillColor('#0f6e56').font('Helvetica').fontSize(12).text(`${T.mo}  ·  ${$(results.savings.yearly)} ${T.yr}`, M, hy + 76, { width: W - 2 * M, align: 'center' });
+  // Comparison table
+  let y = hy + 140;
+  doc.fillColor('#0f1722').font('Helvetica-Bold').fontSize(13).text(T.comp, M, y); y += 26;
+  const c1 = M, c2 = 320, c3 = 470, rowH = 26;
+  doc.font('Helvetica-Bold').fontSize(10).fillColor('#94a3b8');
+  doc.text('', c1, y); doc.text(T.cur, c2, y, { width: 120, align: 'right' }); doc.text(T.cl, c3, y, { width: W - M - c3, align: 'right' });
+  y += 20;
+  const row = (label, a, b, bold) => {
+    doc.moveTo(M, y - 4).lineTo(W - M, y - 4).strokeColor('#eef1f6').stroke();
+    doc.font(bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(bold ? 12 : 11).fillColor(bold ? '#0f1722' : '#475569');
+    doc.text(label, c1, y); doc.text($(a), c2, y, { width: 120, align: 'right' }); doc.text($(b), c3, y, { width: W - M - c3, align: 'right' });
+    y += rowH;
+  };
+  row(T.txn, results.current.txnFees, results.cluster.txnFees);
+  row(T.fix, results.current.fixed, results.cluster.fixed);
+  row(T.tax, results.current.tax, results.cluster.tax);
+  row(T.tot, results.current.total, results.cluster.total, true);
+  // Footer
+  doc.font('Helvetica').fontSize(9).fillColor('#94a3b8').text(T.disc, M, 720, { width: W - 2 * M });
+  doc.fillColor('#94a3b8').fontSize(9).text('saleshub@clustersystems.com  ·  clusterpos.com', M, 752, { width: W - 2 * M, align: 'center' });
+  return new Promise((resolve, reject) => { const ch = []; doc.on('data', d => ch.push(d)); doc.on('end', () => resolve(Buffer.concat(ch))); doc.on('error', reject); doc.end(); });
+}
+// POST /api/savings/pdf — recompute server-side + return the branded offer PDF.
+app.post('/api/savings/pdf', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'savings:use'))) return;
+  try {
+    const { volumes, current, clusterQty, lang } = req.body;
+    if (!volumes || !current || !current.rates) return res.status(400).json({ error: 'volumes + current required' });
+    let t = null;
+    if (req.user.isAdmin && req.body.templateId) t = (await pool.query(`SELECT * FROM pricing_templates WHERE id = $1`, [parseInt(req.body.templateId, 10)])).rows[0];
+    if (!t) t = await getEffectiveTemplate(req.user.email);
+    if (!t) return res.status(404).json({ error: 'no_template' });
+    const overrides = req.user.isAdmin === true ? req.body.overrides : null;
+    const cluster = buildClusterForEngine(t.config, clusterQty, current.interchange || 0, overrides);
+    const results = computeSavingsEngine({ volumes, current, cluster });
+    const buf = await buildSavingsPdf({
+      merchant: String(req.body.merchantName || ''), lang,
+      results, dateStr: new Date().toLocaleDateString(lang === 'en' ? 'en-CA' : 'fr-CA'),
+    });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="savings-${String(req.body.merchantName || 'offer').replace(/[^a-z0-9]+/gi, '-').slice(0, 40) || 'offer'}.pdf"`);
+    res.send(buf);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // ============================================================================
 // DATA HEALTH — "Needs attention" (À corriger): aggregated, count-only signals of
