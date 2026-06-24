@@ -25,6 +25,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const { ZohoCRMService, MONTHLY_QUOTA, MONTHLY_BONUS_TIERS, ANNUAL_BONUS_TIERS, PLAN_START_DATE } = require('./services/zohoCRMService');
 const { ZentactService } = require('./services/zentactService');
 const { ZohoBillingService } = require('./services/zohoBillingService');
+const { computeSavings: computeSavingsEngine } = require('./services/savingsCalc');
 
 dotenv.config();
 
@@ -90,6 +91,10 @@ const PERMISSION_CATALOG = [
 
   // Proposals (build + send a client proposal from a Zoho Books estimate)
   { key: 'proposals:send',             label: 'Build & send client proposals (from Zoho estimates)',            category: 'Proposals' },
+
+  // Rate / Savings calculator (analyze a competitor merchant statement → savings offer)
+  { key: 'savings:use',                label: 'Use the payment savings calculator',                             category: 'Rate Calculator' },
+  { key: 'savings:manage_pricing',     label: 'Manage pricing templates + assign them to reps',                 category: 'Rate Calculator' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -619,6 +624,53 @@ async function initializeDatabase() {
         resolved_by    VARCHAR(255)
       );
     `);
+    // Rate/Savings calculator: pricing templates (Cluster rates + internal costs), per-rep
+    // assignment, and saved analyses. See services/savingsCalc.js for the model.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS pricing_templates (
+        id          SERIAL PRIMARY KEY,
+        name        VARCHAR(120) NOT NULL,
+        is_default  BOOLEAN DEFAULT false,
+        active      BOOLEAN DEFAULT true,
+        config      JSONB NOT NULL,
+        created_at  TIMESTAMPTZ DEFAULT NOW(),
+        updated_at  TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS pricing_template_assignments (
+        rep_email   VARCHAR(255) PRIMARY KEY,
+        template_id INT NOT NULL REFERENCES pricing_templates(id) ON DELETE CASCADE,
+        updated_at  TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS savings_analyses (
+        id           SERIAL PRIMARY KEY,
+        rep_email    VARCHAR(255),
+        rep_name     VARCHAR(255),
+        merchant_name VARCHAR(255),
+        template_id  INT,
+        inputs       JSONB NOT NULL,
+        results      JSONB NOT NULL,
+        created_at   TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    // Seed a default pricing template from the Excel's Cluster values (only if none exists).
+    {
+      const has = (await pool.query(`SELECT 1 FROM pricing_templates LIMIT 1`)).rows.length;
+      if (!has) {
+        const cfg = {
+          rates: { debit:{rate:0,perTrx:0.05}, credit:{rate:0.0015,perTrx:0.05}, amex:{rate:0.0015,perTrx:0.05} },
+          fixedUnit: { terminalS1F2:25, terminalWired:25, pci:7.5, acctOnFile:9, batch:7, lte:0 },
+          costs: { perTrx:0.035, discountRate:0.0005, t1Rate:0.0001, monthlyFixed:5.5, terminalS1F2:34.72, terminalWired:27.5 },
+        };
+        await pool.query(
+          `INSERT INTO pricing_templates (name, is_default, active, config) VALUES ($1, true, true, $2::jsonb)`,
+          ['Standard Cluster', JSON.stringify(cfg)]
+        );
+      }
+    }
     // Seed preset roles (only inserted once if name not already present)
     await pool.query(`
       INSERT INTO roles (name, description, permissions, is_system)
@@ -7518,6 +7570,167 @@ app.get('/api/resellers/pos-activations', authenticateToken, async (req, res) =>
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ============================================================================
+// RATE / SAVINGS CALCULATOR — analyze a competitor merchant statement → savings offer.
+// Pricing templates (Cluster rates + costs) are admin-managed and assignable per rep;
+// reps use their template's prices (locked), an admin can override prices per deal.
+// Engine = services/savingsCalc.js (validated against the source Excel).
+// ============================================================================
+async function getEffectiveTemplate(email) {
+  let row = email ? (await pool.query(
+    `SELECT t.* FROM pricing_template_assignments a JOIN pricing_templates t ON t.id = a.template_id
+     WHERE LOWER(a.rep_email) = LOWER($1) AND t.active = true`, [email])).rows[0] : null;
+  if (!row) row = (await pool.query(`SELECT * FROM pricing_templates WHERE is_default = true AND active = true LIMIT 1`)).rows[0];
+  if (!row) row = (await pool.query(`SELECT * FROM pricing_templates WHERE active = true ORDER BY id LIMIT 1`)).rows[0];
+  return row || null;
+}
+// Build the engine's `cluster` object from a template config + per-deal quantities (+ admin overrides).
+function buildClusterForEngine(config, qty, currentInterchange, overrides) {
+  const cfg = JSON.parse(JSON.stringify(config));
+  if (overrides) {
+    if (overrides.rates) for (const k of ['debit','credit','amex']) if (overrides.rates[k]) Object.assign(cfg.rates[k], overrides.rates[k]);
+    if (overrides.fixedUnit) Object.assign(cfg.fixedUnit, overrides.fixedUnit);
+    if (overrides.costs) Object.assign(cfg.costs, overrides.costs);
+  }
+  const q = qty || {};
+  const u = cfg.fixedUnit;
+  return {
+    rates: cfg.rates,
+    interchange: (overrides && overrides.interchange != null) ? overrides.interchange : currentInterchange,
+    fixed: {
+      terminalS1F2: { qty: q.terminalS1F2 || 0, unit: u.terminalS1F2 || 0 },
+      terminalWired: { qty: q.terminalWired || 0, unit: u.terminalWired || 0 },
+      pci:        { qty: q.pci || 0,        unit: u.pci || 0 },
+      acctOnFile: { qty: q.acctOnFile || 0, unit: u.acctOnFile || 0 },
+      batch:      { qty: q.batch || 0,      unit: u.batch || 0 },
+      lte:        { qty: q.lte || 0,        unit: u.lte || 0 },
+    },
+    costs: cfg.costs,
+  };
+}
+
+// --- Pricing templates (admin) ---
+app.get('/api/savings/templates', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'savings:manage_pricing'))) return;
+  try {
+    const rows = (await pool.query(`SELECT id, name, is_default, active, config, updated_at FROM pricing_templates ORDER BY is_default DESC, name`)).rows;
+    res.json({ templates: rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/savings/templates', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'savings:manage_pricing'))) return;
+  const name = String(req.body.name || '').trim();
+  const config = req.body.config;
+  if (!name || !config || !config.rates || !config.fixedUnit || !config.costs) return res.status(400).json({ error: 'name + valid config required' });
+  try {
+    if (req.body.isDefault) await pool.query(`UPDATE pricing_templates SET is_default = false`);
+    const row = (await pool.query(
+      `INSERT INTO pricing_templates (name, is_default, active, config) VALUES ($1, $2, true, $3::jsonb) RETURNING id`,
+      [name, !!req.body.isDefault, JSON.stringify(config)])).rows[0];
+    res.json({ id: row.id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/savings/templates/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'savings:manage_pricing'))) return;
+  const id = parseInt(req.params.id, 10);
+  try {
+    if (req.body.isDefault) await pool.query(`UPDATE pricing_templates SET is_default = false`);
+    const sets = ['updated_at = NOW()']; const params = []; let i = 1;
+    if (req.body.name !== undefined) { sets.push(`name = $${i++}`); params.push(String(req.body.name).trim()); }
+    if (req.body.config !== undefined) { sets.push(`config = $${i++}::jsonb`); params.push(JSON.stringify(req.body.config)); }
+    if (req.body.active !== undefined) { sets.push(`active = $${i++}`); params.push(!!req.body.active); }
+    if (req.body.isDefault !== undefined) { sets.push(`is_default = $${i++}`); params.push(!!req.body.isDefault); }
+    params.push(id);
+    await pool.query(`UPDATE pricing_templates SET ${sets.join(', ')} WHERE id = $${i}`, params);
+    res.json({ updated: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/savings/templates/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'savings:manage_pricing'))) return;
+  try { await pool.query(`DELETE FROM pricing_templates WHERE id = $1`, [parseInt(req.params.id, 10)]); res.json({ deleted: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+// --- Assignments (admin) ---
+app.get('/api/savings/assignments', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'savings:manage_pricing'))) return;
+  try { res.json({ assignments: (await pool.query(`SELECT rep_email, template_id FROM pricing_template_assignments ORDER BY rep_email`)).rows }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/savings/assignments', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'savings:manage_pricing'))) return;
+  const repEmail = String(req.body.repEmail || '').trim().toLowerCase();
+  const templateId = req.body.templateId;
+  if (!repEmail) return res.status(400).json({ error: 'repEmail required' });
+  try {
+    if (templateId == null) { await pool.query(`DELETE FROM pricing_template_assignments WHERE LOWER(rep_email) = $1`, [repEmail]); }
+    else {
+      await pool.query(
+        `INSERT INTO pricing_template_assignments (rep_email, template_id, updated_at) VALUES ($1, $2, NOW())
+         ON CONFLICT (rep_email) DO UPDATE SET template_id = EXCLUDED.template_id, updated_at = NOW()`,
+        [repEmail, parseInt(templateId, 10)]);
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// --- Rep: the pricing template to prefill the Cluster side ---
+app.get('/api/savings/my-template', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'savings:use'))) return;
+  try {
+    const t = await getEffectiveTemplate(req.user.email);
+    if (!t) return res.status(404).json({ error: 'no_template' });
+    res.json({ templateId: t.id, name: t.name, config: t.config, canOverride: req.user.isAdmin === true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// --- Compute (server recomputes; reps can't change prices, admins may override) ---
+app.post('/api/savings/calculate', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'savings:use'))) return;
+  try {
+    const { volumes, current, clusterQty } = req.body;
+    if (!volumes || !current || !current.rates) return res.status(400).json({ error: 'volumes + current required' });
+    let t = null;
+    if (req.user.isAdmin && req.body.templateId) t = (await pool.query(`SELECT * FROM pricing_templates WHERE id = $1`, [parseInt(req.body.templateId, 10)])).rows[0];
+    if (!t) t = await getEffectiveTemplate(req.user.email);
+    if (!t) return res.status(404).json({ error: 'no_template' });
+    const overrides = req.user.isAdmin === true ? req.body.overrides : null; // price overrides = admin only
+    const cluster = buildClusterForEngine(t.config, clusterQty, current.interchange || 0, overrides);
+    const results = computeSavingsEngine({ volumes, current, cluster });
+    res.json({ templateId: t.id, templateName: t.name, clusterResolved: cluster, results });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// --- Saved analyses ---
+app.post('/api/savings/analyses', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'savings:use'))) return;
+  try {
+    const row = (await pool.query(
+      `INSERT INTO savings_analyses (rep_email, rep_name, merchant_name, template_id, inputs, results)
+       VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb) RETURNING id`,
+      [req.user.realAdminEmail || req.user.email || null, req.user.name || null,
+       String(req.body.merchantName || '').slice(0, 255), req.body.templateId || null,
+       JSON.stringify(req.body.inputs || {}), JSON.stringify(req.body.results || {})])).rows[0];
+    res.json({ id: row.id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/savings/analyses', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'savings:use'))) return;
+  try {
+    const all = req.user.isAdmin === true;
+    const rows = (await pool.query(
+      `SELECT id, rep_email, rep_name, merchant_name, template_id, results, created_at FROM savings_analyses
+       ${all ? '' : 'WHERE LOWER(rep_email) = LOWER($1)'} ORDER BY created_at DESC LIMIT 100`,
+      all ? [] : [req.user.email || ''])).rows;
+    res.json({ analyses: rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/savings/analyses/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'savings:use'))) return;
+  try {
+    const r = (await pool.query(`SELECT * FROM savings_analyses WHERE id = $1`, [parseInt(req.params.id, 10)])).rows[0];
+    if (!r) return res.status(404).json({ error: 'not_found' });
+    if (req.user.isAdmin !== true && (r.rep_email || '').toLowerCase() !== (req.user.email || '').toLowerCase()) return res.status(403).json({ error: 'forbidden' });
+    res.json({ analysis: r });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ============================================================================
