@@ -5526,7 +5526,7 @@ app.get('/api/proposals/estimates', authenticateToken, async (req, res) => {
       const row = (await pool.query('SELECT is_admin FROM user_tokens WHERE email = $1', [req.user.email])).rows[0];
       effAdmin = row ? !!row.is_admin : false;
     }
-    if (!effAdmin && req.user.name) params.salesperson_name = req.user.name;
+    if (!effAdmin && req.user.name) { params.salesperson_name = req.user.name; params.per_page = 200; }
     const r = await axios.get(`${apiDomain}/books/v3/estimates`, {
       params, headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
     });
@@ -5534,7 +5534,7 @@ app.get('/api/proposals/estimates', authenticateToken, async (req, res) => {
       const detail = typeof r.data === 'string' ? r.data.slice(0, 300) : JSON.stringify(r.data).slice(0, 300);
       return res.status(502).json({ error: 'zoho_error', detail });
     }
-    const estimates = (r.data.estimates || []).map(e => ({
+    let estimates = (r.data.estimates || []).map(e => ({
       estimateId: e.estimate_id,
       number: e.estimate_number,
       customerName: e.customer_name,
@@ -5545,6 +5545,12 @@ app.get('/api/proposals/estimates', authenticateToken, async (req, res) => {
       salesperson: e.salesperson_name || '',
       reference: e.reference_number || '',
     }));
+    // Zoho Books doesn't reliably honor the salesperson_name filter param, so enforce
+    // scoping server-side: a non-admin (incl. impersonated rep) sees ONLY their own estimates.
+    if (!effAdmin) {
+      const me = (req.user.name || '').trim().toLowerCase();
+      estimates = estimates.filter(e => e.salesperson.trim().toLowerCase() === me);
+    }
     res.json({ estimates });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -5745,7 +5751,22 @@ async function getEstimateDetail(estimateId) {
   const e = r.data.estimate || {};
   let email = e.email || '';
   if (!email && Array.isArray(e.contact_persons)) { const cp = e.contact_persons.find(c => c.email); email = cp ? cp.email : ''; }
-  return { customerName: e.customer_name || '', email, number: e.estimate_number || '' };
+  return { customerName: e.customer_name || '', email, number: e.estimate_number || '', salesperson: e.salesperson_name || '' };
+}
+
+// Ownership guard: non-admins (incl. impersonated reps) may only act on THEIR OWN estimates.
+// Returns true if allowed, else sends a 403 and returns false. `det` = getEstimateDetail result.
+async function assertEstimateOwnership(req, res, det) {
+  let effAdmin = false;
+  if (!req.user.impersonating && req.user.email) {
+    const row = (await pool.query('SELECT is_admin FROM user_tokens WHERE email = $1', [req.user.email])).rows[0];
+    effAdmin = row ? !!row.is_admin : false;
+  }
+  if (effAdmin) return true;
+  const me = (req.user.name || '').trim().toLowerCase();
+  const owner = (det?.salesperson || '').trim().toLowerCase();
+  if (!me || owner !== me) { res.status(403).json({ error: 'not_your_estimate' }); return false; }
+  return true;
 }
 
 // Mark an estimate "sent" in Zoho (activates client tracking + acceptance). Best-effort.
@@ -5808,6 +5829,7 @@ app.post('/api/proposals/prepare', authenticateToken, async (req, res) => {
   if (!estimateId) return res.status(400).json({ error: 'estimateId required' });
   try {
     const det = await getEstimateDetail(estimateId);
+    if (!(await assertEstimateOwnership(req, res, det))) return;
     const clientName = (req.body.clientName || '').trim() || (det && det.customerName) || (lang === 'en' ? 'your business' : 'votre entreprise');
     const repName = req.user.name || req.user.email || '';
     const selectedPages = Array.isArray(req.body.selectedPages) ? req.body.selectedPages.map(Number).filter(Boolean) : null;
@@ -5837,6 +5859,7 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
   if (!estimateId || !to || !subject) return res.status(400).json({ error: 'estimateId, to and subject are required' });
   try {
     const det = await getEstimateDetail(estimateId);
+    if (!(await assertEstimateOwnership(req, res, det))) return;
     const clientName = (req.body.clientName || '').trim() || (det && det.customerName) || '';
     const repName = req.user.name || req.user.email || '';
     const selectedPages = Array.isArray(req.body.selectedPages) ? req.body.selectedPages.map(Number).filter(Boolean) : null;
