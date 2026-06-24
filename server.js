@@ -5092,7 +5092,14 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
     );
     const sp = spResult.rows[0];
 
+    // Assigned RBAC role names (for the read-only "Role" field on the profile).
+    const roleRows = (await pool.query(
+      `SELECT r.name FROM roles r JOIN user_roles ur ON ur.role_id = r.id
+       WHERE LOWER(ur.user_email) = LOWER($1) ORDER BY r.name`, [email]
+    )).rows;
+
     res.json({
+      roles: roleRows.map(r => r.name),
       email: td.email || email,
       name: td.display_name || req.user.name || email,
       photo: td.photo || req.user.photo || null,
