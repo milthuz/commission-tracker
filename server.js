@@ -2064,6 +2064,23 @@ app.get('/api/demo/kaizen-capacity', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/admin/pos-activations-recent?secret=  — diagnostic: latest reseller POS
+// activations, to confirm the Zoho Form webhook is landing rows (and spot test/blank rows).
+app.get('/api/admin/pos-activations-recent', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const rows = (await pool.query(
+      `SELECT id, reseller_name, customer_name, quantity, submitted_at,
+              EXTRACT(EPOCH FROM (NOW() - submitted_at))/60 AS age_min
+       FROM reseller_pos_activations ORDER BY submitted_at DESC LIMIT 8`
+    )).rows.map(r => ({ ...r, age_min: Math.round(r.age_min) }));
+    res.json({ count: rows.length, rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/sync-health?secret=  — diagnostic: how recently did the WORKER run its
 // scheduled jobs? Reads timestamps the worker writes to the (shared) DB, so it works even
 // though the worker has no HTTP. Used to confirm the Railway worker is alive after the move.
