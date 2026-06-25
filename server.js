@@ -7724,11 +7724,12 @@ const STATEMENT_SCHEMA = {
       }, required: ['debit', 'credit', 'amex'],
     },
     interchange: { type: 'number' },
+    totalTransactionCharge: { type: 'number' },
     currentFixed: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { label: { type: 'string' }, qty: { type: 'number' }, unit: { type: 'number' } }, required: ['label', 'qty', 'unit'] } },
     statementTotalMonthly: { type: 'number' },
     notes: { type: 'string' },
   },
-  required: ['merchantName', 'currency', 'period', 'volumes', 'currentRates', 'interchange', 'currentFixed', 'statementTotalMonthly', 'notes'],
+  required: ['merchantName', 'currency', 'period', 'volumes', 'currentRates', 'interchange', 'totalTransactionCharge', 'currentFixed', 'statementTotalMonthly', 'notes'],
 };
 const STATEMENT_PROMPT = `You are extracting data from a competitor merchant payment-processing statement (relevé marchand) to feed a savings calculator. The statement may be in French or English, from a Canadian/Québec processor (Moneris, Global Payments, Chase, TD, Square, Stripe, Elavon, Desjardins, etc.).
 
@@ -7736,14 +7737,18 @@ Extract, as JSON matching the schema:
 - merchantName: the business name on the statement.
 - currency: e.g. "CAD".
 - period: the statement period (e.g. "2026-05" or "May 2026"), as text.
-- volumes: monthly transaction COUNT (trx) and dollar AMOUNT for three buckets — debit = Interac/debit; credit = Visa + Mastercard combined; amex = American Express + Discover combined.
-- currentRates: the processor's MARKUP per bucket when the statement is interchange-plus or shows a discount/markup rate — ratePct = percentage markup AS A PERCENT NUMBER (e.g. 0.15 means 0.15%), perTrx = per-transaction fee in dollars. If the statement is bundled/flat and the markup cannot be separated, set both to 0 and say so in notes.
-- interchange: total interchange + card-brand/assessment fees in dollars (pass-through). If not separable, set 0 and note it.
-- currentFixed: list of fixed monthly fees (terminal rental, PCI, monthly/statement fee, account fee, etc.) — each {label, qty, unit price}.
-- statementTotalMonthly: the statement's total monthly cost/fees if shown (for cross-check).
+- volumes: monthly transaction COUNT (trx) and dollar AMOUNT for three buckets. BUCKET BY HOW THE CARD IS PRICED, not by card category:
+    • debit = ONLY flat per-transaction Interac debit (labels: "Interac", "Interac Flash"/"IF", "IDEBT"). These are charged a flat $/transaction, 0%.
+    • credit = Visa + Mastercard + Visa Debit (VCDBT) + UnionPay — i.e. every card charged a PERCENTAGE discount rate. ⚠️ "Visa Debit"/"VCDBT" is a debit card but is charged the % rate, so it goes in CREDIT, never in debit.
+    • amex = American Express + Discover.
+- currentRates: the processor's MARKUP per bucket from the discount-rate / "Taux d'escompte" table — ratePct = percentage markup AS A PERCENT NUMBER (e.g. 0.15 means 0.15%), perTrx = per-transaction fee in dollars. For debit this is typically 0% + a flat $/trx (e.g. 0.04); for credit/amex typically a % + 0$.
+- totalTransactionCharge: the statement's TOTAL card-processing charge that bundles the markup AND interchange together — e.g. the "Frais de service" / "Service charge" / total "discount" amount (as a positive number). MANY statements (Clover, Commerce Control, Global, TD) report the separate "Frais d'interchange"/"Interchange" line as 0 and put everything in this one bundled total. When that is the case, fill totalTransactionCharge with that bundled total and set interchange to 0 — the app derives interchange = totalTransactionCharge − markup, so do NOT also report the bundled total as interchange (that would double-count the markup).
+- interchange: ONLY use this when the statement genuinely lists a SEPARATE interchange/card-brand pass-through amount distinct from the markup. Otherwise set 0 and use totalTransactionCharge instead.
+- currentFixed: list of fixed/recurring monthly fees (terminal/equipment rental, monthly/statement fee, PCI, account/admin fee) — each {label, qty, unit price}. Capture ALL of them (often under "Autres frais"/"Other fees"); do NOT include per-transaction interchange line items here.
+- statementTotalMonthly: the statement's grand total of all fees/charges for the period if shown (for cross-check).
 - notes: what you could not determine, assumptions made, and your confidence (write in the statement's language).
 
-Rules: numbers only (no $ or % signs). Use 0 for anything you genuinely cannot find — do NOT invent values. Combine Visa+MC into credit, Amex+Discover into amex.`;
+Rules: numbers only (no $ or % signs, no minus signs — use positive magnitudes). Use 0 for anything you genuinely cannot find — do NOT invent values.`;
 
 // POST /api/savings/parse-statement — upload a competitor PDF → Claude extracts the inputs.
 app.post('/api/savings/parse-statement', authenticateToken, uploadStatement.single('file'), async (req, res) => {
@@ -7765,6 +7770,19 @@ app.post('/api/savings/parse-statement', authenticateToken, uploadStatement.sing
     if (resp.stop_reason === 'refusal') return res.status(422).json({ error: 'refused' });
     const text = (resp.content.find(b => b.type === 'text') || {}).text || '{}';
     let data; try { data = JSON.parse(text); } catch { return res.status(502).json({ error: 'parse_failed' }); }
+    // Derive interchange deterministically when the statement bundles it into a single total
+    // charge (e.g. Clover "Frais de service"): interchange = totalTransactionCharge − markup,
+    // so markup + interchange equals the real charge instead of double-counting the markup.
+    try {
+      const v = data.volumes || {}, r = data.currentRates || {};
+      const part = (vol, rate) => ((vol?.trx || 0) * (rate?.perTrx || 0)) + ((vol?.amount || 0) * ((rate?.ratePct || 0) / 100));
+      const markup = part(v.debit, r.debit) + part(v.credit, r.credit) + part(v.amex, r.amex);
+      const total = data.totalTransactionCharge || 0;
+      if (total > 0 && total >= markup) {
+        data.interchange = Math.round((total - markup) * 100) / 100;
+        data.interchangeDerived = true;
+      }
+    } catch { /* leave model's interchange as-is */ }
     res.json({ extracted: data });
   } catch (e) {
     console.warn('[savings/parse-statement]', e.name, e.message);
