@@ -1004,6 +1004,7 @@ async function initializeDatabase() {
         activated_at        DATE,
         points              INT          DEFAULT 1,
         bonus_amount        DECIMAL(10,2) DEFAULT 100.00,
+        stores              JSONB,
         raw_attributes      JSONB,
         created_at          TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
         updated_at          TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
@@ -1012,6 +1013,8 @@ async function initializeDatabase() {
     // Zentact "Reseller" custom attribute — added after the table shipped, so
     // ensure it exists on the live table too (CREATE TABLE IF NOT EXISTS is a no-op there).
     await pool.query(`ALTER TABLE zentact_merchants ADD COLUMN IF NOT EXISTS reseller_attribute VARCHAR(255)`);
+    // Stores (locations) nested under a merchant account — added after the table shipped.
+    await pool.query(`ALTER TABLE zentact_merchants ADD COLUMN IF NOT EXISTS stores JSONB`);
 
     // Per-merchant monthly revenue from Zentact's transaction-profitability report.
     // All monetary fields are in MINOR UNITS (cents). transaction_profit_cents = the
@@ -4582,8 +4585,8 @@ async function syncZentactMerchants() {
     const result = await pool.query(`
       INSERT INTO zentact_merchants
         (merchant_account_id, organization_id, business_name, invitee_email, status,
-         sales_rep_email, sales_rep_name, opportunity_id, reseller_attribute, activated_at, raw_attributes)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+         sales_rep_email, sales_rep_name, opportunity_id, reseller_attribute, activated_at, stores, raw_attributes)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb)
       ON CONFLICT (merchant_account_id) DO UPDATE SET
         status            = EXCLUDED.status,
         business_name     = EXCLUDED.business_name,
@@ -4600,11 +4603,13 @@ async function syncZentactMerchants() {
             THEN COALESCE(zentact_merchants.activated_at, EXCLUDED.activated_at)
           ELSE NULL
         END,
+        stores          = EXCLUDED.stores,
         raw_attributes  = EXCLUDED.raw_attributes,
         updated_at      = CURRENT_TIMESTAMP
       RETURNING (xmax = 0) AS inserted
     `, [m.merchant_account_id, m.organization_id, m.business_name, m.invitee_email,
-        m.status, m.sales_rep_email, repName, m.opportunity_id, m.reseller_attribute, activatedAt, m.raw_attributes]);
+        m.status, m.sales_rep_email, repName, m.opportunity_id, m.reseller_attribute, activatedAt,
+        JSON.stringify(m.stores || []), m.raw_attributes]);
 
     if (result.rows[0]?.inserted) newCount++;
   }
@@ -8113,7 +8118,7 @@ app.get('/api/zentact/revenue', authenticateToken, async (req, res) => {
     const rows = (await pool.query(
       `SELECT r.merchant_account_id, r.month, r.transaction_profit_cents, r.total_volume_cents,
               r.other_revenue_cents, r.payments_count, r.currency, zm.business_name, zm.sales_rep_name,
-              LOWER(zm.sales_rep_name) AS rep_l, LOWER(zm.reseller_attribute) AS reseller_attr_l
+              zm.stores, LOWER(zm.sales_rep_name) AS rep_l, LOWER(zm.reseller_attribute) AS reseller_attr_l
        FROM zentact_merchant_revenue r
        LEFT JOIN zentact_merchants zm ON zm.merchant_account_id = r.merchant_account_id
        WHERE r.year = $1`,
@@ -8130,6 +8135,12 @@ app.get('/api/zentact/revenue', authenticateToken, async (req, res) => {
       volume: Number(r.total_volume_cents) / 100,
       payments_count: r.payments_count,
       currency: r.currency,
+      // Stores (locations) under this merchant — { storeId, storeReferenceId }.
+      // Revenue is merchant-level (no per-store breakdown from Zentact); this is
+      // for display so a multi-location merchant shows all its store names.
+      stores: Array.isArray(r.stores)
+        ? r.stores.map((s) => ({ storeId: s.storeId, storeReferenceId: s.storeReferenceId }))
+        : [],
     }));
     const years = (await pool.query(`SELECT DISTINCT year FROM zentact_merchant_revenue ORDER BY year DESC`)).rows.map((x) => x.year);
     res.json({ year, years, rows: out });

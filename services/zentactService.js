@@ -169,6 +169,14 @@ class ZentactService {
       sales_rep_email:     null,          // not used by this org — kept for schema compat
       opportunity_id:      opportunityId,
       reseller_attribute:  resellerAttr,  // Zentact "Reseller" custom attribute, if present
+      // Stores (locations) under this merchant account. Zentact nests multiple
+      // physical locations in a `stores[]` array — each { storeId, storeReferenceId,
+      // balanceAccountId, splitConfigurationId }. There is NO per-store name field;
+      // storeReferenceId is a slug derived from the location name (e.g.
+      // "Cantine_Des_Sources") and is the only human-readable identifier.
+      // NOTE: revenue/profitability is reported by Zentact at the MERCHANT level
+      // only (no per-store breakdown), so this is for display/transparency.
+      stores:              Array.isArray(merchant.stores) ? merchant.stores : [],
       raw_attributes:      JSON.stringify(attrs),
     };
   }
