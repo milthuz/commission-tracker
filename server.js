@@ -3254,9 +3254,17 @@ app.get('/api/admin/zentact-raw', async (req, res) => {
   try {
     const zentact = new ZentactService(process.env.ZENTACT_API_KEY);
     const merchants = await zentact.getMerchantAccounts({ status: 'ACTIVE' });
-    const sample = merchants.slice(0, 2);
     const allKeys = [...new Set(merchants.flatMap(m => Object.keys(m || {})))].sort();
-    res.json({ count: merchants.length, allKeys, sample });
+    // Optional ?name= filter — inspect a specific merchant's stores[] structure.
+    const q = String(req.query.name || '').trim().toLowerCase();
+    if (q) {
+      const matches = merchants
+        .filter(m => String(m.businessName || '').toLowerCase().includes(q))
+        .map(m => ({ businessName: m.businessName, merchantAccountId: m.merchantAccountId,
+                     storeCount: Array.isArray(m.stores) ? m.stores.length : 0, stores: m.stores || [] }));
+      return res.json({ count: merchants.length, query: q, matchCount: matches.length, matches });
+    }
+    res.json({ count: merchants.length, allKeys, sample: merchants.slice(0, 2) });
   } catch (e) { res.status(500).json({ error: e.message, detail: e.response?.data }); }
 });
 
