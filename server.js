@@ -2133,6 +2133,11 @@ app.get('/api/admin/kaizen-capacity-raw', async (req, res) => {
     const f = (fleetsOut.Fleets || [])[0] || {};
     res.json({
       fleetState: f.State, fleetType: f.FleetType, capacity: f.ComputeCapacityStatus || null,
+      timeouts: {
+        disconnectTimeoutSec:     f.DisconnectTimeoutInSeconds ?? null,     // disconnected session kept this long before terminating
+        idleDisconnectTimeoutSec: f.IdleDisconnectTimeoutInSeconds ?? null, // idle → disconnect
+        maxUserDurationSec:       f.MaxUserDurationInSeconds ?? null,       // hard cap on a session
+      },
       sessionCount: (sessionsOut.Sessions || []).length,
       sessions: (sessionsOut.Sessions || []).map(s => ({ userId: s.UserId, state: s.State, connectionState: s.ConnectionState, startTime: s.StartTime })),
     });
