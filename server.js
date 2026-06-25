@@ -2064,6 +2064,33 @@ app.get('/api/demo/kaizen-capacity', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/admin/sync-health?secret=  — diagnostic: how recently did the WORKER run its
+// scheduled jobs? Reads timestamps the worker writes to the (shared) DB, so it works even
+// though the worker has no HTTP. Used to confirm the Railway worker is alive after the move.
+app.get('/api/admin/sync-health', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const now = (await pool.query(`SELECT NOW() AS now`)).rows[0].now;
+    const lastSync = (await pool.query(
+      `SELECT synced_at, status, invoice_count FROM sync_log ORDER BY synced_at DESC LIMIT 1`
+    )).rows[0] || null;
+    const merch = (await pool.query(
+      `SELECT MAX(updated_at) AS last_merchant_update FROM zentact_merchants`
+    )).rows[0] || null;
+    const ageMin = (ts) => ts ? Math.round((new Date(now) - new Date(ts)) / 60000) : null;
+    res.json({
+      server_now: now,
+      role_serving_this: process.env.ROLE || 'all',   // which service answered (web)
+      last_invoice_sync: lastSync ? { ...lastSync, age_min: ageMin(lastSync.synced_at) } : null,
+      last_merchant_update: merch?.last_merchant_update || null,
+      last_merchant_update_age_min: ageMin(merch?.last_merchant_update),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/kaizen-capacity-raw?secret=  — diagnostic: confirms the AWS creds can
 // call DescribeFleets/DescribeSessions (distinct IAM actions from CreateStreamingURL).
 app.get('/api/admin/kaizen-capacity-raw', async (req, res) => {
