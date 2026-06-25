@@ -1996,6 +1996,95 @@ app.post('/api/demo/kaizen-url', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/demo/kaizen-capacity — fleet state + capacity + who's currently streaming.
+// Diagnoses "No streaming resources are available" (fleet running but no free instance,
+// or still scaling up) vs "fleet_stopped". User identities are revealed only to admins.
+app.get('/api/demo/kaizen-capacity', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'demo:kaizen'))) return;
+  const client = getAppStream();
+  if (!client) return res.status(503).json({ error: 'demo_not_configured' });
+  try {
+    const { DescribeFleetsCommand, DescribeSessionsCommand } = require('@aws-sdk/client-appstream');
+
+    // Effective admin (like /api/auth/verify) — gates seeing other reps' identities.
+    let isAdmin = false;
+    if (!req.user.impersonating && req.user.email) {
+      const row = (await pool.query('SELECT is_admin FROM user_tokens WHERE email = $1', [req.user.email])).rows[0];
+      isAdmin = row && row.is_admin != null ? !!row.is_admin : !!req.user.isAdmin && !!row;
+    }
+    const myUserId = appstreamUserId(req);
+
+    const [fleetsOut, sessionsOut] = await Promise.all([
+      client.send(new DescribeFleetsCommand({ Names: [process.env.APPSTREAM_FLEET] })),
+      client.send(new DescribeSessionsCommand({
+        StackName: process.env.APPSTREAM_STACK,
+        FleetName: process.env.APPSTREAM_FLEET,
+        Limit: 50,
+      })),
+    ]);
+
+    const f = (fleetsOut.Fleets || [])[0] || {};
+    const cap = f.ComputeCapacityStatus || {};
+    const sessions = (sessionsOut.Sessions || []).map((s) => {
+      const mine = s.UserId === myUserId;
+      return {
+        // Only admins (or the user themselves) see the real userId; others are anonymised.
+        userId: isAdmin || mine ? s.UserId : null,
+        mine,
+        state: s.State,                       // ACTIVE | PENDING | EXPIRED
+        connectionState: s.ConnectionState,   // CONNECTED | NOT_CONNECTED
+        startTime: s.StartTime || null,
+      };
+    });
+
+    res.json({
+      fleet: {
+        state: f.State || 'UNKNOWN',          // RUNNING | STOPPED | STARTING | STOPPING
+        type: f.FleetType || null,            // ALWAYS_ON | ON_DEMAND
+        maxUserDurationSec: f.MaxUserDurationInSeconds || null,
+        idleDisconnectSec: f.IdleDisconnectTimeoutInSeconds || null,
+      },
+      capacity: {
+        desired: cap.Desired ?? null,         // instances the fleet is asked to run
+        running: cap.Running ?? null,         // instances powered on
+        inUse: cap.InUse ?? null,             // instances with a live session
+        available: cap.Available ?? null,     // ready & free to take a new session
+      },
+      sessions,
+      isAdmin,
+    });
+  } catch (e) {
+    console.warn('[DEMO] capacity error:', e.name, e.message);
+    res.status(502).json({ error: 'demo_error', detail: e.message });
+  }
+});
+
+// GET /api/admin/kaizen-capacity-raw?secret=  — diagnostic: confirms the AWS creds can
+// call DescribeFleets/DescribeSessions (distinct IAM actions from CreateStreamingURL).
+app.get('/api/admin/kaizen-capacity-raw', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const client = getAppStream();
+  if (!client) return res.status(503).json({ error: 'demo_not_configured' });
+  try {
+    const { DescribeFleetsCommand, DescribeSessionsCommand } = require('@aws-sdk/client-appstream');
+    const [fleetsOut, sessionsOut] = await Promise.all([
+      client.send(new DescribeFleetsCommand({ Names: [process.env.APPSTREAM_FLEET] })),
+      client.send(new DescribeSessionsCommand({ StackName: process.env.APPSTREAM_STACK, FleetName: process.env.APPSTREAM_FLEET, Limit: 50 })),
+    ]);
+    const f = (fleetsOut.Fleets || [])[0] || {};
+    res.json({
+      fleetState: f.State, fleetType: f.FleetType, capacity: f.ComputeCapacityStatus || null,
+      sessionCount: (sessionsOut.Sessions || []).length,
+      sessions: (sessionsOut.Sessions || []).map(s => ({ userId: s.UserId, state: s.State, connectionState: s.ConnectionState, startTime: s.StartTime })),
+    });
+  } catch (e) {
+    res.status(502).json({ error: e.name, detail: e.message });
+  }
+});
+
 // 5. Force-set profile photo URL from Zoho contacts (no re-login needed)
 app.post('/api/auth/refresh-photo', authenticateToken, async (req, res) => {
   try {
