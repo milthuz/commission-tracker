@@ -29,6 +29,23 @@ const { computeSavings: computeSavingsEngine } = require('./services/savingsCalc
 
 dotenv.config();
 
+// ============================================================================
+// JWT secret — REQUIRED, no fallback.
+// The old hardcoded default ('your-secret-key') let anyone forge a valid token,
+// including an admin token (the Zoho JWT carries isAdmin). We now fail closed:
+// the server refuses to start unless JWT_SECRET is set — in every environment.
+// We deliberately don't auto-detect prod vs dev (NODE_ENV is not reliably set
+// on Railway), so there is no environment where an insecure default can slip
+// through. Local dev sets JWT_SECRET in .env alongside the other required vars.
+// NOTE: changing JWT_SECRET invalidates ALL existing sessions (Zoho SSO + local
+// email/password) — every user must log in again.
+// ============================================================================
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error('❌ FATAL: JWT_SECRET is not set. Refusing to start (no insecure default). Set a strong random JWT_SECRET.');
+  process.exit(1);
+}
+
 const app = express();
 
 // ============================================================================
@@ -1095,7 +1112,7 @@ const authenticateToken = async (req, res, next) => {
   if (!token) return res.status(401).json({ error: 'No token provided' });
 
   try {
-    const user = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const user = jwt.verify(token, JWT_SECRET);
     req.user = user;
 
     // SECURITY: the Zoho-login JWT is signed isAdmin:true for everyone (legacy). NEVER trust
@@ -1325,7 +1342,7 @@ app.get('/api/auth/callback', async (req, res) => {
         zoho_id: userInfo.ZUID,
         isAdmin: true
       },
-      process.env.JWT_SECRET || 'your-secret-key',
+      JWT_SECRET,
       { expiresIn: '7d' }
     );
 
@@ -1520,14 +1537,14 @@ function rateLimited(key, max = 8, windowMs = 15 * 60 * 1000) {
 
 const signLocalJwt = (u) => jwt.sign(
   { email: u.email, name: u.display_name || u.email, isAdmin: false, userType: 'local' },
-  process.env.JWT_SECRET || 'your-secret-key', { expiresIn: '7d' }
+  JWT_SECRET, { expiresIn: '7d' }
 );
 const signMfaJwt = (email, purpose) => jwt.sign(
-  { email, purpose }, process.env.JWT_SECRET || 'your-secret-key', { expiresIn: '15m' }
+  { email, purpose }, JWT_SECRET, { expiresIn: '15m' }
 );
 function verifyMfaJwt(token, purpose) {
   try {
-    const p = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const p = jwt.verify(token, JWT_SECRET);
     return p.purpose === purpose ? p : null;
   } catch { return null; }
 }
@@ -6169,7 +6186,7 @@ app.get('/api/invoices/:invoiceNumber/preview', async (req, res) => {
   const token = req.query.token;
   if (!token) return res.status(401).send('Missing token');
   try {
-    jwt.verify(String(token), process.env.JWT_SECRET || 'your-secret-key');
+    jwt.verify(String(token), JWT_SECRET);
   } catch {
     return res.status(401).send('Invalid token');
   }
