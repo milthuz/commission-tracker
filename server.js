@@ -2072,12 +2072,19 @@ app.get('/api/admin/pos-activations-recent', async (req, res) => {
     return res.status(401).json({ error: 'invalid secret' });
   }
   try {
+    // Optional cleanup: ?delete=<id> removes one activation row (e.g. a blank test row).
+    let deleted = null;
+    const delId = parseInt(req.query.delete);
+    if (delId) {
+      const d = await pool.query(`DELETE FROM reseller_pos_activations WHERE id = $1 RETURNING id`, [delId]);
+      deleted = d.rowCount ? delId : 'not_found';
+    }
     const rows = (await pool.query(
       `SELECT id, reseller_name, customer_name, quantity, submitted_at,
               EXTRACT(EPOCH FROM (NOW() - submitted_at))/60 AS age_min
        FROM reseller_pos_activations ORDER BY submitted_at DESC LIMIT 8`
     )).rows.map(r => ({ ...r, age_min: Math.round(r.age_min) }));
-    res.json({ count: rows.length, rows });
+    res.json({ deleted, count: rows.length, rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
