@@ -207,9 +207,14 @@ function userHasPermission(permSet, requiredPerm) {
 // from the Heroku dynos. Every round-trip pays ~30-100ms of public-internet latency, so we
 // bound connections and fail fast instead of hanging into the Heroku 30s H12 timeout.
 const isWorker = process.env.ROLE === 'worker';
+// SSL: the Railway PUBLIC proxy (proxy.rlwy.net, used from Heroku) requires SSL; the Railway
+// PRIVATE network (*.railway.internal, used once the app runs ON Railway) speaks plaintext and
+// REJECTS an SSL handshake. Detect the internal host so the Heroku→Railway cutover doesn't fail
+// on "The server does not support SSL connections".
+const _dbInternal = /\.railway\.internal\b/.test(process.env.DATABASE_URL || '');
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: _dbInternal ? false : { rejectUnauthorized: false },
   max: isWorker ? 5 : 10,         // worker = batch séquentiel ; web = HTTP concurrent (Railway = 100 conn. dispo)
   connectionTimeoutMillis: 10000, // échoue proprement en 10s si le pool est saturé, au lieu de pendre → fini le H12 muet
   idleTimeoutMillis: 30000,
