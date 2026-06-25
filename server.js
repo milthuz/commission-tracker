@@ -14412,6 +14412,8 @@ app.get('/api/_health', (req, res) => {
     role:      ROLE,
     uptime_s:  Math.round(process.uptime()),
     pid:       process.pid,
+    node:      process.version,
+    has_global_crypto: typeof globalThis.crypto?.getRandomValues === 'function',
     memory_mb: { rss: Math.round(m.rss / 1024 / 1024), heap_used: Math.round(m.heapUsed / 1024 / 1024) },
   });
 });
