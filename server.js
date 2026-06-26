@@ -11862,19 +11862,17 @@ app.get('/api/commissions/my-processing', authenticateToken, async (req, res) =>
       if (b.merchant_name) bonusByName.set(b.merchant_name.toLowerCase(), b);
     }
 
+    // Reps see only their merchants + the commission paid — NOT the underlying processing
+    // revenue (business-sensitive), so it's intentionally omitted from the response.
     const out = merchants.map(m => {
       const b = bonusByMid.get(m.merchant_account_id) || bonusByName.get((m.business_name || '').toLowerCase()) || null;
-      const profit = Number(m.profit_cents) / 100, other = Number(m.other_cents) / 100;
       return {
         merchantId: m.merchant_account_id, name: m.business_name || m.merchant_account_id,
         status: m.status, activatedAt: m.activated_at,
-        profit, other, revenue: profit + other,
         bonusPaid: !!b, bonusAmount: b ? b.amount : 0, bonusDate: b ? (b.report_date || b.paid_for_period) : null,
       };
     });
-    const totals = out.reduce((a, m) => ({
-      revenue: a.revenue + m.revenue, profit: a.profit + m.profit, other: a.other + m.other, bonus: a.bonus + m.bonusAmount,
-    }), { revenue: 0, profit: 0, other: 0, bonus: 0 });
+    const totals = { bonus: out.reduce((a, m) => a + m.bonusAmount, 0) };
     res.json({ rep: targetRep, merchants: out, totals });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
