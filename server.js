@@ -11829,6 +11829,56 @@ app.get('/api/commissions/invoices', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/commissions/my-processing — a rep's PAYMENT (Zentact) merchants with their processing
+// revenue (transaction profit + other revenue, all-time) and the bi-annual "processing bonus"
+// commission paid on each. Rep-scoped via resolveTargetRep (a salesperson sees only their own;
+// an admin/manager can pass ?repName=).
+app.get('/api/commissions/my-processing', authenticateToken, async (req, res) => {
+  const { email, name: jwtName } = req.user;
+  try {
+    const tokenResult = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
+    const myName = tokenResult.rows[0]?.display_name || jwtName || email;
+    const targetRep = await resolveTargetRep(req, req.query.repName, myName);
+
+    const merchants = (await pool.query(`
+      SELECT zm.merchant_account_id, zm.business_name, zm.status, zm.activated_at,
+             COALESCE(SUM(r.transaction_profit_cents),0)::bigint AS profit_cents,
+             COALESCE(SUM(r.other_revenue_cents),0)::bigint     AS other_cents
+      FROM zentact_merchants zm
+      LEFT JOIN zentact_merchant_revenue r ON r.merchant_account_id = zm.merchant_account_id
+      WHERE LOWER(zm.sales_rep_name) = LOWER($1)
+      GROUP BY zm.merchant_account_id, zm.business_name, zm.status, zm.activated_at
+      ORDER BY (COALESCE(SUM(r.transaction_profit_cents),0)+COALESCE(SUM(r.other_revenue_cents),0)) DESC
+    `, [targetRep])).rows;
+
+    // Processing bonuses already paid/committed to this rep (one per merchant account).
+    const bonuses = (await pool.query(`
+      SELECT merchant_name, matched_zentact_id, amount::float AS amount, report_date, paid_for_period
+      FROM commission_bonuses WHERE LOWER(rep_name) = LOWER($1) AND bonus_type = 'processing'
+    `, [targetRep])).rows;
+    const bonusByMid = new Map(), bonusByName = new Map();
+    for (const b of bonuses) {
+      if (b.matched_zentact_id) bonusByMid.set(b.matched_zentact_id, b);
+      if (b.merchant_name) bonusByName.set(b.merchant_name.toLowerCase(), b);
+    }
+
+    const out = merchants.map(m => {
+      const b = bonusByMid.get(m.merchant_account_id) || bonusByName.get((m.business_name || '').toLowerCase()) || null;
+      const profit = Number(m.profit_cents) / 100, other = Number(m.other_cents) / 100;
+      return {
+        merchantId: m.merchant_account_id, name: m.business_name || m.merchant_account_id,
+        status: m.status, activatedAt: m.activated_at,
+        profit, other, revenue: profit + other,
+        bonusPaid: !!b, bonusAmount: b ? b.amount : 0, bonusDate: b ? (b.report_date || b.paid_for_period) : null,
+      };
+    });
+    const totals = out.reduce((a, m) => ({
+      revenue: a.revenue + m.revenue, profit: a.profit + m.profit, other: a.other + m.other, bonus: a.bonus + m.bonusAmount,
+    }), { revenue: 0, profit: 0, other: 0, bonus: 0 });
+    res.json({ rep: targetRep, merchants: out, totals });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /api/commissions/approve — supports { repName, year, month } OR { invoiceNumbers: [...] }
 // Locks a commission for payroll: sets approval_status='approved' (does NOT mark as paid).
 // Use /mark-paid afterwards to record actual rep payout.
