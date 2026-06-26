@@ -4603,12 +4603,13 @@ async function syncCrmSoldDeals(crm) {
   }
 
   // Upsert all unique CRM rep names into salespeople table.
-  // New reps default to active=true. Existing reps keep their current is_active status.
+  // New auto-detected reps default to INACTIVE (admin activates the real ones); existing
+  // reps keep their current is_active status (DO NOTHING never flips it).
   const uniqueReps = [...new Set(deals.map(d => crm.transformDeal(d, userMap).sales_rep_name).filter(n => n && n !== 'Unassigned'))];
   for (const repName of uniqueReps) {
     await pool.query(`
       INSERT INTO salespeople (name, is_active)
-      VALUES ($1, true)
+      VALUES ($1, false)
       ON CONFLICT (name) DO NOTHING
     `, [repName]);
   }
@@ -4789,14 +4790,15 @@ async function syncZentactMerchants() {
     if (result.rows[0]?.inserted) newCount++;
   }
 
-  // Upsert resolved rep names into salespeople table so they appear in the tracker
+  // Upsert resolved rep names into salespeople table. New auto-detected reps default to
+  // INACTIVE (admin activates the real ones); existing reps keep their status (DO NOTHING).
   const activeRepsRes = await pool.query(
     `SELECT DISTINCT sales_rep_name FROM zentact_merchants
      WHERE sales_rep_name IS NOT NULL AND sales_rep_name <> ''`
   );
   const repNamesToUpsert = activeRepsRes.rows.map(r => r.sales_rep_name);
   if (repNamesToUpsert.length) {
-    const valuesSql = repNamesToUpsert.map((_, i) => `($${i + 1}, true)`).join(', ');
+    const valuesSql = repNamesToUpsert.map((_, i) => `($${i + 1}, false)`).join(', ');
     await pool.query(
       `INSERT INTO salespeople (name, is_active) VALUES ${valuesSql} ON CONFLICT (name) DO NOTHING`,
       repNamesToUpsert
@@ -8720,10 +8722,10 @@ app.get('/api/salespeople', authenticateToken, async (req, res) => {
 app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   try {
-    // Auto-register reps from invoices
+    // Auto-register reps from invoices as INACTIVE (admin activates the real ones).
     await pool.query(`
-      INSERT INTO salespeople (name)
-      SELECT DISTINCT salesperson_name FROM invoices
+      INSERT INTO salespeople (name, is_active)
+      SELECT DISTINCT salesperson_name, false FROM invoices
       WHERE salesperson_name IS NOT NULL AND salesperson_name != 'Unassigned'
         AND salesperson_name NOT IN (SELECT name FROM salespeople)
       ON CONFLICT (name) DO NOTHING
