@@ -6189,10 +6189,18 @@ app.get('/api/admin/mail-test', async (req, res) => {
   if (!t) return res.json({ configured: false, cfg });
   let verify = null;
   try { await t.verify(); verify = 'ok'; } catch (e) { verify = e.message; }
+  // Show the verified-sender-domain config + what From a proposal would use for ?repEmail=.
+  const verifiedDomains = (process.env.VERIFIED_SENDER_DOMAINS || '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
+  const repEmail = String(req.query.repEmail || '').trim();
+  let proposalFromForRep = null;
+  if (repEmail) {
+    const repDomain = repEmail.includes('@') ? repEmail.split('@')[1].toLowerCase() : '';
+    proposalFromForRep = (repEmail && verifiedDomains.includes(repDomain)) ? repEmail : (process.env.SMTP_FROM || process.env.SMTP_USER);
+  }
   const to = String(req.query.to || '').trim();
   let send = null;
   if (to) send = await sendMail(to, 'Sales Hub — test SMTP', '<p>Test SMTP depuis Railway. Si tu reçois ceci, l\'envoi fonctionne. ✅</p>');
-  res.json({ configured: true, cfg, verify, sentTo: to || null, send });
+  res.json({ configured: true, cfg, verify, verifiedDomains, proposalFromForRep, sentTo: to || null, send });
 });
 
 // POST /api/proposals/prepare — build the merged PDF + a prefilled email draft (rep reviews before sending).
