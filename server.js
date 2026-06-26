@@ -3435,6 +3435,34 @@ app.get('/api/admin/zentact-raw', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message, detail: e.response?.data }); }
 });
 
+// GET /api/admin/zentact-store-raw?secret=&storeId=&merchantAccountId=  — probe Zentact's
+// dedicated /stores endpoint to discover whether it returns a human "Store Name" (the
+// merchant-accounts stores[] array only has storeId/storeReferenceId, no name).
+app.get('/api/admin/zentact-store-raw', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const axios = require('axios');
+  const base = process.env.ZENTACT_API_URL || 'https://api.zentact.com/api/v1';
+  const headers = { 'X-API-Key': process.env.ZENTACT_API_KEY };
+  const storeId = req.query.storeId;
+  const mid = req.query.merchantAccountId;
+  const tries = [
+    ['GET /stores/{storeId}', `${base}/stores/${storeId}`, undefined],
+    ['GET /stores?merchantAccountId', `${base}/stores`, { merchantAccountId: mid }],
+    ['GET /stores?storeId', `${base}/stores`, { storeId }],
+  ];
+  const out = {};
+  for (const [label, url, params] of tries) {
+    try {
+      const r = await axios.get(url, { headers, params, validateStatus: () => true, timeout: 15000 });
+      out[label] = { status: r.status, data: r.data };
+    } catch (e) { out[label] = { error: e.message }; }
+  }
+  res.json(out);
+});
+
 // GET /api/admin/zentact-attrs?secret=  — distinct custom-attribute keys across all Zentact
 // merchants + a sample, to find which attribute holds the Adyen ID.
 app.get('/api/admin/zentact-attrs', async (req, res) => {
