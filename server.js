@@ -11787,6 +11787,9 @@ app.get('/api/commissions/invoices', authenticateToken, async (req, res) => {
     // Optional customer filter — used by the "Commission by customer" drill-down so it shows
     // ONLY that customer's invoices (previously this param was ignored → it returned everyone's).
     const customer = (req.query.customer || '').toString().trim();
+    // Optional free-text search (?q=) — partial match on customer name OR invoice number, so a
+    // rep can find a specific client/invoice across the whole period (used with month omitted).
+    const q = (req.query.q || '').toString().trim();
     const result = await pool.query(`
       SELECT invoice_number, customer_name, date, total, commission, status,
              commission_paid, commission_status, commission_payable_date,
@@ -11795,8 +11798,9 @@ app.get('/api/commissions/invoices', authenticateToken, async (req, res) => {
       FROM invoices
       WHERE salesperson_name = $1 AND organization_id = $2 AND ${whereDate}
         AND ($5::text IS NULL OR COALESCE(customer_name, 'Unknown') = $5)
+        AND ($6::text IS NULL OR customer_name ILIKE '%'||$6||'%' OR invoice_number ILIKE '%'||$6||'%')
       ORDER BY COALESCE(commission_payable_date, date) DESC, date DESC
-    `, [targetRep, process.env.ZOHO_ORG_ID, startDate, endDate, customer || null]);
+    `, [targetRep, process.env.ZOHO_ORG_ID, startDate, endDate, customer || null, q || null]);
 
     res.json({
       invoices: result.rows.map(r => ({
