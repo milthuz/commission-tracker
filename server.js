@@ -3449,9 +3449,9 @@ app.get('/api/admin/zentact-store-raw', async (req, res) => {
   const storeId = req.query.storeId;
   const mid = req.query.merchantAccountId;
   const tries = [
-    ['GET /stores/{storeId}', `${base}/stores/${storeId}`, undefined],
-    ['GET /stores?merchantAccountId', `${base}/stores`, { merchantAccountId: mid }],
-    ['GET /stores?storeId', `${base}/stores`, { storeId }],
+    ['GET /merchant-accounts/{mid}', `${base}/merchant-accounts/${mid}`, undefined],
+    ['GET /merchant-accounts/{mid}/stores', `${base}/merchant-accounts/${mid}/stores`, undefined],
+    ['GET /merchant-accounts?include=stores', `${base}/merchant-accounts`, { merchantAccountId: mid }],
   ];
   const out = {};
   for (const [label, url, params] of tries) {
