@@ -6037,7 +6037,39 @@ async function getEstimateDetail(estimateId) {
       }
     } catch (err) { console.warn('[proposal] contact email lookup:', err.message); }
   }
+  // Failover to the CRM: Books contacts are often created without an email, but the CRM
+  // (Account → Contact) usually has it. Look it up by customer name.
+  if (!email && e.customer_name) {
+    email = (await findCrmEmailByName(e.customer_name)) || '';
+  }
   return { customerName: e.customer_name || '', email, number: e.estimate_number || '', salesperson: e.salesperson_name || '' };
+}
+
+// Find a client email in Zoho CRM by customer name (Books → CRM failover). Tries the contact(s)
+// linked to an Account of that name, then a full-text contact search, then the Account record.
+async function findCrmEmailByName(name) {
+  const q = String(name || '').trim();
+  if (!q) return null;
+  try {
+    const crmToken = await ensureValidCrmToken();
+    if (!crmToken) return null;
+    const headers = { Authorization: `Zoho-oauthtoken ${crmToken}` };
+    const enc = encodeURIComponent(q);
+    const urls = [
+      `https://www.zohoapis.com/crm/v2/Contacts/search?criteria=(Account_Name:equals:${enc})`,
+      `https://www.zohoapis.com/crm/v2/Contacts/search?word=${enc}`,
+      `https://www.zohoapis.com/crm/v2/Accounts/search?criteria=(Account_Name:equals:${enc})`,
+    ];
+    for (const url of urls) {
+      const r = await axios.get(url, { headers, validateStatus: () => true });
+      if (r.status !== 200) continue; // 204 = no match
+      for (const rec of (r.data?.data || [])) {
+        const em = rec.Email || rec.Secondary_Email || rec.email || null;
+        if (em) return em;
+      }
+    }
+  } catch (e) { console.warn('[proposal] CRM email lookup:', e.message); }
+  return null;
 }
 
 // Ownership guard: non-admins (incl. impersonated reps) may only act on THEIR OWN estimates.
@@ -6115,6 +6147,9 @@ app.get('/api/admin/proposal-email-debug', async (req, res) => {
     return res.status(401).json({ error: 'invalid secret' });
   }
   try {
+    // Direct CRM-failover test: ?crmName=Benedetta → what email the CRM lookup returns.
+    const crmName = String(req.query.crmName || '').trim();
+    if (crmName) return res.json({ crmName, crmEmail: await findCrmEmailByName(crmName) });
     const { accessToken, apiDomain } = await getAdminBooksAuth();
     const headers = { Authorization: `Zoho-oauthtoken ${accessToken}` };
     const params = { organization_id: process.env.ZOHO_ORG_ID };
