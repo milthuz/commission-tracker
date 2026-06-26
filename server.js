@@ -6173,6 +6173,28 @@ app.get('/api/admin/proposal-email-debug', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/mail-test?secret=[&to=]  — diagnose SMTP/SendGrid: config presence, a live
+// transporter.verify() (auth check), and an optional real send to `to`.
+app.get('/api/admin/mail-test', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const cfg = {
+    host: process.env.SMTP_HOST || null, port: process.env.SMTP_PORT || null,
+    user: process.env.SMTP_USER ? '(set)' : null, pass: process.env.SMTP_PASS ? '(set)' : null,
+    from: process.env.SMTP_FROM || null,
+  };
+  const t = getMailer();
+  if (!t) return res.json({ configured: false, cfg });
+  let verify = null;
+  try { await t.verify(); verify = 'ok'; } catch (e) { verify = e.message; }
+  const to = String(req.query.to || '').trim();
+  let send = null;
+  if (to) send = await sendMail(to, 'Sales Hub — test SMTP', '<p>Test SMTP depuis Railway. Si tu reçois ceci, l\'envoi fonctionne. ✅</p>');
+  res.json({ configured: true, cfg, verify, sentTo: to || null, send });
+});
+
 // POST /api/proposals/prepare — build the merged PDF + a prefilled email draft (rep reviews before sending).
 app.post('/api/proposals/prepare', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'proposals:send'))) return;
