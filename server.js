@@ -1209,7 +1209,7 @@ app.get('/api/auth/zoho', (req, res) => {
   const forceConsent = req.query.reconsent === '1' || req.query.prompt === 'consent';
 
   const authUrl = `${ZOHO_CONFIG.accounts_url}/oauth/v2/auth?` +
-    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE,ZohoBooks.estimates.READ,ZohoSubscriptions.plans.READ,ZohoSubscriptions.products.READ,ZohoSubscriptions.subscriptions.READ,AaaServer.profile.READ` +
+    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE,ZohoBooks.estimates.READ,ZohoBooks.contacts.READ,ZohoSubscriptions.plans.READ,ZohoSubscriptions.products.READ,ZohoSubscriptions.subscriptions.READ,AaaServer.profile.READ` +
     `&client_id=${ZOHO_CONFIG.client_id}` +
     `&response_type=code` +
     `&redirect_uri=${ZOHO_CONFIG.redirect_uri}` +
@@ -6105,6 +6105,38 @@ async function getEstimateStatus(estimateId) {
 
 const proposalFileName = (clientName) => `Proposition_ClusterPOS_${String(clientName || 'client').replace(/[^a-z0-9]+/gi, '_').slice(0, 40)}.pdf`;
 const logoFromBody = (b) => (b ? Buffer.from(String(b).replace(/^data:[^,]+,/, ''), 'base64') : null);
+
+// GET /api/admin/proposal-email-debug?secret=[&estimateId=]  — diagnose client-email prefill.
+// No id → list a few recent estimates (id/number/customer). With id → run getEstimateDetail +
+// report the raw contacts-call HTTP status (401 = missing ZohoBooks.contacts.READ scope).
+app.get('/api/admin/proposal-email-debug', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    const headers = { Authorization: `Zoho-oauthtoken ${accessToken}` };
+    const params = { organization_id: process.env.ZOHO_ORG_ID };
+    const eid = String(req.query.estimateId || '').trim();
+    if (!eid) {
+      const r = await axios.get(`${apiDomain}/books/v3/estimates`, { params: { ...params, per_page: 5 }, headers, validateStatus: () => true });
+      return res.json({ status: r.status, estimates: (r.data.estimates || []).map(e => ({ id: e.estimate_id, number: e.estimate_number, customer: e.customer_name })) });
+    }
+    const det = await getEstimateDetail(eid);
+    const e = ((await axios.get(`${apiDomain}/books/v3/estimates/${eid}`, { params, headers, validateStatus: () => true })).data || {}).estimate || {};
+    let contactCallStatus = null, contactEmail = null, contactErr = null;
+    if (e.customer_id) {
+      const c = await axios.get(`${apiDomain}/books/v3/contacts/${e.customer_id}`, { params, headers, validateStatus: () => true });
+      contactCallStatus = c.status;
+      if (c.status === 200) {
+        const ct = c.data.contact || {};
+        contactEmail = ct.email || ((ct.contact_persons || []).find(p => p.email) || {}).email || null;
+      } else { contactErr = c.data?.message || null; }
+    }
+    res.json({ resolvedEmail: det?.email || '', estimateEmail: e.email || '', customer_id: e.customer_id || null, contactCallStatus, contactEmail, contactErr });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // POST /api/proposals/prepare — build the merged PDF + a prefilled email draft (rep reviews before sending).
 app.post('/api/proposals/prepare', authenticateToken, async (req, res) => {
