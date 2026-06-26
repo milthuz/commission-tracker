@@ -515,6 +515,11 @@ async function initializeDatabase() {
       lang VARCHAR(5),
       sent_at TIMESTAMPTZ DEFAULT NOW()
     )`);
+    // Email open-tracking (pixel): a per-send token + when/how often the client opened the email.
+    await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS track_token VARCHAR(64)`);
+    await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ`);
+    await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS open_count INT DEFAULT 0`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_proposals_sent_token ON proposals_sent(track_token)`);
     // Admin-managed category structure for the resources library.
     await pool.query(`
       CREATE TABLE IF NOT EXISTS resource_categories (
@@ -1474,7 +1479,8 @@ async function sendMail(to, subject, html, opts = {}) {
   const t = getMailer();
   if (!t) return { sent: false, reason: 'smtp_not_configured' };
   try {
-    const msg = { from: process.env.SMTP_FROM || process.env.SMTP_USER, to, subject, html };
+    const msg = { from: opts.from || process.env.SMTP_FROM || process.env.SMTP_USER, to, subject, html };
+    if (opts.replyTo) msg.replyTo = opts.replyTo;
     if (opts.cc) msg.cc = opts.cc;
     if (opts.attachments) msg.attachments = opts.attachments; // [{ filename, content(Buffer), contentType }]
     await t.sendMail(msg);
@@ -6013,6 +6019,24 @@ async function getEstimateDetail(estimateId) {
   const e = r.data.estimate || {};
   let email = e.email || '';
   if (!email && Array.isArray(e.contact_persons)) { const cp = e.contact_persons.find(c => c.email); email = cp ? cp.email : ''; }
+  // The estimate object rarely carries the email — fall back to the CUSTOMER (contact) record,
+  // which holds the real billing email + its contact persons. This makes the prefill reliable.
+  if (!email && e.customer_id) {
+    try {
+      const c = await axios.get(`${apiDomain}/books/v3/contacts/${e.customer_id}`, {
+        params: { organization_id: process.env.ZOHO_ORG_ID },
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
+      });
+      if (c.status === 200) {
+        const ct = c.data.contact || {};
+        email = ct.email || '';
+        if (!email && Array.isArray(ct.contact_persons)) {
+          const cp = ct.contact_persons.find(p => p.email) || ct.contact_persons.find(p => p.is_primary_contact && p.email);
+          email = cp ? cp.email : '';
+        }
+      }
+    } catch (err) { console.warn('[proposal] contact email lookup:', err.message); }
+  }
   return { customerName: e.customer_name || '', email, number: e.estimate_number || '', salesperson: e.salesperson_name || '' };
 }
 
@@ -6136,8 +6160,23 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
     const acceptBtn = acceptUrl
       ? `<div style="margin:22px 0"><a href="${esc(acceptUrl)}" style="display:inline-block;background:#fe6523;color:#fff;text-decoration:none;font-weight:700;font-family:Arial,Helvetica,sans-serif;font-size:14px;padding:13px 26px;border-radius:8px">${lang === 'en' ? 'Review & accept the quote online →' : 'Voir et accepter le devis en ligne →'}</a></div>`
       : '';
-    const html = `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#1c2434;line-height:1.5"><div style="white-space:pre-wrap">${esc(bodyText)}</div>${acceptBtn}</div>`;
+    // Open-tracking pixel: a unique token per send; the /track endpoint logs the open when the
+    // client's mail client loads this 1×1 image. (Imperfect — image-blocking/pre-fetching clients.)
+    const trackToken = require('crypto').randomUUID().replace(/-/g, '');
+    const apiBase = process.env.PUBLIC_API_URL || `https://${req.get('host')}`;
+    const pixel = `<img src="${apiBase}/api/proposals/track/${trackToken}.gif" width="1" height="1" alt="" style="display:none;width:1px;height:1px;border:0;max-height:0;overflow:hidden">`;
+    const html = `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#1c2434;line-height:1.5"><div style="white-space:pre-wrap">${esc(bodyText)}</div>${acceptBtn}</div>${pixel}`;
+
+    // From: send AS the Sales Hub rep when their email domain is SendGrid-authenticated
+    // (env VERIFIED_SENDER_DOMAINS, comma-list). Until the domain is verified, keep the verified
+    // saleshub@ address but show the rep's NAME and set Reply-To = rep so replies reach them.
+    const repEmail = (req.user.email || '').trim();
+    const verifiedDomains = (process.env.VERIFIED_SENDER_DOMAINS || '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
+    const repDomain = repEmail.includes('@') ? repEmail.split('@')[1].toLowerCase() : '';
+    const fromAddr = (repEmail && verifiedDomains.includes(repDomain)) ? repEmail : (process.env.SMTP_FROM || process.env.SMTP_USER);
     const r = await sendMail(to, subject, html, {
+      from: { name: repName || 'Cluster Systems', address: fromAddr },
+      replyTo: repEmail || undefined,
       cc: req.body.cc ? String(req.body.cc).trim() : undefined,
       attachments: [{ filename: proposalFileName(clientName), content: Buffer.from(pdf), contentType: 'application/pdf' }],
     });
@@ -6145,11 +6184,29 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
     // Record the send for the status board (best-effort).
     try {
       await pool.query(
-        `INSERT INTO proposals_sent (estimate_id, estimate_number, customer_name, rep_email, to_email, lang) VALUES ($1,$2,$3,$4,$5,$6)`,
-        [estimateId, (det && det.number) || '', clientName, (req.user.realAdminEmail || req.user.email || ''), to, lang]);
+        `INSERT INTO proposals_sent (estimate_id, estimate_number, customer_name, rep_email, to_email, lang, track_token) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [estimateId, (det && det.number) || '', clientName, (req.user.realAdminEmail || req.user.email || ''), to, lang, trackToken]);
     } catch (e) { console.warn('[proposal/send] record:', e.message); }
-    res.json({ success: true, acceptLinkIncluded: !!acceptUrl });
+    res.json({ success: true, acceptLinkIncluded: !!acceptUrl, sentFrom: fromAddr });
   } catch (e) { console.warn('[proposal/send]', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/proposals/track/:token(.gif) — email open-tracking pixel. NO auth (the client's mail
+// client loads it). Logs the open against proposals_sent and returns a 1×1 transparent GIF.
+const TRACK_PIXEL = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+app.get('/api/proposals/track/:token', (req, res) => {
+  const token = String(req.params.token || '').replace(/\.gif$/i, '');
+  if (token) {
+    pool.query(
+      `UPDATE proposals_sent SET opened_at = COALESCE(opened_at, NOW()), open_count = COALESCE(open_count,0) + 1 WHERE track_token = $1`,
+      [token]
+    ).catch(() => { /* never fail the pixel */ });
+  }
+  res.set('Content-Type', 'image/gif');
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.end(TRACK_PIXEL);
 });
 
 // GET /api/proposals/sent — status board: proposals this user (or all, for admins) has sent,
@@ -6174,6 +6231,7 @@ app.get('/api/proposals/sent', authenticateToken, async (req, res) => {
         repEmail: r0.rep_email, toEmail: r0.to_email, sentAt: r0.sent_at,
         status: (st && st.status) || '', viewed: (st && st.viewed) || false, viewedTime: (st && st.viewedTime) || '',
         acceptedDate: (st && st.acceptedDate) || '', declinedDate: (st && st.declinedDate) || '',
+        emailOpened: !!r0.opened_at, emailOpenedAt: r0.opened_at || '', emailOpenCount: r0.open_count || 0,
       });
     }
     res.json({ proposals: out });
