@@ -5565,12 +5565,16 @@ app.put('/api/user/preferences', authenticateToken, async (req, res) => {
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   // Company-wide invoice/revenue stats. Allowed for admins, the company-invoices perm,
   // OR the dedicated Admin-dashboard perm (so a non-admin "Management" role can see it).
+  let perms = null;
   if (req.user.isAdmin !== true) {
-    const perms = await getUserPermissions(req.user.email);
+    perms = await getUserPermissions(req.user.email);
     if (!userHasPermission(perms, 'invoices:view_all') && !userHasPermission(perms, 'dashboard:view_admin')) {
       return res.status(403).json({ error: 'Permission required: dashboard:view_admin' });
     }
   }
+  // Payment (Zentact) revenue is normally gated by revenue:view — only include the
+  // "payment revenue per client" section for admins or users who hold that permission.
+  const canRevenue = req.user.isAdmin === true || (perms && userHasPermission(perms, 'revenue:view'));
   const year = parseInt(req.query.year) || new Date().getFullYear();
   try {
     const startDate = new Date(year, 0, 1);
@@ -5642,6 +5646,45 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
       ORDER BY total DESC LIMIT 10
     `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
 
+    // SaaS revenue per client (SH-8): sum of the SaaS subtotal of paid invoices, by customer.
+    const saasResult = await pool.query(`
+      SELECT
+        COALESCE(NULLIF(TRIM(customer_name), ''), 'Unknown') AS name,
+        COUNT(*) AS invoices,
+        COALESCE(SUM(saas_amount), 0) AS total
+      FROM invoices
+      WHERE organization_id = $1 AND status = 'paid' AND date >= $2 AND date <= $3 ${excl}
+        AND COALESCE(NULLIF(TRIM(customer_name), ''), '') != ''
+      GROUP BY COALESCE(NULLIF(TRIM(customer_name), ''), 'Unknown')
+      HAVING COALESCE(SUM(saas_amount), 0) > 0
+      ORDER BY total DESC LIMIT 10
+    `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
+
+    // Payment (processing) revenue per client (SH-9): Zentact transaction profit by merchant
+    // for the year. Only computed when the caller can see revenue (admins / revenue:view).
+    let paymentByCustomer = [];
+    if (canRevenue) {
+      const payResult = await pool.query(`
+        SELECT
+          COALESCE(NULLIF(TRIM(zm.business_name), ''), r.merchant_account_id) AS name,
+          COALESCE(SUM(r.transaction_profit_cents), 0) / 100.0 AS total,
+          COALESCE(SUM(r.other_revenue_cents), 0) / 100.0 AS other,
+          COUNT(DISTINCT r.month) AS months
+        FROM zentact_merchant_revenue r
+        LEFT JOIN zentact_merchants zm ON zm.merchant_account_id = r.merchant_account_id
+        WHERE r.year = $1
+        GROUP BY r.merchant_account_id, zm.business_name
+        HAVING COALESCE(SUM(r.transaction_profit_cents), 0) > 0
+        ORDER BY total DESC LIMIT 10
+      `, [year]);
+      paymentByCustomer = payResult.rows.map(r => ({
+        name:   r.name,
+        total:  parseFloat(r.total),
+        other:  parseFloat(r.other) || 0,
+        months: parseInt(r.months),
+      }));
+    }
+
     const recentResult = await pool.query(`
       SELECT invoice_number, customer_name, salesperson_name, total, commission, status, date
       FROM invoices
@@ -5676,6 +5719,12 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
         invoices: parseInt(r.invoices),
         total:    parseFloat(r.total),
       })),
+      saasByCustomer: saasResult.rows.map(r => ({
+        name:     r.name,
+        invoices: parseInt(r.invoices),
+        total:    parseFloat(r.total),
+      })),
+      paymentByCustomer,
       recentInvoices: recentResult.rows.map(r => ({
         invoiceNumber: r.invoice_number,
         customer:      r.customer_name || 'Unknown',
