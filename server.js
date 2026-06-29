@@ -5646,8 +5646,15 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
       ORDER BY total DESC LIMIT 10
     `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
 
-    // Board-level AVERAGE SaaS revenue per client (SH-8): total SaaS subtotal of paid invoices
-    // ÷ number of distinct clients that have any SaaS revenue this year.
+    // Board metrics use a MONTHLY run-rate: total ÷ months elapsed in the period ÷ units, so a
+    // partial current year isn't understated (full past year = 12 months; current year = months
+    // so far). Mixes monthly- and annual-billed clients onto a comparable per-month figure.
+    const nowD = new Date();
+    const monthsInPeriod = year < nowD.getFullYear() ? 12 : (year > nowD.getFullYear() ? 0 : (nowD.getMonth() + 1));
+    const perMonth = (total, units) => (monthsInPeriod > 0 && units > 0) ? (total / monthsInPeriod / units) : 0;
+
+    // AVERAGE monthly SaaS revenue per client (SH-8): total paid SaaS subtotal ÷ months ÷ clients
+    // that have any SaaS revenue.
     const saasAvgRes = await pool.query(`
       SELECT
         COALESCE(SUM(saas_amount), 0) AS total,
@@ -5657,11 +5664,11 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
     `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
     const sa = saasAvgRes.rows[0] || {};
     const saasTotal = parseFloat(sa.total) || 0, saasClients = parseInt(sa.clients) || 0;
-    const avgSaas = { total: saasTotal, clients: saasClients, avg: saasClients > 0 ? saasTotal / saasClients : 0 };
+    const avgSaas = { total: saasTotal, clients: saasClients, monthly: perMonth(saasTotal, saasClients) };
 
-    // Board-level AVERAGE processing revenue per merchant (SH-9): total Zentact transaction
-    // profit ÷ number of merchants with positive profit this year. Revenue-gated.
-    let avgProcessing = null;
+    // AVERAGE monthly processing profit per merchant (SH-9) + combined revenue per merchant.
+    // Revenue-gated (admins / revenue:view).
+    let avgProcessing = null, avgRevenuePerMerchant = null;
     if (canRevenue) {
       const procAvgRes = await pool.query(`
         SELECT
@@ -5673,8 +5680,16 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
         ) m
       `, [year]);
       const pa = procAvgRes.rows[0] || {};
-      const procTotal = parseFloat(pa.total) || 0, procClients = parseInt(pa.clients) || 0;
-      avgProcessing = { total: procTotal, clients: procClients, avg: procClients > 0 ? procTotal / procClients : 0 };
+      const procTotal = parseFloat(pa.total) || 0, procMerchants = parseInt(pa.clients) || 0;
+      avgProcessing = { total: procTotal, clients: procMerchants, monthly: perMonth(procTotal, procMerchants) };
+      // Combined SaaS + processing revenue, averaged per merchant per month. NOTE: SaaS is keyed
+      // by Zoho customer and merchants by Zentact account — this is a BLENDED figure (total ÷
+      // merchant count), not a true per-merchant join (that needs SH-14, the CRM↔Zentact link).
+      avgRevenuePerMerchant = {
+        total:    saasTotal + procTotal,
+        merchants: procMerchants,
+        monthly:  perMonth(saasTotal + procTotal, procMerchants),
+      };
     }
 
     const cards = cardsResult.rows[0] || {};
@@ -5706,6 +5721,8 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
       })),
       avgSaas,
       avgProcessing,
+      avgRevenuePerMerchant,
+      monthsInPeriod,
       year,
     });
   } catch (error) {
