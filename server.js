@@ -3559,6 +3559,82 @@ app.get('/api/admin/crm-module-raw', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Fetch all records of a CRM module (paginated), requesting a specific field set.
+async function fetchAllCrmModule(crmToken, module, fields) {
+  const out = [];
+  for (let page = 1; page <= 50; page++) {
+    const r = await axios.get(`https://www.zohoapis.com/crm/v2/${module}`, {
+      params: { fields: fields.join(','), per_page: 200, page },
+      headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true, timeout: 25000,
+    });
+    if (r.status === 204) break;
+    if (r.status !== 200) throw new Error(`${module} HTTP ${r.status}: ${JSON.stringify(r.data).slice(0, 200)}`);
+    out.push(...(r.data?.data || []));
+    if (!r.data?.info?.more_records) break;
+  }
+  return out;
+}
+
+// SH-14 end-to-end coverage diagnostic: how many Zentact merchants link to a SaaS subscription
+// via Project_Cases.Adyen_Store_ID → account → Subscription_Number → Zoho Billing.
+// GET /api/admin/sh14-coverage?secret=
+app.get('/api/admin/sh14-coverage', async (req, res) => {
+  if ((req.query.secret || req.headers['x-cluster-webhook-secret']) !== process.env.ZOHO_WEBHOOK_SECRET) return res.status(401).json({ error: 'invalid secret' });
+  const norm = (s) => String(s || '').trim().toLowerCase();
+  const lookupName = (v) => (v && (v.name || v)) || '';
+  try {
+    const crmToken = await ensureValidCrmToken();
+    if (!crmToken) return res.status(400).json({ error: 'CRM not connected' });
+    // 1) Project_Cases → storeId→account map, and account→subscription_numbers
+    const cases = await fetchAllCrmModule(crmToken, 'Project_Cases', ['Adyen_Store_ID', 'Subscription_Number', 'Account_Name', 'Deal_Name', 'Type']);
+    const caseByStore = new Map();   // adyen storeId → account name
+    const subsByAccount = new Map(); // normalized account → Set(subscription_number)
+    let casesWithStore = 0, casesWithSub = 0;
+    for (const c of cases) {
+      const sid = String(c.Adyen_Store_ID || '').trim();
+      const acc = lookupName(c.Account_Name);
+      if (sid) { casesWithStore++; caseByStore.set(sid, acc); }
+      const sub = String(c.Subscription_Number || '').trim();
+      if (sub) { casesWithSub++; if (acc) { if (!subsByAccount.has(norm(acc))) subsByAccount.set(norm(acc), new Set()); subsByAccount.get(norm(acc)).add(sub); } }
+    }
+    // 2) Billing active subs → subscription_number → monthly MRR
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    const subMrr = new Map();
+    for (const orgId of ZOHO_BILLING_ORG_IDS) {
+      const all = await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.All');
+      for (const s of all) {
+        if (!ACTIVE_STATUSES.has(String(s.status || '').toLowerCase())) continue;
+        const num = String(s.subscription_number || '').trim();
+        if (num) subMrr.set(num, (subMrr.get(num) || 0) + subMonthlyAmount(s.sub_total != null ? s.sub_total : s.amount, s.interval, s.interval_unit));
+      }
+    }
+    // 3) Zentact merchants → walk the chain
+    const merchants = (await pool.query(`SELECT merchant_account_id, business_name, stores FROM zentact_merchants`)).rows;
+    let withStore = 0, storeMatched = 0, accountHasSub = 0, subResolved = 0, matchedMrr = 0;
+    const sampleNoStoreMatch = [];
+    for (const m of merchants) {
+      let stores = []; try { stores = Array.isArray(m.stores) ? m.stores : JSON.parse(m.stores || '[]'); } catch { /* */ }
+      const storeIds = stores.map(s => String(s.storeId || '').trim()).filter(Boolean);
+      if (storeIds.length) withStore++;
+      const acc = storeIds.map(id => caseByStore.get(id)).find(Boolean);
+      if (!acc) { if (sampleNoStoreMatch.length < 10) sampleNoStoreMatch.push({ name: m.business_name, stores: storeIds.length }); continue; }
+      storeMatched++;
+      const subs = subsByAccount.get(norm(acc)) || new Set();
+      if (subs.size) accountHasSub++;
+      let mrr = 0, hit = false;
+      for (const sn of subs) if (subMrr.has(sn)) { hit = true; mrr += subMrr.get(sn); }
+      if (hit) { subResolved++; matchedMrr += mrr; }
+    }
+    res.json({
+      projectCases: { total: cases.length, withAdyenStoreId: casesWithStore, withSubscriptionNumber: casesWithSub },
+      billing: { activeSubsWithNumber: subMrr.size },
+      zentact: { totalMerchants: merchants.length, withStoreId: withStore },
+      chain: { storeMatchedToCase: storeMatched, accountHasSubNumber: accountHasSub, subResolvedInBilling: subResolved, matchedSaasMrr: Math.round(matchedMrr * 100) / 100 },
+      sampleNoStoreMatch,
+    });
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
 // GET /api/admin/zentact-raw?secret=  — dump the FULL raw merchant object from the Zentact API
 // (top-level fields, not just custom attributes) to find an Adyen/PSP identifier.
 app.get('/api/admin/zentact-raw', async (req, res) => {
