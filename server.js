@@ -5861,6 +5861,117 @@ async function getAdminBooksAuth() {
   return { accessToken: admin.access_token, apiDomain: admin.api_domain };
 }
 
+// ============================================================================
+// ZOHO BILLING — board SaaS metrics (MRR / ARPU / active subs / churn / LTV)
+// aggregated across the company's billing organizations (one Zoho account, many
+// orgs). Reuses the admin Zoho token; scope ZohoSubscriptions.subscriptions.READ
+// is already in the login consent. Org IDs via env (default = the 3 known orgs).
+// ============================================================================
+const ZOHO_BILLING_ORG_IDS = (process.env.ZOHO_BILLING_ORG_IDS || '697704869,802470810,905113716')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
+// Normalize a subscription's recurring charge to a MONTHLY amount for MRR.
+function subMonthlyAmount(amount, interval, intervalUnit) {
+  const a = Number(amount) || 0;
+  const iv = Math.max(1, parseInt(interval) || 1);
+  const unit = String(intervalUnit || 'months').toLowerCase();
+  if (unit.startsWith('year')) return a / (iv * 12);
+  if (unit.startsWith('week')) return (a / iv) * (52 / 12);
+  if (unit.startsWith('day'))  return (a / iv) * (365 / 12);
+  return a / iv; // months
+}
+
+// List every subscription of a status for one billing org (paginated).
+async function fetchBillingSubs(apiDomain, accessToken, orgId, filterBy) {
+  const base = (apiDomain || 'https://www.zohoapis.com').replace(/\/$/, '');
+  const out = [];
+  for (let page = 1; page <= 100; page++) {
+    const r = await axios.get(`${base}/billing/v1/subscriptions`, {
+      params: { filter_by: filterBy, page, per_page: 200 },
+      headers: {
+        Authorization: `Zoho-oauthtoken ${accessToken}`,
+        'X-com-zoho-subscriptions-organizationid': orgId,
+      },
+      validateStatus: () => true, timeout: 25000,
+    });
+    if (r.status !== 200) {
+      const msg = typeof r.data === 'object' ? JSON.stringify(r.data).slice(0, 220) : String(r.data).slice(0, 220);
+      throw new Error(`org ${orgId} ${filterBy} HTTP ${r.status}: ${msg}`);
+    }
+    out.push(...(r.data?.subscriptions || []));
+    if (!r.data?.page_context?.has_more_page) break;
+  }
+  return out;
+}
+
+let _billingCache = { at: 0, data: null };
+async function computeBillingMetrics() {
+  const { accessToken, apiDomain } = await getAdminBooksAuth();
+  let mrr = 0, activeSubs = 0, churnedThisMonth = 0;
+  const activeCustomers = new Set();
+  const perOrg = [];
+  for (const orgId of ZOHO_BILLING_ORG_IDS) {
+    // "Active" = LIVE + NON_RENEWING (still serving until period end).
+    const live      = await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.LIVE');
+    const nonRenew  = await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.NON_RENEWING');
+    const cancelled = await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.CANCELLED_THIS_MONTH');
+    const active = [...live, ...nonRenew];
+    let orgMrr = 0;
+    for (const s of active) {
+      orgMrr += subMonthlyAmount(s.amount, s.interval, s.interval_unit);
+      if (s.customer_id) activeCustomers.add(`${orgId}:${s.customer_id}`);
+    }
+    mrr += orgMrr;
+    activeSubs += active.length;
+    churnedThisMonth += cancelled.length;
+    perOrg.push({ orgId, mrr: Math.round(orgMrr * 100) / 100, activeSubs: active.length, churned: cancelled.length });
+  }
+  const customers  = activeCustomers.size || activeSubs;
+  const arpu       = customers > 0 ? mrr / customers : 0;
+  // Approx monthly churn rate (count-based): cancelled this month ÷ (active + cancelled).
+  const churnRate  = (activeSubs + churnedThisMonth) > 0 ? (churnedThisMonth / (activeSubs + churnedThisMonth)) * 100 : 0;
+  // Simple LTV = ARPU ÷ monthly churn rate.
+  const ltv        = churnRate > 0 ? arpu / (churnRate / 100) : 0;
+  const r2 = (n) => Math.round(n * 100) / 100;
+  return {
+    mrr: r2(mrr), arr: r2(mrr * 12), activeSubs, activeCustomers: customers,
+    arpu: r2(arpu), churnedThisMonth, churnRate: r2(churnRate), ltv: r2(ltv),
+    perOrg, orgCount: ZOHO_BILLING_ORG_IDS.length, generatedAt: new Date().toISOString(),
+  };
+}
+
+// GET /api/billing/metrics — board SaaS metrics (admins / dashboard:view_admin). Cached 30 min
+// (heavy: paginated subscriptions across every billing org).
+app.get('/api/billing/metrics', authenticateToken, async (req, res) => {
+  if (req.user.isAdmin !== true) {
+    const perms = await getUserPermissions(req.user.email);
+    if (!userHasPermission(perms, 'invoices:view_all') && !userHasPermission(perms, 'dashboard:view_admin')) {
+      return res.status(403).json({ error: 'Permission required: dashboard:view_admin' });
+    }
+  }
+  try {
+    if (req.query.fresh !== '1' && _billingCache.data && (Date.now() - _billingCache.at) < 30 * 60 * 1000) {
+      return res.json({ ..._billingCache.data, cached: true });
+    }
+    const data = await computeBillingMetrics();
+    _billingCache = { at: Date.now(), data };
+    res.json(data);
+  } catch (e) {
+    res.status(502).json({ error: 'billing_fetch_failed', detail: e.message });
+  }
+});
+
+// Secret diagnostic: raw billing metrics so the numbers can be validated against the
+// Zoho Billing dashboard before wiring the UI. GET /api/admin/billing-metrics-raw?secret=
+app.get('/api/admin/billing-metrics-raw', async (req, res) => {
+  if (req.query.secret !== (process.env.ZOHO_WEBHOOK_SECRET || '')) return res.status(401).json({ error: 'bad secret' });
+  try {
+    res.json(await computeBillingMetrics());
+  } catch (e) {
+    res.status(502).json({ error: 'billing_fetch_failed', detail: e.message });
+  }
+});
+
 // Look up Zoho's internal invoice_id from our local invoice_number by asking
 // the Zoho Books API directly.
 // Uses `search_text` — the documented general search param — and then picks the
