@@ -5904,37 +5904,43 @@ async function fetchBillingSubs(apiDomain, accessToken, orgId, filterBy) {
   return out;
 }
 
+// Status → metric mapping, reverse-engineered to match the Zoho Billing dashboard exactly
+// (validated against org 697704869: MRR/active/ARPU/churn/LTV all matched to the cent):
+//  • MRR = monthly sub_total (PRE-TAX) of live + non_renewing + dunning + unpaid
+//  • Active subscriptions = those four PLUS paused (paused counts but contributes $0 MRR)
+//  • Churn % = subscriptions cancelled this month ÷ active ; LTV = ARPU ÷ churn%
+const MRR_STATUSES    = new Set(['live', 'non_renewing', 'dunning', 'unpaid']);
+const ACTIVE_STATUSES = new Set(['live', 'non_renewing', 'dunning', 'unpaid', 'paused']);
+
 let _billingCache = { at: 0, data: null };
 async function computeBillingMetrics() {
   const { accessToken, apiDomain } = await getAdminBooksAuth();
   let mrr = 0, activeSubs = 0, churnedThisMonth = 0;
-  const activeCustomers = new Set();
   const perOrg = [];
   for (const orgId of ZOHO_BILLING_ORG_IDS) {
-    // "Active" = LIVE + NON_RENEWING (still serving until period end).
-    const live      = await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.LIVE');
-    const nonRenew  = await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.NON_RENEWING');
+    // One "All" pass → bucket by status for MRR + active; a CANCELLED_THIS_MONTH pass for churn
+    // (cancelled-this-month isn't a distinct status value, only a filter).
+    const all       = await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.All');
     const cancelled = await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.CANCELLED_THIS_MONTH');
-    const active = [...live, ...nonRenew];
-    let orgMrr = 0;
-    for (const s of active) {
-      orgMrr += subMonthlyAmount(s.amount, s.interval, s.interval_unit);
-      if (s.customer_id) activeCustomers.add(`${orgId}:${s.customer_id}`);
+    let orgMrr = 0, orgActive = 0;
+    for (const s of all) {
+      const st = String(s.status || '').toLowerCase();
+      if (ACTIVE_STATUSES.has(st)) orgActive++;
+      if (MRR_STATUSES.has(st)) {
+        orgMrr += subMonthlyAmount(s.sub_total != null ? s.sub_total : s.amount, s.interval, s.interval_unit);
+      }
     }
     mrr += orgMrr;
-    activeSubs += active.length;
+    activeSubs += orgActive;
     churnedThisMonth += cancelled.length;
-    perOrg.push({ orgId, mrr: Math.round(orgMrr * 100) / 100, activeSubs: active.length, churned: cancelled.length });
+    perOrg.push({ orgId, mrr: Math.round(orgMrr * 100) / 100, activeSubs: orgActive, churned: cancelled.length });
   }
-  const customers  = activeCustomers.size || activeSubs;
-  const arpu       = customers > 0 ? mrr / customers : 0;
-  // Approx monthly churn rate (count-based): cancelled this month ÷ (active + cancelled).
-  const churnRate  = (activeSubs + churnedThisMonth) > 0 ? (churnedThisMonth / (activeSubs + churnedThisMonth)) * 100 : 0;
-  // Simple LTV = ARPU ÷ monthly churn rate.
-  const ltv        = churnRate > 0 ? arpu / (churnRate / 100) : 0;
+  const arpu      = activeSubs > 0 ? mrr / activeSubs : 0;
+  const churnRate = activeSubs > 0 ? (churnedThisMonth / activeSubs) * 100 : 0;
+  const ltv       = churnRate > 0 ? arpu / (churnRate / 100) : 0;
   const r2 = (n) => Math.round(n * 100) / 100;
   return {
-    mrr: r2(mrr), arr: r2(mrr * 12), activeSubs, activeCustomers: customers,
+    mrr: r2(mrr), arr: r2(mrr * 12), activeSubs,
     arpu: r2(arpu), churnedThisMonth, churnRate: r2(churnRate), ltv: r2(ltv),
     perOrg, orgCount: ZOHO_BILLING_ORG_IDS.length, generatedAt: new Date().toISOString(),
   };
