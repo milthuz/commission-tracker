@@ -5646,51 +5646,36 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
       ORDER BY total DESC LIMIT 10
     `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
 
-    // SaaS revenue per client (SH-8): sum of the SaaS subtotal of paid invoices, by customer.
-    const saasResult = await pool.query(`
+    // Board-level AVERAGE SaaS revenue per client (SH-8): total SaaS subtotal of paid invoices
+    // ÷ number of distinct clients that have any SaaS revenue this year.
+    const saasAvgRes = await pool.query(`
       SELECT
-        COALESCE(NULLIF(TRIM(customer_name), ''), 'Unknown') AS name,
-        COUNT(*) AS invoices,
-        COALESCE(SUM(saas_amount), 0) AS total
+        COALESCE(SUM(saas_amount), 0) AS total,
+        COUNT(DISTINCT CASE WHEN saas_amount > 0 THEN COALESCE(NULLIF(TRIM(customer_name), ''), 'Unknown') END) AS clients
       FROM invoices
       WHERE organization_id = $1 AND status = 'paid' AND date >= $2 AND date <= $3 ${excl}
-        AND COALESCE(NULLIF(TRIM(customer_name), ''), '') != ''
-      GROUP BY COALESCE(NULLIF(TRIM(customer_name), ''), 'Unknown')
-      HAVING COALESCE(SUM(saas_amount), 0) > 0
-      ORDER BY total DESC LIMIT 10
     `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
+    const sa = saasAvgRes.rows[0] || {};
+    const saasTotal = parseFloat(sa.total) || 0, saasClients = parseInt(sa.clients) || 0;
+    const avgSaas = { total: saasTotal, clients: saasClients, avg: saasClients > 0 ? saasTotal / saasClients : 0 };
 
-    // Payment (processing) revenue per client (SH-9): Zentact transaction profit by merchant
-    // for the year. Only computed when the caller can see revenue (admins / revenue:view).
-    let paymentByCustomer = [];
+    // Board-level AVERAGE processing revenue per merchant (SH-9): total Zentact transaction
+    // profit ÷ number of merchants with positive profit this year. Revenue-gated.
+    let avgProcessing = null;
     if (canRevenue) {
-      const payResult = await pool.query(`
+      const procAvgRes = await pool.query(`
         SELECT
-          COALESCE(NULLIF(TRIM(zm.business_name), ''), r.merchant_account_id) AS name,
-          COALESCE(SUM(r.transaction_profit_cents), 0) / 100.0 AS total,
-          COALESCE(SUM(r.other_revenue_cents), 0) / 100.0 AS other,
-          COUNT(DISTINCT r.month) AS months
-        FROM zentact_merchant_revenue r
-        LEFT JOIN zentact_merchants zm ON zm.merchant_account_id = r.merchant_account_id
-        WHERE r.year = $1
-        GROUP BY r.merchant_account_id, zm.business_name
-        HAVING COALESCE(SUM(r.transaction_profit_cents), 0) > 0
-        ORDER BY total DESC LIMIT 10
+          COALESCE(SUM(profit) FILTER (WHERE profit > 0), 0) AS total,
+          COUNT(*) FILTER (WHERE profit > 0) AS clients
+        FROM (
+          SELECT merchant_account_id, SUM(transaction_profit_cents) / 100.0 AS profit
+          FROM zentact_merchant_revenue WHERE year = $1 GROUP BY merchant_account_id
+        ) m
       `, [year]);
-      paymentByCustomer = payResult.rows.map(r => ({
-        name:   r.name,
-        total:  parseFloat(r.total),
-        other:  parseFloat(r.other) || 0,
-        months: parseInt(r.months),
-      }));
+      const pa = procAvgRes.rows[0] || {};
+      const procTotal = parseFloat(pa.total) || 0, procClients = parseInt(pa.clients) || 0;
+      avgProcessing = { total: procTotal, clients: procClients, avg: procClients > 0 ? procTotal / procClients : 0 };
     }
-
-    const recentResult = await pool.query(`
-      SELECT invoice_number, customer_name, salesperson_name, total, commission, status, date
-      FROM invoices
-      WHERE organization_id = $1 AND date >= $2 AND date <= $3 ${excl}
-      ORDER BY date DESC LIMIT 20
-    `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
 
     const cards = cardsResult.rows[0] || {};
     res.json({
@@ -5719,21 +5704,8 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
         invoices: parseInt(r.invoices),
         total:    parseFloat(r.total),
       })),
-      saasByCustomer: saasResult.rows.map(r => ({
-        name:     r.name,
-        invoices: parseInt(r.invoices),
-        total:    parseFloat(r.total),
-      })),
-      paymentByCustomer,
-      recentInvoices: recentResult.rows.map(r => ({
-        invoiceNumber: r.invoice_number,
-        customer:      r.customer_name || 'Unknown',
-        salesperson:   r.salesperson_name || 'Unknown',
-        total:         parseFloat(r.total),
-        commission:    parseFloat(r.commission),
-        status:        r.status,
-        date:          r.date,
-      })),
+      avgSaas,
+      avgProcessing,
       year,
     });
   } catch (error) {
