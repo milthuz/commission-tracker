@@ -3528,6 +3528,37 @@ app.get('/api/admin/zoho-account-raw', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/crm-modules?secret= — list all CRM modules (incl. custom) with their api_name,
+// to find the custom "payment case" module that holds the Adyen Store ID (SH-14).
+app.get('/api/admin/crm-modules', async (req, res) => {
+  if ((req.query.secret || req.headers['x-cluster-webhook-secret']) !== process.env.ZOHO_WEBHOOK_SECRET) return res.status(401).json({ error: 'invalid secret' });
+  try {
+    const crmToken = await ensureValidCrmToken();
+    if (!crmToken) return res.status(400).json({ error: 'CRM not connected' });
+    const r = await axios.get('https://www.zohoapis.com/crm/v2/settings/modules', { headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true });
+    const mods = (r.data?.modules || []).map(m => ({ api_name: m.api_name, label: m.plural_label, generated_type: m.generated_type, custom: m.generated_type === 'custom' || m.api_name?.includes('CustomModule') }));
+    res.json({ status: r.status, modules: mods });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/admin/crm-module-raw?secret=&module=<api_name>[&q=name] — dump non-null fields of the
+// first few records (or a name search) of a CRM module, to find the Adyen Store ID field.
+app.get('/api/admin/crm-module-raw', async (req, res) => {
+  if ((req.query.secret || req.headers['x-cluster-webhook-secret']) !== process.env.ZOHO_WEBHOOK_SECRET) return res.status(401).json({ error: 'invalid secret' });
+  const module = String(req.query.module || '').trim();
+  if (!module) return res.status(400).json({ error: 'module required' });
+  const q = String(req.query.q || '').trim();
+  try {
+    const crmToken = await ensureValidCrmToken();
+    if (!crmToken) return res.status(400).json({ error: 'CRM not connected' });
+    const base = `https://www.zohoapis.com/crm/v2/${encodeURIComponent(module)}`;
+    const url = q ? `${base}/search?word=${encodeURIComponent(q)}` : `${base}?per_page=3`;
+    const r = await axios.get(url, { headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true });
+    const records = (r.data?.data || []).map(rec => { const nn = {}; Object.keys(rec).forEach(k => { if (rec[k] !== null && rec[k] !== '' && !k.startsWith('$')) nn[k] = rec[k]; }); return nn; });
+    res.json({ status: r.status, count: records.length, records });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/zentact-raw?secret=  — dump the FULL raw merchant object from the Zentact API
 // (top-level fields, not just custom attributes) to find an Adyen/PSP identifier.
 app.get('/api/admin/zentact-raw', async (req, res) => {
