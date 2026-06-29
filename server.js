@@ -863,6 +863,10 @@ async function initializeDatabase() {
     // Reseller identity resolution: associated form emails + a Zentact key (residuals).
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS emails JSONB DEFAULT '[]'::jsonb`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS zentact_key VARCHAR(255)`);
+    // Name aliases: other names the same reseller is known by in the Zoho form / Zentact
+    // (e.g. "Lirette" for a reseller renamed "Lirette MG"). Lowercased; used to roll up
+    // activations/residuals that don't match the canonical name exactly.
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS name_aliases JSONB DEFAULT '[]'::jsonb`);
     // Per-reseller logo, stored in-DB as bytea (mirrors the Resources library — no object storage).
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS logo_data BYTEA`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS logo_mime_type VARCHAR(150)`);
@@ -7863,6 +7867,7 @@ app.get('/api/resellers', authenticateToken, async (req, res) => {
     const r = await pool.query(`
       SELECT rs.id, rs.name, rs.active, rs.zentact_key,
              COALESCE(rs.emails, '[]'::jsonb) AS emails,
+             COALESCE(rs.name_aliases, '[]'::jsonb) AS name_aliases,
              (rs.logo_data IS NOT NULL) AS has_logo,
              EXTRACT(EPOCH FROM rs.logo_updated_at)::bigint AS logo_updated_at,
              COALESCE(a.locations, 0) AS locations,
@@ -7900,25 +7905,30 @@ app.post('/api/resellers', authenticateToken, async (req, res) => {
 // PUT /api/resellers/:id — update name / active / emails / zentact_key
 app.put('/api/resellers/:id', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'reseller:manage'))) return;
-  const { name, active, emails, zentact_key } = req.body || {};
-  // Normalize emails to a lowercased, de-duped array.
+  const { name, active, emails, zentact_key, name_aliases } = req.body || {};
+  // Normalize emails / name aliases to lowercased, de-duped arrays.
   const cleanEmails = Array.isArray(emails)
     ? [...new Set(emails.map(e => (e || '').toString().trim().toLowerCase()).filter(Boolean))]
+    : null;
+  const cleanAliases = Array.isArray(name_aliases)
+    ? [...new Set(name_aliases.map(e => (e || '').toString().trim().toLowerCase()).filter(Boolean))]
     : null;
   try {
     await pool.query(
       `UPDATE resellers SET
-         name        = COALESCE($2, name),
-         active      = COALESCE($3, active),
-         emails      = COALESCE($4::jsonb, emails),
-         zentact_key = $5,
-         updated_at  = CURRENT_TIMESTAMP
+         name         = COALESCE($2, name),
+         active       = COALESCE($3, active),
+         emails       = COALESCE($4::jsonb, emails),
+         zentact_key  = $5,
+         name_aliases = COALESCE($6::jsonb, name_aliases),
+         updated_at   = CURRENT_TIMESTAMP
        WHERE id = $1`,
       [parseInt(req.params.id),
        name != null ? String(name).trim() : null,
        typeof active === 'boolean' ? active : null,
        cleanEmails ? JSON.stringify(cleanEmails) : null,
-       zentact_key != null ? String(zentact_key).trim() || null : null]
+       zentact_key != null ? String(zentact_key).trim() || null : null,
+       cleanAliases ? JSON.stringify(cleanAliases) : null]
     );
     res.json({ success: true });
   } catch (e) {
@@ -8066,6 +8076,7 @@ app.get('/api/resellers/pos-activations', authenticateToken, async (req, res) =>
          SELECT r.name FROM resellers r
          WHERE r.emails @> to_jsonb(LOWER(a.reseller_email))
             OR LOWER(r.name) = LOWER(NULLIF(a.reseller_name, ''))
+            OR r.name_aliases @> to_jsonb(LOWER(NULLIF(a.reseller_name, '')))
          ORDER BY (r.emails @> to_jsonb(LOWER(a.reseller_email))) DESC
          LIMIT 1
        ) rs ON true`;
@@ -8552,6 +8563,25 @@ app.post('/api/admin/user-reports/:id/resolve', authenticateToken, async (req, r
   }
 });
 
+// Build a lowercased key → canonical-reseller-name map from [{name, zentact_key, name_aliases}].
+// A Zentact merchant's sales_rep_name / "Reseller" attribute matches a reseller by any of its
+// zentact_key(s), its own name, OR any configured name alias (e.g. "Lirette" → "Lirette MG").
+function buildResellerKeyMap(resellers) {
+  const map = new Map();
+  for (const rs of resellers) {
+    for (const k of String(rs.zentact_key || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)) {
+      map.set(k, rs.name);
+    }
+    const nk = String(rs.name || '').trim().toLowerCase();
+    if (nk && !map.has(nk)) map.set(nk, rs.name);
+    for (const al of (Array.isArray(rs.name_aliases) ? rs.name_aliases : [])) {
+      const ak = String(al || '').trim().toLowerCase();
+      if (ak && !map.has(ak)) map.set(ak, rs.name);
+    }
+  }
+  return map;
+}
+
 // GET /api/resellers/residuals — a reseller's Zentact SALES (merchants they activated),
 // matched by the reseller's zentact_key against zentact_merchants.sales_rep_name
 // (comma-separated, case-insensitive). Resellers don't get bonuses — this is their sales.
@@ -8561,7 +8591,7 @@ app.get('/api/resellers/residuals', authenticateToken, async (req, res) => {
     // All resellers: matched by their zentact_key (sales_rep_name) AND/OR by name
     // against the Zentact "Reseller" custom attribute, so a reseller links even
     // before an admin sets its zentact_key.
-    const resellers = (await pool.query(`SELECT name, zentact_key FROM resellers`)).rows;
+    const resellers = (await pool.query(`SELECT name, zentact_key, name_aliases FROM resellers`)).rows;
     const merchants = (await pool.query(
       `SELECT zm.business_name, zm.status, zm.activated_at,
               LOWER(zm.sales_rep_name)     AS rep,
@@ -8576,17 +8606,8 @@ app.get('/api/resellers/residuals', authenticateToken, async (req, res) => {
           OR (zm.reseller_attribute IS NOT NULL AND zm.reseller_attribute <> '')`
     )).rows;
 
-    // Build key(lowercased) → reseller name map. A reseller is identified in Zentact
-    // EITHER by a sales_rep_name OR by the "Reseller" custom attribute — both are matched
-    // against the same comma-separated zentact_key, plus the reseller's own name as a fallback.
-    const keyToReseller = new Map();
-    for (const rs of resellers) {
-      for (const k of String(rs.zentact_key).split(',').map(s => s.trim().toLowerCase()).filter(Boolean)) {
-        keyToReseller.set(k, rs.name);
-      }
-      const nameKey = String(rs.name || '').trim().toLowerCase();
-      if (nameKey && !keyToReseller.has(nameKey)) keyToReseller.set(nameKey, rs.name);
-    }
+    // Match by sales_rep_name / "Reseller" attribute → canonical reseller (zentact_key, name, or alias).
+    const keyToReseller = buildResellerKeyMap(resellers);
 
     const detail = [];
     const agg = new Map(); // reseller → { merchants, active, profit_cents }
@@ -8619,15 +8640,8 @@ app.get('/api/zentact/revenue', authenticateToken, async (req, res) => {
   try {
     const year = parseInt(req.query.year) || new Date().getFullYear();
     // Reseller resolution map (same rules as /api/resellers/residuals).
-    const resellers = (await pool.query(`SELECT name, zentact_key FROM resellers`)).rows;
-    const keyToReseller = new Map();
-    for (const rs of resellers) {
-      for (const k of String(rs.zentact_key || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)) {
-        keyToReseller.set(k, rs.name);
-      }
-      const nk = String(rs.name || '').trim().toLowerCase();
-      if (nk && !keyToReseller.has(nk)) keyToReseller.set(nk, rs.name);
-    }
+    const resellers = (await pool.query(`SELECT name, zentact_key, name_aliases FROM resellers`)).rows;
+    const keyToReseller = buildResellerKeyMap(resellers);
     const rows = (await pool.query(
       `SELECT r.merchant_account_id, r.month, r.transaction_profit_cents, r.total_volume_cents,
               r.other_revenue_cents, r.payments_count, r.currency, zm.business_name, zm.sales_rep_name,
