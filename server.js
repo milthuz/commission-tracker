@@ -520,6 +520,12 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ`);
     await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS open_count INT DEFAULT 0`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_proposals_sent_token ON proposals_sent(track_token)`);
+    // Accept-link CLICK tracking (reliable, unlike the open pixel): the stored Zoho accept URL
+    // we redirect to + when/how often the client clicked through.
+    await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS accept_url TEXT`);
+    await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS click_count INT DEFAULT 0`);
+    await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS first_click_at TIMESTAMPTZ`);
+    await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS last_click_at TIMESTAMPTZ`);
     // Admin-managed category structure for the resources library.
     await pool.query(`
       CREATE TABLE IF NOT EXISTS resource_categories (
@@ -6359,13 +6365,16 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
     await markEstimateSent(estimateId);
     const acceptUrl = await getEstimateAcceptUrl(estimateId);
     const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    const acceptBtn = acceptUrl
-      ? `<div style="margin:22px 0"><a href="${esc(acceptUrl)}" style="display:inline-block;background:#fe6523;color:#fff;text-decoration:none;font-weight:700;font-family:Arial,Helvetica,sans-serif;font-size:14px;padding:13px 26px;border-radius:8px">${lang === 'en' ? 'Review & accept the quote online →' : 'Voir et accepter le devis en ligne →'}</a></div>`
-      : '';
-    // Open-tracking pixel: a unique token per send; the /track endpoint logs the open when the
-    // client's mail client loads this 1×1 image. (Imperfect — image-blocking/pre-fetching clients.)
+    // A unique token per send drives both the open pixel and the accept-link click redirect.
     const trackToken = require('crypto').randomUUID().replace(/-/g, '');
     const apiBase = process.env.PUBLIC_API_URL || `https://${req.get('host')}`;
+    // Route the accept button through our backend so every click is logged (reliable repeat
+    // counting), then 302s to the Zoho accept URL stored against this send.
+    const acceptBtn = acceptUrl
+      ? `<div style="margin:22px 0"><a href="${apiBase}/api/proposals/click/${trackToken}" style="display:inline-block;background:#fe6523;color:#fff;text-decoration:none;font-weight:700;font-family:Arial,Helvetica,sans-serif;font-size:14px;padding:13px 26px;border-radius:8px">${lang === 'en' ? 'Review & accept the quote online →' : 'Voir et accepter le devis en ligne →'}</a></div>`
+      : '';
+    // Open-tracking pixel: the /track endpoint logs the open when the client's mail client loads
+    // this 1×1 image. (Imperfect — Gmail/Outlook proxy-cache images, so opens under-count.)
     const pixel = `<img src="${apiBase}/api/proposals/track/${trackToken}.gif" width="1" height="1" alt="" style="display:none;width:1px;height:1px;border:0;max-height:0;overflow:hidden">`;
     const html = `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#1c2434;line-height:1.5"><div style="white-space:pre-wrap">${esc(bodyText)}</div>${acceptBtn}</div>${pixel}`;
 
@@ -6386,8 +6395,8 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
     // Record the send for the status board (best-effort).
     try {
       await pool.query(
-        `INSERT INTO proposals_sent (estimate_id, estimate_number, customer_name, rep_email, to_email, lang, track_token) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [estimateId, (det && det.number) || '', clientName, (req.user.realAdminEmail || req.user.email || ''), to, lang, trackToken]);
+        `INSERT INTO proposals_sent (estimate_id, estimate_number, customer_name, rep_email, to_email, lang, track_token, accept_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [estimateId, (det && det.number) || '', clientName, (req.user.realAdminEmail || req.user.email || ''), to, lang, trackToken, acceptUrl || null]);
     } catch (e) { console.warn('[proposal/send] record:', e.message); }
     res.json({ success: true, acceptLinkIncluded: !!acceptUrl, sentFrom: fromAddr });
   } catch (e) { console.warn('[proposal/send]', e.message); res.status(500).json({ error: e.message }); }
@@ -6409,6 +6418,24 @@ app.get('/api/proposals/track/:token', (req, res) => {
   res.set('Pragma', 'no-cache');
   res.set('Expires', '0');
   res.end(TRACK_PIXEL);
+});
+
+// GET /api/proposals/click/:token — accept-link click tracking. Logs the click (count + first/
+// last timestamps), then 302s to the stored Zoho accept URL. NO auth (the client clicks from
+// their email). Reliable repeat counting — unlike the open pixel, links aren't proxy-cached.
+app.get('/api/proposals/click/:token', async (req, res) => {
+  const token = String(req.params.token || '');
+  let url = '';
+  try {
+    const r = await pool.query(
+      `UPDATE proposals_sent SET click_count = COALESCE(click_count,0) + 1,
+              first_click_at = COALESCE(first_click_at, NOW()), last_click_at = NOW()
+       WHERE track_token = $1 RETURNING accept_url`,
+      [token]
+    );
+    url = r.rows[0]?.accept_url || '';
+  } catch (e) { /* never block the redirect */ }
+  res.redirect(302, url || (process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com'));
 });
 
 // GET /api/proposals/sent — status board: proposals this user (or all, for admins) has sent,
@@ -6434,6 +6461,7 @@ app.get('/api/proposals/sent', authenticateToken, async (req, res) => {
         status: (st && st.status) || '', viewed: (st && st.viewed) || false, viewedTime: (st && st.viewedTime) || '',
         acceptedDate: (st && st.acceptedDate) || '', declinedDate: (st && st.declinedDate) || '',
         emailOpened: !!r0.opened_at, emailOpenedAt: r0.opened_at || '', emailOpenCount: r0.open_count || 0,
+        linkClickCount: r0.click_count || 0, linkFirstClickAt: r0.first_click_at || '', linkLastClickAt: r0.last_click_at || '',
       });
     }
     res.json({ proposals: out });
