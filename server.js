@@ -6028,6 +6028,50 @@ app.get('/api/admin/billing-debug', async (req, res) => {
   }
 });
 
+// SH-14 feasibility diagnostic: how well do Zentact merchants join to SaaS subscriptions?
+// Tests the CRM-Deal-ID bridge (merchant.opportunity_id == subscription.zcrm_potential_id)
+// plus a name-match fallback. GET /api/admin/merchant-saas-link-debug?secret=
+app.get('/api/admin/merchant-saas-link-debug', async (req, res) => {
+  if (req.query.secret !== (process.env.ZOHO_WEBHOOK_SECRET || '')) return res.status(401).json({ error: 'bad secret' });
+  const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  try {
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    const byPotential = new Map(); // zcrm_potential_id → monthly SaaS MRR
+    const byName = new Map();      // normalized customer_name → monthly SaaS MRR
+    let totalActiveSubs = 0, subsWithPotential = 0;
+    for (const orgId of ZOHO_BILLING_ORG_IDS) {
+      const all = await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.All');
+      for (const s of all) {
+        if (!ACTIVE_STATUSES.has(String(s.status || '').toLowerCase())) continue;
+        totalActiveSubs++;
+        const m = subMonthlyAmount(s.sub_total != null ? s.sub_total : s.amount, s.interval, s.interval_unit);
+        const pid = String(s.zcrm_potential_id || '').trim();
+        if (pid) { subsWithPotential++; byPotential.set(pid, (byPotential.get(pid) || 0) + m); }
+        const nn = norm(s.customer_name); if (nn) byName.set(nn, (byName.get(nn) || 0) + m);
+      }
+    }
+    const merchants = (await pool.query(`SELECT merchant_account_id, business_name, opportunity_id FROM zentact_merchants`)).rows;
+    let withOpp = 0, oppMatched = 0, nameOnlyMatched = 0, matchedSaasMrr = 0;
+    const sampleUnmatched = [];
+    for (const mch of merchants) {
+      const opp = String(mch.opportunity_id || '').trim();
+      const oppHit = opp && byPotential.has(opp);
+      if (opp) withOpp++;
+      if (oppHit) { oppMatched++; matchedSaasMrr += byPotential.get(opp); }
+      else if (byName.has(norm(mch.business_name))) nameOnlyMatched++;
+      else if (sampleUnmatched.length < 8) sampleUnmatched.push({ name: mch.business_name, opp: opp || null });
+    }
+    res.json({
+      billing: { totalActiveSubs, subsWithPotential, distinctPotentials: byPotential.size },
+      zentact: { totalMerchants: merchants.length, withOpportunityId: withOpp },
+      join: { viaCrmDealId: oppMatched, viaNameFallback: nameOnlyMatched, totalMatched: oppMatched + nameOnlyMatched, matchedSaasMrr: Math.round(matchedSaasMrr * 100) / 100 },
+      sampleUnmatched,
+    });
+  } catch (e) {
+    res.status(502).json({ error: 'link_debug_failed', detail: e.message });
+  }
+});
+
 // Look up Zoho's internal invoice_id from our local invoice_number by asking
 // the Zoho Books API directly.
 // Uses `search_text` — the documented general search param — and then picks the
