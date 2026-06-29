@@ -3602,20 +3602,24 @@ app.get('/api/admin/sh14-coverage', async (req, res) => {
     }
     // 2) Billing active subs → subscription_number → monthly MRR
     const { accessToken, apiDomain } = await getAdminBooksAuth();
-    const subMrr = new Map();
+    const subMrr = new Map();           // subscription_number → monthly MRR
+    const subMrrByCustomer = new Map(); // normalized billing customer_name → monthly MRR
     for (const orgId of ZOHO_BILLING_ORG_IDS) {
       const all = await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.All');
       for (const s of all) {
         if (!ACTIVE_STATUSES.has(String(s.status || '').toLowerCase())) continue;
+        const mm = subMonthlyAmount(s.sub_total != null ? s.sub_total : s.amount, s.interval, s.interval_unit);
         const num = String(s.subscription_number || '').trim();
-        if (num) subMrr.set(num, (subMrr.get(num) || 0) + subMonthlyAmount(s.sub_total != null ? s.sub_total : s.amount, s.interval, s.interval_unit));
+        if (num) subMrr.set(num, (subMrr.get(num) || 0) + mm);
+        const cust = norm(s.customer_name);
+        if (cust) subMrrByCustomer.set(cust, (subMrrByCustomer.get(cust) || 0) + mm);
       }
     }
     // 3) Zentact merchants → walk the chain
     const merchants = (await pool.query(`SELECT merchant_account_id, business_name, stores FROM zentact_merchants`)).rows;
     const resolveMrr = (subs) => { let mrr = 0, hit = false; for (const sn of subs) if (subMrr.has(sn)) { hit = true; mrr += subMrr.get(sn); } return hit ? mrr : null; };
     let withStore = 0, storeMatched = 0;
-    let viaStoreId = 0, viaName = 0, resolvedAny = 0, matchedMrr = 0;
+    let viaStoreId = 0, viaCaseName = 0, viaDirectName = 0, resolvedAny = 0, matchedMrr = 0;
     const sampleUnresolved = [];
     for (const m of merchants) {
       let stores = []; try { stores = Array.isArray(m.stores) ? m.stores : JSON.parse(m.stores || '[]'); } catch { /* */ }
@@ -3626,19 +3630,24 @@ app.get('/api/admin/sh14-coverage', async (req, res) => {
       if (acc) storeMatched++;
       let mrr = acc ? resolveMrr(subsByAccount.get(norm(acc)) || new Set()) : null;
       if (mrr != null) viaStoreId++;
-      // Path B — fallback: merchant name → case (Restaurant_Name) → its subscription numbers.
+      // Path B — merchant name → CRM case (Restaurant_Name) → its subscription numbers.
       if (mrr == null) {
         const m2 = resolveMrr(subsByRestaurant.get(norm(m.business_name)) || new Set());
-        if (m2 != null) { mrr = m2; viaName++; }
+        if (m2 != null) { mrr = m2; viaCaseName++; }
+      }
+      // Path C — direct: merchant name → Zoho Billing customer_name (no CRM in between).
+      if (mrr == null) {
+        const m3 = subMrrByCustomer.get(norm(m.business_name));
+        if (m3 != null && m3 > 0) { mrr = m3; viaDirectName++; }
       }
       if (mrr != null) { resolvedAny++; matchedMrr += mrr; }
       else if (sampleUnresolved.length < 10) sampleUnresolved.push({ name: m.business_name, stores: storeIds.length });
     }
     res.json({
       projectCases: { total: cases.length, withAdyenStoreId: casesWithStore, withSubscriptionNumber: casesWithSub },
-      billing: { activeSubsWithNumber: subMrr.size },
+      billing: { activeSubsWithNumber: subMrr.size, distinctCustomerNames: subMrrByCustomer.size },
       zentact: { totalMerchants: merchants.length, withStoreId: withStore, storeMatchedToCase: storeMatched },
-      resolved: { viaStoreId, viaName, totalMerchantsWithSaaS: resolvedAny, pctOfMerchants: Math.round(resolvedAny / merchants.length * 1000) / 10, matchedSaasMrr: Math.round(matchedMrr * 100) / 100 },
+      resolved: { viaStoreId, viaCaseName, viaDirectName, totalMerchantsWithSaaS: resolvedAny, pctOfMerchants: Math.round(resolvedAny / merchants.length * 1000) / 10, matchedSaasMrr: Math.round(matchedMrr * 100) / 100 },
       sampleUnresolved,
     });
   } catch (e) { res.status(502).json({ error: e.message }); }
