@@ -98,6 +98,7 @@ const PERMISSION_CATALOG = [
 
   // Revenue (Zentact transaction profit)
   { key: 'revenue:view',               label: 'View merchant revenue (Transaction Profit by rep / reseller)',    category: 'Revenue' },
+  { key: 'revenue:manage_links',       label: 'Manage Merchant ↔ SaaS links (match merchants to subscriptions)', category: 'Revenue' },
 
   // Resources (sales document library)
   { key: 'resources:view',             label: 'View the Resources library (sales documents)',                   category: 'Resources' },
@@ -1082,6 +1083,21 @@ async function initializeDatabase() {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_merch_revenue_period ON zentact_merchant_revenue(year, month)`);
+
+    // SH-14: admin-curated link between a Zentact merchant and its Zoho Billing SaaS customer,
+    // so combined (SaaS + processing) revenue per merchant is accurate. status 'linked' (a
+    // billing customer/subscription) or 'no_saas' (confirmed payments-only). Overrides the
+    // name-based auto-match.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS merchant_saas_links (
+        merchant_account_id   VARCHAR(255) PRIMARY KEY,
+        billing_customer_name VARCHAR(500),
+        subscription_number   VARCHAR(255),
+        status                VARCHAR(20) NOT NULL DEFAULT 'linked',
+        linked_by             VARCHAR(255),
+        linked_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
 
     console.log('✅ Database tables initialized');
   } catch (error) {
@@ -6125,6 +6141,96 @@ if (process.env.ROLE !== 'worker') {
   setTimeout(warmBillingCache, 20000);
   setInterval(warmBillingCache, 25 * 60 * 1000);
 }
+
+// ── SH-14: Merchant ↔ SaaS linking (admin-curated) ──────────────────────────
+const normName = (s) => String(s || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+// Active Zoho Billing customers (name → monthly MRR), cached 30 min. Feeds the auto name-match,
+// the admin search, and the combined-revenue computation.
+let _billingCustCache = { at: 0, data: null };
+async function getBillingCustomers() {
+  if (_billingCustCache.data && Date.now() - _billingCustCache.at < 30 * 60 * 1000) return _billingCustCache.data;
+  const { accessToken, apiDomain } = await getAdminBooksAuth();
+  const byName = new Map();
+  for (const orgId of ZOHO_BILLING_ORG_IDS) {
+    const all = await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.All');
+    for (const s of all) {
+      if (!ACTIVE_STATUSES.has(String(s.status || '').toLowerCase())) continue;
+      const name = String(s.customer_name || '').trim(); const key = normName(name); if (!key) continue;
+      const mm = subMonthlyAmount(s.sub_total != null ? s.sub_total : s.amount, s.interval, s.interval_unit);
+      const e = byName.get(key) || { name, mrr: 0, subscription_number: s.subscription_number };
+      e.mrr += mm; byName.set(key, e);
+    }
+  }
+  const data = { byName, list: [...byName.values()] };
+  _billingCustCache = { at: Date.now(), data };
+  return data;
+}
+
+// GET /api/admin/merchant-links — every Zentact merchant with its monthly processing, its SaaS
+// (manual link > auto name-match > 0), and link status. Gated by revenue:manage_links.
+app.get('/api/admin/merchant-links', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'revenue:manage_links'))) return;
+  try {
+    const year = new Date().getFullYear();
+    const months = new Date().getMonth() + 1;
+    const merchants = (await pool.query(`SELECT merchant_account_id, business_name, status FROM zentact_merchants ORDER BY business_name`)).rows;
+    const profitRows = (await pool.query(`SELECT merchant_account_id, COALESCE(SUM(transaction_profit_cents),0)/100.0 AS profit FROM zentact_merchant_revenue WHERE year = $1 GROUP BY merchant_account_id`, [year])).rows;
+    const profitByMerchant = new Map(profitRows.map(r => [r.merchant_account_id, Number(r.profit)]));
+    const links = (await pool.query(`SELECT * FROM merchant_saas_links`)).rows;
+    const linkByMerchant = new Map(links.map(l => [l.merchant_account_id, l]));
+    const { byName } = await getBillingCustomers();
+    const r2 = (n) => Math.round(n * 100) / 100;
+    const out = merchants.map(m => {
+      const processingMonthly = months > 0 ? (profitByMerchant.get(m.merchant_account_id) || 0) / months : 0;
+      const link = linkByMerchant.get(m.merchant_account_id);
+      const auto = byName.get(normName(m.business_name));
+      let saasMonthly = 0, status = 'unmatched', linkedCustomer = null;
+      if (link) {
+        if (link.status === 'no_saas') { status = 'no_saas'; }
+        else { status = 'manual'; linkedCustomer = link.billing_customer_name; const c = byName.get(normName(link.billing_customer_name || '')); saasMonthly = c ? c.mrr : 0; }
+      } else if (auto) { status = 'auto'; saasMonthly = auto.mrr; linkedCustomer = auto.name; }
+      return { merchantAccountId: m.merchant_account_id, businessName: m.business_name, active: m.status,
+        processingMonthly: r2(processingMonthly), saasMonthly: r2(saasMonthly), combinedMonthly: r2(processingMonthly + saasMonthly), status, linkedCustomer };
+    });
+    const by = (s) => out.filter(x => x.status === s).length;
+    res.json({ merchants: out, summary: { total: out.length, manual: by('manual'), auto: by('auto'), noSaas: by('no_saas'), unmatched: by('unmatched') } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/admin/billing-customers?q= — search active Billing customers by name (for linking).
+app.get('/api/admin/billing-customers', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'revenue:manage_links'))) return;
+  const q = normName(req.query.q || '');
+  try {
+    const { list } = await getBillingCustomers();
+    const rows = (q ? list.filter(c => normName(c.name).includes(q)) : list)
+      .sort((a, b) => b.mrr - a.mrr).slice(0, 30)
+      .map(c => ({ customerName: c.name, subscriptionNumber: c.subscription_number, mrr: Math.round(c.mrr * 100) / 100 }));
+    res.json({ customers: rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/admin/merchant-links/:merchantId — set { customerName, subscriptionNumber } | { noSaas } | { clear }.
+app.put('/api/admin/merchant-links/:merchantId', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'revenue:manage_links'))) return;
+  const id = String(req.params.merchantId);
+  const { customerName, subscriptionNumber, noSaas, clear } = req.body || {};
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  try {
+    if (clear) { await pool.query(`DELETE FROM merchant_saas_links WHERE merchant_account_id = $1`, [id]); return res.json({ success: true, cleared: true }); }
+    if (noSaas) {
+      await pool.query(`INSERT INTO merchant_saas_links (merchant_account_id, status, linked_by, linked_at) VALUES ($1, 'no_saas', $2, NOW())
+        ON CONFLICT (merchant_account_id) DO UPDATE SET status = 'no_saas', billing_customer_name = NULL, subscription_number = NULL, linked_by = $2, linked_at = NOW()`, [id, actor]);
+      return res.json({ success: true, status: 'no_saas' });
+    }
+    const name = String(customerName || '').trim();
+    if (!name) return res.status(400).json({ error: 'customerName, noSaas, or clear required' });
+    await pool.query(`INSERT INTO merchant_saas_links (merchant_account_id, billing_customer_name, subscription_number, status, linked_by, linked_at) VALUES ($1, $2, $3, 'linked', $4, NOW())
+      ON CONFLICT (merchant_account_id) DO UPDATE SET billing_customer_name = $2, subscription_number = $3, status = 'linked', linked_by = $4, linked_at = NOW()`,
+      [id, name, String(subscriptionNumber || '') || null, actor]);
+    res.json({ success: true, status: 'linked' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // Secret calibration diagnostic: per-status breakdown for ONE org (count + MRR via `amount`
 // vs `sub_total`) + the subscription field keys, to nail the exact MRR/active definition that
