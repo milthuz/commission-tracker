@@ -3586,16 +3586,19 @@ app.get('/api/admin/sh14-coverage', async (req, res) => {
     const crmToken = await ensureValidCrmToken();
     if (!crmToken) return res.status(400).json({ error: 'CRM not connected' });
     // 1) Project_Cases → storeId→account map, and account→subscription_numbers
-    const cases = await fetchAllCrmModule(crmToken, 'Project_Cases', ['Adyen_Store_ID', 'Subscription_Number', 'Account_Name', 'Deal_Name', 'Type']);
-    const caseByStore = new Map();   // adyen storeId → account name
-    const subsByAccount = new Map(); // normalized account → Set(subscription_number)
+    const cases = await fetchAllCrmModule(crmToken, 'Project_Cases', ['Adyen_Store_ID', 'Subscription_Number', 'Account_Name', 'Deal_Name', 'Restaurant_Name', 'Type']);
+    const caseByStore = new Map();      // adyen storeId → account name
+    const subsByAccount = new Map();    // normalized account → Set(subscription_number)
+    const subsByRestaurant = new Map(); // normalized restaurant name → Set(subscription_number)
+    const addTo = (map, key, val) => { if (key) { if (!map.has(key)) map.set(key, new Set()); map.get(key).add(val); } };
     let casesWithStore = 0, casesWithSub = 0;
     for (const c of cases) {
       const sid = String(c.Adyen_Store_ID || '').trim();
       const acc = lookupName(c.Account_Name);
+      const rest = lookupName(c.Restaurant_Name);
       if (sid) { casesWithStore++; caseByStore.set(sid, acc); }
       const sub = String(c.Subscription_Number || '').trim();
-      if (sub) { casesWithSub++; if (acc) { if (!subsByAccount.has(norm(acc))) subsByAccount.set(norm(acc), new Set()); subsByAccount.get(norm(acc)).add(sub); } }
+      if (sub) { casesWithSub++; addTo(subsByAccount, norm(acc), sub); addTo(subsByRestaurant, norm(rest), sub); }
     }
     // 2) Billing active subs → subscription_number → monthly MRR
     const { accessToken, apiDomain } = await getAdminBooksAuth();
@@ -3610,27 +3613,33 @@ app.get('/api/admin/sh14-coverage', async (req, res) => {
     }
     // 3) Zentact merchants → walk the chain
     const merchants = (await pool.query(`SELECT merchant_account_id, business_name, stores FROM zentact_merchants`)).rows;
-    let withStore = 0, storeMatched = 0, accountHasSub = 0, subResolved = 0, matchedMrr = 0;
-    const sampleNoStoreMatch = [];
+    const resolveMrr = (subs) => { let mrr = 0, hit = false; for (const sn of subs) if (subMrr.has(sn)) { hit = true; mrr += subMrr.get(sn); } return hit ? mrr : null; };
+    let withStore = 0, storeMatched = 0;
+    let viaStoreId = 0, viaName = 0, resolvedAny = 0, matchedMrr = 0;
+    const sampleUnresolved = [];
     for (const m of merchants) {
       let stores = []; try { stores = Array.isArray(m.stores) ? m.stores : JSON.parse(m.stores || '[]'); } catch { /* */ }
       const storeIds = stores.map(s => String(s.storeId || '').trim()).filter(Boolean);
       if (storeIds.length) withStore++;
+      // Path A — precise: storeId → case (Adyen_Store_ID) → account → its subscription numbers.
       const acc = storeIds.map(id => caseByStore.get(id)).find(Boolean);
-      if (!acc) { if (sampleNoStoreMatch.length < 10) sampleNoStoreMatch.push({ name: m.business_name, stores: storeIds.length }); continue; }
-      storeMatched++;
-      const subs = subsByAccount.get(norm(acc)) || new Set();
-      if (subs.size) accountHasSub++;
-      let mrr = 0, hit = false;
-      for (const sn of subs) if (subMrr.has(sn)) { hit = true; mrr += subMrr.get(sn); }
-      if (hit) { subResolved++; matchedMrr += mrr; }
+      if (acc) storeMatched++;
+      let mrr = acc ? resolveMrr(subsByAccount.get(norm(acc)) || new Set()) : null;
+      if (mrr != null) viaStoreId++;
+      // Path B — fallback: merchant name → case (Restaurant_Name) → its subscription numbers.
+      if (mrr == null) {
+        const m2 = resolveMrr(subsByRestaurant.get(norm(m.business_name)) || new Set());
+        if (m2 != null) { mrr = m2; viaName++; }
+      }
+      if (mrr != null) { resolvedAny++; matchedMrr += mrr; }
+      else if (sampleUnresolved.length < 10) sampleUnresolved.push({ name: m.business_name, stores: storeIds.length });
     }
     res.json({
       projectCases: { total: cases.length, withAdyenStoreId: casesWithStore, withSubscriptionNumber: casesWithSub },
       billing: { activeSubsWithNumber: subMrr.size },
-      zentact: { totalMerchants: merchants.length, withStoreId: withStore },
-      chain: { storeMatchedToCase: storeMatched, accountHasSubNumber: accountHasSub, subResolvedInBilling: subResolved, matchedSaasMrr: Math.round(matchedMrr * 100) / 100 },
-      sampleNoStoreMatch,
+      zentact: { totalMerchants: merchants.length, withStoreId: withStore, storeMatchedToCase: storeMatched },
+      resolved: { viaStoreId, viaName, totalMerchantsWithSaaS: resolvedAny, pctOfMerchants: Math.round(resolvedAny / merchants.length * 1000) / 10, matchedSaasMrr: Math.round(matchedMrr * 100) / 100 },
+      sampleUnresolved,
     });
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
