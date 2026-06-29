@@ -12573,7 +12573,45 @@ app.post('/api/commissions/pay-stub/email', authenticateToken, async (req, res) 
   }
 });
 
-// POST /api/feedback/feature-request — any authenticated user suggests a feature. Emails admins.
+// Create a Jira issue via the Cloud REST API (best-effort; never throws). Requires env
+// JIRA_BASE_URL (e.g. https://clusterpos.atlassian.net), JIRA_EMAIL, JIRA_API_TOKEN.
+// Optional: JIRA_PROJECT_KEY (default SH), JIRA_ISSUE_TYPE (default Task). Returns
+// { created, key } or { created:false, reason } so callers can degrade gracefully.
+async function createJiraIssue({ summary, descriptionText, labels = [] }) {
+  const base = (process.env.JIRA_BASE_URL || '').replace(/\/+$/, '');
+  const email = process.env.JIRA_EMAIL;
+  const token = process.env.JIRA_API_TOKEN;
+  if (!base || !email || !token) return { created: false, reason: 'jira_not_configured' };
+  const auth = Buffer.from(`${email}:${token}`).toString('base64');
+  const body = {
+    fields: {
+      project: { key: process.env.JIRA_PROJECT_KEY || 'SH' },
+      summary: String(summary || 'Feature request').slice(0, 250),
+      issuetype: { name: process.env.JIRA_ISSUE_TYPE || 'Task' },
+      labels: (labels || []).map(l => String(l).replace(/\s+/g, '-')),
+      description: {
+        type: 'doc', version: 1,
+        content: [{ type: 'paragraph', content: [{ type: 'text', text: String(descriptionText || '').slice(0, 30000) }] }],
+      },
+    },
+  };
+  try {
+    const resp = await fetch(`${base}/rest/api/3/issue`, {
+      method: 'POST',
+      headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) return { created: false, reason: `jira_${resp.status}: ${(await resp.text()).slice(0, 300)}` };
+    const data = await resp.json();
+    return { created: true, key: data.key };
+  } catch (e) {
+    return { created: false, reason: e.message };
+  }
+}
+
+// POST /api/feedback/feature-request — any authenticated user suggests a feature. Persists it
+// to the "À corriger" dashboard (user_reports), auto-creates a Jira ticket in the backlog,
+// and emails admins.
 app.post('/api/feedback/feature-request', authenticateToken, async (req, res) => {
   const { email, name: jwtName } = req.user;
   const message = (req.body.message || '').toString().trim().slice(0, 4000);
@@ -12582,15 +12620,33 @@ app.post('/api/feedback/feature-request', authenticateToken, async (req, res) =>
     const tok = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
     const who = tok.rows[0]?.display_name || jwtName || email || 'Unknown user';
     const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // 1) Persist → shows in the admin "À corriger" dashboard (report_type 'feature_request').
+    await pool.query(
+      `INSERT INTO user_reports (report_type, reporter_email, reporter_name, message)
+       VALUES ('feature_request', $1, $2, $3)`,
+      [email || null, who, message]
+    );
+    _dataHealthCache = { at: 0, data: null }; // bust the 60s cache so the badge updates now
+    // 2) Auto-create a Jira ticket in the backlog (best-effort — needs JIRA_* env vars).
+    const firstLine = message.split('\n')[0].slice(0, 120);
+    const jira = await createJiraIssue({
+      summary: `Feature request: ${firstLine}`,
+      descriptionText: `Submitted by ${who} (${email || '—'}) via Sales Hub.\n\n${message}`,
+      labels: ['feature-request', 'sales-hub-intake'],
+    });
+    // 3) Email admins (existing behaviour), noting the Jira ticket if one was created.
     const admins = (await pool.query('SELECT email FROM user_tokens WHERE is_admin = true AND email IS NOT NULL')).rows.map(r => r.email);
     const recipients = [...new Set([...admins, process.env.SMTP_FROM || process.env.SMTP_USER].filter(Boolean))];
+    const jiraLine = jira.created
+      ? `<br><br><strong>JIRA:</strong> ${esc(jira.key)}${process.env.JIRA_BASE_URL ? ` — <a href="${process.env.JIRA_BASE_URL.replace(/\/+$/, '')}/browse/${esc(jira.key)}">${esc(jira.key)}</a>` : ''}`
+      : '';
     const html = mailShell(
       'Demande de fonctionnalité / Feature request',
-      `<strong>${esc(who)}</strong> (${esc(email || '—')}) propose / suggests:<br><br>${esc(message).replace(/\n/g, '<br>')}`,
+      `<strong>${esc(who)}</strong> (${esc(email || '—')}) propose / suggests:<br><br>${esc(message).replace(/\n/g, '<br>')}${jiraLine}`,
       null, null
     );
     const r = await sendMail(recipients.join(','), `Demande de fonctionnalité — ${who}`, html);
-    res.json({ sent: r.sent, reason: r.reason });
+    res.json({ sent: r.sent, reason: r.reason, saved: true, jira });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
