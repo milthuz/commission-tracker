@@ -5972,6 +5972,33 @@ app.get('/api/admin/billing-metrics-raw', async (req, res) => {
   }
 });
 
+// Secret calibration diagnostic: per-status breakdown for ONE org (count + MRR via `amount`
+// vs `sub_total`) + the subscription field keys, to nail the exact MRR/active definition that
+// matches the Zoho dashboard. GET /api/admin/billing-debug?secret=&org=
+app.get('/api/admin/billing-debug', async (req, res) => {
+  if (req.query.secret !== (process.env.ZOHO_WEBHOOK_SECRET || '')) return res.status(401).json({ error: 'bad secret' });
+  const orgId = String(req.query.org || ZOHO_BILLING_ORG_IDS[0]);
+  try {
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    const all = await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.All');
+    const r2 = (n) => Math.round(n * 100) / 100;
+    const byStatus = {};
+    for (const s of all) {
+      const st = s.status || 'unknown';
+      (byStatus[st] ||= { count: 0, mrrAmount: 0, mrrSubTotal: 0 });
+      byStatus[st].count++;
+      byStatus[st].mrrAmount   += subMonthlyAmount(s.amount, s.interval, s.interval_unit);
+      byStatus[st].mrrSubTotal += subMonthlyAmount(s.sub_total != null ? s.sub_total : s.amount, s.interval, s.interval_unit);
+    }
+    for (const k of Object.keys(byStatus)) { byStatus[k].mrrAmount = r2(byStatus[k].mrrAmount); byStatus[k].mrrSubTotal = r2(byStatus[k].mrrSubTotal); }
+    const sample = all[0] || null;
+    res.json({ org: orgId, total: all.length, byStatus, sampleKeys: sample ? Object.keys(sample) : [],
+      sampleAmounts: sample ? { amount: sample.amount, sub_total: sample.sub_total, interval: sample.interval, interval_unit: sample.interval_unit, status: sample.status } : null });
+  } catch (e) {
+    res.status(502).json({ error: 'billing_debug_failed', detail: e.message });
+  }
+});
+
 // Look up Zoho's internal invoice_id from our local invoice_number by asking
 // the Zoho Books API directly.
 // Uses `search_text` — the documented general search param — and then picks the
