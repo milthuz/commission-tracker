@@ -5972,11 +5972,24 @@ app.get('/api/billing/metrics', authenticateToken, async (req, res) => {
 app.get('/api/admin/billing-metrics-raw', async (req, res) => {
   if (req.query.secret !== (process.env.ZOHO_WEBHOOK_SECRET || '')) return res.status(401).json({ error: 'bad secret' });
   try {
-    res.json(await computeBillingMetrics());
+    const data = await computeBillingMetrics();
+    _billingCache = { at: Date.now(), data }; // warm the shared cache so the dashboard is instant
+    res.json(data);
   } catch (e) {
     res.status(502).json({ error: 'billing_fetch_failed', detail: e.message });
   }
 });
+
+// Keep the billing cache hot so the board dashboard never pays the ~30s cold-fetch. Web role
+// only; initial warm shortly after boot, then refresh just under the 30-min cache TTL.
+async function warmBillingCache() {
+  try { _billingCache = { at: Date.now(), data: await computeBillingMetrics() }; }
+  catch (e) { console.warn('[billing] cache warm failed:', e.message); }
+}
+if (process.env.ROLE !== 'worker') {
+  setTimeout(warmBillingCache, 20000);
+  setInterval(warmBillingCache, 25 * 60 * 1000);
+}
 
 // Secret calibration diagnostic: per-status breakdown for ONE org (count + MRR via `amount`
 // vs `sub_total`) + the subscription field keys, to nail the exact MRR/active definition that
