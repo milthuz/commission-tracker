@@ -6173,7 +6173,7 @@ app.get('/api/admin/merchant-links', authenticateToken, async (req, res) => {
   try {
     const year = new Date().getFullYear();
     const months = new Date().getMonth() + 1;
-    const merchants = (await pool.query(`SELECT merchant_account_id, business_name, status FROM zentact_merchants ORDER BY business_name`)).rows;
+    const merchants = (await pool.query(`SELECT merchant_account_id, business_name, status, activated_at FROM zentact_merchants ORDER BY business_name`)).rows;
     const profitRows = (await pool.query(`SELECT merchant_account_id, COALESCE(SUM(transaction_profit_cents),0)/100.0 AS profit FROM zentact_merchant_revenue WHERE year = $1 GROUP BY merchant_account_id`, [year])).rows;
     const profitByMerchant = new Map(profitRows.map(r => [r.merchant_account_id, Number(r.profit)]));
     const links = (await pool.query(`SELECT * FROM merchant_saas_links`)).rows;
@@ -6190,6 +6190,7 @@ app.get('/api/admin/merchant-links', authenticateToken, async (req, res) => {
         else { status = 'manual'; linkedCustomer = link.billing_customer_name; const c = byName.get(normName(link.billing_customer_name || '')); saasMonthly = c ? c.mrr : 0; }
       } else if (auto) { status = 'auto'; saasMonthly = auto.mrr; linkedCustomer = auto.name; }
       return { merchantAccountId: m.merchant_account_id, businessName: m.business_name, active: m.status,
+        activatedAt: m.activated_at,
         processingMonthly: r2(processingMonthly), saasMonthly: r2(saasMonthly), combinedMonthly: r2(processingMonthly + saasMonthly), status, linkedCustomer };
     });
     const by = (s) => out.filter(x => x.status === s).length;
