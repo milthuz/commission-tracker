@@ -863,6 +863,11 @@ async function initializeDatabase() {
     // Reseller identity resolution: associated form emails + a Zentact key (residuals).
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS emails JSONB DEFAULT '[]'::jsonb`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS zentact_key VARCHAR(255)`);
+    // Per-reseller logo, stored in-DB as bytea (mirrors the Resources library — no object storage).
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS logo_data BYTEA`);
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS logo_mime_type VARCHAR(150)`);
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS logo_file_name VARCHAR(400)`);
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS logo_updated_at TIMESTAMP`);
     await pool.query(`UPDATE resellers SET emails = jsonb_build_array(LOWER(email))
                       WHERE (emails IS NULL OR emails = '[]'::jsonb) AND email IS NOT NULL AND email <> ''`);
 
@@ -1490,9 +1495,14 @@ async function sendMail(to, subject, html, opts = {}) {
     return { sent: false, reason: e.message };
   }
 }
-function mailShell(title, intro, ctaLabel, ctaUrl) {
+// Shared branded email chrome: dark header with the Cluster logo, orange accent bar,
+// white content card, and a bilingual footer. `inner` is arbitrary trusted HTML (already
+// escaped by the caller). Every transactional email funnels through here so they all look
+// identical — pay stubs and payroll included.
+function mailChrome(inner, preheaderRaw) {
   const year = new Date().getFullYear();
-  const preheader = String(title || '').replace(/<[^>]+>/g, '');
+  const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+  const preheader = String(preheaderRaw || '').replace(/<[^>]+>/g, '');
   return `<!doctype html><html lang="fr"><head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="light only"><meta name="supported-color-schemes" content="light">
@@ -1502,26 +1512,24 @@ function mailShell(title, intro, ctaLabel, ctaUrl) {
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f6;padding:32px 12px">
       <tr><td align="center">
         <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(16,23,34,.08),0 10px 28px rgba(16,23,34,.07)">
-          <tr><td style="background:#0f1722;padding:24px 36px">
-            <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-.3px">Sales&nbsp;Hub</span><span style="color:#f97316;font-size:22px;font-weight:700">.</span>
-            <span style="display:block;color:#8a99af;font-size:12px;margin-top:3px;letter-spacing:.2px">by Cluster Systems</span>
+          <tr><td style="background:#0f1722;padding:22px 36px">
+            <table role="presentation" cellpadding="0" cellspacing="0"><tr>
+              <td style="padding-right:12px;vertical-align:middle">
+                <img src="${base}/cluster-favicon-256.png" width="36" height="36" alt="Cluster" style="display:block;border:0;border-radius:9px">
+              </td>
+              <td style="vertical-align:middle">
+                <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-.3px">Sales&nbsp;Hub</span><span style="color:#f97316;font-size:22px;font-weight:700">.</span>
+                <span style="display:block;color:#8a99af;font-size:12px;margin-top:2px;letter-spacing:.2px">by Cluster Systems</span>
+              </td>
+            </tr></table>
           </td></tr>
           <tr><td style="height:4px;background:#f97316;font-size:0;line-height:0">&nbsp;</td></tr>
-          <tr><td style="padding:34px 36px 6px">
-            <h1 style="margin:0 0 14px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${title}</h1>
-            <div style="color:#475569;font-size:14.5px;line-height:1.65">${intro}</div>
-            ${(ctaUrl && ctaLabel) ? `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:26px 0 4px"><tr><td style="border-radius:9px;background:#3c50e0">
-              <a href="${ctaUrl}" style="display:inline-block;padding:13px 30px;color:#ffffff;font-size:14px;font-weight:700;text-decoration:none;border-radius:9px">${ctaLabel}</a>
-            </td></tr></table>
-            <p style="margin:18px 0 0;color:#94a3b8;font-size:12px;line-height:1.6">Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :<br>
-            If the button doesn't work, copy this link into your browser:<br>
-            <a href="${ctaUrl}" style="color:#3c50e0;word-break:break-all">${ctaUrl}</a></p>` : ''}
-          </td></tr>
+          <tr><td style="padding:34px 36px 6px">${inner}</td></tr>
           <tr><td style="padding:26px 36px 0"><div style="border-top:1px solid #eef1f6;font-size:0;line-height:0">&nbsp;</div></td></tr>
           <tr><td style="padding:16px 36px 30px">
             <p style="margin:0;color:#94a3b8;font-size:12px;line-height:1.7">
               Une question ? / Questions? <a href="mailto:saleshub@clustersystems.com" style="color:#3c50e0;text-decoration:none">saleshub@clustersystems.com</a><br>
-              © ${year} Cluster Systems — <a href="https://saleshub.clusterpos.com" style="color:#94a3b8;text-decoration:none">saleshub.clusterpos.com</a>
+              © ${year} Cluster Systems — <a href="${base}" style="color:#94a3b8;text-decoration:none">saleshub.clusterpos.com</a>
             </p>
           </td></tr>
         </table>
@@ -1529,6 +1537,18 @@ function mailShell(title, intro, ctaLabel, ctaUrl) {
       </td></tr>
     </table>
   </body></html>`;
+}
+// Convenience wrapper for the common "heading + paragraph + optional CTA" email.
+function mailShell(title, intro, ctaLabel, ctaUrl) {
+  const inner = `<h1 style="margin:0 0 14px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${title}</h1>
+            <div style="color:#475569;font-size:14.5px;line-height:1.65">${intro}</div>
+            ${(ctaUrl && ctaLabel) ? `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:26px 0 4px"><tr><td style="border-radius:9px;background:#3c50e0">
+              <a href="${ctaUrl}" style="display:inline-block;padding:13px 30px;color:#ffffff;font-size:14px;font-weight:700;text-decoration:none;border-radius:9px">${ctaLabel}</a>
+            </td></tr></table>
+            <p style="margin:18px 0 0;color:#94a3b8;font-size:12px;line-height:1.6">Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :<br>
+            If the button doesn't work, copy this link into your browser:<br>
+            <a href="${ctaUrl}" style="color:#3c50e0;word-break:break-all">${ctaUrl}</a></p>` : ''}`;
+  return mailChrome(inner, title);
 }
 
 // Simple in-memory rate limiter for credential endpoints (per dyno — good enough).
@@ -7762,6 +7782,8 @@ app.get('/api/resellers', authenticateToken, async (req, res) => {
     const r = await pool.query(`
       SELECT rs.id, rs.name, rs.active, rs.zentact_key,
              COALESCE(rs.emails, '[]'::jsonb) AS emails,
+             (rs.logo_data IS NOT NULL) AS has_logo,
+             EXTRACT(EPOCH FROM rs.logo_updated_at)::bigint AS logo_updated_at,
              COALESCE(a.locations, 0) AS locations,
              COALESCE(a.licenses, 0) AS licenses
       FROM resellers rs
@@ -7832,6 +7854,56 @@ app.delete('/api/resellers/:id', authenticateToken, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// Reseller logos are small images — 2 MB cap, kept in memory then written to bytea.
+const uploadResellerLogo = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
+
+// POST /api/resellers/:id/logo — upload/replace a reseller's logo (multipart field "file").
+app.post('/api/resellers/:id/logo', authenticateToken, uploadResellerLogo.single('file'), async (req, res) => {
+  if (!(await requirePerm(req, res, 'reseller:manage'))) return;
+  const file = req.file;
+  if (!file) return res.status(400).json({ error: 'file required (multipart field "file")' });
+  if (!/^image\//.test(file.mimetype)) return res.status(400).json({ error: 'logo must be an image' });
+  try {
+    const r = await pool.query(
+      `UPDATE resellers SET logo_data = $2, logo_mime_type = $3, logo_file_name = $4,
+              logo_updated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 RETURNING id`,
+      [parseInt(req.params.id), file.buffer, file.mimetype, file.originalname]
+    );
+    if (!r.rows[0]) return res.status(404).json({ error: 'reseller not found' });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/resellers/:id/logo — clear a reseller's logo.
+app.delete('/api/resellers/:id/logo', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'reseller:manage'))) return;
+  try {
+    await pool.query(
+      `UPDATE resellers SET logo_data = NULL, logo_mime_type = NULL, logo_file_name = NULL,
+              logo_updated_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [parseInt(req.params.id)]
+    );
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/resellers/:id/logo — serve the logo image. Intentionally UNAUTHENTICATED: a
+// reseller logo is a public brand asset, and serving it without a token lets the frontend
+// render it directly in <img src> tags (which can't send an Authorization header) across the
+// admin table, the portal lists, and the hero. No sensitive data is exposed.
+app.get('/api/resellers/:id/logo', async (req, res) => {
+  try {
+    const r = (await pool.query(
+      `SELECT logo_data, logo_mime_type FROM resellers WHERE id = $1`, [parseInt(req.params.id)]
+    )).rows[0];
+    if (!r || !r.logo_data) return res.status(404).end();
+    res.setHeader('Content-Type', r.logo_mime_type || 'image/png');
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    res.send(r.logo_data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // GET /api/resellers/unassigned-emails — reseller emails seen in activations but not mapped to any reseller
@@ -12387,25 +12459,17 @@ app.post('/api/commissions/pay-stub/email', authenticateToken, async (req, res) 
            <td style="padding:6px 10px;border-top:1px solid #eef1f6;text-align:right">${money(b.amount)}</td></tr>`;
     }).join('');
     const statusLabel = source === 'imported' ? 'Payé / Paid' : 'En attente d\'approbation / Pending approval';
-    const html = `<!doctype html><html><body style="margin:0;background:#f4f6fa;font-family:Arial,Helvetica,sans-serif">
-      <table width="100%" cellpadding="0" cellspacing="0" style="padding:28px 12px"><tr><td align="center">
-        <table width="620" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:10px;overflow:hidden">
-          <tr><td style="background:#1c2434;padding:20px 28px">
-            <span style="color:#fff;font-size:19px;font-weight:bold">Sales Hub</span>
-            <span style="color:#8a99af;font-size:12px;margin-left:8px">Bulletin de paie / Pay Stub</span></td></tr>
-          <tr><td style="padding:24px 28px">
-            <p style="margin:0 0 4px;color:#1c2434;font-size:16px;font-weight:bold">${esc(repName)}</p>
-            <p style="margin:0 0 14px;color:#64748b;font-size:13px">Période / Period: ${esc(period)} · ${statusLabel}</p>
-            ${lineRows ? `<p style="margin:14px 0 4px;color:#94a3b8;font-size:11px;text-transform:uppercase;font-weight:bold">Commissions</p>
-            <table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434">${lineRows}</table>` : ''}
-            ${bonusRows ? `<p style="margin:16px 0 4px;color:#94a3b8;font-size:11px;text-transform:uppercase;font-weight:bold">Bonus</p>
-            <table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434">${bonusRows}</table>` : ''}
-            <table width="100%" style="margin-top:18px"><tr>
-              <td style="font-size:14px;font-weight:bold;color:#1c2434">Total</td>
-              <td style="text-align:right;font-size:18px;font-weight:bold;color:#f97316">${money(total)}</td></tr></table>
-            <p style="margin:18px 0 0;color:#94a3b8;font-size:11px">Montants bruts, avant impôts et retenues. / Gross amounts, before tax and withholdings.</p>
-          </td></tr>
-        </table></td></tr></table></body></html>`;
+    const sectionLabel = (txt) => `<p style="margin:18px 0 6px;color:#94a3b8;font-size:11px;text-transform:uppercase;font-weight:700;letter-spacing:.4px">${txt}</p>`;
+    const inner = `<h1 style="margin:0 0 4px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${esc(repName)}</h1>
+            <p style="margin:0 0 4px;color:#64748b;font-size:13px">Bulletin de paie / Pay Stub · ${esc(period)}</p>
+            <p style="margin:0;color:#64748b;font-size:13px">${statusLabel}</p>
+            ${lineRows ? sectionLabel('Commissions') + `<table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434;border-collapse:collapse">${lineRows}</table>` : ''}
+            ${bonusRows ? sectionLabel('Bonus') + `<table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434;border-collapse:collapse">${bonusRows}</table>` : ''}
+            <table width="100%" style="margin-top:20px;border-top:2px solid #0f1722"><tr>
+              <td style="padding-top:12px;font-size:14px;font-weight:700;color:#0f1722">Total</td>
+              <td style="padding-top:12px;text-align:right;font-size:20px;font-weight:700;color:#f97316">${money(total)}</td></tr></table>
+            <p style="margin:18px 0 0;color:#94a3b8;font-size:11px">Montants bruts, avant impôts et retenues. / Gross amounts, before tax and withholdings.</p>`;
+    const html = mailChrome(inner, `Bulletin de paie / Pay Stub — ${esc(repName)} · ${esc(period)}`);
     const r = await sendMail(recipient, `Bulletin de paie / Pay Stub — ${repName} · ${period}`, html);
     if (!r.sent) return res.status(502).json({ error: r.reason || 'send failed' });
     res.json({ sent: true });
@@ -12426,8 +12490,8 @@ app.post('/api/feedback/feature-request', authenticateToken, async (req, res) =>
     const admins = (await pool.query('SELECT email FROM user_tokens WHERE is_admin = true AND email IS NOT NULL')).rows.map(r => r.email);
     const recipients = [...new Set([...admins, process.env.SMTP_FROM || process.env.SMTP_USER].filter(Boolean))];
     const html = mailShell(
-      'Demande de fonctionnalité',
-      `<strong>${esc(who)}</strong> (${esc(email || '—')}) propose :<br><br>${esc(message).replace(/\n/g, '<br>')}`,
+      'Demande de fonctionnalité / Feature request',
+      `<strong>${esc(who)}</strong> (${esc(email || '—')}) propose / suggests:<br><br>${esc(message).replace(/\n/g, '<br>')}`,
       null, null
     );
     const r = await sendMail(recipients.join(','), `Demande de fonctionnalité — ${who}`, html);
@@ -12464,12 +12528,12 @@ async function handleUserReport(reportType, req, res) {
       return res.json({ saved: true, sent: false, reason: 'no_recipients_configured', recipients: 0 });
     }
     const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    const refLabel = isPoints ? 'Marchand / dossier' : 'Facture';
+    const refLabel = isPoints ? 'Marchand / dossier · Merchant' : 'Facture · Invoice';
     const html = mailShell(
-      isPoints ? 'Signalement de points manquants' : 'Signalement de commission manquante',
-      `<strong>${esc(repName)}</strong> (${esc(email || '—')}) signale ${isPoints ? 'des points possiblement manquants' : 'une commission possiblement manquante'}.<br><br>`
+      isPoints ? 'Signalement de points manquants / Missing points report' : 'Signalement de commission manquante / Missing commission report',
+      `<strong>${esc(repName)}</strong> (${esc(email || '—')}) ${isPoints ? 'signale des points possiblement manquants / reports possibly missing points' : 'signale une commission possiblement manquante / reports a possibly missing commission'}.<br><br>`
       + (reference ? `<strong>${refLabel} :</strong> ${esc(reference)}<br>` : '')
-      + (period ? `<strong>Période :</strong> ${esc(period)}<br>` : '')
+      + (period ? `<strong>Période · Period :</strong> ${esc(period)}<br>` : '')
       + `<strong>Message :</strong><br>${esc(message).replace(/\n/g, '<br>')}`,
       null, null
     );
@@ -13178,19 +13242,14 @@ app.post('/api/commissions/payroll/send', authenticateToken, async (req, res) =>
     const rowsHtml = reps.map(r =>
       `<tr><td style="padding:6px 10px;border-top:1px solid #eef1f6">${r.rep}</td>
            <td style="padding:6px 10px;border-top:1px solid #eef1f6;text-align:right">${money(r.total)}</td></tr>`).join('');
-    const html = `<!doctype html><html><body style="margin:0;background:#f4f6fa;font-family:Arial,Helvetica,sans-serif">
-      <table width="100%" cellpadding="0" cellspacing="0" style="padding:28px 12px"><tr><td align="center">
-        <table width="560" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:10px;overflow:hidden">
-          <tr><td style="background:#1c2434;padding:20px 28px"><span style="color:#fff;font-size:19px;font-weight:bold">Sales Hub</span></td></tr>
-          <tr><td style="padding:24px 28px">
-            <h2 style="margin:0 0 12px;color:#1c2434;font-size:18px">${T.emailSubject} — ${periodLabel}</h2>
-            <table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434">
-              <tr><th style="text-align:left;padding:6px 10px;color:#94a3b8;font-size:11px">REP</th><th style="text-align:right;padding:6px 10px;color:#94a3b8;font-size:11px">TOTAL</th></tr>
+    const inner = `<h1 style="margin:0 0 14px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${T.emailSubject} — ${periodLabel}</h1>
+            <table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434;border-collapse:collapse">
+              <tr><th style="text-align:left;padding:6px 10px;color:#94a3b8;font-size:11px;letter-spacing:.4px">${T.rep}</th><th style="text-align:right;padding:6px 10px;color:#94a3b8;font-size:11px;letter-spacing:.4px">${T.amount}</th></tr>
               ${rowsHtml}
-              <tr><td style="padding:10px;border-top:2px solid #1c2434;font-weight:bold">Total</td><td style="padding:10px;border-top:2px solid #1c2434;text-align:right;font-weight:bold;color:#f97316">${money(grand)}</td></tr>
+              <tr><td style="padding:10px;border-top:2px solid #0f1722;font-weight:700">${T.totalPaid}</td><td style="padding:10px;border-top:2px solid #0f1722;text-align:right;font-weight:700;color:#f97316">${money(grand)}</td></tr>
             </table>
-            <p style="margin:18px 0 0;color:#94a3b8;font-size:11px">${T.emailFooter}</p>
-          </td></tr></table></td></tr></table></body></html>`;
+            <p style="margin:18px 0 0;color:#94a3b8;font-size:11px">${T.emailFooter}</p>`;
+    const html = mailChrome(inner, `${T.emailSubject} — ${periodLabel}`);
     const pdf = await buildPayrollPdf(periodLabel, reps, req.body.lang);
     const t = getMailer();
     if (!t) return res.status(502).json({ error: 'smtp_not_configured' });
