@@ -5869,6 +5869,8 @@ async function getAdminBooksAuth() {
 // ============================================================================
 const ZOHO_BILLING_ORG_IDS = (process.env.ZOHO_BILLING_ORG_IDS || '697704869,802470810,905113716')
   .split(',').map(s => s.trim()).filter(Boolean);
+// Display names for the per-org breakdown shown when a dashboard tile is clicked.
+const ZOHO_BILLING_ORG_NAMES = { '697704869': 'Cluster Canada', '802470810': 'Cluster USA', '905113716': 'Xperio POS' };
 
 // Normalize a subscription's recurring charge to a MONTHLY amount for MRR.
 function subMonthlyAmount(amount, interval, intervalUnit) {
@@ -5933,7 +5935,15 @@ async function computeBillingMetrics() {
     mrr += orgMrr;
     activeSubs += orgActive;
     churnedThisMonth += cancelled.length;
-    perOrg.push({ orgId, mrr: Math.round(orgMrr * 100) / 100, activeSubs: orgActive, churned: cancelled.length });
+    const rr = (n) => Math.round(n * 100) / 100;
+    const oArpu  = orgActive > 0 ? orgMrr / orgActive : 0;
+    const oChurn = orgActive > 0 ? (cancelled.length / orgActive) * 100 : 0;
+    const oLtv   = oChurn > 0 ? oArpu / (oChurn / 100) : 0;
+    perOrg.push({
+      orgId, name: ZOHO_BILLING_ORG_NAMES[orgId] || orgId,
+      mrr: rr(orgMrr), arr: rr(orgMrr * 12), activeSubs: orgActive,
+      arpu: rr(oArpu), churned: cancelled.length, churnRate: rr(oChurn), ltv: rr(oLtv),
+    });
   }
   const arpu      = activeSubs > 0 ? mrr / activeSubs : 0;
   const churnRate = activeSubs > 0 ? (churnedThisMonth / activeSubs) * 100 : 0;
