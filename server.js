@@ -1636,6 +1636,87 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
   res.json({ sent: mail.sent, to, error: mail.sent ? null : mail.reason });
 });
 
+// ── Email template preview & test (admin:users) ─────────────────────────────
+// Render each transactional email with sample data so an admin can see the look
+// & feel in the panel and send a test copy. Mirrors the real builders so the
+// preview reflects exactly what recipients get.
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points'];
+function sampleEmail(type, lang) {
+  const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+  const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  switch (type) {
+    case 'reset':
+      return { subject: 'Réinitialisation du mot de passe — Sales Hub / Password reset',
+        html: mailShell('Réinitialiser votre mot de passe · Reset your password',
+          `Une réinitialisation du mot de passe a été demandée pour votre compte Sales Hub. Le lien expire dans 1 heure.<br><br>A password reset was requested for your Sales Hub account. The link expires in 1 hour.`,
+          'Réinitialiser / Reset password', `${base}/reset-password?token=SAMPLE`) };
+    case 'paystub': {
+      const sectionLabel = (txt) => `<p style="margin:18px 0 6px;color:#94a3b8;font-size:11px;text-transform:uppercase;font-weight:700;letter-spacing:.4px">${txt}</p>`;
+      const lineRows = [['INV-001', 'Café du Coin', 420.00], ['INV-002', 'Boutique Émilie', 180.50]]
+        .map(([inv, cust, amt]) => `<tr><td style="padding:6px 10px;border-top:1px solid #eef1f6;font-family:monospace">${inv}</td><td style="padding:6px 10px;border-top:1px solid #eef1f6">${cust}</td><td style="padding:6px 10px;border-top:1px solid #eef1f6;text-align:right">${money(amt)}</td></tr>`).join('');
+      const bonusRows = `<tr><td style="padding:6px 10px;border-top:1px solid #eef1f6">Bonus mensuel</td><td style="padding:6px 10px;border-top:1px solid #eef1f6">—</td><td style="padding:6px 10px;border-top:1px solid #eef1f6;text-align:right">${money(150)}</td></tr>`;
+      const inner = `<h1 style="margin:0 0 4px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">Amy Spicer</h1>
+            <p style="margin:0 0 4px;color:#64748b;font-size:13px">Bulletin de paie / Pay Stub · 2026-05</p>
+            <p style="margin:0;color:#64748b;font-size:13px">En attente d'approbation / Pending approval</p>
+            ${sectionLabel('Commissions')}<table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434;border-collapse:collapse">${lineRows}</table>
+            ${sectionLabel('Bonus')}<table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434;border-collapse:collapse">${bonusRows}</table>
+            <table width="100%" style="margin-top:20px;border-top:2px solid #0f1722"><tr><td style="padding-top:12px;font-size:14px;font-weight:700;color:#0f1722">Total</td><td style="padding-top:12px;text-align:right;font-size:20px;font-weight:700;color:#f97316">${money(750.50)}</td></tr></table>
+            <p style="margin:18px 0 0;color:#94a3b8;font-size:11px">Montants bruts, avant impôts et retenues. / Gross amounts, before tax and withholdings.</p>`;
+      return { subject: 'Bulletin de paie / Pay Stub — Amy Spicer · 2026-05', html: mailChrome(inner, 'Bulletin de paie / Pay Stub') };
+    }
+    case 'payroll': {
+      const T = payrollI18n(lang);
+      const rows = [['Amy Spicer', 750.50], ['Gabriella Daly', 1240.00], ['Sophie Tremblay', 430.25]];
+      const grand = rows.reduce((s, r) => s + r[1], 0);
+      const rowsHtml = rows.map(([rep, tot]) => `<tr><td style="padding:6px 10px;border-top:1px solid #eef1f6">${rep}</td><td style="padding:6px 10px;border-top:1px solid #eef1f6;text-align:right">${money(tot)}</td></tr>`).join('');
+      const inner = `<h1 style="margin:0 0 14px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${T.emailSubject} — 2026-05</h1>
+            <table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434;border-collapse:collapse">
+              <tr><th style="text-align:left;padding:6px 10px;color:#94a3b8;font-size:11px;letter-spacing:.4px">${T.rep}</th><th style="text-align:right;padding:6px 10px;color:#94a3b8;font-size:11px;letter-spacing:.4px">${T.amount}</th></tr>
+              ${rowsHtml}
+              <tr><td style="padding:10px;border-top:2px solid #0f1722;font-weight:700">${T.totalPaid}</td><td style="padding:10px;border-top:2px solid #0f1722;text-align:right;font-weight:700;color:#f97316">${money(grand)}</td></tr>
+            </table>
+            <p style="margin:18px 0 0;color:#94a3b8;font-size:11px">${T.emailFooter}</p>`;
+      return { subject: `${T.emailSubject} — 2026-05`, html: mailChrome(inner, T.emailSubject) };
+    }
+    case 'feature_request':
+      return { subject: 'Demande de fonctionnalité — Amy Spicer',
+        html: mailShell('Demande de fonctionnalité / Feature request',
+          `<strong>Amy Spicer</strong> (amy@example.com) propose / suggests:<br><br>Ajouter un export Excel sur la page des commissions.`, null, null) };
+    case 'missing_points':
+      return { subject: 'Points manquants — Amy Spicer',
+        html: mailShell('Signalement de points manquants / Missing points report',
+          `<strong>Amy Spicer</strong> (amy@example.com) signale des points possiblement manquants / reports possibly missing points.<br><br><strong>Marchand / dossier · Merchant :</strong> Café du Coin<br><strong>Période · Period :</strong> 2026-05<br><strong>Message :</strong><br>Le marchand n'apparaît pas dans mes points.`, null, null) };
+    case 'missing_commission':
+      return { subject: 'Commission manquante — Amy Spicer',
+        html: mailShell('Signalement de commission manquante / Missing commission report',
+          `<strong>Amy Spicer</strong> (amy@example.com) signale une commission possiblement manquante / reports a possibly missing commission.<br><br><strong>Facture · Invoice :</strong> INV-001<br><strong>Période · Period :</strong> 2026-05<br><strong>Message :</strong><br>Cette facture devrait m'être attribuée.`, null, null) };
+    case 'invitation':
+    default:
+      return { subject: 'Invitation — Sales Hub / You are invited to Sales Hub',
+        html: mailShell('Vous êtes invité à Sales Hub · You are invited to Sales Hub',
+          `Marie, un compte vous a été préparé sur Sales Hub. Cliquez ci-dessous pour choisir votre mot de passe et activer la vérification en deux étapes. Le lien expire dans 7 jours.<br><br>An account has been prepared for you on Sales Hub. Click below to set your password and enable two-step verification. The link expires in 7 days.`,
+          'Activer mon compte / Activate my account', `${base}/accept-invite?token=SAMPLE`) };
+  }
+}
+
+// GET /api/admin/email-preview?type=&lang= → { type, subject, html } for the preview iframe.
+app.get('/api/admin/email-preview', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:users'))) return;
+  const type = EMAIL_TEMPLATE_TYPES.includes(req.query.type) ? req.query.type : 'invitation';
+  res.json({ type, types: EMAIL_TEMPLATE_TYPES, ...sampleEmail(type, req.query.lang) });
+});
+
+// POST /api/admin/email-preview/send { type, lang, to } → email a sample (defaults to the admin).
+app.post('/api/admin/email-preview/send', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:users'))) return;
+  const type = EMAIL_TEMPLATE_TYPES.includes(req.body.type) ? req.body.type : 'invitation';
+  const to = String(req.body.to || req.user.realAdminEmail || req.user.email || '').trim();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(to)) return res.status(400).json({ error: 'valid recipient email required' });
+  const s = sampleEmail(type, req.body.lang);
+  const mail = await sendMail(to, `[TEST] ${s.subject}`, s.html);
+  res.json({ sent: mail.sent, to, error: mail.sent ? null : mail.reason });
+});
+
 // GET /api/admin/local-users — list external users (no secrets)
 app.get('/api/admin/local-users', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'admin:users'))) return;
