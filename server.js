@@ -6345,6 +6345,35 @@ app.get('/api/admin/billing-debug', async (req, res) => {
   }
 });
 
+// GET /api/admin/billing-sub-debug?secret=&num= — find a subscription by number and list ALL
+// active subscriptions of its customer, to explain why a customer's matched MRR may exceed one
+// subscription's amount (we aggregate per customer).
+app.get('/api/admin/billing-sub-debug', async (req, res) => {
+  if ((req.query.secret || req.headers['x-cluster-webhook-secret']) !== process.env.ZOHO_WEBHOOK_SECRET) return res.status(401).json({ error: 'invalid secret' });
+  const num = String(req.query.num || '').trim().toLowerCase();
+  if (!num) return res.status(400).json({ error: 'num required' });
+  try {
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    const all = [];
+    let target = null;
+    for (const orgId of ZOHO_BILLING_ORG_IDS) {
+      for (const s of await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.All')) {
+        const row = { orgId, number: s.subscription_number, customer_id: s.customer_id, customer_name: s.customer_name,
+          plan: s.plan_name, status: s.status, sub_total: s.sub_total, amount: s.amount, interval: s.interval, interval_unit: s.interval_unit,
+          monthly: Math.round(subMonthlyAmount(s.sub_total != null ? s.sub_total : s.amount, s.interval, s.interval_unit) * 100) / 100 };
+        all.push(row);
+        if (String(s.subscription_number || '').toLowerCase().includes(num)) target = row;
+      }
+    }
+    if (!target) return res.json({ found: false, num });
+    const custSubs = all.filter(s => s.customer_id === target.customer_id);
+    const activeMonthlyTotal = custSubs.filter(s => ACTIVE_STATUSES.has(String(s.status || '').toLowerCase()))
+      .reduce((t, s) => t + s.monthly, 0);
+    res.json({ found: true, customer: target.customer_name, customer_id: target.customer_id,
+      activeMonthlyTotal: Math.round(activeMonthlyTotal * 100) / 100, subscriptions: custSubs });
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
 // SH-14 feasibility diagnostic: how well do Zentact merchants join to SaaS subscriptions?
 // Tests the CRM-Deal-ID bridge (merchant.opportunity_id == subscription.zcrm_potential_id)
 // plus a name-match fallback. GET /api/admin/merchant-saas-link-debug?secret=
