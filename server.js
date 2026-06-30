@@ -5912,13 +5912,20 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
       const pa = procAvgRes.rows[0] || {};
       const procTotal = parseFloat(pa.total) || 0, procMerchants = parseInt(pa.clients) || 0;
       avgProcessing = { total: procTotal, clients: procMerchants, monthly: perMonth(procTotal, procMerchants) };
-      // Combined SaaS + processing revenue, averaged per merchant per month. NOTE: SaaS is keyed
-      // by Zoho customer and merchants by Zentact account — this is a BLENDED figure (total ÷
-      // merchant count), not a true per-merchant join (that needs SH-14, the CRM↔Zentact link).
+      // Combined SaaS + processing revenue, averaged per merchant per month — TRUE per-merchant
+      // join via the curated merchant_saas_links (SH-14). Each merchant's combinedMonthly already
+      // blends monthly- and annual-billed SaaS onto a per-month figure; we average across the
+      // merchants that actually generate revenue (processing and/or linked SaaS > 0).
+      const mRows = await computeMerchantRevenueRows(year);
+      const withRev = mRows.filter(r => r.combinedMonthly > 0);
+      const combinedMonthlyTotal = withRev.reduce((s, r) => s + r.combinedMonthly, 0);
       avgRevenuePerMerchant = {
-        total:    saasTotal + procTotal,
-        merchants: procMerchants,
-        monthly:  perMonth(saasTotal + procTotal, procMerchants),
+        total:     Math.round(combinedMonthlyTotal * monthsInPeriod * 100) / 100,
+        merchants: withRev.length,
+        monthly:   withRev.length ? Math.round((combinedMonthlyTotal / withRev.length) * 100) / 100 : 0,
+        saasMonthly:       Math.round(withRev.reduce((s, r) => s + r.saasMonthly, 0) * 100) / 100,
+        processingMonthly: Math.round(withRev.reduce((s, r) => s + r.processingMonthly, 0) * 100) / 100,
+        linkedMerchants:   mRows.filter(r => r.status === 'manual' || r.status === 'auto').length,
       };
     }
 
@@ -6261,40 +6268,47 @@ async function getBillingCustomers() {
   return data;
 }
 
+// Shared: per-merchant combined revenue (monthly processing + linked SaaS) using the curated
+// merchant_saas_links. SaaS resolution per merchant: manual link (exact sub > customer total) >
+// auto name-match > 0. `months` is how many months the year's profit is spread over (run-rate).
+async function computeMerchantRevenueRows(year) {
+  const now = new Date();
+  const months = year < now.getFullYear() ? 12 : (year > now.getFullYear() ? 0 : now.getMonth() + 1);
+  const merchants = (await pool.query(`SELECT merchant_account_id, business_name, status, activated_at FROM zentact_merchants ORDER BY business_name`)).rows;
+  const profitRows = (await pool.query(`SELECT merchant_account_id, COALESCE(SUM(transaction_profit_cents),0)/100.0 AS profit FROM zentact_merchant_revenue WHERE year = $1 GROUP BY merchant_account_id`, [year])).rows;
+  const profitByMerchant = new Map(profitRows.map(r => [r.merchant_account_id, Number(r.profit)]));
+  const links = (await pool.query(`SELECT * FROM merchant_saas_links`)).rows;
+  const linkByMerchant = new Map(links.map(l => [l.merchant_account_id, l]));
+  const { byName, subByNumber } = await getBillingCustomers();
+  const r2 = (n) => Math.round(n * 100) / 100;
+  return merchants.map(m => {
+    const processingMonthly = months > 0 ? (profitByMerchant.get(m.merchant_account_id) || 0) / months : 0;
+    const link = linkByMerchant.get(m.merchant_account_id);
+    const auto = byName.get(normName(m.business_name));
+    let saasMonthly = 0, status = 'unmatched', linkedCustomer = null, linkedSubscription = null;
+    if (link) {
+      if (link.status === 'no_saas') { status = 'no_saas'; }
+      else {
+        status = 'manual'; linkedCustomer = link.billing_customer_name; linkedSubscription = link.subscription_number || null;
+        // Prefer the exact subscription's monthly; fall back to the customer total for legacy links.
+        saasMonthly = (link.subscription_number && subByNumber.has(link.subscription_number))
+          ? subByNumber.get(link.subscription_number)
+          : (byName.get(normName(link.billing_customer_name || ''))?.mrr || 0);
+      }
+    } else if (auto) { status = 'auto'; saasMonthly = auto.mrr; linkedCustomer = auto.name; }
+    return { merchantAccountId: m.merchant_account_id, businessName: m.business_name, active: m.status,
+      activatedAt: m.activated_at,
+      processingMonthly: r2(processingMonthly), saasMonthly: r2(saasMonthly), combinedMonthly: r2(processingMonthly + saasMonthly),
+      status, linkedCustomer, linkedSubscription };
+  });
+}
+
 // GET /api/admin/merchant-links — every Zentact merchant with its monthly processing, its SaaS
 // (manual link > auto name-match > 0), and link status. Gated by revenue:manage_links.
 app.get('/api/admin/merchant-links', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'revenue:manage_links'))) return;
   try {
-    const year = new Date().getFullYear();
-    const months = new Date().getMonth() + 1;
-    const merchants = (await pool.query(`SELECT merchant_account_id, business_name, status, activated_at FROM zentact_merchants ORDER BY business_name`)).rows;
-    const profitRows = (await pool.query(`SELECT merchant_account_id, COALESCE(SUM(transaction_profit_cents),0)/100.0 AS profit FROM zentact_merchant_revenue WHERE year = $1 GROUP BY merchant_account_id`, [year])).rows;
-    const profitByMerchant = new Map(profitRows.map(r => [r.merchant_account_id, Number(r.profit)]));
-    const links = (await pool.query(`SELECT * FROM merchant_saas_links`)).rows;
-    const linkByMerchant = new Map(links.map(l => [l.merchant_account_id, l]));
-    const { byName, subByNumber } = await getBillingCustomers();
-    const r2 = (n) => Math.round(n * 100) / 100;
-    const out = merchants.map(m => {
-      const processingMonthly = months > 0 ? (profitByMerchant.get(m.merchant_account_id) || 0) / months : 0;
-      const link = linkByMerchant.get(m.merchant_account_id);
-      const auto = byName.get(normName(m.business_name));
-      let saasMonthly = 0, status = 'unmatched', linkedCustomer = null, linkedSubscription = null;
-      if (link) {
-        if (link.status === 'no_saas') { status = 'no_saas'; }
-        else {
-          status = 'manual'; linkedCustomer = link.billing_customer_name; linkedSubscription = link.subscription_number || null;
-          // Prefer the exact subscription's monthly; fall back to the customer total for legacy links.
-          saasMonthly = (link.subscription_number && subByNumber.has(link.subscription_number))
-            ? subByNumber.get(link.subscription_number)
-            : (byName.get(normName(link.billing_customer_name || ''))?.mrr || 0);
-        }
-      } else if (auto) { status = 'auto'; saasMonthly = auto.mrr; linkedCustomer = auto.name; }
-      return { merchantAccountId: m.merchant_account_id, businessName: m.business_name, active: m.status,
-        activatedAt: m.activated_at,
-        processingMonthly: r2(processingMonthly), saasMonthly: r2(saasMonthly), combinedMonthly: r2(processingMonthly + saasMonthly),
-        status, linkedCustomer, linkedSubscription };
-    });
+    const out = await computeMerchantRevenueRows(new Date().getFullYear());
     const by = (s) => out.filter(x => x.status === s).length;
     res.json({ merchants: out, summary: { total: out.length, manual: by('manual'), auto: by('auto'), noSaas: by('no_saas'), unmatched: by('unmatched') } });
   } catch (e) { res.status(500).json({ error: e.message }); }
