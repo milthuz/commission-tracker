@@ -6235,18 +6235,24 @@ let _billingCustCache = { at: 0, data: null };
 async function getBillingCustomers() {
   if (_billingCustCache.data && Date.now() - _billingCustCache.at < 30 * 60 * 1000) return _billingCustCache.data;
   const { accessToken, apiDomain } = await getAdminBooksAuth();
-  const byName = new Map();
+  const byName = new Map();        // normName → { name, mrr } (sum across the customer's subs)
+  const subByNumber = new Map();   // subscription_number → monthly (pre-tax)
+  const subList = [];              // one entry per active subscription, for per-sub matching
   for (const orgId of ZOHO_BILLING_ORG_IDS) {
     const all = await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.All');
     for (const s of all) {
       if (!ACTIVE_STATUSES.has(String(s.status || '').toLowerCase())) continue;
-      const name = String(s.customer_name || '').trim(); const key = normName(name); if (!key) continue;
+      const name = String(s.customer_name || '').trim(); const key = normName(name);
       const mm = subMonthlyAmount(s.sub_total != null ? s.sub_total : s.amount, s.interval, s.interval_unit);
-      const e = byName.get(key) || { name, mrr: 0, subscription_number: s.subscription_number };
-      e.mrr += mm; byName.set(key, e);
+      if (key) { const e = byName.get(key) || { name, mrr: 0 }; e.mrr += mm; byName.set(key, e); }
+      const num = String(s.subscription_number || '').trim();
+      if (num) {
+        subByNumber.set(num, mm);
+        subList.push({ subscriptionNumber: num, customerName: name, plan: s.plan_name || '', monthly: mm });
+      }
     }
   }
-  const data = { byName, list: [...byName.values()] };
+  const data = { byName, subByNumber, subList };
   _billingCustCache = { at: Date.now(), data };
   return data;
 }
@@ -6263,36 +6269,44 @@ app.get('/api/admin/merchant-links', authenticateToken, async (req, res) => {
     const profitByMerchant = new Map(profitRows.map(r => [r.merchant_account_id, Number(r.profit)]));
     const links = (await pool.query(`SELECT * FROM merchant_saas_links`)).rows;
     const linkByMerchant = new Map(links.map(l => [l.merchant_account_id, l]));
-    const { byName } = await getBillingCustomers();
+    const { byName, subByNumber } = await getBillingCustomers();
     const r2 = (n) => Math.round(n * 100) / 100;
     const out = merchants.map(m => {
       const processingMonthly = months > 0 ? (profitByMerchant.get(m.merchant_account_id) || 0) / months : 0;
       const link = linkByMerchant.get(m.merchant_account_id);
       const auto = byName.get(normName(m.business_name));
-      let saasMonthly = 0, status = 'unmatched', linkedCustomer = null;
+      let saasMonthly = 0, status = 'unmatched', linkedCustomer = null, linkedSubscription = null;
       if (link) {
         if (link.status === 'no_saas') { status = 'no_saas'; }
-        else { status = 'manual'; linkedCustomer = link.billing_customer_name; const c = byName.get(normName(link.billing_customer_name || '')); saasMonthly = c ? c.mrr : 0; }
+        else {
+          status = 'manual'; linkedCustomer = link.billing_customer_name; linkedSubscription = link.subscription_number || null;
+          // Prefer the exact subscription's monthly; fall back to the customer total for legacy links.
+          saasMonthly = (link.subscription_number && subByNumber.has(link.subscription_number))
+            ? subByNumber.get(link.subscription_number)
+            : (byName.get(normName(link.billing_customer_name || ''))?.mrr || 0);
+        }
       } else if (auto) { status = 'auto'; saasMonthly = auto.mrr; linkedCustomer = auto.name; }
       return { merchantAccountId: m.merchant_account_id, businessName: m.business_name, active: m.status,
         activatedAt: m.activated_at,
-        processingMonthly: r2(processingMonthly), saasMonthly: r2(saasMonthly), combinedMonthly: r2(processingMonthly + saasMonthly), status, linkedCustomer };
+        processingMonthly: r2(processingMonthly), saasMonthly: r2(saasMonthly), combinedMonthly: r2(processingMonthly + saasMonthly),
+        status, linkedCustomer, linkedSubscription };
     });
     const by = (s) => out.filter(x => x.status === s).length;
     res.json({ merchants: out, summary: { total: out.length, manual: by('manual'), auto: by('auto'), noSaas: by('no_saas'), unmatched: by('unmatched') } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /api/admin/billing-customers?q= — search active Billing customers by name (for linking).
+// GET /api/admin/billing-customers?q= — search active Billing SUBSCRIPTIONS (by sub number or
+// customer name) for per-subscription linking. Returns one row per subscription.
 app.get('/api/admin/billing-customers', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'revenue:manage_links'))) return;
   const q = normName(req.query.q || '');
   try {
-    const { list } = await getBillingCustomers();
-    const rows = (q ? list.filter(c => normName(c.name).includes(q)) : list)
-      .sort((a, b) => b.mrr - a.mrr).slice(0, 30)
-      .map(c => ({ customerName: c.name, subscriptionNumber: c.subscription_number, mrr: Math.round(c.mrr * 100) / 100 }));
-    res.json({ customers: rows });
+    const { subList } = await getBillingCustomers();
+    const rows = (q ? subList.filter(s => normName(s.customerName).includes(q) || normName(s.subscriptionNumber).includes(q)) : subList)
+      .sort((a, b) => b.monthly - a.monthly).slice(0, 40)
+      .map(s => ({ subscriptionNumber: s.subscriptionNumber, customerName: s.customerName, plan: s.plan, mrr: Math.round(s.monthly * 100) / 100 }));
+    res.json({ subscriptions: rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
