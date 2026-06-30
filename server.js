@@ -1110,6 +1110,17 @@ async function initializeDatabase() {
       );
     `);
 
+    // Dedup log for probation-ending manager notifications (one row per rep/end-date/milestone).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS probation_notifications (
+        rep_name  VARCHAR(255) NOT NULL,
+        end_date  DATE NOT NULL,
+        threshold INT NOT NULL,
+        sent_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (rep_name, end_date, threshold)
+      );
+    `);
+
     console.log('✅ Database tables initialized');
   } catch (error) {
     console.error('Database initialization error:', error);
@@ -4852,6 +4863,13 @@ function startAutoSync() {
     runOtherRev();
     setInterval(runOtherRev, 24 * 60 * 60 * 1000);
   }, 2 * 60 * 1000);
+
+  // Probation-ending notifications — daily check (45/30/15 days before end). First run 3 min
+  // after boot (staggered).
+  setTimeout(() => {
+    checkProbationNotifications();
+    setInterval(checkProbationNotifications, 24 * 60 * 60 * 1000);
+  }, 3 * 60 * 1000);
 }
 
 function stopAutoSync() {
@@ -9112,6 +9130,58 @@ app.put('/api/admin/report-recipients', authenticateToken, async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// app_settings key 'probation_recipients' — who gets the 45/30/15-day probation-ending emails.
+async function getProbationRecipients() {
+  try {
+    const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'probation_recipients'`);
+    const v = r.rows[0]?.value;
+    return Array.isArray(v) ? v.filter(e => typeof e === 'string') : [];
+  } catch { return []; }
+}
+app.get('/api/admin/probation-recipients', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:data_health'))) return;
+  try { res.json({ recipients: await getProbationRecipients() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/admin/probation-recipients', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:data_health'))) return;
+  const emails = Array.isArray(req.body?.emails) ? req.body.emails.map(e => String(e).trim().toLowerCase()).filter(Boolean) : null;
+  if (!emails) return res.status(400).json({ error: 'emails array required' });
+  if (emails.some(e => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e))) return res.status(400).json({ error: 'invalid email' });
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('probation_recipients', $1::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [JSON.stringify(emails)]
+    );
+    res.json({ recipients: emails });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Daily job: email the configured recipients when an active rep's probation ends in 45/30/15
+// days. Deduped per (rep, end_date, threshold) so each milestone fires once.
+async function checkProbationNotifications() {
+  try {
+    const recipients = await getProbationRecipients();
+    if (!recipients.length) return;
+    const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const reps = (await pool.query(`SELECT name, hire_date FROM salespeople WHERE is_active = true AND hire_date IS NOT NULL`)).rows;
+    for (const r of reps) {
+      const info = probationInfo(r.hire_date);
+      if (!info.inProbation || ![45, 30, 15].includes(info.daysLeft)) continue;
+      const ins = await pool.query(
+        `INSERT INTO probation_notifications (rep_name, end_date, threshold) VALUES ($1, $2::date, $3)
+         ON CONFLICT DO NOTHING RETURNING rep_name`, [r.name, info.endDate, info.daysLeft]);
+      if (!ins.rows.length) continue; // already sent this milestone
+      const html = mailShell(
+        `Fin de probation dans ${info.daysLeft} jours / Probation ends in ${info.daysLeft} days`,
+        `<strong>${esc(r.name)}</strong> — fin de probation le <strong>${info.endDate}</strong> (dans ${info.daysLeft} jours). Après cette date, le quota mensuel s'applique.<br><br>${esc(r.name)}'s new-hire probation ends on ${info.endDate} (in ${info.daysLeft} days). The monthly quota gate applies after that.`,
+        null, null);
+      await sendMail(recipients.join(','), `Probation — ${r.name} (J-${info.daysLeft})`, html);
+    }
+  } catch (e) { console.error('❌ [PROBATION] notification check error:', e.message); }
+}
 
 // POST /api/admin/user-reports/:id/resolve — mark a user report (missing commission/points) resolved.
 app.post('/api/admin/user-reports/:id/resolve', authenticateToken, async (req, res) => {
