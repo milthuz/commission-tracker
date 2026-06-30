@@ -2620,6 +2620,13 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       });
     }
 
+    // Seed every ACTIVE salesperson so reps with no deals/activations this period still appear
+    // (at 0 points) — lets managers see their quota progress + probation badge from day one.
+    for (const r of (await pool.query(`SELECT name FROM salespeople WHERE is_active = true`)).rows) {
+      const rep = r.name;
+      if (rep && !repMap[rep]) repMap[rep] = { repName: rep, totalPoints: 0, crmPoints: 0, deals: [], zentactMerchants: [] };
+    }
+
     // Per-salesperson signup-bonus config (amount per activation + on/off). Default $100, on.
     const spCfgRows = (await pool.query(`SELECT name, signup_bonus_amount, signup_bonus_enabled, monthly_quota, annual_bonus_enabled FROM salespeople`)).rows;
     const signupByRep = new Map(spCfgRows.map(s => [String(s.name).toLowerCase(), {
