@@ -150,6 +150,17 @@ async function refreshBonusTiers() {
 setInterval(() => { refreshBonusTiers(); }, 60000);
 
 // Team ids a (manager) user oversees. Empty array = manages no team.
+// Probation = the comp-plan new-hire ramp: hire_date + 90 days (~3 months). During it the quota
+// gate is waived (commission paid regardless of points). Returns inProbation + end date + days
+// left; null-ish when no hire_date is set. Single source of truth for the badge + notifications.
+const PROBATION_DAYS = 90;
+function probationInfo(hireDate) {
+  if (!hireDate) return { inProbation: false, endDate: null, daysLeft: null };
+  const end = new Date(hireDate); end.setDate(end.getDate() + PROBATION_DAYS);
+  const daysLeft = Math.ceil((end.getTime() - Date.now()) / 86400000);
+  return { inProbation: daysLeft > 0, endDate: end.toISOString().slice(0, 10), daysLeft };
+}
+
 async function getManagedTeamIds(email) {
   if (!email) return [];
   try {
@@ -9665,6 +9676,7 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
         signupBonusEnabled: r.signup_bonus_enabled !== false,
         monthlyQuota:       r.monthly_quota == null ? null : parseInt(r.monthly_quota),
         hireDate:           r.hire_date ? new Date(r.hire_date).toISOString().slice(0, 10) : null,
+        probation:          probationInfo(r.hire_date),
         quotaGateEnabled:   r.quota_gate_enabled !== false,
         processingBonusEnabled: r.processing_bonus_enabled !== false,
         annualBonusEnabled: r.annual_bonus_enabled !== false,
@@ -12347,7 +12359,7 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
     let canViewSalary = isAdmin || isOwnReport;
     if (!canViewSalary) canViewSalary = userHasPermission(await getUserPermissions(email), 'report:view_salary');
 
-    const spResult = await pool.query('SELECT commission_rate, base_salary FROM salespeople WHERE name = $1', [targetRep]);
+    const spResult = await pool.query('SELECT commission_rate, base_salary, hire_date FROM salespeople WHERE name = $1', [targetRep]);
     const commissionRate = parseFloat(spResult.rows[0]?.commission_rate) || 10;
     const baseSalary = canViewSalary ? (parseFloat(spResult.rows[0]?.base_salary) || 0) : null; // annual base salary (null = hidden)
 
@@ -12446,6 +12458,7 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
       commissionRate,
       baseSalary,
       canViewSalary,
+      probation: probationInfo(spResult.rows[0]?.hire_date),
       year: targetYear,
       groupBy,
       months,
@@ -13066,7 +13079,7 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
           `SELECT 1 FROM quota_month_waivers WHERE rep_name = $1 AND period = $2::date`,
           [targetRep, `${year}-${mm}-01`]
         )).rows.length > 0;
-        quota = { points, required, met: points >= required, ramp: !!ramp, waived };
+        quota = { points, required, met: points >= required, ramp: !!ramp, waived, probation: probationInfo(sp.hire_date) };
       }
     }
 
