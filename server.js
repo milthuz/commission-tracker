@@ -3446,6 +3446,21 @@ app.patch('/api/zentact/merchants/:merchantId/rep', authenticateToken, async (re
   }
 });
 
+// POST /api/salespeople { name } — manually add a salesperson. For reps who only have
+// estimates (no paid invoices / CRM deal / Zentact merchant), so were never auto-created.
+app.post('/api/salespeople', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const name = String(req.body?.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'name required' });
+  try {
+    const r = await pool.query(
+      `INSERT INTO salespeople (name, is_active) VALUES ($1, true) ON CONFLICT (name) DO NOTHING RETURNING name`,
+      [name]
+    );
+    res.json({ success: true, created: r.rows.length > 0, name });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/crm/sync-debug — run getSoldDeals() live and return raw counts + samples
 app.get('/api/crm/sync-debug', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
