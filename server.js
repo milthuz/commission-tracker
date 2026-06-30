@@ -1688,7 +1688,7 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // Render each transactional email with sample data so an admin can see the look
 // & feel in the panel and send a test copy. Mirrors the real builders so the
 // preview reflects exactly what recipients get.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points'];
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'probation'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -1738,6 +1738,10 @@ function sampleEmail(type, lang) {
       return { subject: 'Commission manquante — Amy Spicer',
         html: mailShell('Signalement de commission manquante / Missing commission report',
           `<strong>Amy Spicer</strong> (amy@example.com) signale une commission possiblement manquante / reports a possibly missing commission.<br><br><strong>Facture · Invoice :</strong> INV-001<br><strong>Période · Period :</strong> 2026-05<br><strong>Message :</strong><br>Cette facture devrait m'être attribuée.`, null, null) };
+    case 'probation':
+      return { subject: 'Probation — Amy Spicer (J-15)',
+        html: mailShell('Fin de probation dans 15 jours / Probation ends in 15 days',
+          `<strong>Amy Spicer</strong> — fin de probation le <strong>2026-07-18</strong> (dans 15 jours). Après cette date, le quota mensuel s'applique.<br><br>Amy Spicer's new-hire probation ends on 2026-07-18 (in 15 days). The monthly quota gate applies after that.`, null, null) };
     case 'invitation':
     default:
       return { subject: 'Invitation — Sales Hub / You are invited to Sales Hub',
