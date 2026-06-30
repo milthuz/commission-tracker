@@ -2628,7 +2628,8 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     }
 
     // Per-salesperson signup-bonus config (amount per activation + on/off). Default $100, on.
-    const spCfgRows = (await pool.query(`SELECT name, signup_bonus_amount, signup_bonus_enabled, monthly_quota, annual_bonus_enabled FROM salespeople`)).rows;
+    const spCfgRows = (await pool.query(`SELECT name, signup_bonus_amount, signup_bonus_enabled, monthly_quota, annual_bonus_enabled, hire_date FROM salespeople`)).rows;
+    const probationByRep = new Map(spCfgRows.map(s => [String(s.name).toLowerCase(), probationInfo(s.hire_date)]));
     const signupByRep = new Map(spCfgRows.map(s => [String(s.name).toLowerCase(), {
       amount: s.signup_bonus_amount == null ? 100 : parseFloat(s.signup_bonus_amount),
       enabled: s.signup_bonus_enabled !== false,
@@ -2676,6 +2677,7 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       const monthlyBonus = ZohoCRMService.calculateMonthlyBonus(effectivePoints);
       return {
         repName:             rep.repName,
+        probation:           probationByRep.get(String(rep.repName).toLowerCase()) || null,
         team:                team ? { id: team.id, name: team.name } : null,
         countsTowardQuota:   team ? team.countsTowardQuota : true,
         includeDeals,        // false → this rep's CRM deals are shown but don't count
