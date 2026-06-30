@@ -3669,6 +3669,38 @@ app.get('/api/admin/sh14-coverage', async (req, res) => {
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
+// GET /api/admin/find-salesperson?secret=&q= — search the salespeople table AND recent Zoho
+// Books estimates for a salesperson name (to locate a rep who only has estimates, no invoices).
+app.get('/api/admin/find-salesperson', async (req, res) => {
+  if ((req.query.secret || req.headers['x-cluster-webhook-secret']) !== process.env.ZOHO_WEBHOOK_SECRET) return res.status(401).json({ error: 'invalid secret' });
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.status(400).json({ error: 'q required' });
+  try {
+    const sp = (await pool.query(`SELECT name, is_active FROM salespeople WHERE name ILIKE '%' || $1 || '%' ORDER BY name`, [q])).rows;
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    const counts = {};
+    let scanned = 0;
+    for (let page = 1; page <= 12; page++) {
+      const r = await axios.get(`${apiDomain}/books/v3/estimates`, {
+        params: { organization_id: process.env.ZOHO_ORG_ID, per_page: 200, page, sort_column: 'date', sort_order: 'D' },
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true, timeout: 25000,
+      });
+      if (r.status !== 200) break;
+      const ests = r.data.estimates || [];
+      scanned += ests.length;
+      for (const e of ests) {
+        const name = e.salesperson_name || '';
+        if (name && name.toLowerCase().includes(q.toLowerCase())) {
+          const k = `${name}|${e.status}`;
+          counts[k] = (counts[k] || 0) + 1;
+        }
+      }
+      if (!r.data.page_context?.has_more_page) break;
+    }
+    res.json({ q, salespeopleTable: sp, estimatesScanned: scanned, estimateMatches: counts });
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
 // GET /api/admin/zentact-raw?secret=  — dump the FULL raw merchant object from the Zentact API
 // (top-level fields, not just custom attributes) to find an Adyen/PSP identifier.
 app.get('/api/admin/zentact-raw', async (req, res) => {
