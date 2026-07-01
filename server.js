@@ -5813,30 +5813,91 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
     // NULL-named invoices are kept (they aren't a named, excludable customer).
     const excl = `AND (customer_name IS NULL OR customer_name NOT IN (SELECT customer_name FROM excluded_customers WHERE organization_id = $1))`;
 
-    const cardsResult = await pool.query(`
-      SELECT
-        COALESCE(SUM(CASE WHEN status = 'paid'    THEN total ELSE 0 END), 0) AS paid_revenue,
-        COALESCE(SUM(CASE WHEN status = 'paid'    THEN commission ELSE 0 END), 0) AS total_commission,
-        COUNT(*)                                                               AS total_invoices,
-        COALESCE(SUM(CASE WHEN status = 'overdue' THEN total ELSE 0 END), 0) AS overdue_amount,
-        COUNT(CASE WHEN status = 'paid'    THEN 1 END)                       AS paid_count,
-        COUNT(CASE WHEN status = 'overdue' THEN 1 END)                       AS overdue_count
-      FROM invoices
-      WHERE organization_id = $1 AND date >= $2 AND date <= $3 ${excl}
-    `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
+    // Board metrics use a MONTHLY run-rate: total ÷ months elapsed in the period ÷ units, so a
+    // partial current year isn't understated (full past year = 12 months; current year = months
+    // so far). Mixes monthly- and annual-billed clients onto a comparable per-month figure.
+    const nowD = new Date();
+    const monthsInPeriod = year < nowD.getFullYear() ? 12 : (year > nowD.getFullYear() ? 0 : (nowD.getMonth() + 1));
+    const perMonth = (total, units) => (monthsInPeriod > 0 && units > 0) ? (total / monthsInPeriod / units) : 0;
 
-    const monthlyResult = await pool.query(`
-      SELECT
-        TO_CHAR(date, 'Mon') AS month,
-        EXTRACT(MONTH FROM date) AS month_num,
-        COALESCE(SUM(CASE WHEN status = 'paid'    THEN total ELSE 0 END), 0) AS revenue,
-        COALESCE(SUM(CASE WHEN status = 'overdue' THEN total ELSE 0 END), 0) AS overdue,
-        COALESCE(SUM(CASE WHEN status = 'paid'    THEN commission ELSE 0 END), 0) AS commission
-      FROM invoices
-      WHERE organization_id = $1 AND date >= $2 AND date <= $3 ${excl}
-      GROUP BY TO_CHAR(date, 'Mon'), EXTRACT(MONTH FROM date)
-      ORDER BY month_num
-    `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
+    // All of this section's queries are independent of each other — fire them all concurrently
+    // in one batch instead of stacking round-trips (the DB is cross-cloud from this backend, so
+    // each sequential await adds real latency; this was the slowest part of the first load).
+    const [cardsResult, monthlyResult, repResult, customerResult, saasAvgRes, revenueExtras] = await Promise.all([
+      pool.query(`
+        SELECT
+          COALESCE(SUM(CASE WHEN status = 'paid'    THEN total ELSE 0 END), 0) AS paid_revenue,
+          COALESCE(SUM(CASE WHEN status = 'paid'    THEN commission ELSE 0 END), 0) AS total_commission,
+          COUNT(*)                                                               AS total_invoices,
+          COALESCE(SUM(CASE WHEN status = 'overdue' THEN total ELSE 0 END), 0) AS overdue_amount,
+          COUNT(CASE WHEN status = 'paid'    THEN 1 END)                       AS paid_count,
+          COUNT(CASE WHEN status = 'overdue' THEN 1 END)                       AS overdue_count
+        FROM invoices
+        WHERE organization_id = $1 AND date >= $2 AND date <= $3 ${excl}
+      `, [process.env.ZOHO_ORG_ID, startDate, endDate]),
+
+      pool.query(`
+        SELECT
+          TO_CHAR(date, 'Mon') AS month,
+          EXTRACT(MONTH FROM date) AS month_num,
+          COALESCE(SUM(CASE WHEN status = 'paid'    THEN total ELSE 0 END), 0) AS revenue,
+          COALESCE(SUM(CASE WHEN status = 'overdue' THEN total ELSE 0 END), 0) AS overdue,
+          COALESCE(SUM(CASE WHEN status = 'paid'    THEN commission ELSE 0 END), 0) AS commission
+        FROM invoices
+        WHERE organization_id = $1 AND date >= $2 AND date <= $3 ${excl}
+        GROUP BY TO_CHAR(date, 'Mon'), EXTRACT(MONTH FROM date)
+        ORDER BY month_num
+      `, [process.env.ZOHO_ORG_ID, startDate, endDate]),
+
+      pool.query(`
+        SELECT salesperson_name AS name,
+               COUNT(*) AS invoices,
+               COALESCE(SUM(total), 0) AS sales,
+               COALESCE(SUM(commission), 0) AS commission
+        FROM invoices
+        WHERE organization_id = $1 AND status = 'paid' AND date >= $2 AND date <= $3 ${excl}
+        GROUP BY salesperson_name ORDER BY commission DESC LIMIT 10
+      `, [process.env.ZOHO_ORG_ID, startDate, endDate]),
+
+      pool.query(`
+        SELECT
+          COALESCE(NULLIF(TRIM(customer_name), ''), 'Unknown') AS name,
+          COUNT(*) AS invoices,
+          COALESCE(SUM(total), 0) AS total
+        FROM invoices
+        WHERE organization_id = $1 AND status = 'paid' AND date >= $2 AND date <= $3 ${excl}
+          AND COALESCE(NULLIF(TRIM(customer_name), ''), '') != ''
+        GROUP BY COALESCE(NULLIF(TRIM(customer_name), ''), 'Unknown')
+        ORDER BY total DESC LIMIT 10
+      `, [process.env.ZOHO_ORG_ID, startDate, endDate]),
+
+      // AVERAGE monthly SaaS revenue per client (SH-8): total paid SaaS subtotal ÷ months ÷
+      // clients that have any SaaS revenue.
+      pool.query(`
+        SELECT
+          COALESCE(SUM(saas_amount), 0) AS total,
+          COUNT(DISTINCT CASE WHEN saas_amount > 0 THEN COALESCE(NULLIF(TRIM(customer_name), ''), 'Unknown') END) AS clients
+        FROM invoices
+        WHERE organization_id = $1 AND status = 'paid' AND date >= $2 AND date <= $3 ${excl}
+      `, [process.env.ZOHO_ORG_ID, startDate, endDate]),
+
+      // Revenue-gated extras (admins / revenue:view): processing-profit average + the SH-14
+      // per-merchant rows (also fires the Zoho Billing fetch, on a cold cache).
+      canRevenue
+        ? Promise.all([
+            pool.query(`
+              SELECT
+                COALESCE(SUM(profit) FILTER (WHERE profit > 0), 0) AS total,
+                COUNT(*) FILTER (WHERE profit > 0) AS clients
+              FROM (
+                SELECT merchant_account_id, SUM(transaction_profit_cents) / 100.0 AS profit
+                FROM zentact_merchant_revenue WHERE year = $1 GROUP BY merchant_account_id
+              ) m
+            `, [year]),
+            computeMerchantRevenueRows(year),
+          ])
+        : Promise.resolve(null),
+    ]);
 
     const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
     const mmap = {};
@@ -5848,50 +5909,6 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
       commission: parseFloat(mmap[m]?.commission) || 0,
     }));
 
-    const repResult = await pool.query(`
-      SELECT salesperson_name AS name,
-             COUNT(*) AS invoices,
-             COALESCE(SUM(total), 0) AS sales,
-             COALESCE(SUM(commission), 0) AS commission
-      FROM invoices
-      WHERE organization_id = $1 AND status = 'paid' AND date >= $2 AND date <= $3 ${excl}
-      GROUP BY salesperson_name ORDER BY commission DESC LIMIT 10
-    `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
-
-    const statusResult = await pool.query(`
-      SELECT status, COUNT(*) AS count, COALESCE(SUM(total), 0) AS total
-      FROM invoices WHERE organization_id = $1 AND date >= $2 AND date <= $3 ${excl}
-      GROUP BY status
-    `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
-
-    const customerResult = await pool.query(`
-      SELECT
-        COALESCE(NULLIF(TRIM(customer_name), ''), 'Unknown') AS name,
-        COUNT(*) AS invoices,
-        COALESCE(SUM(total), 0) AS total
-      FROM invoices
-      WHERE organization_id = $1 AND status = 'paid' AND date >= $2 AND date <= $3 ${excl}
-        AND COALESCE(NULLIF(TRIM(customer_name), ''), '') != ''
-      GROUP BY COALESCE(NULLIF(TRIM(customer_name), ''), 'Unknown')
-      ORDER BY total DESC LIMIT 10
-    `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
-
-    // Board metrics use a MONTHLY run-rate: total ÷ months elapsed in the period ÷ units, so a
-    // partial current year isn't understated (full past year = 12 months; current year = months
-    // so far). Mixes monthly- and annual-billed clients onto a comparable per-month figure.
-    const nowD = new Date();
-    const monthsInPeriod = year < nowD.getFullYear() ? 12 : (year > nowD.getFullYear() ? 0 : (nowD.getMonth() + 1));
-    const perMonth = (total, units) => (monthsInPeriod > 0 && units > 0) ? (total / monthsInPeriod / units) : 0;
-
-    // AVERAGE monthly SaaS revenue per client (SH-8): total paid SaaS subtotal ÷ months ÷ clients
-    // that have any SaaS revenue.
-    const saasAvgRes = await pool.query(`
-      SELECT
-        COALESCE(SUM(saas_amount), 0) AS total,
-        COUNT(DISTINCT CASE WHEN saas_amount > 0 THEN COALESCE(NULLIF(TRIM(customer_name), ''), 'Unknown') END) AS clients
-      FROM invoices
-      WHERE organization_id = $1 AND status = 'paid' AND date >= $2 AND date <= $3 ${excl}
-    `, [process.env.ZOHO_ORG_ID, startDate, endDate]);
     const sa = saasAvgRes.rows[0] || {};
     const saasTotal = parseFloat(sa.total) || 0, saasClients = parseInt(sa.clients) || 0;
     const avgSaas = { total: saasTotal, clients: saasClients, monthly: perMonth(saasTotal, saasClients) };
@@ -5900,15 +5917,7 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
     // Revenue-gated (admins / revenue:view).
     let avgProcessing = null, avgRevenuePerMerchant = null;
     if (canRevenue) {
-      const procAvgRes = await pool.query(`
-        SELECT
-          COALESCE(SUM(profit) FILTER (WHERE profit > 0), 0) AS total,
-          COUNT(*) FILTER (WHERE profit > 0) AS clients
-        FROM (
-          SELECT merchant_account_id, SUM(transaction_profit_cents) / 100.0 AS profit
-          FROM zentact_merchant_revenue WHERE year = $1 GROUP BY merchant_account_id
-        ) m
-      `, [year]);
+      const [procAvgRes, mRows] = revenueExtras;
       const pa = procAvgRes.rows[0] || {};
       const procTotal = parseFloat(pa.total) || 0, procMerchants = parseInt(pa.clients) || 0;
       avgProcessing = { total: procTotal, clients: procMerchants, monthly: perMonth(procTotal, procMerchants) };
@@ -5917,7 +5926,6 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
       // a SaaS (saasMonthly > 0, i.e. manual link or auto name-match); for each we sum its monthly
       // SaaS + its processing profit. So the tile reads "for merchants we matched to a SaaS, the
       // average monthly combined revenue". Merchants with only processing (no SaaS yet) are excluded.
-      const mRows = await computeMerchantRevenueRows(year);
       const withSaas = mRows.filter(r => r.saasMonthly > 0);
       const combinedMonthlyTotal = withSaas.reduce((s, r) => s + r.combinedMonthly, 0);
       avgRevenuePerMerchant = {
@@ -5945,11 +5953,6 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
         invoices:   parseInt(r.invoices),
         sales:      parseFloat(r.sales),
         commission: parseFloat(r.commission),
-      })),
-      statusBreakdown: statusResult.rows.map(r => ({
-        status: r.status,
-        count:  parseInt(r.count),
-        total:  parseFloat(r.total),
       })),
       topCustomers: customerResult.rows.map(r => ({
         name:     r.name,
@@ -6227,11 +6230,16 @@ app.get('/api/admin/billing-metrics-raw', async (req, res) => {
   }
 });
 
-// Keep the billing cache hot so the board dashboard never pays the ~30s cold-fetch. Web role
+// Keep the billing caches hot so the board dashboard never pays the cold-fetch. Web role
 // only; initial warm shortly after boot, then refresh just under the 30-min cache TTL.
+// Warms BOTH the metrics cache (SaaS tiles) and the per-customer cache (SH-14 merchant
+// matching) — the latter used to be warmed only on-demand, which made the FIRST dashboard
+// load after a deploy/idle period block on a live multi-org Zoho Billing fetch.
 async function warmBillingCache() {
-  try { _billingCache = { at: Date.now(), data: await computeBillingMetrics() }; }
-  catch (e) { console.warn('[billing] cache warm failed:', e.message); }
+  const results = await Promise.allSettled([computeBillingMetrics(), getBillingCustomers()]);
+  if (results[0].status === 'fulfilled') _billingCache = { at: Date.now(), data: results[0].value };
+  else console.warn('[billing] metrics cache warm failed:', results[0].reason?.message);
+  if (results[1].status === 'rejected') console.warn('[billing] customers cache warm failed:', results[1].reason?.message);
 }
 if (process.env.ROLE !== 'worker') {
   setTimeout(warmBillingCache, 20000);
@@ -6274,12 +6282,19 @@ async function getBillingCustomers() {
 async function computeMerchantRevenueRows(year) {
   const now = new Date();
   const months = year < now.getFullYear() ? 12 : (year > now.getFullYear() ? 0 : now.getMonth() + 1);
-  const merchants = (await pool.query(`SELECT merchant_account_id, business_name, status, activated_at FROM zentact_merchants ORDER BY business_name`)).rows;
-  const profitRows = (await pool.query(`SELECT merchant_account_id, COALESCE(SUM(transaction_profit_cents),0)/100.0 AS profit FROM zentact_merchant_revenue WHERE year = $1 GROUP BY merchant_account_id`, [year])).rows;
-  const profitByMerchant = new Map(profitRows.map(r => [r.merchant_account_id, Number(r.profit)]));
-  const links = (await pool.query(`SELECT * FROM merchant_saas_links`)).rows;
-  const linkByMerchant = new Map(links.map(l => [l.merchant_account_id, l]));
-  const { byName, subByNumber } = await getBillingCustomers();
+  // These 4 sources are independent — run them concurrently instead of stacking round-trips
+  // (DB is cross-cloud from this backend, and getBillingCustomers can be a live Zoho fetch
+  // on a cold cache), which is what made this the slowest piece of the dashboard.
+  const [merchantsRes, profitRes, linksRes, billing] = await Promise.all([
+    pool.query(`SELECT merchant_account_id, business_name, status, activated_at FROM zentact_merchants ORDER BY business_name`),
+    pool.query(`SELECT merchant_account_id, COALESCE(SUM(transaction_profit_cents),0)/100.0 AS profit FROM zentact_merchant_revenue WHERE year = $1 GROUP BY merchant_account_id`, [year]),
+    pool.query(`SELECT * FROM merchant_saas_links`),
+    getBillingCustomers(),
+  ]);
+  const merchants = merchantsRes.rows;
+  const profitByMerchant = new Map(profitRes.rows.map(r => [r.merchant_account_id, Number(r.profit)]));
+  const linkByMerchant = new Map(linksRes.rows.map(l => [l.merchant_account_id, l]));
+  const { byName, subByNumber } = billing;
   const r2 = (n) => Math.round(n * 100) / 100;
   return merchants.map(m => {
     const processingMonthly = months > 0 ? (profitByMerchant.get(m.merchant_account_id) || 0) / months : 0;
