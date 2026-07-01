@@ -4254,17 +4254,42 @@ app.get('/api/crm/sync-status', authenticateToken, (req, res) => {
   res.json(crmSyncStatus);
 });
 
-// PATCH /api/crm/sold-deals-db/:dealId — manually correct a deal's sold_date
+// GET /api/admin/deals-search?q=<name|account|rep> — find deals to correct their sold_date
+// (e.g. a deal submitted last month but only just synced). Admin-only, up to 50 matches.
+app.get('/api/admin/deals-search', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const q = String(req.query.q || '').trim();
+  if (q.length < 2) return res.status(400).json({ error: 'q must be at least 2 characters' });
+  try {
+    const rows = (await pool.query(
+      `SELECT deal_id, deal_name, account_name, owner_name,
+              COALESCE(lead_source_group_override, lead_source_group) AS lead_source_group,
+              points, sold_date::date AS sold_date
+       FROM crm_sold_deals
+       WHERE deal_name ILIKE '%'||$1||'%' OR account_name ILIKE '%'||$1||'%' OR owner_name ILIKE '%'||$1||'%'
+       ORDER BY sold_date DESC, deal_name LIMIT 50`,
+      [q]
+    )).rows;
+    res.json({ deals: rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PATCH /api/crm/sold-deals-db/:dealId — manually correct a deal's sold_date (which month it
+// counts toward for points/quota). sold_date is otherwise immutable across CRM re-syncs (see the
+// upsert in syncCrmSoldDeals), so this correction sticks.
 app.patch('/api/crm/sold-deals-db/:dealId', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   const { soldDate } = req.body; // expects "YYYY-MM-DD"
   if (!soldDate) return res.status(400).json({ error: 'soldDate required (YYYY-MM-DD)' });
   try {
-    await pool.query(
-      'UPDATE crm_sold_deals SET sold_date = $1, updated_at = CURRENT_TIMESTAMP WHERE deal_id = $2',
+    const r = await pool.query(
+      'UPDATE crm_sold_deals SET sold_date = $1, updated_at = CURRENT_TIMESTAMP WHERE deal_id = $2 RETURNING deal_id, sold_date::date AS sold_date',
       [soldDate, req.params.dealId]
     );
-    res.json({ success: true });
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Deal not found' });
+    res.json({ success: true, deal: r.rows[0] });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -4966,7 +4991,9 @@ async function syncCrmSoldDeals(crm) {
         owner_name        = EXCLUDED.owner_name,
         lead_source_group = EXCLUDED.lead_source_group,
         points            = EXCLUDED.points,
-        sold_date         = COALESCE(EXCLUDED.sold_date, crm_sold_deals.sold_date),
+        -- sold_date intentionally NOT in this SET list: it must stay immutable once first set
+        -- (see the table comment) so re-syncs never move a deal's month, and so an admin's
+        -- manual month correction (PATCH /api/crm/sold-deals-db/:dealId) can't be clobbered later.
         closing_date_crm  = EXCLUDED.closing_date_crm,
         amount            = EXCLUDED.amount,
         updated_at        = CURRENT_TIMESTAMP
