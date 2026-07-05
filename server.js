@@ -1353,8 +1353,9 @@ app.get('/api/auth/callback', async (req, res) => {
     }
 
     // Store tokens in database with error handling
+    let isFirstLogin = false;
     try {
-      await pool.query(
+      const upsert = await pool.query(
         `INSERT INTO user_tokens (email, access_token, refresh_token, api_domain, expires_at, photo, display_name)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (email) DO UPDATE SET
@@ -1364,9 +1365,11 @@ app.get('/api/auth/callback', async (req, res) => {
          -- Overwriting with NULL here is exactly what broke the admin's Books sync.
          refresh_token = COALESCE(NULLIF($3, ''), user_tokens.refresh_token),
          api_domain = $4, expires_at = $5,
-         photo = $6, display_name = $7, updated_at = CURRENT_TIMESTAMP`,
+         photo = $6, display_name = $7, updated_at = CURRENT_TIMESTAMP
+         RETURNING (xmax = 0) AS is_new`,
         [userEmail, access_token, refresh_token, api_domain, Date.now() + expires_in * 1000, userPhoto, userName]
       );
+      isFirstLogin = upsert.rows[0]?.is_new === true;
       console.log('✅ Tokens stored in database for:', userEmail);
     } catch (dbError) {
       console.error('❌ Database error:', dbError.message);
@@ -1391,6 +1394,10 @@ app.get('/api/auth/callback', async (req, res) => {
         [userEmail, userName]
       );
     } catch (_e) { /* non-fatal — role can be assigned manually */ }
+
+    // First login and still no role after the auto-assign above → the user sees an empty
+    // menu; alert the configured admins so they assign one (fire-and-forget).
+    if (isFirstLogin) notifyNewUserWithoutRole(userEmail, userName, 'Zoho');
 
     // Create JWT — photo stored in DB, not JWT (base64 would be too large for URL)
     const jwtToken = jwt.sign(
@@ -1688,7 +1695,7 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // Render each transactional email with sample data so an admin can see the look
 // & feel in the panel and send a test copy. Mirrors the real builders so the
 // preview reflects exactly what recipients get.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'probation'];
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'probation', 'new_user'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -1742,6 +1749,8 @@ function sampleEmail(type, lang) {
       return { subject: 'Probation — Amy Spicer (J-15)',
         html: mailShell('Fin de probation dans 15 jours / Probation ends in 15 days',
           `<strong>Amy Spicer</strong> — fin de probation le <strong>2026-07-18</strong> (dans 15 jours). Après cette date, le quota mensuel s'applique.<br><br>Amy Spicer's new-hire probation ends on 2026-07-18 (in 15 days). The monthly quota gate applies after that.`, null, null) };
+    case 'new_user':
+      return newUserEmail('Marie Dubois', 'marie@example.com', 'Zoho');
     case 'invitation':
     default:
       return { subject: 'Invitation — Sales Hub / You are invited to Sales Hub',
@@ -1876,6 +1885,9 @@ app.post('/api/auth/invite/verify-2fa', async (req, res) => {
               invite_expires_at = NULL, last_login_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
        WHERE id = $1`, [u.id]
     );
+    // Account just activated — if no role was pre-assigned to this email, alert the
+    // configured admins (fire-and-forget; skips silently when a role exists).
+    notifyNewUserWithoutRole(u.email, u.display_name, 'invitation');
     res.json({ success: true, token: signLocalJwt(u) });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -9211,7 +9223,7 @@ app.get('/api/admin/data-health', authenticateToken, async (req, res) => {
 });
 
 // Recipients for the missing-commission / missing-points notification emails. Configured in
-// app_settings key 'report_recipients'; empty → falls back to all admins (+ SMTP_FROM).
+// app_settings key 'report_recipients'; empty → NO email (reports live in the dashboard only).
 async function getReportRecipients() {
   try {
     const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'report_recipients'`);
@@ -9270,6 +9282,66 @@ app.put('/api/admin/probation-recipients', authenticateToken, async (req, res) =
     res.json({ recipients: emails });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// app_settings key 'new_user_recipients' — who gets notified when a brand-new user signs in
+// without any role (their menu is empty until an admin assigns one). Empty = nobody.
+async function getNewUserRecipients() {
+  try {
+    const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'new_user_recipients'`);
+    const v = r.rows[0]?.value;
+    return Array.isArray(v) ? v.filter(e => typeof e === 'string') : [];
+  } catch { return []; }
+}
+app.get('/api/admin/new-user-recipients', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:data_health'))) return;
+  try { res.json({ recipients: await getNewUserRecipients() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/admin/new-user-recipients', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:data_health'))) return;
+  const emails = Array.isArray(req.body?.emails) ? req.body.emails.map(e => String(e).trim().toLowerCase()).filter(Boolean) : null;
+  if (!emails) return res.status(400).json({ error: 'emails array required' });
+  if (emails.some(e => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e))) return res.status(400).json({ error: 'invalid email' });
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('new_user_recipients', $1::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [JSON.stringify(emails)]
+    );
+    res.json({ recipients: emails });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// The new-user-without-role email. Shared with the email-preview sample ('new_user').
+function newUserEmail(displayName, email, source) {
+  const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+  const who = esc(displayName || email);
+  const src = source === 'invitation'
+    ? 'invitation externe / external invitation'
+    : 'connexion Zoho / Zoho sign-in';
+  return {
+    subject: `Nouvel utilisateur sans rôle — ${displayName || email}`,
+    html: mailShell('Nouvel utilisateur sans rôle / New user without a role',
+      `<strong>${who}</strong> (${esc(email)}) vient de se connecter à Sales Hub pour la première fois (${src}) et n'a <strong>aucun rôle</strong> : son menu restera vide tant qu'un rôle ne lui sera pas assigné.<br><br>${who} just signed in to Sales Hub for the first time (${src}) and has <strong>no role</strong> — their menu stays empty until a role is assigned.`,
+      'Assigner un rôle / Assign a role', `${base}/admin/users`),
+  };
+}
+
+// Fired on a user's FIRST login/activation: if they hold no role, email the configured
+// recipients. Never throws (called fire-and-forget from the auth flows).
+async function notifyNewUserWithoutRole(email, displayName, source) {
+  try {
+    const hasRole = (await pool.query(
+      `SELECT 1 FROM user_roles WHERE LOWER(user_email) = LOWER($1) LIMIT 1`, [email])).rows.length > 0;
+    if (hasRole) return;
+    const recipients = await getNewUserRecipients();
+    if (!recipients.length) return;
+    const { subject, html } = newUserEmail(displayName, email, source);
+    await sendMail(recipients.join(','), subject, html);
+    console.log(`📣 [NEWUSER] notified ${recipients.length} recipient(s) about ${email} (no role)`);
+  } catch (e) { console.warn('[NEWUSER] notify failed:', e.message); }
+}
 
 // Daily job: email the configured recipients when an active rep's probation ends in 45/30/15
 // days. Deduped per (rep, end_date, threshold) so each milestone fires once.
