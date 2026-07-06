@@ -14941,7 +14941,7 @@ async function runRecalcV2(source = 'manual') {
 
       // Load all invoices (paid + not paid) with enriched data
       const invRes = await pool.query(`
-        SELECT id, invoice_number, salesperson_name, customer_name, total,
+        SELECT id, invoice_number, salesperson_name, customer_name, total, date,
                hardware_amount, saas_amount, subscription_activation_date,
                paid_date, commission_status, status, approval_status, commission,
                sub_total, discount_total, gross_line_total, payable_override, commission_excluded
@@ -15076,6 +15076,26 @@ async function runRecalcV2(source = 'manual') {
       // invoice. Later subscription activations (add-ons) are renewals. Pure-annual invoices
       // neither claim nor define groups (they follow the annual 10% rule); void/deleted
       // invoices can't claim a group either.
+      // Pre-pass: the customer's earliest monthly-SaaS invoice date, WITH OR WITHOUT an
+      // activation date. Guards the initial-sale detection below: enrichment often failed to
+      // resolve the activation date on a customer's OLD invoices, so their first invoice that
+      // finally got one (months later) used to masquerade as the customer's "first month" and
+      // paid a 100% activation on a years-old subscription (e.g. Habaneros, June 2026).
+      const earliestSaasByCustomer = new Map();
+      for (const inv of invRes.rows) {
+        if (inv.status === 'void' || inv.status === 'deleted') continue;
+        const saasAmt = parseFloat(inv.saas_amount) || 0;
+        const annualTot = annualByInvoice.get(inv.id)?.total || 0;
+        if (saasAmt - annualTot <= 0.005) continue; // no monthly-SaaS portion
+        const d = toDate(inv.date);
+        if (!d) continue;
+        const cur = earliestSaasByCustomer.get(inv.customer_name);
+        if (!cur || d < cur) earliestSaasByCustomer.set(inv.customer_name, d);
+      }
+      // An initial-sale group must START near the customer's first monthly-SaaS invoice —
+      // 45 days of slack covers a failed first-invoice enrichment + billing-cycle offsets.
+      const INITIAL_GROUP_SLACK_MS = 45 * 24 * 3600 * 1000;
+
       const firstMonthByGroup = new Map();
       const initialGroupByCustomer = new Map();
       for (const inv of invRes.rows) {
@@ -15086,7 +15106,16 @@ async function runRecalcV2(source = 'manual') {
         if (inv.subscription_activation_date) {
           const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
           if (!firstMonthByGroup.has(key)) firstMonthByGroup.set(key, inv.id);
-          if (!initialGroupByCustomer.has(inv.customer_name)) initialGroupByCustomer.set(inv.customer_name, key);
+          if (!initialGroupByCustomer.has(inv.customer_name)) {
+            const earliest = earliestSaasByCustomer.get(inv.customer_name);
+            const d = toDate(inv.date);
+            // Only a group that starts near the customer's very first monthly-SaaS invoice
+            // can be the initial sale. An old customer whose early invoices never got an
+            // activation date ends up with NO initial group → everything stays a renewal.
+            if (earliest && d && (d.getTime() - earliest.getTime()) <= INITIAL_GROUP_SLACK_MS) {
+              initialGroupByCustomer.set(inv.customer_name, key);
+            }
+          }
         }
       }
 
