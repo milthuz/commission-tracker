@@ -448,6 +448,14 @@ async function initializeDatabase() {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_adjustment_target ON commission_adjustments(rep_name, target_period)`);
+    // Reconciliation suggestions the admin chose to ignore (key = type|invoice|rep).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS adjustment_suggestion_dismissals (
+        key          TEXT PRIMARY KEY,
+        dismissed_by VARCHAR(255),
+        dismissed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
     // Payroll send log: one row per (rep, pay month) each time payroll is emailed, so the
     // preview can show a "Sent" badge. Latest sent_at per rep+period is what's displayed.
     await pool.query(`
@@ -13853,7 +13861,8 @@ app.get('/api/commissions/adjustments', authenticateToken, async (req, res) => {
 // (still-pending) commission line. recalc honors payable_override; undo clears it.
 app.post('/api/commissions/adjustments', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
-  const { repName, year, month, invoiceNumbers, description, amount, sourceYear, sourceMonth } = req.body;
+  const { repName, year, month, invoiceNumbers, description, amount, sourceYear, sourceMonth,
+          refInvoiceNumber, refCustomer } = req.body;
   const freeAmount = parseFloat(amount);
   const hasInvoices = Array.isArray(invoiceNumbers) && invoiceNumbers.length > 0;
   const isFreeForm = !hasInvoices && Number.isFinite(freeAmount) && freeAmount !== 0;
@@ -13865,16 +13874,22 @@ app.post('/api/commissions/adjustments', authenticateToken, async (req, res) => 
 
   // Free-form (±) adjustment — no invoice moved; shows as an "Ajustement" line on the target
   // month's stub/commit/payroll. Negative = deduct an overpayment from a past period.
+  // refInvoiceNumber/refCustomer are OPTIONAL references (set by reconciliation suggestions):
+  // stored for context + dedup, but the invoice itself is untouched. The stub/payroll queries
+  // pick rows by invoice_number IS NULL — a referenced free row must therefore keep NULL there;
+  // the reference lives in the description and the customer column instead.
   if (isFreeForm) {
     const src = (sourceYear && sourceMonth)
       ? `${sourceYear}-${String(sourceMonth).padStart(2, '0')}-01` : null;
+    const desc = [refInvoiceNumber ? `[${String(refInvoiceNumber).slice(0, 40)}]` : '',
+                  (description || '').toString()].filter(Boolean).join(' ').slice(0, 300);
     try {
       const row = (await pool.query(
         `INSERT INTO commission_adjustments
            (rep_name, target_period, invoice_number, customer, amount, source_period, description, created_by)
-         VALUES ($1, $2::date, NULL, NULL, $3, $4::date, $5, $6) RETURNING id`,
-        [repName, target, Math.round(freeAmount * 100) / 100, src,
-         (description || '').toString().slice(0, 300), actor])).rows[0];
+         VALUES ($1, $2::date, NULL, $3, $4, $5::date, $6, $7) RETURNING id`,
+        [repName, target, refCustomer ? String(refCustomer).slice(0, 255) : null,
+         Math.round(freeAmount * 100) / 100, src, desc, actor])).rows[0];
       return res.json({ success: true, created: 1, total: freeAmount, freeForm: true, id: row.id });
     } catch (e) {
       return res.status(500).json({ error: e.message });
@@ -13938,6 +13953,114 @@ app.delete('/api/commissions/adjustments/:id', authenticateToken, async (req, re
     await client.query('ROLLBACK').catch(() => {});
     res.status(500).json({ error: e.message });
   } finally { client.release(); }
+});
+
+// GET /api/commissions/adjustments/suggestions — reconciliation-driven adjustment proposals.
+// Four detectors; each row carries a stable `key` for dismissal and everything needed to
+// apply it with one click (the frontend calls the regular POST endpoints).
+app.get('/api/commissions/adjustments/suggestions', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const orgId = process.env.ZOHO_ORG_ID;
+  try {
+    const suggestions = [];
+
+    // A. Overpaid: PAID "first month" activation on a customer that already had SaaS long
+    //    before (frozen rows the classification fixes can't touch) → suggest a clawback.
+    const overAct = (await pool.query(`
+      SELECT i.invoice_number, i.customer_name, i.salesperson_name, i.commission::float AS commission,
+             i.commission_payable_date::date AS source_period
+        FROM invoices i
+        JOIN LATERAL (
+          SELECT MIN(e.date)::date AS first_saas FROM invoices e
+           WHERE e.organization_id = i.organization_id AND e.customer_name = i.customer_name
+             AND e.saas_amount > 0 AND e.status NOT IN ('void','deleted')
+        ) fs ON true
+       WHERE i.organization_id = $1 AND i.commission_status = 'saas_first'
+         AND i.approval_status = 'paid' AND i.commission > 0
+         AND (i.date::date - fs.first_saas) > 45`, [orgId])).rows;
+    for (const r of overAct) suggestions.push({
+      key: `over_activation|${r.invoice_number}`, type: 'over_activation',
+      repName: r.salesperson_name, invoiceNumber: r.invoice_number, customer: r.customer_name,
+      amount: -Math.round(r.commission * 100) / 100, sourcePeriod: r.source_period,
+    });
+
+    // B. Overpaid: commission paid but the invoice is now VOID/DELETED in Zoho.
+    const overVoid = (await pool.query(`
+      SELECT invoice_number, customer_name, salesperson_name, commission::float AS commission,
+             commission_payable_date::date AS source_period
+        FROM invoices
+       WHERE organization_id = $1 AND status IN ('void','deleted')
+         AND approval_status = 'paid' AND commission > 0`, [orgId])).rows;
+    for (const r of overVoid) suggestions.push({
+      key: `over_void|${r.invoice_number}`, type: 'over_void',
+      repName: r.salesperson_name, invoiceNumber: r.invoice_number, customer: r.customer_name,
+      amount: -Math.round(r.commission * 100) / 100, sourcePeriod: r.source_period,
+    });
+
+    // C. Double-paid: the same invoice appears in more than one pay-file/commit for the
+    //    same rep → suggest clawing back everything beyond the largest single payment.
+    const doublePaid = (await pool.query(`
+      SELECT l.invoice_number, MIN(l.customer) AS customer, imp.rep_name,
+             SUM(l.paid_amount)::float AS total_paid, MAX(l.paid_amount)::float AS max_paid,
+             COUNT(DISTINCT imp.id)::int AS times, MAX(imp.paid_for_period)::date AS source_period
+        FROM commission_payment_lines l
+        JOIN commission_payment_imports imp ON imp.id = l.import_id
+       WHERE l.paid_amount > 0
+       GROUP BY l.invoice_number, imp.rep_name
+      HAVING COUNT(DISTINCT imp.id) > 1 AND SUM(l.paid_amount) > MAX(l.paid_amount) + 0.005`)).rows;
+    for (const r of doublePaid) suggestions.push({
+      key: `double_paid|${r.invoice_number}|${r.rep_name}`, type: 'double_paid',
+      repName: r.rep_name, invoiceNumber: r.invoice_number, customer: r.customer,
+      amount: -Math.round((r.total_paid - r.max_paid) * 100) / 100,
+      sourcePeriod: r.source_period, times: r.times,
+    });
+
+    // D. Underpaid: commissions unlocked in a CLOSED platform month (≥ May 2026, at least one
+    //    full month back) that were never paid → suggest carrying them to the current month.
+    const underpaid = (await pool.query(`
+      SELECT invoice_number, customer_name, salesperson_name, commission::float AS commission,
+             commission_payable_date::date AS source_period
+        FROM invoices
+       WHERE organization_id = $1 AND commission > 0
+         AND commission_status IN ('hardware','saas_first','saas_annual')
+         AND approval_status <> 'paid' AND status NOT IN ('void','deleted')
+         AND commission_payable_date >= '2026-05-01'
+         AND commission_payable_date < date_trunc('month', CURRENT_DATE) - interval '1 month'`,
+      [orgId])).rows;
+    for (const r of underpaid) suggestions.push({
+      key: `never_paid|${r.invoice_number}`, type: 'never_paid',
+      repName: r.salesperson_name, invoiceNumber: r.invoice_number, customer: r.customer_name,
+      amount: Math.round(r.commission * 100) / 100, sourcePeriod: r.source_period,
+    });
+
+    // Drop dismissed ones and ones already covered by an adjustment (invoice-based rows match
+    // on invoice_number; free-form clawbacks embed the reference as "[INV-…]" in description).
+    const dismissed = new Set((await pool.query(`SELECT key FROM adjustment_suggestion_dismissals`)).rows.map(r => r.key));
+    const adjRows = (await pool.query(
+      `SELECT invoice_number, description FROM commission_adjustments`)).rows;
+    const covered = new Set();
+    for (const a of adjRows) {
+      if (a.invoice_number) covered.add(a.invoice_number);
+      const m = String(a.description || '').match(/\[([A-Za-z0-9-]+)\]/);
+      if (m) covered.add(m[1]);
+    }
+    const out = suggestions.filter(s => !dismissed.has(s.key) && !covered.has(s.invoiceNumber));
+    res.json({ suggestions: out, count: out.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/commissions/adjustments/suggestions/dismiss { key } — hide a suggestion for good.
+app.post('/api/commissions/adjustments/suggestions/dismiss', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const key = String(req.body?.key || '').slice(0, 200);
+  if (!key) return res.status(400).json({ error: 'key required' });
+  try {
+    await pool.query(
+      `INSERT INTO adjustment_suggestion_dismissals (key, dismissed_by) VALUES ($1, $2)
+       ON CONFLICT (key) DO NOTHING`,
+      [key, req.user.realAdminEmail || req.user.email || 'unknown']);
+    res.json({ dismissed: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/commissions/quota-waiver', authenticateToken, async (req, res) => {
