@@ -4037,7 +4037,7 @@ app.get('/api/admin/saas-first-audit', async (req, res) => {
              i.commission_payable_date::date AS payable_date, i.approval_status,
              i.subscription_activation_date::date AS activation_date,
              fs.first_saas_date,
-             (i.date - fs.first_saas_date) > 45 AS had_prior_saas
+             (i.date::date - fs.first_saas_date) > 45 AS had_prior_saas
         FROM invoices i
         JOIN LATERAL (
           SELECT MIN(e.date)::date AS first_saas_date
