@@ -13879,6 +13879,11 @@ app.post('/api/commissions/adjustments', authenticateToken, async (req, res) => 
   // pick rows by invoice_number IS NULL — a referenced free row must therefore keep NULL there;
   // the reference lives in the description and the customer column instead.
   if (isFreeForm) {
+    // The description is what the rep reads on their stub ("Ajustement — <description>"):
+    // a bare unexplained deduction is not acceptable bookkeeping.
+    if (!String(description || '').trim()) {
+      return res.status(400).json({ error: 'description required for a free-form adjustment' });
+    }
     const src = (sourceYear && sourceMonth)
       ? `${sourceYear}-${String(sourceMonth).padStart(2, '0')}-01` : null;
     const desc = [refInvoiceNumber ? `[${String(refInvoiceNumber).slice(0, 40)}]` : '',
