@@ -15076,17 +15076,19 @@ async function runRecalcV2(source = 'manual') {
       // invoice. Later subscription activations (add-ons) are renewals. Pure-annual invoices
       // neither claim nor define groups (they follow the annual 10% rule); void/deleted
       // invoices can't claim a group either.
-      // Pre-pass: the customer's earliest monthly-SaaS invoice date, WITH OR WITHOUT an
-      // activation date. Guards the initial-sale detection below: enrichment often failed to
-      // resolve the activation date on a customer's OLD invoices, so their first invoice that
-      // finally got one (months later) used to masquerade as the customer's "first month" and
-      // paid a 100% activation on a years-old subscription (e.g. Habaneros, June 2026).
+      // Pre-pass: the customer's earliest SaaS invoice date — ANY SaaS line, monthly OR
+      // annual, with or without an activation date. Guards the initial-sale detection below:
+      // (a) enrichment often failed to resolve the activation date on a customer's OLD
+      // invoices, so their first invoice that finally got one (months later) used to
+      // masquerade as the customer's "first month" and paid a 100% activation on a years-old
+      // subscription (Habaneros, June 2026); (b) a long-time ANNUAL customer whose billing
+      // switches to monthly is a migration, not a new sale — same doctrine as monthly→annual
+      // (0%) and add-ons-to-existing-customers (0%) (Presotea Bleury, user rule 2026-07-06).
       const earliestSaasByCustomer = new Map();
       for (const inv of invRes.rows) {
         if (inv.status === 'void' || inv.status === 'deleted') continue;
         const saasAmt = parseFloat(inv.saas_amount) || 0;
-        const annualTot = annualByInvoice.get(inv.id)?.total || 0;
-        if (saasAmt - annualTot <= 0.005) continue; // no monthly-SaaS portion
+        if (saasAmt <= 0.005) continue; // no SaaS at all
         const d = toDate(inv.date);
         if (!d) continue;
         const cur = earliestSaasByCustomer.get(inv.customer_name);
