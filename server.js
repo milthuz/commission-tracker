@@ -4022,6 +4022,41 @@ app.get('/api/admin/customer-invoices', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/saas-first-audit?secret=  — every saas_first invoice, flagged when the customer
+// already had a MUCH older SaaS invoice (suspect: an old customer re-classified as a new
+// activation because only their latest invoice got a subscription_activation_date).
+app.get('/api/admin/saas-first-audit', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const rows = (await pool.query(`
+      SELECT i.invoice_number, i.customer_name, i.salesperson_name,
+             i.date::date AS date, i.commission::float AS commission,
+             i.commission_payable_date::date AS payable_date, i.approval_status,
+             i.subscription_activation_date::date AS activation_date,
+             fs.first_saas_date,
+             (i.date - fs.first_saas_date) > 45 AS had_prior_saas
+        FROM invoices i
+        JOIN LATERAL (
+          SELECT MIN(e.date)::date AS first_saas_date
+            FROM invoices e
+           WHERE e.organization_id = i.organization_id AND e.customer_name = i.customer_name
+             AND e.saas_amount > 0 AND e.status NOT IN ('void','deleted')
+        ) fs ON true
+       WHERE i.organization_id = $1 AND i.commission_status = 'saas_first'
+       ORDER BY i.date DESC`, [process.env.ZOHO_ORG_ID])).rows;
+    const flagged = rows.filter(r => r.had_prior_saas);
+    res.json({
+      total_saas_first: rows.length,
+      flagged_count: flagged.length,
+      flagged_commission: Math.round(flagged.reduce((s, r) => s + (r.commission || 0), 0) * 100) / 100,
+      flagged,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/exclude-add?secret=&name=  — replicate the exclude-customer INSERT at the DB
 // level (diagnose why the UI add doesn't persist) AND actually exclude the customer.
 app.get('/api/admin/exclude-add', async (req, res) => {
