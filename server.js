@@ -288,6 +288,8 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT false`);
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS photo TEXT`);
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS display_name VARCHAR(255)`);
+    // Demo mode: this account sees scrambled data (fake client names, scaled amounts) read-only
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS demo_mode BOOLEAN DEFAULT false`);
 
     // Invoices table
     await pool.query(`
@@ -865,6 +867,8 @@ async function initializeDatabase() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    // Demo mode for external users too (same semantics as user_tokens.demo_mode)
+    await pool.query(`ALTER TABLE local_users ADD COLUMN IF NOT EXISTS demo_mode BOOLEAN DEFAULT false`);
 
     // Resellers — third-party companies that resell licenses. POS activations come from a
     // Zoho Form; residual payments come from Zentact. Linked by reseller name for now.
@@ -1179,13 +1183,23 @@ const authenticateToken = async (req, res, next) => {
     // /api/crm/points returns everyone's deals, etc.). Local (external) users aren't in
     // user_tokens → resolves false, which is correct (they're never admins).
     let realIsAdmin = false;
+    let isDemo = false;
     if (user.email) {
       try {
-        const r = await pool.query('SELECT is_admin FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1', [user.email]);
+        // One round-trip: admin flag (Zoho accounts only) + demo flag (either account type)
+        const r = await pool.query(
+          `SELECT COALESCE((SELECT is_admin  FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1), false) AS is_admin,
+                  COALESCE((SELECT demo_mode FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1),
+                           (SELECT demo_mode FROM local_users WHERE LOWER(email) = LOWER($1) LIMIT 1),
+                           false) AS demo_mode`,
+          [user.email]
+        );
         realIsAdmin = r.rows[0]?.is_admin === true;
+        isDemo = r.rows[0]?.demo_mode === true;
       } catch { /* default false */ }
     }
     req.user.isAdmin = realIsAdmin;
+    req.user.isDemo = isDemo;
 
     const impersonateVal = req.headers['x-impersonate-as'];
     if (impersonateVal && realIsAdmin) {
@@ -1228,11 +1242,98 @@ const authenticateToken = async (req, res, next) => {
         req.user.email          = adoptEmail;          // their own perms (or none)
       }
     }
+
+    // DEMO MODE: read-only + every JSON response scrambled (fake client names, scaled
+    // amounts). Applied last so it also covers impersonation started from a demo login.
+    if (req.user.isDemo) {
+      if (!applyDemoGuards(req, res)) return; // request already answered with 403
+    }
     next();
   } catch (error) {
     res.status(401).json({ error: 'Invalid token' });
   }
 };
+
+// ============================================================================
+// DEMO MODE — a flagged account gets the real app with scrambled data, read-only.
+// Toggled per user in Admin → Users (user_tokens.demo_mode / local_users.demo_mode).
+// ============================================================================
+
+// Single global factor: every monetary value is scaled by it, so sums, ratios and
+// charts stay internally consistent while absolute numbers are fiction.
+const DEMO_MONEY_FACTOR = 0.7317;
+
+// Deterministic fake business names: same real client always maps to the same fake
+// name across every page (dashboards, reports, drill-downs stay coherent).
+const DEMO_BIZ_TYPE = ['Café', 'Bistro', 'Restaurant', 'Brasserie', 'Pizzeria', 'Cantine', 'Boulangerie', 'Taverne', 'Grill', 'Sushi', 'Casse-croûte', 'Traiteur', 'Pub', 'Crêperie'];
+const DEMO_BIZ_NAME = ['Doré', 'Lumière', 'du Coin', 'Central', 'Express', 'Moderne', 'du Parc', 'Étoile', 'Soleil', 'Nordique', 'Urbain', 'Azur', 'du Port', 'Belle-Vue', 'Riviera', 'des Pins', 'Royal'];
+function demoHash(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  return h;
+}
+function demoFakeBizName(real) {
+  const h = demoHash(String(real).toLowerCase().trim());
+  return `${DEMO_BIZ_TYPE[h % DEMO_BIZ_TYPE.length]} ${DEMO_BIZ_NAME[(h >>> 4) % DEMO_BIZ_NAME.length]}`;
+}
+
+// Keys whose STRING value is a client/merchant/deal identity → faked.
+// (Internal demo: salespeople/user names stay real — do NOT add generic 'name' here.)
+const DEMO_NAME_KEYS = new Set([
+  'customer_name', 'customername', 'client_name', 'business_name', 'businessname',
+  'deal_name', 'account_name', 'merchant_name', 'company_name',
+  'billing_customer_name', 'merchant', 'client', 'customer',
+]);
+// Numeric keys that are MONEY → scaled. Counts/ids/rates are excluded below.
+const DEMO_MONEY_RE = /(commission|revenue|amount|total|salary|profit|balance|price|mrr|arr|ltv|arpu|sub_total|subtotal|bonus|savings|margin|fee|paid|earned|value|cost)/i;
+const DEMO_NOT_MONEY_RE = /(count|issues|qty|quantity|number|_id$|^id$|pct|percent|rate|points|page|index|threshold|days|months|year|interval|clients$|invoices$|merchants$|subs$|periods)/i;
+
+function demoScramble(node, keyHint) {
+  if (node === null || node === undefined) return node;
+  if (Array.isArray(node)) return node.map((x) => demoScramble(x, keyHint));
+  if (typeof node === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(node)) out[k] = demoScramble(v, k);
+    return out;
+  }
+  const k = String(keyHint || '').toLowerCase();
+  if (typeof node === 'string') {
+    if (DEMO_NAME_KEYS.has(k) && node.trim()) return demoFakeBizName(node);
+    return node;
+  }
+  if (typeof node === 'number' && Number.isFinite(node) && node !== 0) {
+    if (DEMO_MONEY_RE.test(k) && !DEMO_NOT_MONEY_RE.test(k)) {
+      const scaled = node * DEMO_MONEY_FACTOR;
+      return Number.isInteger(node) ? Math.round(scaled) : Math.round(scaled * 100) / 100;
+    }
+  }
+  return node;
+}
+
+// Endpoints a demo user may still POST to (pure computation / no data written that matters).
+const DEMO_POST_ALLOW = new Set(['/api/assistant/chat', '/api/savings/calculate']);
+// GET endpoints that stream real data OUT of the scrambler (files/exports) → blocked.
+const DEMO_BLOCKED_GET_RE = /(excel|export|dump|download|\.xlsx?|\/pdf)/i;
+
+// Returns false when the request was already answered (blocked); true to continue.
+function applyDemoGuards(req, res) {
+  const method = req.method.toUpperCase();
+  const path = (req.baseUrl || '') + (req.path || '');
+  if (method !== 'GET' && !DEMO_POST_ALLOW.has(path)) {
+    res.status(403).json({ error: 'Demo mode is read-only / Le mode démo est en lecture seule', demo: true });
+    return false;
+  }
+  if (method === 'GET' && DEMO_BLOCKED_GET_RE.test(path)) {
+    res.status(403).json({ error: 'Exports are disabled in demo mode / Les exports sont désactivés en mode démo', demo: true });
+    return false;
+  }
+  const origJson = res.json.bind(res);
+  res.json = (body) => {
+    try { return origJson(demoScramble(body)); }
+    catch { return origJson(body); }
+  };
+  return true;
+}
 
 // ============================================================================
 // ZOHO OAUTH CONFIG
@@ -1492,6 +1593,7 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
         zoho_id: req.user.zoho_id || req.user.email,
         isAdmin,
         isSalesperson,
+        isDemo: req.user.isDemo || false,
         permissions,
         impersonating:   req.user.impersonating || false,
         realAdminEmail:  req.user.realAdminEmail || null,
@@ -11214,7 +11316,7 @@ app.get('/api/admin/users', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   try {
     const result = await pool.query(
-      `SELECT email, display_name, is_admin, created_at, updated_at AS last_login
+      `SELECT email, display_name, is_admin, demo_mode, created_at, updated_at AS last_login
        FROM user_tokens ORDER BY created_at DESC`
     );
     // Batch-fetch roles per user
@@ -11237,13 +11339,14 @@ app.get('/api/admin/users', authenticateToken, async (req, res) => {
       email:     r.email,
       displayName: r.display_name || null,
       isAdmin:   r.is_admin,
+      isDemo:    r.demo_mode === true,
       createdAt: r.created_at,
       lastLogin: r.last_login,
       userType:  'zoho',
       roles:     rolesByUser[r.email.toLowerCase()] || [],
     }));
     const localRes = await pool.query(
-      `SELECT email, display_name, status, created_at, last_login_at AS last_login FROM local_users ORDER BY created_at DESC`
+      `SELECT email, display_name, status, demo_mode, created_at, last_login_at AS last_login FROM local_users ORDER BY created_at DESC`
     );
     for (const r of localRes.rows) {
       if (seen.has(r.email.toLowerCase())) continue;
@@ -11252,6 +11355,7 @@ app.get('/api/admin/users', authenticateToken, async (req, res) => {
         email:     r.email,
         displayName: r.display_name || null,
         isAdmin:   false,
+        isDemo:    r.demo_mode === true,
         createdAt: r.created_at,
         lastLogin: r.last_login,
         userType:  'external',
@@ -11293,6 +11397,29 @@ app.delete('/api/admin/users/:email', authenticateToken, async (req, res) => {
     await pool.query('DELETE FROM team_managers WHERE LOWER(user_email) = $1', [email]);
     await pool.query('DELETE FROM user_preferences WHERE LOWER(email) = $1', [email]);
     res.json({ deleted: true, hadToken: tok.rowCount > 0, hadLocal: loc.rowCount > 0 });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/admin/users/:email/demo-mode { enabled } — toggle demo mode (scrambled data,
+// read-only) on any account, Zoho or external. Admin cannot demo-flag themselves (they'd
+// lock themselves out of every write, including turning it back off).
+app.put('/api/admin/users/:email/demo-mode', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const email = decodeURIComponent(String(req.params.email || '')).trim().toLowerCase();
+  const enabled = req.body?.enabled === true;
+  if (!email) return res.status(400).json({ error: 'email required' });
+  if (email === String(req.user.email || '').toLowerCase() && enabled) {
+    return res.status(400).json({ error: 'cannot_demo_self' });
+  }
+  try {
+    const tok = await pool.query('UPDATE user_tokens SET demo_mode = $2 WHERE LOWER(email) = $1', [email, enabled]);
+    const loc = await pool.query('UPDATE local_users SET demo_mode = $2 WHERE LOWER(email) = $1', [email, enabled]);
+    if (tok.rowCount === 0 && loc.rowCount === 0) {
+      return res.status(404).json({ error: 'user_not_found_or_never_logged_in' });
+    }
+    res.json({ email, isDemo: enabled });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
