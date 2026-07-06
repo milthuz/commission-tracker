@@ -13964,11 +13964,15 @@ app.get('/api/commissions/adjustments/suggestions', authenticateToken, async (re
   try {
     const suggestions = [];
 
+    // Suggestions only make sense for reps we actually PAY: an "Unassigned" (or inactive/
+    // departed) invoice has no pay stub to adjust — those live in the data-health radar.
+    const activeRep = `EXISTS (SELECT 1 FROM salespeople s WHERE s.name = %COL% AND s.is_active = true)`;
+
     // A. Overpaid: PAID "first month" activation on a customer that already had SaaS long
     //    before (frozen rows the classification fixes can't touch) → suggest a clawback.
     const overAct = (await pool.query(`
       SELECT i.invoice_number, i.customer_name, i.salesperson_name, i.commission::float AS commission,
-             i.commission_payable_date::date AS source_period
+             i.commission_payable_date::date AS source_period, fs.first_saas AS first_saas_date
         FROM invoices i
         JOIN LATERAL (
           SELECT MIN(e.date)::date AS first_saas FROM invoices e
@@ -13977,35 +13981,46 @@ app.get('/api/commissions/adjustments/suggestions', authenticateToken, async (re
         ) fs ON true
        WHERE i.organization_id = $1 AND i.commission_status = 'saas_first'
          AND i.approval_status = 'paid' AND i.commission > 0
-         AND (i.date::date - fs.first_saas) > 45`, [orgId])).rows;
+         AND (i.date::date - fs.first_saas) > 45
+         AND ${activeRep.replace('%COL%', 'i.salesperson_name')}`, [orgId])).rows;
     for (const r of overAct) suggestions.push({
       key: `over_activation|${r.invoice_number}`, type: 'over_activation',
       repName: r.salesperson_name, invoiceNumber: r.invoice_number, customer: r.customer_name,
       amount: -Math.round(r.commission * 100) / 100, sourcePeriod: r.source_period,
+      detail: { firstSaasDate: r.first_saas_date },
     });
 
     // B. Overpaid: commission paid but the invoice is now VOID/DELETED in Zoho.
     const overVoid = (await pool.query(`
       SELECT invoice_number, customer_name, salesperson_name, commission::float AS commission,
-             commission_payable_date::date AS source_period
-        FROM invoices
+             commission_payable_date::date AS source_period, status AS invoice_status
+        FROM invoices i
        WHERE organization_id = $1 AND status IN ('void','deleted')
-         AND approval_status = 'paid' AND commission > 0`, [orgId])).rows;
+         AND approval_status = 'paid' AND commission > 0
+         AND ${activeRep.replace('%COL%', 'i.salesperson_name')}`, [orgId])).rows;
     for (const r of overVoid) suggestions.push({
       key: `over_void|${r.invoice_number}`, type: 'over_void',
       repName: r.salesperson_name, invoiceNumber: r.invoice_number, customer: r.customer_name,
       amount: -Math.round(r.commission * 100) / 100, sourcePeriod: r.source_period,
+      detail: { invoiceStatus: r.invoice_status },
     });
 
     // C. Double-paid: the same invoice appears in more than one pay-file/commit for the
     //    same rep → suggest clawing back everything beyond the largest single payment.
+    //    `payments` lists each occurrence (period + source file + amount) for the tooltip.
     const doublePaid = (await pool.query(`
       SELECT l.invoice_number, MIN(l.customer) AS customer, imp.rep_name,
              SUM(l.paid_amount)::float AS total_paid, MAX(l.paid_amount)::float AS max_paid,
-             COUNT(DISTINCT imp.id)::int AS times, MAX(imp.paid_for_period)::date AS source_period
+             COUNT(DISTINCT imp.id)::int AS times, MAX(imp.paid_for_period)::date AS source_period,
+             json_agg(json_build_object(
+               'period', to_char(imp.paid_for_period, 'YYYY-MM'),
+               'file', LEFT(imp.filename, 60),
+               'amount', l.paid_amount::float
+             ) ORDER BY imp.paid_for_period) AS payments
         FROM commission_payment_lines l
         JOIN commission_payment_imports imp ON imp.id = l.import_id
        WHERE l.paid_amount > 0
+         AND ${activeRep.replace('%COL%', 'imp.rep_name')}
        GROUP BY l.invoice_number, imp.rep_name
       HAVING COUNT(DISTINCT imp.id) > 1 AND SUM(l.paid_amount) > MAX(l.paid_amount) + 0.005`)).rows;
     for (const r of doublePaid) suggestions.push({
@@ -14013,6 +14028,7 @@ app.get('/api/commissions/adjustments/suggestions', authenticateToken, async (re
       repName: r.rep_name, invoiceNumber: r.invoice_number, customer: r.customer,
       amount: -Math.round((r.total_paid - r.max_paid) * 100) / 100,
       sourcePeriod: r.source_period, times: r.times,
+      detail: { payments: r.payments, totalPaid: Math.round(r.total_paid * 100) / 100 },
     });
 
     // D. Underpaid: commissions unlocked in a CLOSED platform month (≥ May 2026, at least one
@@ -14020,12 +14036,13 @@ app.get('/api/commissions/adjustments/suggestions', authenticateToken, async (re
     const underpaid = (await pool.query(`
       SELECT invoice_number, customer_name, salesperson_name, commission::float AS commission,
              commission_payable_date::date AS source_period
-        FROM invoices
+        FROM invoices i
        WHERE organization_id = $1 AND commission > 0
          AND commission_status IN ('hardware','saas_first','saas_annual')
          AND approval_status <> 'paid' AND status NOT IN ('void','deleted')
          AND commission_payable_date >= '2026-05-01'
-         AND commission_payable_date < date_trunc('month', CURRENT_DATE) - interval '1 month'`,
+         AND commission_payable_date < date_trunc('month', CURRENT_DATE) - interval '1 month'
+         AND ${activeRep.replace('%COL%', 'i.salesperson_name')}`,
       [orgId])).rows;
     for (const r of underpaid) suggestions.push({
       key: `never_paid|${r.invoice_number}`, type: 'never_paid',
