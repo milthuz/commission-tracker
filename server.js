@@ -7366,10 +7366,24 @@ app.get('/api/invoices/:invoiceNumber/preview', async (req, res) => {
   // iframes can't set Authorization headers, so we accept the JWT via query string
   const token = req.query.token;
   if (!token) return res.status(401).send('Missing token');
+  let tokenEmail = null;
   try {
-    jwt.verify(String(token), JWT_SECRET);
+    tokenEmail = jwt.verify(String(token), JWT_SECRET)?.email || null;
   } catch {
     return res.status(401).send('Invalid token');
+  }
+  // Demo accounts get scrambled JSON everywhere — the raw Zoho PDF would leak the real
+  // client name and amounts, so block it (this route bypasses authenticateToken's guards).
+  if (tokenEmail) {
+    try {
+      const d = await pool.query(
+        `SELECT COALESCE((SELECT demo_mode FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1),
+                         (SELECT demo_mode FROM local_users WHERE LOWER(email) = LOWER($1) LIMIT 1),
+                         false) AS demo_mode`, [tokenEmail]);
+      if (d.rows[0]?.demo_mode === true) {
+        return res.status(403).send('<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>Aperçu désactivé en mode démo / Preview disabled in demo mode</h3></body></html>');
+      }
+    } catch { /* fail open on DB hiccup — same as before this guard */ }
   }
   try {
     const result = await fetchInvoicePdfBytes(req.params.invoiceNumber);
