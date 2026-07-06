@@ -1240,6 +1240,17 @@ const authenticateToken = async (req, res, next) => {
         req.user.isAdmin        = false;               // never admin while impersonating
         req.user.impersonating  = true;
         req.user.email          = adoptEmail;          // their own perms (or none)
+        // Impersonating a demo-flagged account adopts demo mode too — lets an admin
+        // preview exactly what the demo user sees (scrambled data, read-only).
+        if (!req.user.isDemo && adoptEmail) {
+          try {
+            const d = await pool.query(
+              `SELECT COALESCE((SELECT demo_mode FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1),
+                               (SELECT demo_mode FROM local_users WHERE LOWER(email) = LOWER($1) LIMIT 1),
+                               false) AS demo_mode`, [adoptEmail]);
+            req.user.isDemo = d.rows[0]?.demo_mode === true;
+          } catch { /* keep false */ }
+        }
       }
     }
 
