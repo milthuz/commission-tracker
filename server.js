@@ -13251,7 +13251,13 @@ async function snapshotAppGeneratedStub(repName, year, month, actor) {
     `SELECT amount::float AS amount, description FROM manual_bonuses WHERE rep_name = $1 AND period = $2::date`,
     [repName, periodDate])).rows;
   const manualTotal = manualRows.reduce((a, m) => a + (m.amount || 0), 0);
-  const total = invRows.reduce((a, r) => a + (r.commission || 0), 0) + bonusTotal + perfBonus + manualTotal;
+  // Free-form (±) adjustments (overpayment deductions etc.) — part of the committed total.
+  const adjRows = (await pool.query(
+    `SELECT amount::float AS amount, description FROM commission_adjustments
+     WHERE rep_name = $1 AND target_period = $2::date AND invoice_number IS NULL`,
+    [repName, periodDate])).rows;
+  const adjTotal = adjRows.reduce((a, m) => a + (m.amount || 0), 0);
+  const total = invRows.reduce((a, r) => a + (r.commission || 0), 0) + bonusTotal + perfBonus + manualTotal + adjTotal;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -13264,7 +13270,7 @@ async function snapshotAppGeneratedStub(repName, year, month, actor) {
          (filename, rep_name, paid_for_period, imported_by, invoices_marked, invoices_skipped,
           invoices_not_found, signup_bonuses_count, signup_bonuses_amount, monthly_bonus_amount, total_amount, raw_summary)
        VALUES ($1, $2, $3::date, $4, $5, 0, 0, $6, $7, $8, $9, $10::jsonb) RETURNING id`,
-      [filename, repName, periodDate, actor, invRows.length, bonusRows.length, bonusTotal, perfBonus + manualTotal, total,
+      [filename, repName, periodDate, actor, invRows.length, bonusRows.length, bonusTotal, perfBonus + manualTotal + adjTotal, total,
        JSON.stringify({ source: 'app-generated', via: 'mark-paid', period: `${year}-${mm}`, performance_points: perfPts })])).rows[0];
     for (const r of invRows) {
       await client.query(`INSERT INTO commission_payment_lines (import_id, invoice_number, customer, paid_amount, app_commission) VALUES ($1,$2,$3,$4,$4)`,
@@ -13278,6 +13284,8 @@ async function snapshotAppGeneratedStub(repName, year, month, actor) {
       [imp.id, repName, `${perfPts} pts`, perfBonus, periodDate]);
     for (const m of manualRows) await client.query(`INSERT INTO commission_bonuses (import_id, rep_name, bonus_type, merchant_name, amount, paid_for_period) VALUES ($1,$2,'manual',$3,$4,$5::date)`,
       [imp.id, repName, m.description || null, m.amount, periodDate]);
+    for (const a of adjRows) await client.query(`INSERT INTO commission_bonuses (import_id, rep_name, bonus_type, merchant_name, amount, paid_for_period) VALUES ($1,$2,'adjustment',$3,$4,$5::date)`,
+      [imp.id, repName, a.description || null, a.amount, periodDate]);
     await client.query('COMMIT');
     return { importId: imp.id, total, invoices: invRows.length };
   } catch (e) {
@@ -13455,6 +13463,18 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
       )).rows;
       for (const m of manual) {
         bonuses.push({ bonus_type: 'manual', merchant_name: m.description || null, amount: m.amount, report_date: null });
+      }
+      // Free-form (±) adjustments targeting this period — e.g. deduct an overpayment from a
+      // past month. Invoice-based adjustments are NOT added here (their invoice already moved).
+      const freeAdj = (await pool.query(
+        `SELECT amount::float AS amount, description, source_period::date AS source_period
+         FROM commission_adjustments
+         WHERE rep_name = $1 AND target_period = $2::date AND invoice_number IS NULL
+         ORDER BY created_at`,
+        [targetRep, periodStart]
+      )).rows;
+      for (const a of freeAdj) {
+        bonuses.push({ bonus_type: 'adjustment', merchant_name: a.description || null, amount: a.amount, report_date: a.source_period || null });
       }
       // Accepted bi-annual processing payout for this month (June/December).
       bonuses.push(...(await committedProcessing()));
@@ -13833,12 +13853,33 @@ app.get('/api/commissions/adjustments', authenticateToken, async (req, res) => {
 // (still-pending) commission line. recalc honors payable_override; undo clears it.
 app.post('/api/commissions/adjustments', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
-  const { repName, year, month, invoiceNumbers, description } = req.body;
-  if (!repName || !year || !month || !Array.isArray(invoiceNumbers) || !invoiceNumbers.length) {
-    return res.status(400).json({ error: 'repName, year, month, invoiceNumbers[] required' });
+  const { repName, year, month, invoiceNumbers, description, amount, sourceYear, sourceMonth } = req.body;
+  const freeAmount = parseFloat(amount);
+  const hasInvoices = Array.isArray(invoiceNumbers) && invoiceNumbers.length > 0;
+  const isFreeForm = !hasInvoices && Number.isFinite(freeAmount) && freeAmount !== 0;
+  if (!repName || !year || !month || (!hasInvoices && !isFreeForm)) {
+    return res.status(400).json({ error: 'repName, year, month and either invoiceNumbers[] or a non-zero amount required' });
   }
   const target = `${year}-${String(month).padStart(2, '0')}-01`;
   const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+
+  // Free-form (±) adjustment — no invoice moved; shows as an "Ajustement" line on the target
+  // month's stub/commit/payroll. Negative = deduct an overpayment from a past period.
+  if (isFreeForm) {
+    const src = (sourceYear && sourceMonth)
+      ? `${sourceYear}-${String(sourceMonth).padStart(2, '0')}-01` : null;
+    try {
+      const row = (await pool.query(
+        `INSERT INTO commission_adjustments
+           (rep_name, target_period, invoice_number, customer, amount, source_period, description, created_by)
+         VALUES ($1, $2::date, NULL, NULL, $3, $4::date, $5, $6) RETURNING id`,
+        [repName, target, Math.round(freeAmount * 100) / 100, src,
+         (description || '').toString().slice(0, 300), actor])).rows[0];
+      return res.json({ success: true, created: 1, total: freeAmount, freeForm: true, id: row.id });
+    } catch (e) {
+      return res.status(500).json({ error: e.message });
+    }
+  }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -14210,6 +14251,13 @@ async function payrollDataForMonth(year, month) {
          WHERE rep_name = $1 AND period = $2::date`, [rep, periodStart]
       )).rows;
       for (const m of manual) bonuses.push({ bonus_type: 'manual', merchant_name: m.description, amount: m.amount });
+      // Free-form (±) adjustments targeting this month (overpayment deductions etc.).
+      const freeAdj = (await pool.query(
+        `SELECT amount::float AS amount, description FROM commission_adjustments
+         WHERE rep_name = $1 AND target_period = $2::date AND invoice_number IS NULL`,
+        [rep, periodStart]
+      )).rows;
+      for (const a of freeAdj) bonuses.push({ bonus_type: 'adjustment', merchant_name: a.description, amount: a.amount });
       // Accepted bi-annual processing payout (June/December) — same rows the stub shows.
       bonuses.push(...committedProc);
       total = lines.reduce((s, l) => s + (l.paid_amount || 0), 0) + bonuses.reduce((s, b) => s + (b.amount || 0), 0);
