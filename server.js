@@ -3996,6 +3996,32 @@ app.get('/api/admin/customer-lookup', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/customer-invoices?secret=&q=  — every invoice of customers matching q with
+// the full commission-relevant state (diagnose "why is X in this rep's report?").
+app.get('/api/admin/customer-invoices', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.status(400).json({ error: 'q required' });
+  try {
+    const rows = (await pool.query(`
+      SELECT invoice_number, customer_name, salesperson_name,
+             date::date AS date, paid_date::date AS paid_date,
+             commission_payable_date::date AS payable_date,
+             status, approval_status, commission_status, commission_paid,
+             commission::float AS commission, total::float AS total,
+             sub_total::float AS sub_total, saas_amount::float AS saas_amount,
+             hardware_amount::float AS hardware_amount,
+             subscription_activation_date::date AS activation_date, line_items
+        FROM invoices
+       WHERE organization_id = $2 AND customer_name ILIKE '%'||$1||'%'
+       ORDER BY customer_name, date`, [q, process.env.ZOHO_ORG_ID])).rows;
+    res.json({ count: rows.length, rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/exclude-add?secret=&name=  — replicate the exclude-customer INSERT at the DB
 // level (diagnose why the UI add doesn't persist) AND actually exclude the customer.
 app.get('/api/admin/exclude-add', async (req, res) => {
