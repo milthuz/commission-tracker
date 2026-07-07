@@ -66,6 +66,7 @@ const PERMISSION_CATALOG = [
   { key: 'report:view_paystub',        label: 'View pay stubs (own + per role)',             category: 'Commission Report' },
   { key: 'report:view_salary',         label: 'View base salary & total compensation',       category: 'Commission Report' },
   { key: 'report:annual_reconciliation', label: 'View the annual reconciliation report (paid vs calculated)', category: 'Commission Report' },
+  { key: 'report:adjustments',         label: 'Manage commission adjustments & reconciliation suggestions', category: 'Commission Report' },
 
   // Dashboard
   { key: 'dashboard:view_admin',       label: 'View the Admin dashboard (company finance + action items)', category: 'Dashboard' },
@@ -86,6 +87,8 @@ const PERMISSION_CATALOG = [
   { key: 'admin:releases',             label: 'Push new app releases',                       category: 'Admin Panel' },
   { key: 'admin:impersonate',          label: 'Use impersonation mode',                      category: 'Admin Panel' },
   { key: 'admin:data_health',          label: 'View the "Needs attention" data-health page', category: 'Admin Panel' },
+  { key: 'admin:notifications',        label: 'Configure notification recipients & email templates', category: 'Admin Panel' },
+  { key: 'admin:demo_mode',            label: 'Toggle demo mode on user accounts',            category: 'Admin Panel' },
 
   // Syncs
   { key: 'sync:books',                 label: 'Trigger Zoho Books sync manually',            category: 'Syncs' },
@@ -213,6 +216,20 @@ async function requirePerm(req, res, perm) {
     return false;
   }
   return true;
+}
+
+// Like requirePerm but passes when the user holds ANY of the given keys — used when a
+// feature gets its own dedicated permission LATER: roles holding the original broader
+// permission keep working (e.g. ['report:adjustments', 'report:mark_paid']).
+async function requirePermAny(req, res, permList) {
+  if (req.user.isAdmin === true) return true;
+  const email = req.user.email;
+  if (email) {
+    const perms = await getUserPermissions(email);
+    for (const p of permList) if (userHasPermission(perms, p)) return true;
+  }
+  res.status(403).json({ error: `Permission required: ${permList.join(' or ')}` });
+  return false;
 }
 
 // Check helper: wildcards (*) grant all
@@ -1884,14 +1901,14 @@ function sampleEmail(type, lang) {
 
 // GET /api/admin/email-preview?type=&lang= → { type, subject, html } for the preview iframe.
 app.get('/api/admin/email-preview', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'admin:users'))) return;
+  if (!(await requirePermAny(req, res, ['admin:notifications', 'admin:users']))) return;
   const type = EMAIL_TEMPLATE_TYPES.includes(req.query.type) ? req.query.type : 'invitation';
   res.json({ type, types: EMAIL_TEMPLATE_TYPES, ...sampleEmail(type, req.query.lang) });
 });
 
 // POST /api/admin/email-preview/send { type, lang, to } → email a sample (defaults to the admin).
 app.post('/api/admin/email-preview/send', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'admin:users'))) return;
+  if (!(await requirePermAny(req, res, ['admin:notifications', 'admin:users']))) return;
   const type = EMAIL_TEMPLATE_TYPES.includes(req.body.type) ? req.body.type : 'invitation';
   const to = String(req.body.to || req.user.realAdminEmail || req.user.email || '').trim();
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(to)) return res.status(400).json({ error: 'valid recipient email required' });
@@ -7373,16 +7390,26 @@ app.get('/api/invoices/:invoiceNumber/preview', async (req, res) => {
   } catch {
     return res.status(401).send('Invalid token');
   }
-  // Demo accounts get scrambled JSON everywhere — the raw Zoho PDF would leak the real
-  // client name and amounts, so block it (this route bypasses authenticateToken's guards).
+  // This route bypasses authenticateToken (JWT via query for the iframe), so it needs its
+  // own guards: (a) demo accounts are blocked — the raw Zoho PDF would leak real client
+  // names/amounts; (b) the user must hold at least one invoice/report view permission
+  // (admins pass) — a valid JWT alone used to be enough to fetch ANY invoice by number.
   if (tokenEmail) {
     try {
       const d = await pool.query(
-        `SELECT COALESCE((SELECT demo_mode FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1),
+        `SELECT COALESCE((SELECT is_admin  FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1), false) AS is_admin,
+                COALESCE((SELECT demo_mode FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1),
                          (SELECT demo_mode FROM local_users WHERE LOWER(email) = LOWER($1) LIMIT 1),
                          false) AS demo_mode`, [tokenEmail]);
       if (d.rows[0]?.demo_mode === true) {
         return res.status(403).send('<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>Aperçu désactivé en mode démo / Preview disabled in demo mode</h3></body></html>');
+      }
+      if (d.rows[0]?.is_admin !== true) {
+        const perms = await getUserPermissions(tokenEmail);
+        const viewPerms = ['invoices:view_own', 'invoices:view_all', 'report:view_own', 'report:view_others', 'report:view_paystub'];
+        if (!viewPerms.some(p => userHasPermission(perms, p))) {
+          return res.status(403).send('<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>Permission requise / Permission required</h3></body></html>');
+        }
       }
     } catch { /* fail open on DB hiccup — same as before this guard */ }
   }
@@ -9430,13 +9457,13 @@ async function getReportRecipients() {
 }
 // GET /api/admin/report-recipients — the configured recipient list (empty = all admins).
 app.get('/api/admin/report-recipients', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'admin:data_health'))) return;
+  if (!(await requirePermAny(req, res, ['admin:notifications', 'admin:data_health']))) return;
   try { res.json({ recipients: await getReportRecipients() }); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 // PUT /api/admin/report-recipients { emails:[...] } — set who gets missing commission/points emails.
 app.put('/api/admin/report-recipients', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'admin:data_health'))) return;
+  if (!(await requirePermAny(req, res, ['admin:notifications', 'admin:data_health']))) return;
   const emails = Array.isArray(req.body?.emails) ? req.body.emails.map(e => String(e).trim().toLowerCase()).filter(Boolean) : null;
   if (!emails) return res.status(400).json({ error: 'emails array required' });
   if (emails.some(e => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e))) return res.status(400).json({ error: 'invalid email' });
@@ -9461,12 +9488,12 @@ async function getProbationRecipients() {
   } catch { return []; }
 }
 app.get('/api/admin/probation-recipients', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'admin:data_health'))) return;
+  if (!(await requirePermAny(req, res, ['admin:notifications', 'admin:data_health']))) return;
   try { res.json({ recipients: await getProbationRecipients() }); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.put('/api/admin/probation-recipients', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'admin:data_health'))) return;
+  if (!(await requirePermAny(req, res, ['admin:notifications', 'admin:data_health']))) return;
   const emails = Array.isArray(req.body?.emails) ? req.body.emails.map(e => String(e).trim().toLowerCase()).filter(Boolean) : null;
   if (!emails) return res.status(400).json({ error: 'emails array required' });
   if (emails.some(e => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e))) return res.status(400).json({ error: 'invalid email' });
@@ -9490,12 +9517,12 @@ async function getNewUserRecipients() {
   } catch { return []; }
 }
 app.get('/api/admin/new-user-recipients', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'admin:data_health'))) return;
+  if (!(await requirePermAny(req, res, ['admin:notifications', 'admin:data_health']))) return;
   try { res.json({ recipients: await getNewUserRecipients() }); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.put('/api/admin/new-user-recipients', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'admin:data_health'))) return;
+  if (!(await requirePermAny(req, res, ['admin:notifications', 'admin:data_health']))) return;
   const emails = Array.isArray(req.body?.emails) ? req.body.emails.map(e => String(e).trim().toLowerCase()).filter(Boolean) : null;
   if (!emails) return res.status(400).json({ error: 'emails array required' });
   if (emails.some(e => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e))) return res.status(400).json({ error: 'invalid email' });
@@ -11501,7 +11528,7 @@ app.delete('/api/admin/users/:email', authenticateToken, async (req, res) => {
 // read-only) on any account, Zoho or external. Admin cannot demo-flag themselves (they'd
 // lock themselves out of every write, including turning it back off).
 app.put('/api/admin/users/:email/demo-mode', authenticateToken, async (req, res) => {
-  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  if (!(await requirePerm(req, res, 'admin:demo_mode'))) return; // admins auto-pass
   const email = decodeURIComponent(String(req.params.email || '')).trim().toLowerCase();
   const enabled = req.body?.enabled === true;
   if (!email) return res.status(400).json({ error: 'email required' });
@@ -13834,7 +13861,7 @@ app.delete('/api/commissions/manual-bonus/:id', authenticateToken, async (req, r
 // GET /api/commissions/unpaid-commissions?repName=  — a rep's earned-but-unpaid commission
 // invoices (the radar across all months), eligible to be carried forward as an adjustment.
 app.get('/api/commissions/unpaid-commissions', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  if (!(await requirePermAny(req, res, ['report:adjustments', 'report:mark_paid']))) return;
   const rep = req.query.repName;
   if (!rep) return res.status(400).json({ error: 'repName required' });
   try {
@@ -13854,7 +13881,7 @@ app.get('/api/commissions/unpaid-commissions', authenticateToken, async (req, re
 
 // GET /api/commissions/adjustments?repName=&year=&month=  (or ?all=true) — list adjustments.
 app.get('/api/commissions/adjustments', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  if (!(await requirePermAny(req, res, ['report:adjustments', 'report:mark_paid']))) return;
   const sel = `SELECT id, rep_name, target_period::date AS target_period, invoice_number, customer,
                       amount::float AS amount, source_period::date AS source_period, description, created_by, created_at
                FROM commission_adjustments`;
@@ -13881,7 +13908,7 @@ app.get('/api/commissions/adjustments', authenticateToken, async (req, res) => {
 // LEAVES its original month and appears in the target month's report/stub/payroll as a normal
 // (still-pending) commission line. recalc honors payable_override; undo clears it.
 app.post('/api/commissions/adjustments', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  if (!(await requirePermAny(req, res, ['report:adjustments', 'report:mark_paid']))) return;
   const { repName, year, month, invoiceNumbers, description, amount, sourceYear, sourceMonth,
           refInvoiceNumber, refCustomer } = req.body;
   const freeAmount = parseFloat(amount);
@@ -13959,7 +13986,7 @@ app.post('/api/commissions/adjustments', authenticateToken, async (req, res) => 
 
 // DELETE /api/commissions/adjustments/:id  — undo: move the invoice back to its original month.
 app.delete('/api/commissions/adjustments/:id', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  if (!(await requirePermAny(req, res, ['report:adjustments', 'report:mark_paid']))) return;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -13985,7 +14012,7 @@ app.delete('/api/commissions/adjustments/:id', authenticateToken, async (req, re
 // Four detectors; each row carries a stable `key` for dismissal and everything needed to
 // apply it with one click (the frontend calls the regular POST endpoints).
 app.get('/api/commissions/adjustments/suggestions', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  if (!(await requirePermAny(req, res, ['report:adjustments', 'report:mark_paid']))) return;
   const orgId = process.env.ZOHO_ORG_ID;
   try {
     const suggestions = [];
@@ -14094,7 +14121,7 @@ app.get('/api/commissions/adjustments/suggestions', authenticateToken, async (re
 
 // POST /api/commissions/adjustments/suggestions/dismiss { key } — hide a suggestion for good.
 app.post('/api/commissions/adjustments/suggestions/dismiss', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  if (!(await requirePermAny(req, res, ['report:adjustments', 'report:mark_paid']))) return;
   const key = String(req.body?.key || '').slice(0, 200);
   if (!key) return res.status(400).json({ error: 'key required' });
   try {
