@@ -9938,11 +9938,16 @@ app.get('/api/admin/commission-imports/coverage/matrix', (req, res, next) => {
     }
 
     const [repsRes, importsRes, unpaidRes, quotaRes, ackRes] = await Promise.all([
+      // is_active per rep so the frontend can hide departed/inactive reps by default — an
+      // inactive rep can still show up here (historical import) but shouldn't clutter the
+      // default view. COALESCE to false when the name has no salespeople row at all.
       pool.query(
-        `SELECT DISTINCT name FROM (
+        `SELECT t.name, COALESCE(s.is_active, false) AS is_active FROM (
            SELECT name FROM salespeople WHERE is_active = true
            UNION SELECT DISTINCT rep_name FROM commission_payment_imports
-         ) t ORDER BY name`
+         ) t
+         LEFT JOIN salespeople s ON s.name = t.name
+         ORDER BY t.name`
       ),
       pool.query(
         `SELECT rep_name, to_char(paid_for_period, 'YYYY-MM') AS ym,
@@ -9979,7 +9984,7 @@ app.get('/api/admin/commission-imports/coverage/matrix', (req, res, next) => {
     const ackSet = new Set(ackRes.rows.map(r => `${r.rep_name}|${r.ym}`));
 
     const rows = [];
-    for (const { name } of repsRes.rows) {
+    for (const { name, is_active } of repsRes.rows) {
       const cells = {};
       let totalPaid = 0, totalUnpaid = 0, hasAny = false;
       for (const ym of months) {
@@ -10004,6 +10009,7 @@ app.get('/api/admin/commission-imports/coverage/matrix', (req, res, next) => {
       if (!hasAny) continue;
       rows.push({
         rep: name,
+        isActive: is_active === true,
         cells,
         totalPaid:   Math.round(totalPaid * 100) / 100,
         totalUnpaid: Math.round(totalUnpaid * 100) / 100,
