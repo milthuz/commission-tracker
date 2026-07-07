@@ -6393,16 +6393,73 @@ async function fetchBillingSubs(apiDomain, accessToken, orgId, filterBy) {
 const MRR_STATUSES    = new Set(['live', 'non_renewing', 'dunning', 'unpaid']);
 const ACTIVE_STATUSES = new Set(['live', 'non_renewing', 'dunning', 'unpaid', 'paused']);
 
-let _billingCache = { at: 0, data: null };
+// Generic 2-tier cache: in-memory (fast) backed by a durable Postgres row (app_settings) so a
+// fresh dyno boot / post-deploy restart can serve the LAST KNOWN GOOD value INSTANTLY instead
+// of blocking the first request on a live multi-org Zoho fetch (this — not the DB queries —
+// was the "still super slow on first load" bottleneck for the dashboard and Merchant↔SaaS
+// links, both of which depend on these caches). `serialize`/`deserialize` let callers store
+// non-JSON types (Maps) in the JSONB column.
+function makeDurableCache(settingsKey, { ttlMs = 30 * 60 * 1000, serialize = (v) => v, deserialize = (v) => v } = {}) {
+  let mem = { at: 0, data: null };
+  let refreshing = null; // in-flight Promise, de-dupes concurrent triggers
+  async function loadFromDb() {
+    try {
+      const r = await pool.query(`SELECT value, updated_at FROM app_settings WHERE key = $1`, [settingsKey]);
+      if (!r.rows[0]) return null;
+      return { data: deserialize(r.rows[0].value), at: new Date(r.rows[0].updated_at).getTime() };
+    } catch { return null; }
+  }
+  async function saveToDb(data) {
+    try {
+      await pool.query(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES ($1, $2::jsonb, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+        [settingsKey, JSON.stringify(serialize(data))]
+      );
+    } catch (e) { console.warn(`[cache:${settingsKey}] persist failed:`, e.message); }
+  }
+  function refresh(computeFn) {
+    if (!refreshing) {
+      refreshing = computeFn().then((data) => {
+        mem = { at: Date.now(), data };
+        saveToDb(data); // fire-and-forget — never blocks the caller
+        return data;
+      }).finally(() => { refreshing = null; });
+    }
+    return refreshing;
+  }
+  // Fresh memory hit -> serve. Else try the DB fallback (serve stale, refresh in the
+  // background) -> block on a live compute only when NOTHING is cached anywhere yet.
+  async function get(computeFn, { fresh = false } = {}) {
+    if (!fresh && mem.data && (Date.now() - mem.at) < ttlMs) return mem.data;
+    if (!fresh) {
+      if (!mem.data) {
+        const db = await loadFromDb();
+        if (db) mem = db;
+      }
+      if (mem.data) { refresh(computeFn); return mem.data; }
+    }
+    return refresh(computeFn);
+  }
+  function warm(computeFn) { return refresh(computeFn); }
+  return { get, warm };
+}
+
 async function computeBillingMetrics() {
   const { accessToken, apiDomain } = await getAdminBooksAuth();
+  // Orgs (and each org's two filter passes) are independent — fetch all of them concurrently.
+  // This was the single biggest lever on cold-fetch time: 3 orgs × 2 sequential paginated
+  // calls each used to run one after another; now they run together.
+  const perOrgRaw = await Promise.all(ZOHO_BILLING_ORG_IDS.map(async (orgId) => {
+    const [all, cancelled] = await Promise.all([
+      fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.All'),
+      fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.CANCELLED_THIS_MONTH'),
+    ]);
+    return { orgId, all, cancelled };
+  }));
   let mrr = 0, activeSubs = 0, churnedThisMonth = 0;
   const perOrg = [];
-  for (const orgId of ZOHO_BILLING_ORG_IDS) {
-    // One "All" pass → bucket by status for MRR + active; a CANCELLED_THIS_MONTH pass for churn
-    // (cancelled-this-month isn't a distinct status value, only a filter).
-    const all       = await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.All');
-    const cancelled = await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.CANCELLED_THIS_MONTH');
+  for (const { orgId, all, cancelled } of perOrgRaw) {
     let orgMrr = 0, orgActive = 0;
     for (const s of all) {
       const st = String(s.status || '').toLowerCase();
@@ -6434,9 +6491,11 @@ async function computeBillingMetrics() {
     perOrg, orgCount: ZOHO_BILLING_ORG_IDS.length, generatedAt: new Date().toISOString(),
   };
 }
+const billingMetricsCache = makeDurableCache('billing_metrics_durable_cache');
+const getBillingMetrics = (opts) => billingMetricsCache.get(computeBillingMetrics, opts);
 
-// GET /api/billing/metrics — board SaaS metrics (admins / dashboard:view_admin). Cached 30 min
-// (heavy: paginated subscriptions across every billing org).
+// GET /api/billing/metrics — board SaaS metrics (admins / dashboard:view_admin). Cached 30 min,
+// with a durable DB fallback so a cold dyno serves last-known-good instantly (see makeDurableCache).
 app.get('/api/billing/metrics', authenticateToken, async (req, res) => {
   if (req.user.isAdmin !== true) {
     const perms = await getUserPermissions(req.user.email);
@@ -6445,12 +6504,9 @@ app.get('/api/billing/metrics', authenticateToken, async (req, res) => {
     }
   }
   try {
-    if (req.query.fresh !== '1' && _billingCache.data && (Date.now() - _billingCache.at) < 30 * 60 * 1000) {
-      return res.json({ ..._billingCache.data, cached: true });
-    }
-    const data = await computeBillingMetrics();
-    _billingCache = { at: Date.now(), data };
-    res.json(data);
+    const fresh = req.query.fresh === '1';
+    const data = await getBillingMetrics({ fresh });
+    res.json({ ...data, cached: !fresh });
   } catch (e) {
     res.status(502).json({ error: 'billing_fetch_failed', detail: e.message });
   }
@@ -6461,8 +6517,7 @@ app.get('/api/billing/metrics', authenticateToken, async (req, res) => {
 app.get('/api/admin/billing-metrics-raw', async (req, res) => {
   if (req.query.secret !== (process.env.ZOHO_WEBHOOK_SECRET || '')) return res.status(401).json({ error: 'bad secret' });
   try {
-    const data = await computeBillingMetrics();
-    _billingCache = { at: Date.now(), data }; // warm the shared cache so the dashboard is instant
+    const data = await billingMetricsCache.warm(computeBillingMetrics); // also (re)warms the shared cache
     res.json(data);
   } catch (e) {
     res.status(502).json({ error: 'billing_fetch_failed', detail: e.message });
@@ -6470,14 +6525,14 @@ app.get('/api/admin/billing-metrics-raw', async (req, res) => {
 });
 
 // Keep the billing caches hot so the board dashboard never pays the cold-fetch. Web role
-// only; initial warm shortly after boot, then refresh just under the 30-min cache TTL.
-// Warms BOTH the metrics cache (SaaS tiles) and the per-customer cache (SH-14 merchant
-// matching) — the latter used to be warmed only on-demand, which made the FIRST dashboard
-// load after a deploy/idle period block on a live multi-org Zoho Billing fetch.
+// only; initial warm shortly after boot, then refresh just under the 30-min cache TTL. Warms
+// BOTH the metrics cache (SaaS tiles) and the per-customer cache (SH-14 merchant matching).
 async function warmBillingCache() {
-  const results = await Promise.allSettled([computeBillingMetrics(), getBillingCustomers()]);
-  if (results[0].status === 'fulfilled') _billingCache = { at: Date.now(), data: results[0].value };
-  else console.warn('[billing] metrics cache warm failed:', results[0].reason?.message);
+  const results = await Promise.allSettled([
+    billingMetricsCache.warm(computeBillingMetrics),
+    billingCustomersCache.warm(computeBillingCustomers),
+  ]);
+  if (results[0].status === 'rejected') console.warn('[billing] metrics cache warm failed:', results[0].reason?.message);
   if (results[1].status === 'rejected') console.warn('[billing] customers cache warm failed:', results[1].reason?.message);
 }
 if (process.env.ROLE !== 'worker') {
@@ -6487,17 +6542,18 @@ if (process.env.ROLE !== 'worker') {
 
 // ── SH-14: Merchant ↔ SaaS linking (admin-curated) ──────────────────────────
 const normName = (s) => String(s || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
-// Active Zoho Billing customers (name → monthly MRR), cached 30 min. Feeds the auto name-match,
-// the admin search, and the combined-revenue computation.
-let _billingCustCache = { at: 0, data: null };
-async function getBillingCustomers() {
-  if (_billingCustCache.data && Date.now() - _billingCustCache.at < 30 * 60 * 1000) return _billingCustCache.data;
+// Active Zoho Billing customers (name → monthly MRR), cached 30 min (+ durable DB fallback —
+// see makeDurableCache). Feeds the auto name-match, the admin search, and computeMerchantRevenueRows.
+async function computeBillingCustomers() {
   const { accessToken, apiDomain } = await getAdminBooksAuth();
+  // Orgs are independent — fetch concurrently instead of one after another.
+  const perOrgAll = await Promise.all(
+    ZOHO_BILLING_ORG_IDS.map(orgId => fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.All'))
+  );
   const byName = new Map();        // normName → { name, mrr } (sum across the customer's subs)
   const subByNumber = new Map();   // subscription_number → monthly (pre-tax)
   const subList = [];              // one entry per active subscription, for per-sub matching
-  for (const orgId of ZOHO_BILLING_ORG_IDS) {
-    const all = await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.All');
+  for (const all of perOrgAll) {
     for (const s of all) {
       if (!ACTIVE_STATUSES.has(String(s.status || '').toLowerCase())) continue;
       const name = String(s.customer_name || '').trim(); const key = normName(name);
@@ -6510,10 +6566,13 @@ async function getBillingCustomers() {
       }
     }
   }
-  const data = { byName, subByNumber, subList };
-  _billingCustCache = { at: Date.now(), data };
-  return data;
+  return { byName, subByNumber, subList };
 }
+const billingCustomersCache = makeDurableCache('billing_customers_durable_cache', {
+  serialize:   (d) => ({ byName: Array.from(d.byName.entries()), subByNumber: Array.from(d.subByNumber.entries()), subList: d.subList }),
+  deserialize: (v) => ({ byName: new Map(v.byName), subByNumber: new Map(v.subByNumber), subList: v.subList }),
+});
+const getBillingCustomers = (opts) => billingCustomersCache.get(computeBillingCustomers, opts);
 
 // Shared: per-merchant combined revenue (monthly processing + linked SaaS) using the curated
 // merchant_saas_links. SaaS resolution per merchant: manual link (exact sub > customer total) >
