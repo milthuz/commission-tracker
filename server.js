@@ -65,6 +65,7 @@ const PERMISSION_CATALOG = [
   { key: 'report:mark_paid',           label: 'Mark approved commissions as paid to rep',    category: 'Commission Report' },
   { key: 'report:view_paystub',        label: 'View pay stubs (own + per role)',             category: 'Commission Report' },
   { key: 'report:view_salary',         label: 'View base salary & total compensation',       category: 'Commission Report' },
+  { key: 'report:annual_reconciliation', label: 'View the annual reconciliation report (paid vs calculated)', category: 'Commission Report' },
 
   // Dashboard
   { key: 'dashboard:view_admin',       label: 'View the Admin dashboard (company finance + action items)', category: 'Dashboard' },
@@ -14562,6 +14563,110 @@ function buildPayrollPdf(periodLabel, reps, lang) {
     } catch (e) { reject(e); }
   });
 }
+
+// GET /api/commissions/annual-reconciliation?year= — year-end books check: for every active
+// rep × month, what was PAID (pay-file/commit ledger) vs what the model CALCULATES vs the
+// delta. Pre-platform months (< May 2026) differ BY DESIGN (imported reports were the truth).
+app.get('/api/commissions/annual-reconciliation', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:annual_reconciliation'))) return;
+  const year = parseInt(req.query.year) || new Date().getFullYear();
+  const yearStart = `${year}-01-01`, yearEnd = `${year + 1}-01-01`;
+  const orgId = process.env.ZOHO_ORG_ID;
+  try {
+    const reps = (await pool.query(
+      `SELECT name, monthly_quota FROM salespeople WHERE is_active = true ORDER BY name`)).rows;
+
+    // PAID: the latest import per rep+month (same pick as payroll/pay-stub)…
+    const paidRows = (await pool.query(`
+      SELECT rep_name, to_char(paid_for_period, 'YYYY-MM') AS ym, total_amount::float AS total
+        FROM (SELECT rep_name, paid_for_period, total_amount,
+                     ROW_NUMBER() OVER (PARTITION BY rep_name, date_trunc('month', paid_for_period)
+                                        ORDER BY imported_at DESC) AS rn
+                FROM commission_payment_imports
+               WHERE paid_for_period >= $1::date AND paid_for_period < $2::date) x
+       WHERE rn = 1`, [yearStart, yearEnd])).rows;
+    // …plus accepted bi-annual processing payouts (committed outside imports) — they are both
+    // paid AND part of the model, so they land on BOTH sides (no artificial delta).
+    const procRows = (await pool.query(`
+      SELECT rep_name, to_char(paid_for_period, 'YYYY-MM') AS ym, SUM(amount)::float AS total
+        FROM commission_bonuses
+       WHERE bonus_type = 'processing' AND import_id IS NULL
+         AND paid_for_period >= $1::date AND paid_for_period < $2::date
+       GROUP BY 1, 2`, [yearStart, yearEnd])).rows;
+
+    // CALCULATED: the model's value for the month (mirrors the generated pay stub).
+    const invRows = (await pool.query(`
+      SELECT salesperson_name AS rep, to_char(commission_payable_date, 'YYYY-MM') AS ym,
+             SUM(commission)::float AS total
+        FROM invoices
+       WHERE organization_id = $3 AND commission > 0
+         AND commission_status IN ('hardware','saas_first','saas_annual')
+         AND commission_payable_date >= $1::date AND commission_payable_date < $2::date
+       GROUP BY 1, 2`, [yearStart, yearEnd, orgId])).rows;
+    const signupRows = (await pool.query(`
+      SELECT LOWER(sales_rep_name) AS rep, to_char(activated_at, 'YYYY-MM') AS ym,
+             SUM(bonus_amount)::float AS total
+        FROM zentact_merchants
+       WHERE status = 'ACTIVE' AND sales_rep_name IS NOT NULL
+         AND activated_at >= $1::date AND activated_at < $2::date
+       GROUP BY 1, 2`, [yearStart, yearEnd])).rows;
+    const manualRows = (await pool.query(`
+      SELECT rep_name, to_char(period, 'YYYY-MM') AS ym, SUM(amount)::float AS total
+        FROM manual_bonuses WHERE period >= $1::date AND period < $2::date
+       GROUP BY 1, 2`, [yearStart, yearEnd])).rows;
+    const freeAdjRows = (await pool.query(`
+      SELECT rep_name, to_char(target_period, 'YYYY-MM') AS ym, SUM(amount)::float AS total
+        FROM commission_adjustments
+       WHERE invoice_number IS NULL AND target_period >= $1::date AND target_period < $2::date
+       GROUP BY 1, 2`, [yearStart, yearEnd])).rows;
+    // One pass covers every month of the year (map is keyed rep|YYYY-MM).
+    const ptsMap = await getMonthlyPointsByRep(new Date(yearStart));
+
+    const key = (rep, ym) => `${rep}|${ym}`;
+    const toMap = (rows, repCol = 'rep_name') => {
+      const m = new Map();
+      for (const r of rows) m.set(key(r[repCol] ?? r.rep, r.ym), r.total || 0);
+      return m;
+    };
+    const paidMap = toMap(paidRows), procMap = toMap(procRows), invMap = toMap(invRows, 'rep'),
+          manualMap = toMap(manualRows), adjMap = toMap(freeAdjRows);
+    const signupMap = toMap(signupRows, 'rep'); // keyed by LOWER(rep)
+
+    const platformFrom = '2026-05'; // the platform pays from May 2026; before = imported truth
+    const round2 = (n) => Math.round(n * 100) / 100;
+    const out = [];
+    for (const sp of reps) {
+      const rep = sp.name;
+      const quota = sp.monthly_quota == null ? MONTHLY_QUOTA : parseInt(sp.monthly_quota);
+      const months = [];
+      let paidY = 0, calcY = 0;
+      for (let m = 1; m <= 12; m++) {
+        const ym = `${year}-${String(m).padStart(2, '0')}`;
+        const proc = procMap.get(key(rep, ym)) || 0;
+        const paid = (paidMap.get(key(rep, ym)) || 0) + proc;
+        let calc = (invMap.get(key(rep, ym)) || 0)
+                 + (signupMap.get(key(rep.toLowerCase(), ym)) || 0)
+                 + (manualMap.get(key(rep, ym)) || 0)
+                 + (adjMap.get(key(rep, ym)) || 0)
+                 + proc;
+        if (ym >= platformFrom) {
+          const pts = ptsMap.get(`${rep}|${ym}`) || 0;
+          if (pts >= quota) calc += ZohoCRMService.calculateMonthlyBonus(pts);
+        }
+        paidY += paid; calcY += calc;
+        months.push({ month: m, paid: round2(paid), calculated: round2(calc), delta: round2(paid - calc) });
+      }
+      if (Math.abs(paidY) < 0.005 && Math.abs(calcY) < 0.005) continue; // nothing all year
+      out.push({ rep, months, totals: { paid: round2(paidY), calculated: round2(calcY), delta: round2(paidY - calcY) } });
+    }
+    const grand = {
+      paid: round2(out.reduce((s, r) => s + r.totals.paid, 0)),
+      calculated: round2(out.reduce((s, r) => s + r.totals.calculated, 0)),
+      delta: round2(out.reduce((s, r) => s + r.totals.delta, 0)),
+    };
+    res.json({ year, platformFrom, reps: out, grand });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // GET /api/commissions/payroll/preview?year=&month= — per-rep totals + the calendar deadline.
 app.get('/api/commissions/payroll/preview', authenticateToken, async (req, res) => {
