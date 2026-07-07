@@ -13608,15 +13608,20 @@ app.post('/api/commissions/pay-stub/email', authenticateToken, async (req, res) 
       `<tr><td style="padding:6px 10px;border-top:1px solid #eef1f6;font-family:monospace">${esc(l.invoice_number)}</td>
            <td style="padding:6px 10px;border-top:1px solid #eef1f6">${esc(l.customer) || '—'}</td>
            <td style="padding:6px 10px;border-top:1px solid #eef1f6;text-align:right">${money(l.paid_amount)}</td></tr>`).join('');
-    const bonusRows = (bonuses || []).map(b => {
+    // Adjustments (corrections on past periods) get their own section, not mixed with bonuses.
+    const realBonuses = (bonuses || []).filter(b => b.bonus_type !== 'adjustment');
+    const adjustments = (bonuses || []).filter(b => b.bonus_type === 'adjustment');
+    const bonusRows = realBonuses.map(b => {
       const label = b.bonus_type === 'signup' ? 'Bonus d\'inscription'
         : (b.bonus_type === 'monthly' || b.bonus_type === 'monthly_performance') ? 'Bonus mensuel'
-        : b.bonus_type === 'processing' ? 'Bonus de paiement'
-        : b.bonus_type === 'adjustment' ? 'Ajustement' : esc(b.bonus_type);
+        : b.bonus_type === 'processing' ? 'Bonus de paiement' : esc(b.bonus_type);
       return `<tr><td style="padding:6px 10px;border-top:1px solid #eef1f6">${label}</td>
            <td style="padding:6px 10px;border-top:1px solid #eef1f6">${esc(b.merchant_name) || '—'}</td>
            <td style="padding:6px 10px;border-top:1px solid #eef1f6;text-align:right">${money(b.amount)}</td></tr>`;
     }).join('');
+    const adjustmentRows = adjustments.map(b =>
+      `<tr><td style="padding:6px 10px;border-top:1px solid #eef1f6">${esc(b.merchant_name) || 'Ajustement'}</td>
+           <td style="padding:6px 10px;border-top:1px solid #eef1f6;text-align:right;${(Number(b.amount) || 0) < 0 ? 'color:#d34053' : ''}">${money(b.amount)}</td></tr>`).join('');
     const statusLabel = source === 'imported' ? 'Payé / Paid' : 'En attente d\'approbation / Pending approval';
     const sectionLabel = (txt) => `<p style="margin:18px 0 6px;color:#94a3b8;font-size:11px;text-transform:uppercase;font-weight:700;letter-spacing:.4px">${txt}</p>`;
     const inner = `<h1 style="margin:0 0 4px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${esc(repName)}</h1>
@@ -13624,6 +13629,7 @@ app.post('/api/commissions/pay-stub/email', authenticateToken, async (req, res) 
             <p style="margin:0;color:#64748b;font-size:13px">${statusLabel}</p>
             ${lineRows ? sectionLabel('Commissions') + `<table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434;border-collapse:collapse">${lineRows}</table>` : ''}
             ${bonusRows ? sectionLabel('Bonus') + `<table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434;border-collapse:collapse">${bonusRows}</table>` : ''}
+            ${adjustmentRows ? sectionLabel('Ajustements / Adjustments') + `<table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434;border-collapse:collapse">${adjustmentRows}</table>` : ''}
             <table width="100%" style="margin-top:20px;border-top:2px solid #0f1722"><tr>
               <td style="padding-top:12px;font-size:14px;font-weight:700;color:#0f1722">Total</td>
               <td style="padding-top:12px;text-align:right;font-size:20px;font-weight:700;color:#f97316">${money(total)}</td></tr></table>
@@ -14436,6 +14442,7 @@ function payrollI18n(lang) {
     payStubTitle: 'PAY STUB', rep: 'REP', period: 'PERIOD', status: 'STATUS', paid: 'Paid', pending: 'Pending approval',
     commissions: 'COMMISSIONS', invoice: 'INVOICE', customer: 'CUSTOMER', amount: 'AMOUNT', subtotalCommissions: 'Commissions subtotal',
     bonus: 'BONUSES', type: 'TYPE', detail: 'DETAIL', subtotalBonus: 'Bonus subtotal',
+    adjustments: 'ADJUSTMENTS', subtotalAdjustments: 'Adjustments subtotal',
     totalPaid: 'TOTAL PAID', grossNote: 'Gross amounts, before taxes and deductions.',
     blSignup: 'Signup bonus', blMonthly: 'Monthly bonus', blProcessing: 'Processing bonus', blAdjustment: 'Adjustment',
   } : {
@@ -14443,6 +14450,7 @@ function payrollI18n(lang) {
     payStubTitle: 'BULLETIN DE PAIE', rep: 'VENDEUR', period: 'PÉRIODE', status: 'STATUT', paid: 'Payé', pending: "En attente d'approbation",
     commissions: 'COMMISSIONS', invoice: 'FACTURE', customer: 'CLIENT', amount: 'MONTANT', subtotalCommissions: 'Sous-total commissions',
     bonus: 'BONUS', type: 'TYPE', detail: 'DÉTAIL', subtotalBonus: 'Sous-total bonus',
+    adjustments: 'AJUSTEMENTS', subtotalAdjustments: 'Sous-total ajustements',
     totalPaid: 'TOTAL VERSÉ', grossNote: 'Montants bruts, avant impôts et retenues.',
     blSignup: "Bonus d'inscription", blMonthly: 'Bonus mensuel', blProcessing: 'Bonus de processing', blAdjustment: 'Ajustement',
   };
@@ -14497,21 +14505,21 @@ function buildPayrollPdf(periodLabel, reps, lang) {
         doc.moveTo(L, doc.y).lineTo(R, doc.y).strokeColor(C.dark).lineWidth(1).stroke();
         doc.y += 5;
       };
-      const row = (c0, c1, amt, i) => {
+      const row = (c0, c1, amt, i, neg) => {
         ensure(18);
         const y = doc.y;
         if (i % 2) doc.rect(L, y - 3, W, 17).fill(C.zebra);
         doc.fillColor(C.dark).font('Helvetica').fontSize(9).text(String(c0 || ''), L + 2, y, { width: 122, ellipsis: true });
         doc.fillColor(C.gray).text(String(c1 || '—'), L + 130, y, { width: AMT_X - (L + 130) - 8, ellipsis: true });
-        doc.fillColor(C.dark).font('Helvetica-Bold').text(amt, AMT_X, y, { width: 92, align: 'right' });
+        doc.fillColor(neg ? '#d34053' : C.dark).font('Helvetica-Bold').text(amt, AMT_X, y, { width: 92, align: 'right' });
         doc.y = y + 17;
       };
-      const subtotal = (label, amt) => {
+      const subtotal = (label, amt, neg) => {
         doc.moveTo(L, doc.y).lineTo(R, doc.y).strokeColor(C.dark).lineWidth(1).stroke();
         doc.y += 5;
         const y = doc.y;
         doc.fillColor(C.gray).font('Helvetica-Bold').fontSize(8).text(label.toUpperCase(), L, y, { width: AMT_X - L - 8, align: 'right', characterSpacing: 0.5 });
-        doc.fillColor(C.dark).fontSize(10).text(amt, AMT_X, y - 1, { width: 92, align: 'right' });
+        doc.fillColor(neg ? '#d34053' : C.dark).fontSize(10).text(amt, AMT_X, y - 1, { width: 92, align: 'right' });
         doc.y = y + 18;
       };
 
@@ -14523,11 +14531,21 @@ function buildPayrollPdf(periodLabel, reps, lang) {
           r.lines.forEach((l, i) => row(l.invoice_number, l.customer, money(l.paid_amount), i));
           subtotal(T.subtotalCommissions, money(r.lines.reduce((s, l) => s + (l.paid_amount || 0), 0)));
         }
-        if (r.bonuses.length) {
+        // Adjustments (corrections on past periods) print in their OWN section, after bonuses.
+        const realBonuses = r.bonuses.filter(b => b.bonus_type !== 'adjustment');
+        const adjustments = r.bonuses.filter(b => b.bonus_type === 'adjustment');
+        if (realBonuses.length) {
           doc.y += 8;
           sectionHead(T.bonus, T.type, T.detail);
-          r.bonuses.forEach((b, i) => row(bl(b.bonus_type), b.merchant_name, money(b.amount), i));
-          subtotal(T.subtotalBonus, money(r.bonuses.reduce((s, b) => s + (b.amount || 0), 0)));
+          realBonuses.forEach((b, i) => row(bl(b.bonus_type), b.merchant_name, money(b.amount), i));
+          subtotal(T.subtotalBonus, money(realBonuses.reduce((s, b) => s + (b.amount || 0), 0)));
+        }
+        if (adjustments.length) {
+          doc.y += 8;
+          sectionHead(T.adjustments, T.type, T.detail);
+          adjustments.forEach((b, i) => row(bl(b.bonus_type), b.merchant_name, money(b.amount), i, (b.amount || 0) < 0));
+          const adjSum = adjustments.reduce((s, b) => s + (b.amount || 0), 0);
+          subtotal(T.subtotalAdjustments, money(adjSum), adjSum < 0);
         }
         // TOTAL box
         ensure(60);
