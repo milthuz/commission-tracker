@@ -6512,6 +6512,19 @@ app.get('/api/billing/metrics', authenticateToken, async (req, res) => {
   }
 });
 
+// Secret diagnostic: confirms the durable cache rows exist + their age, without needing
+// direct DB access. GET /api/admin/durable-cache-status?secret=
+app.get('/api/admin/durable-cache-status', async (req, res) => {
+  if (req.query.secret !== (process.env.ZOHO_WEBHOOK_SECRET || '')) return res.status(401).json({ error: 'bad secret' });
+  try {
+    const rows = (await pool.query(
+      `SELECT key, updated_at, length(value::text) AS bytes FROM app_settings
+       WHERE key IN ('billing_metrics_durable_cache', 'billing_customers_durable_cache')`
+    )).rows;
+    res.json({ rows: rows.map(r => ({ key: r.key, updated_at: r.updated_at, age_s: Math.round((Date.now() - new Date(r.updated_at).getTime()) / 1000), bytes: r.bytes })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Secret diagnostic: raw billing metrics so the numbers can be validated against the
 // Zoho Billing dashboard before wiring the UI. GET /api/admin/billing-metrics-raw?secret=
 app.get('/api/admin/billing-metrics-raw', async (req, res) => {
