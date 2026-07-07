@@ -67,6 +67,7 @@ const PERMISSION_CATALOG = [
   { key: 'report:view_salary',         label: 'View base salary & total compensation',       category: 'Commission Report' },
   { key: 'report:annual_reconciliation', label: 'View the annual reconciliation report (paid vs calculated)', category: 'Commission Report' },
   { key: 'report:adjustments',         label: 'Manage commission adjustments & reconciliation suggestions', category: 'Commission Report' },
+  { key: 'report:quota_review',        label: 'Review quota-gated (forfeited) commissions',  category: 'Commission Report' },
 
   // Dashboard
   { key: 'dashboard:view_admin',       label: 'View the Admin dashboard (company finance + action items)', category: 'Dashboard' },
@@ -434,6 +435,20 @@ async function initializeDatabase() {
         PRIMARY KEY (rep_name, period)
       );
     `);
+    // Quota-gate forfeitures the admin has explicitly reviewed and confirmed (kept at $0,
+    // no waiver). Purely an audit trail — doesn't change any money. A rep+month NOT in this
+    // table but with a live forfeiture shows up in the quota-review queue as "needs a decision".
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS quota_review_acknowledgements (
+        id              SERIAL PRIMARY KEY,
+        rep_name        VARCHAR(255) NOT NULL,
+        period          DATE NOT NULL,
+        note            TEXT DEFAULT '',
+        acknowledged_by VARCHAR(255),
+        acknowledged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (rep_name, period)
+      );
+    `);
     // Manually-added bonuses on a rep's monthly pay stub (free-text description + amount).
     await pool.query(`
       CREATE TABLE IF NOT EXISTS manual_bonuses (
@@ -607,6 +622,11 @@ async function initializeDatabase() {
     // Admin manually refused commission on this invoice → recalc forces commission 0 / status
     // 'excluded'. Reversible (clear the flag). Per-invoice override of the model.
     await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS commission_excluded BOOLEAN DEFAULT false`);
+    // Quota-gate review trail: when recalc-v2 zeroes a commission because the rep missed that
+    // month's quota, it also stamps what the commission WOULD have been + which month, so the
+    // quota-review queue can show admins real numbers instead of a bare "$0, no reason given".
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS quota_forfeited_amount NUMERIC(12,2)`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS quota_forfeited_period DATE`);
     // One-time migration: convert OLD-style adjustments (source invoice marked paid in its
     // original month) to the new re-home model (move the unlock month to the target, keep
     // pending). Idempotent — after conversion the payout note is cleared so it won't re-match.
@@ -9917,7 +9937,7 @@ app.get('/api/admin/commission-imports/coverage/matrix', (req, res, next) => {
       if (!disabledYears.includes(d.getUTCFullYear())) months.push(d.toISOString().slice(0, 7));
     }
 
-    const [repsRes, importsRes, unpaidRes] = await Promise.all([
+    const [repsRes, importsRes, unpaidRes, quotaRes, ackRes] = await Promise.all([
       pool.query(
         `SELECT DISTINCT name FROM (
            SELECT name FROM salespeople WHERE is_active = true
@@ -9943,10 +9963,20 @@ app.get('/api/admin/commission-imports/coverage/matrix', (req, res, next) => {
          GROUP BY 1, 2`,
         [process.env.ZOHO_ORG_ID]
       ),
+      // Quota-gate forfeitures per rep×month (see quota-review queue) — surfaced on the
+      // matrix as a small badge so a missed quota is visible without opening each stub.
+      pool.query(
+        `SELECT salesperson_name AS rep, to_char(quota_forfeited_period, 'YYYY-MM') AS ym,
+                COUNT(*)::int AS cnt, SUM(quota_forfeited_amount)::float AS amt
+         FROM invoices WHERE quota_forfeited_amount > 0 GROUP BY 1, 2`
+      ),
+      pool.query(`SELECT rep_name, to_char(period, 'YYYY-MM') AS ym FROM quota_review_acknowledgements`),
     ]);
 
     const impMap = new Map(importsRes.rows.map(r => [`${r.rep_name}|${r.ym}`, r]));
     const unpMap = new Map(unpaidRes.rows.map(r => [`${r.rep}|${r.ym}`, r]));
+    const quotaMap = new Map(quotaRes.rows.map(r => [`${r.rep}|${r.ym}`, r]));
+    const ackSet = new Set(ackRes.rows.map(r => `${r.rep_name}|${r.ym}`));
 
     const rows = [];
     for (const { name } of repsRes.rows) {
@@ -9955,13 +9985,17 @@ app.get('/api/admin/commission-imports/coverage/matrix', (req, res, next) => {
       for (const ym of months) {
         const imp = impMap.get(`${name}|${ym}`);
         const unp = unpMap.get(`${name}|${ym}`);
+        const qf = quotaMap.get(`${name}|${ym}`);
         const cell = {
           importTotal: imp ? imp.total : null,
           source:      imp ? (imp.has_file && imp.has_app ? 'both' : (imp.has_app ? 'app' : 'file')) : null,
           unpaid:      unp ? unp.amt : 0,
           unpaidCount: unp ? unp.cnt : 0,
+          quotaForfeited:     qf ? qf.amt : 0,
+          quotaForfeitedCount: qf ? qf.cnt : 0,
+          quotaAcknowledged:  qf ? ackSet.has(`${name}|${ym}`) : null,
         };
-        if (imp || (unp && unp.amt > 0)) hasAny = true;
+        if (imp || (unp && unp.amt > 0) || qf) hasAny = true;
         totalPaid   += imp ? imp.total : 0;
         totalUnpaid += unp ? unp.amt : 0;
         cells[ym] = cell;
@@ -14228,6 +14262,70 @@ app.post('/api/commissions/quota-waiver', authenticateToken, async (req, res) =>
   }
 });
 
+// GET /api/commissions/quota-review?includeAcked=1 — every rep×month currently forfeiting
+// commissions to the quota gate, grouped, with the acknowledgement state. Default (no
+// includeAcked) returns only rows that still need a decision; includeAcked=1 also returns
+// the reviewed history.
+app.get('/api/commissions/quota-review', authenticateToken, async (req, res) => {
+  if (!(await requirePermAny(req, res, ['report:quota_review', 'report:mark_paid']))) return;
+  try {
+    const forfeited = (await pool.query(`
+      SELECT salesperson_name AS rep, to_char(quota_forfeited_period, 'YYYY-MM') AS ym,
+             COUNT(*)::int AS invoices, SUM(quota_forfeited_amount)::float AS forfeited
+        FROM invoices
+       WHERE quota_forfeited_amount > 0
+       GROUP BY 1, 2`)).rows;
+    const acks = (await pool.query(`
+      SELECT id, rep_name, to_char(period, 'YYYY-MM') AS ym, note, acknowledged_by, acknowledged_at
+        FROM quota_review_acknowledgements`)).rows;
+    const ackMap = new Map(acks.map(a => [`${a.rep_name}|${a.ym}`, a]));
+    let rows = forfeited.map(r => {
+      const ack = ackMap.get(`${r.rep}|${r.ym}`);
+      return {
+        rep: r.rep, year: parseInt(r.ym.slice(0, 4)), month: parseInt(r.ym.slice(5, 7)),
+        invoices: r.invoices, forfeited: Math.round(r.forfeited * 100) / 100,
+        acknowledged: !!ack,
+        ackId: ack?.id || null, ackNote: ack?.note || null,
+        ackBy: ack?.acknowledged_by || null, ackAt: ack?.acknowledged_at || null,
+      };
+    });
+    if (req.query.includeAcked !== '1') rows = rows.filter(r => !r.acknowledged);
+    rows.sort((a, b) => b.forfeited - a.forfeited);
+    res.json({ rows, count: rows.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/commissions/quota-review/acknowledge { repName, year, month, note? } — admin has
+// reviewed this rep+month's quota-gated forfeiture and confirms it stays at $0 (no waiver).
+// Pure audit trail — no money moves. Use POST /api/commissions/quota-waiver instead to pay
+// the month anyway.
+app.post('/api/commissions/quota-review/acknowledge', authenticateToken, async (req, res) => {
+  if (!(await requirePermAny(req, res, ['report:quota_review', 'report:mark_paid']))) return;
+  const { repName, year, month, note } = req.body;
+  if (!repName || !year || !month) return res.status(400).json({ error: 'repName, year, month required' });
+  const period = `${year}-${String(month).padStart(2, '0')}-01`;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  try {
+    await pool.query(
+      `INSERT INTO quota_review_acknowledgements (rep_name, period, note, acknowledged_by)
+       VALUES ($1, $2::date, $3, $4)
+       ON CONFLICT (rep_name, period) DO UPDATE SET note = EXCLUDED.note, acknowledged_by = EXCLUDED.acknowledged_by, acknowledged_at = NOW()`,
+      [repName, period, (note || '').toString().slice(0, 300), actor]
+    );
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/commissions/quota-review/acknowledge/:id — undo: the rep+month reappears in the
+// active quota-review queue.
+app.delete('/api/commissions/quota-review/acknowledge/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePermAny(req, res, ['report:quota_review', 'report:mark_paid']))) return;
+  try {
+    await pool.query(`DELETE FROM quota_review_acknowledgements WHERE id = $1`, [parseInt(req.params.id)]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /api/commissions/pay-stub/commit — Étape 3 "commit": pay a period's APP-GENERATED stub.
 // Marks the period's unlocked-but-unpaid commissions (Unlock Month in period, hardware/saas_first,
 // not already paid) as paid, AND records the stub as an 'app-generated' import so it appears in
@@ -15599,17 +15697,19 @@ async function runRecalcV2(source = 'manual') {
         for (const part of chunk(recalcUpdates, RECALC_UPDATE_CHUNK)) {
           const vals = [];
           const tuples = part.map((u, k) => {
-            const b = k * 4;
-            vals.push(u.id, u.commission, u.bucket, u.payableDate);
-            return `($${b+1}::int, $${b+2}::numeric, $${b+3}::text, $${b+4}::date)`;
+            const b = k * 6;
+            vals.push(u.id, u.commission, u.bucket, u.payableDate, u.quotaForfeitedAmount, u.quotaForfeitedPeriod);
+            return `($${b+1}::int, $${b+2}::numeric, $${b+3}::text, $${b+4}::date, $${b+5}::numeric, $${b+6}::date)`;
           });
           await pool.query(
             `UPDATE invoices AS i SET
                commission = v.commission,
                commission_status = v.bucket,
                commission_payable_date = v.payable_date,
+               quota_forfeited_amount = v.quota_forfeited_amount,
+               quota_forfeited_period = v.quota_forfeited_period,
                updated_at = CURRENT_TIMESTAMP
-             FROM (VALUES ${tuples.join(', ')}) AS v(id, commission, bucket, payable_date)
+             FROM (VALUES ${tuples.join(', ')}) AS v(id, commission, bucket, payable_date, quota_forfeited_amount, quota_forfeited_period)
              WHERE i.id = v.id`,
             vals
           );
@@ -15642,6 +15742,10 @@ async function runRecalcV2(source = 'manual') {
         // Hardware       → max(hardware paid_date, first SaaS paid_date) — if HW was paid
         //                   before the SaaS, the unlock still has to wait for SaaS to be paid.
         let payableDate = null;
+        // Set only when the quota gate below actually zeroes this invoice — lets the
+        // quota-review queue show what the commission would have been + for which month.
+        let quotaForfeitedAmount = null;
+        let quotaForfeitedPeriod = null;
 
         // Voided/deleted invoices: never eligible. Catch this BEFORE the
         // generic 'pending_payment' branch so we don't mislabel them.
@@ -15732,6 +15836,8 @@ async function runRecalcV2(source = 'manual') {
         // Carried-forward adjustments (payable_override) are NOT re-gated — already earned.
         if (commission > 0 && payableDate && payableDate >= PLAN_START_DATE
             && !inv.payable_override && !quotaGatePasses(inv.salesperson_name, payableDate)) {
+          quotaForfeitedAmount = Math.round(commission * 100) / 100;
+          quotaForfeitedPeriod = new Date(Date.UTC(payableDate.getUTCFullYear(), payableDate.getUTCMonth(), 1));
           commission = 0;
           bucket = 'quota_not_met';
           payableDate = null;
@@ -15768,7 +15874,7 @@ async function runRecalcV2(source = 'manual') {
 
         // Buffer the write (commission + commission_status + commission_payable_date);
         // flushed in chunks below so report endpoints still get the same persisted values.
-        recalcUpdates.push({ id: inv.id, commission, bucket, payableDate });
+        recalcUpdates.push({ id: inv.id, commission, bucket, payableDate, quotaForfeitedAmount, quotaForfeitedPeriod });
         recalcV2Job.processed++;
         recalcV2Job.message = `Processed ${recalcV2Job.processed} of ${recalcV2Job.total}`;
         if (recalcUpdates.length >= RECALC_UPDATE_CHUNK) await flushRecalcUpdates();
