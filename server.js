@@ -13018,6 +13018,22 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
         AND commission_status IN ('pending_saas','pending_payment')
     `, [targetRep, process.env.ZOHO_ORG_ID, startDate, endDate, commissionRate]);
 
+    // Quota-gate transparency (user request 2026-07-07): a rep should see WHY a month's
+    // commission is $0 rather than just a bare zero. Visible to the rep on their OWN report
+    // (or an admin) — same "own report" scoping as canViewSalary above, deliberately narrower
+    // than the full admin quota-review queue (no acknowledgement/audit info here, just the fact).
+    let quotaForfeitedByMonth = new Map();
+    if (isAdmin || isOwnReport) {
+      const qfRows = (await pool.query(`
+        SELECT EXTRACT(MONTH FROM quota_forfeited_period)::int AS month_num,
+               SUM(quota_forfeited_amount)::float AS forfeited
+          FROM invoices
+         WHERE salesperson_name = $1 AND quota_forfeited_amount > 0
+           AND quota_forfeited_period >= $2 AND quota_forfeited_period <= $3
+         GROUP BY 1`, [targetRep, startDate, endDate])).rows;
+      quotaForfeitedByMonth = new Map(qfRows.map(r => [r.month_num, r.forfeited]));
+    }
+
     const mMap = {};
     monthlyResult.rows.forEach(r => { mMap[parseInt(r.month_num)] = r; });
     const months = Array.from({ length: 12 }, (_, i) => {
@@ -13033,6 +13049,7 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
         commissionApprovedCount:   parseInt(m.commission_approved_count)    || 0,
         commissionQualifyingCount: parseInt(m.commission_qualifying_count)  || 0,
         approvedCommission:        parseFloat(m.approved_commission)        || 0,
+        quotaForfeited:            Math.round((quotaForfeitedByMonth.get(i + 1) || 0) * 100) / 100,
       };
     });
 
@@ -13692,10 +13709,13 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
     const bonuses = await genBonuses();
     const total   = lines.reduce((a, l) => a + l.paid_amount, 0) + bonuses.reduce((a, b) => a + b.amount, 0);
 
-    // Quota-gate context for payroll admins (plan v7.7 §2): lets the modal show
-    // "quota non atteint (X/15 pts)" + the per-month "payer quand même" override.
+    // Quota-gate context (plan v7.7 §2): lets the modal show "quota non atteint (X/15 pts)".
+    // Payroll admins (canAudit) also get the per-month "payer quand même" override button
+    // (gated separately on the frontend via the onQuotaWaive prop); a rep sees the same
+    // status for their OWN stub (user request 2026-07-07 — don't leave a bare unexplained
+    // $0), without the override control.
     let quota = null;
-    if (canAudit && periodStart >= PLAN_START_DATE) {
+    if ((canAudit || targetRep === myName) && periodStart >= PLAN_START_DATE) {
       const sp = (await pool.query(
         `SELECT monthly_quota, quota_gate_enabled, hire_date FROM salespeople WHERE name = $1`, [targetRep]
       )).rows[0];
