@@ -15458,7 +15458,7 @@ async function runRecalcV2(source = 'manual') {
     source,
     processed: 0, total: 0,
     message: `Starting (${source})...`,
-    stats: { hardware: 0, saas_first: 0, saas_annual: 0, saas_renewal: 0, too_late: 0, pending_saas: 0, pending_payment: 0, not_eligible: 0, quota_not_met: 0, excluded: 0, frozen_paid: 0, total_commission: 0 },
+    stats: { hardware: 0, saas_first: 0, saas_annual: 0, saas_renewal: 0, too_late: 0, pending_saas: 0, pending_payment: 0, not_eligible: 0, quota_not_met: 0, rep_inactive: 0, excluded: 0, frozen_paid: 0, total_commission: 0 },
   };
   try {
       // Load rep rates + quota-gate config (plan v7.7)
@@ -15472,9 +15472,8 @@ async function runRecalcV2(source = 'manual') {
         spInfo.set(r.name, {
           quota:    r.monthly_quota == null ? MONTHLY_QUOTA : parseInt(r.monthly_quota),
           hireDate: r.hire_date ? new Date(r.hire_date) : null,
-          // Inactive reps (departed, or pseudo/fallback names like "Zoho Admin") are exempt —
-          // they never had a real quota obligation to begin with (user decision 2026-07-07).
-          gated:    r.quota_gate_enabled !== false && r.is_active === true,
+          gated:    r.quota_gate_enabled !== false,
+          active:   r.is_active === true,
         });
       });
 
@@ -15860,6 +15859,18 @@ async function runRecalcV2(source = 'manual') {
         if (commission > 0 && (parseFloat(inv.total) || 0) <= 0) {
           commission = 0;
           bucket = 'not_eligible';
+          payableDate = null;
+        }
+
+        // INACTIVE REP: unconditional — a departed rep or a pseudo/fallback name (e.g. "Zoho
+        // Admin") never has commission, period (user decision 2026-07-07: this is NOT the
+        // quota gate, it wins over everything else including any adjustment carry-forward).
+        // A rep with NO salespeople row at all is left alone (permissive default, matches
+        // quotaGatePasses' existing "no row → let it through" behavior).
+        const repInfo = spInfo.get(inv.salesperson_name);
+        if (commission > 0 && repInfo && repInfo.active === false) {
+          commission = 0;
+          bucket = 'rep_inactive';
           payableDate = null;
         }
 
