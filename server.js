@@ -14295,11 +14295,15 @@ app.post('/api/commissions/quota-waiver', authenticateToken, async (req, res) =>
 app.get('/api/commissions/quota-review', authenticateToken, async (req, res) => {
   if (!(await requirePermAny(req, res, ['report:quota_review', 'report:mark_paid']))) return;
   try {
+    // Only ACTIVE reps: the quota gate itself runs for anyone with a salespeople row
+    // (including departed reps and pseudo/fallback names like "Zoho Admin" that never had
+    // a real quota to begin with) — this queue is for actionable review, not a full audit.
     const forfeited = (await pool.query(`
-      SELECT salesperson_name AS rep, to_char(quota_forfeited_period, 'YYYY-MM') AS ym,
-             COUNT(*)::int AS invoices, SUM(quota_forfeited_amount)::float AS forfeited
-        FROM invoices
-       WHERE quota_forfeited_amount > 0
+      SELECT i.salesperson_name AS rep, to_char(i.quota_forfeited_period, 'YYYY-MM') AS ym,
+             COUNT(*)::int AS invoices, SUM(i.quota_forfeited_amount)::float AS forfeited
+        FROM invoices i
+       WHERE i.quota_forfeited_amount > 0
+         AND EXISTS (SELECT 1 FROM salespeople s WHERE s.name = i.salesperson_name AND s.is_active = true)
        GROUP BY 1, 2`)).rows;
     const acks = (await pool.query(`
       SELECT id, rep_name, to_char(period, 'YYYY-MM') AS ym, note, acknowledged_by, acknowledged_at
