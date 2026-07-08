@@ -13582,7 +13582,8 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
     // Each line carries approval_status so callers can split paid vs unpaid.
     const genLines = async () => {
       const rows = (await pool.query(
-        `SELECT invoice_number, customer_name, commission::float AS commission, approval_status
+        `SELECT invoice_number, customer_name, commission::float AS commission, approval_status,
+                commission_status, quota_forfeited_amount::float AS quota_forfeited_amount
          FROM invoices
          WHERE salesperson_name = $1 AND organization_id = $2
            AND commission_payable_date >= $3 AND commission_payable_date < $4
@@ -13596,6 +13597,8 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
         paid_amount:    r.commission || 0,
         app_commission: r.commission || 0,
         approval_status: r.approval_status || 'pending',
+        quota_partial: r.commission_status === 'quota_partial',
+        quota_forfeited_amount: r.quota_forfeited_amount || 0,
       }));
     };
     // Committed bi-annual processing bonuses (platform commit = import_id NULL) whose payout
@@ -13715,7 +13718,10 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
       // i.e. invoices the pay file didn't cover. This is the user's forgot-to-pay radar.
       const appLines = await genLines();
       const missed   = appLines.filter(l => l.approval_status !== 'paid')
-        .map(l => ({ invoice_number: l.invoice_number, customer: l.customer, app_commission: l.app_commission }));
+        .map(l => ({
+          invoice_number: l.invoice_number, customer: l.customer, app_commission: l.app_commission,
+          quotaPartial: l.quota_partial, quotaForfeited: l.quota_forfeited_amount,
+        }));
       const outLines = (linesStored ? lines : appLines)
         .map(l => canAudit ? l : { ...l, app_commission: null });
       return res.json({
@@ -14320,6 +14326,10 @@ app.post('/api/commissions/quota-waiver', authenticateToken, async (req, res) =>
         `INSERT INTO quota_waiver_log (rep_name, period, percent, action, created_by) VALUES ($1, $2::date, $3, 'set', $4)`,
         [repName, period, percent, actor]
       );
+      // A prior "confirmed forfeit" acknowledgment meant "reviewed, stays at $0" — setting a
+      // waiver now overrides that decision, so the old ack is stale and would otherwise hide
+      // this rep+month from the default queue even though real money is still involved.
+      await pool.query(`DELETE FROM quota_review_acknowledgements WHERE rep_name = $1 AND period = $2::date`, [repName, period]);
     }
     res.json({ success: true, waived: waived !== false, percent, recalc: 'started' });
     runRecalcV2('quota-waiver').catch(e => console.error('waiver recalc error:', e.message));
