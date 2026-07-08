@@ -13684,7 +13684,14 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
       const procExtra = await committedProcessing();
       bonuses.push(...procExtra);
       const procExtraTotal = procExtra.reduce((a, b) => a + b.amount, 0);
-      const linesStored = lines.length > 0;
+      const isAppGenerated = String(imp.filename || '').startsWith('app-generated');
+      // linesStored=false is only meaningful for a REAL historical pay file that predates
+      // per-invoice storage (2026-06-09) — its lines table is empty even though it truly had
+      // invoices, so we reconstruct from the app model as a best-effort fallback. An
+      // app-generated commit's lines table is always authoritative: zero rows genuinely means
+      // zero qualifying commission invoices that period (e.g. only a signup bonus that month),
+      // NOT missing data — never show the "reconstructed" banner or substitute appLines for it.
+      const linesStored = isAppGenerated ? true : lines.length > 0;
       // "Missed" = earned (unlocked) in this period per the app's model but still NOT paid —
       // i.e. invoices the pay file didn't cover. This is the user's forgot-to-pay radar.
       const appLines = await genLines();
@@ -13699,7 +13706,7 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
         period:      `${year}-${mm}`,
         importId:    imp.id,
         filename:    imp.filename,
-        appGenerated: String(imp.filename || '').startsWith('app-generated'),  // undoable via uncommit
+        appGenerated: isAppGenerated,  // undoable via uncommit
         lines:       outLines,
         bonuses,
         total:       (parseFloat(imp.total_amount) || 0) + procExtraTotal,
