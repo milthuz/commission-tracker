@@ -15537,6 +15537,11 @@ async function runRecalcV2(source = 'manual') {
           .rows.map(r => [`${r.rep_name}|${r.ym}`, r.percent])
       );
       const RAMP_MS = 90 * 86400000;
+      // A month still in progress hasn't earned its final "points so far" verdict yet — a rep
+      // 8 days into July isn't "quota not met", they just aren't done. Gate only fully-elapsed
+      // months (user decision 2026-07-08); the current/future month always passes through.
+      const now = new Date();
+      const currentYm = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
       // Returns the fraction (0..1) of the normally-computed commission this rep actually
       // gets for a payDate's month: 1 = quota met / gate doesn't apply, 0 = fully forfeited,
       // anything between = an admin's partial "payer quand même" override.
@@ -15545,6 +15550,7 @@ async function runRecalcV2(source = 'manual') {
         if (!sp || !sp.gated) return 1;
         if (sp.hireDate && (payDate.getTime() - sp.hireDate.getTime()) < RAMP_MS) return 1; // ramp
         const ym = `${payDate.getUTCFullYear()}-${String(payDate.getUTCMonth() + 1).padStart(2, '0')}`;
+        if (ym >= currentYm) return 1; // month not over yet — nothing final to gate on
         if (waiverPercent.has(`${rep}|${ym}`)) {
           return Math.max(0, Math.min(100, waiverPercent.get(`${rep}|${ym}`))) / 100;
         }
