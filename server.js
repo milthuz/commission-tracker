@@ -435,6 +435,11 @@ async function initializeDatabase() {
         PRIMARY KEY (rep_name, period)
       );
     `);
+    // How much of the normally-computed commission to release for a waived rep+month — 100 =
+    // full "pay anyway" (pre-existing behavior, and the default for any waiver row created
+    // before this column existed), 0 = same as no waiver, anything between = partial payout
+    // (user decision 2026-07-07: "pay anyway" doesn't have to mean all-or-nothing).
+    await pool.query(`ALTER TABLE quota_month_waivers ADD COLUMN IF NOT EXISTS percent NUMERIC(5,2) NOT NULL DEFAULT 100`);
     // Quota-gate forfeitures the admin has explicitly reviewed and confirmed (kept at $0,
     // no waiver). Purely an audit trail — doesn't change any money. A rep+month NOT in this
     // table but with a live forfeiture shows up in the quota-review queue as "needs a decision".
@@ -8109,7 +8114,7 @@ app.get('/api/admin/db-stats', async (req, res) => {
               commission_payable_date::date AS payable_date
        FROM invoices
        WHERE approval_status IN ('paid','approved')
-         AND (commission_status IS NULL OR commission_status NOT IN ('hardware','saas_first','saas_annual'))
+         AND (commission_status IS NULL OR commission_status NOT IN ('hardware','saas_first','saas_annual','quota_partial'))
        ORDER BY salesperson_name, date
        LIMIT 200`
     )).rows;
@@ -9962,7 +9967,7 @@ app.get('/api/admin/commission-imports/coverage/matrix', (req, res, next) => {
                 COUNT(*)::int AS cnt, COALESCE(SUM(commission), 0)::float AS amt
          FROM invoices
          WHERE organization_id = $1 AND commission > 0
-           AND commission_status IN ('hardware','saas_first','saas_annual')
+           AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
            AND approval_status <> 'paid'
            AND commission_payable_date >= '2025-01-01'::date
          GROUP BY 1, 2`,
@@ -13074,7 +13079,7 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
       FROM invoices
       WHERE salesperson_name = $1 AND organization_id = $2
         AND ${dateCol} >= $3 AND ${dateCol} ${custEndOp} $4
-        AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual')
+        AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
       GROUP BY customer_name ORDER BY commission DESC LIMIT 50
     `, [targetRep, process.env.ZOHO_ORG_ID, custStart, custEnd]);
 
@@ -13262,7 +13267,7 @@ app.post('/api/commissions/approve', authenticateToken, async (req, res) => {
              approved_at    = CURRENT_TIMESTAMP,
              updated_at     = CURRENT_TIMESTAMP
          WHERE invoice_number = ANY($1)
-           AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual')
+           AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
            AND approval_status = 'pending'
          RETURNING invoice_number`,
         [invoiceNumbers, approverEmail]
@@ -13281,7 +13286,7 @@ app.post('/api/commissions/approve', authenticateToken, async (req, res) => {
              updated_at     = CURRENT_TIMESTAMP
          WHERE salesperson_name = $1 AND organization_id = $2
            AND commission_payable_date >= $3 AND commission_payable_date < $4
-           AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual')
+           AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
            AND approval_status = 'pending'
          RETURNING invoice_number`,
         [repName, process.env.ZOHO_ORG_ID, startDate, endDate, approverEmail]
@@ -13408,7 +13413,7 @@ async function snapshotAppGeneratedStub(repName, year, month, actor) {
     `SELECT invoice_number, customer_name, commission::float AS commission FROM invoices
      WHERE salesperson_name = $1 AND organization_id = $2 AND commission_payable_date >= $3
        AND commission_payable_date < $4 AND commission > 0
-       AND commission_status IN ('hardware','saas_first','saas_annual') AND approval_status = 'paid'
+       AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial') AND approval_status = 'paid'
      ORDER BY commission DESC`,
     [repName, orgId, periodStart, periodEnd])).rows;
   const bonusRows = (await pool.query(
@@ -13567,7 +13572,7 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
          FROM invoices
          WHERE salesperson_name = $1 AND organization_id = $2
            AND commission_payable_date >= $3 AND commission_payable_date < $4
-           AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual')
+           AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
          ORDER BY commission DESC`,
         [targetRep, process.env.ZOHO_ORG_ID, periodStart, periodEnd]
       )).rows;
@@ -13940,9 +13945,11 @@ app.post('/api/commissions/missing-report', authenticateToken, (req, res) => han
 app.post('/api/commissions/missing-points-report', authenticateToken, (req, res) => handleUserReport('missing_points', req, res));
 
 // POST /api/commissions/quota-waiver — admin decision: pay a rep's month DESPITE the
-// missed quota (plan v7.7 exception). Body: { repName, year, month, waived }. Setting or
-// removing a waiver kicks a recalc so the month's forfeited commissions come back (or
-// get re-gated) — allow ~2 minutes before reopening the stub.
+// missed quota (plan v7.7 exception). Body: { repName, year, month, waived, percent }.
+// percent (0-100, default 100) is how much of the normally-computed commission to release —
+// 100 = full "pay anyway", anything less = partial payout, remainder stays forfeited (user
+// decision 2026-07-07). Setting or removing a waiver kicks a recalc so the month's forfeited
+// commissions come back (or get re-gated) — allow ~2 minutes before reopening the stub.
 // ── Manual bonuses ──────────────────────────────────────────────────────────
 // Add/list/delete a free-text bonus on a rep's monthly pay stub (admin-curated).
 // GET ?year=&month= → all manual bonuses for that period (optionally ?repName=).
@@ -14009,7 +14016,7 @@ app.get('/api/commissions/unpaid-commissions', authenticateToken, async (req, re
               commission_status, commission_payable_date::date AS payable_date
        FROM invoices
        WHERE salesperson_name = $1 AND organization_id = $2
-         AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual')
+         AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
          AND approval_status <> 'paid'
        ORDER BY commission_payable_date, invoice_number`,
       [rep, process.env.ZOHO_ORG_ID]
@@ -14230,7 +14237,7 @@ app.get('/api/commissions/adjustments/suggestions', authenticateToken, async (re
              commission_payable_date::date AS source_period
         FROM invoices i
        WHERE organization_id = $1 AND commission > 0
-         AND commission_status IN ('hardware','saas_first','saas_annual')
+         AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
          AND approval_status <> 'paid' AND status NOT IN ('void','deleted')
          AND commission_payable_date >= '2026-05-01'
          AND commission_payable_date < date_trunc('month', CURRENT_DATE) - interval '1 month'
@@ -14278,17 +14285,21 @@ app.post('/api/commissions/quota-waiver', authenticateToken, async (req, res) =>
   if (!repName || !year || !month) return res.status(400).json({ error: 'repName, year, month required' });
   const period = `${year}-${String(month).padStart(2, '0')}-01`;
   const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  let percent = req.body.percent === undefined || req.body.percent === null ? 100 : parseFloat(req.body.percent);
+  if (isNaN(percent)) percent = 100;
+  percent = Math.max(0, Math.min(100, percent));
   try {
     if (waived === false) {
       await pool.query(`DELETE FROM quota_month_waivers WHERE rep_name = $1 AND period = $2::date`, [repName, period]);
     } else {
       await pool.query(
-        `INSERT INTO quota_month_waivers (rep_name, period, created_by)
-         VALUES ($1, $2::date, $3) ON CONFLICT (rep_name, period) DO NOTHING`,
-        [repName, period, actor]
+        `INSERT INTO quota_month_waivers (rep_name, period, created_by, percent)
+         VALUES ($1, $2::date, $3, $4)
+         ON CONFLICT (rep_name, period) DO UPDATE SET percent = EXCLUDED.percent, created_by = EXCLUDED.created_by, created_at = NOW()`,
+        [repName, period, actor, percent]
       );
     }
-    res.json({ success: true, waived: waived !== false, recalc: 'started' });
+    res.json({ success: true, waived: waived !== false, percent, recalc: 'started' });
     runRecalcV2('quota-waiver').catch(e => console.error('waiver recalc error:', e.message));
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -14316,14 +14327,20 @@ app.get('/api/commissions/quota-review', authenticateToken, async (req, res) => 
       SELECT id, rep_name, to_char(period, 'YYYY-MM') AS ym, note, acknowledged_by, acknowledged_at
         FROM quota_review_acknowledgements`)).rows;
     const ackMap = new Map(acks.map(a => [`${a.rep_name}|${a.ym}`, a]));
+    const waivers = (await pool.query(`
+      SELECT rep_name, to_char(period, 'YYYY-MM') AS ym, percent::float AS percent
+        FROM quota_month_waivers`)).rows;
+    const waiverMap = new Map(waivers.map(w => [`${w.rep_name}|${w.ym}`, w.percent]));
     let rows = forfeited.map(r => {
       const ack = ackMap.get(`${r.rep}|${r.ym}`);
+      const waivedPercent = waiverMap.has(`${r.rep}|${r.ym}`) ? waiverMap.get(`${r.rep}|${r.ym}`) : null;
       return {
         rep: r.rep, year: parseInt(r.ym.slice(0, 4)), month: parseInt(r.ym.slice(5, 7)),
         invoices: r.invoices, forfeited: Math.round(r.forfeited * 100) / 100,
         acknowledged: !!ack,
         ackId: ack?.id || null, ackNote: ack?.note || null,
         ackBy: ack?.acknowledged_by || null, ackAt: ack?.acknowledged_at || null,
+        waived: waivedPercent !== null, waivedPercent,
       };
     });
     if (req.query.includeAcked !== '1') rows = rows.filter(r => !r.acknowledged);
@@ -14398,7 +14415,7 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
        FROM invoices
        WHERE salesperson_name = $1 AND organization_id = $2
          AND commission_payable_date >= $3 AND commission_payable_date < $4
-         AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual')
+         AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
          AND approval_status <> 'paid'
        ORDER BY commission DESC`,
       [repName, process.env.ZOHO_ORG_ID, periodStart, periodEnd]
@@ -14632,7 +14649,7 @@ async function payrollDataForMonth(year, month) {
         `SELECT invoice_number, customer_name AS customer, commission::float AS paid_amount FROM invoices
          WHERE salesperson_name = $1 AND organization_id = $2
            AND commission_payable_date >= $3 AND commission_payable_date < $4
-           AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual')
+           AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
            AND approval_status <> 'paid' ORDER BY commission DESC`,
         [rep, orgId, periodStart, periodEnd])).rows;
       const signups = (await pool.query(
@@ -14834,7 +14851,7 @@ app.get('/api/commissions/annual-reconciliation', authenticateToken, async (req,
              SUM(commission)::float AS total
         FROM invoices
        WHERE organization_id = $3 AND commission > 0
-         AND commission_status IN ('hardware','saas_first','saas_annual')
+         AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
          AND commission_payable_date >= $1::date AND commission_payable_date < $2::date
        GROUP BY 1, 2`, [yearStart, yearEnd, orgId])).rows;
     const signupRows = (await pool.query(`
@@ -15465,7 +15482,7 @@ async function runRecalcV2(source = 'manual') {
     source,
     processed: 0, total: 0,
     message: `Starting (${source})...`,
-    stats: { hardware: 0, saas_first: 0, saas_annual: 0, saas_renewal: 0, too_late: 0, pending_saas: 0, pending_payment: 0, not_eligible: 0, quota_not_met: 0, rep_inactive: 0, excluded: 0, frozen_paid: 0, total_commission: 0 },
+    stats: { hardware: 0, saas_first: 0, saas_annual: 0, saas_renewal: 0, too_late: 0, pending_saas: 0, pending_payment: 0, not_eligible: 0, quota_not_met: 0, quota_partial: 0, rep_inactive: 0, excluded: 0, frozen_paid: 0, total_commission: 0 },
   };
   try {
       // Load rep rates + quota-gate config (plan v7.7)
@@ -15489,19 +15506,26 @@ async function runRecalcV2(source = 'manual') {
       // bonuses are never gated. 90-day ramp from hire_date waives the gate (§7);
       // quota_gate_enabled=false exempts the rep entirely.
       const pointsByRepMonth = await getMonthlyPointsByRep(PLAN_START_DATE);
-      // Per-month admin waivers ("payer quand même") override the gate for that rep+month.
-      const waivers = new Set(
-        (await pool.query(`SELECT rep_name, to_char(period, 'YYYY-MM') AS ym FROM quota_month_waivers`))
-          .rows.map(r => `${r.rep_name}|${r.ym}`)
+      // Per-month admin overrides ("payer quand même") — a PERCENT of the normally-computed
+      // commission to release for that rep+month (100 = full pay-anyway, 0 = same as no
+      // override; user decision 2026-07-07: not all-or-nothing).
+      const waiverPercent = new Map(
+        (await pool.query(`SELECT rep_name, to_char(period, 'YYYY-MM') AS ym, percent::float AS percent FROM quota_month_waivers`))
+          .rows.map(r => [`${r.rep_name}|${r.ym}`, r.percent])
       );
       const RAMP_MS = 90 * 86400000;
-      const quotaGatePasses = (rep, payDate) => {
+      // Returns the fraction (0..1) of the normally-computed commission this rep actually
+      // gets for a payDate's month: 1 = quota met / gate doesn't apply, 0 = fully forfeited,
+      // anything between = an admin's partial "payer quand même" override.
+      const quotaPayoutFactor = (rep, payDate) => {
         const sp = spInfo.get(rep);
-        if (!sp || !sp.gated) return true;
-        if (sp.hireDate && (payDate.getTime() - sp.hireDate.getTime()) < RAMP_MS) return true; // ramp
+        if (!sp || !sp.gated) return 1;
+        if (sp.hireDate && (payDate.getTime() - sp.hireDate.getTime()) < RAMP_MS) return 1; // ramp
         const ym = `${payDate.getUTCFullYear()}-${String(payDate.getUTCMonth() + 1).padStart(2, '0')}`;
-        if (waivers.has(`${rep}|${ym}`)) return true; // admin month waiver
-        return (pointsByRepMonth.get(`${rep}|${ym}`) || 0) >= sp.quota;
+        if (waiverPercent.has(`${rep}|${ym}`)) {
+          return Math.max(0, Math.min(100, waiverPercent.get(`${rep}|${ym}`))) / 100;
+        }
+        return (pointsByRepMonth.get(`${rep}|${ym}`) || 0) >= sp.quota ? 1 : 0;
       };
 
       // Load all invoices (paid + not paid) with enriched data
@@ -15873,7 +15897,7 @@ async function runRecalcV2(source = 'manual') {
         // Admin") never has commission, period (user decision 2026-07-07: this is NOT the
         // quota gate, it wins over everything else including any adjustment carry-forward).
         // A rep with NO salespeople row at all is left alone (permissive default, matches
-        // quotaGatePasses' existing "no row → let it through" behavior).
+        // quotaPayoutFactor's existing "no row → let it through" behavior).
         const repInfo = spInfo.get(inv.salesperson_name);
         if (commission > 0 && repInfo && repInfo.active === false) {
           commission = 0;
@@ -15882,15 +15906,27 @@ async function runRecalcV2(source = 'manual') {
         }
 
         // QUOTA GATE: from the platform era (PLAN_START_DATE), commissions whose unlock
-        // month missed the rep's quota are forfeited (plan v7.7 §2 — base salary only).
-        // Carried-forward adjustments (payable_override) are NOT re-gated — already earned.
-        if (commission > 0 && payableDate && payableDate >= PLAN_START_DATE
-            && !inv.payable_override && !quotaGatePasses(inv.salesperson_name, payableDate)) {
-          quotaForfeitedAmount = Math.round(commission * 100) / 100;
-          quotaForfeitedPeriod = new Date(Date.UTC(payableDate.getUTCFullYear(), payableDate.getUTCMonth(), 1));
-          commission = 0;
-          bucket = 'quota_not_met';
-          payableDate = null;
+        // month missed the rep's quota are forfeited (plan v7.7 §2 — base salary only),
+        // UNLESS an admin set a partial "payer quand même" override for that rep+month
+        // (quotaPayoutFactor: 1 = quota met/no gate, 0 = fully forfeited, between = partial
+        // payout — user decision 2026-07-07). Carried-forward adjustments (payable_override)
+        // are NOT re-gated — already earned.
+        if (commission > 0 && payableDate && payableDate >= PLAN_START_DATE && !inv.payable_override) {
+          const quotaFactor = quotaPayoutFactor(inv.salesperson_name, payableDate);
+          if (quotaFactor < 1) {
+            const fullCommission = commission;
+            quotaForfeitedAmount = Math.round(fullCommission * (1 - quotaFactor) * 100) / 100;
+            quotaForfeitedPeriod = new Date(Date.UTC(payableDate.getUTCFullYear(), payableDate.getUTCMonth(), 1));
+            commission = Math.round(fullCommission * quotaFactor * 100) / 100;
+            if (quotaFactor === 0) {
+              bucket = 'quota_not_met';
+              payableDate = null;
+            } else {
+              // Partial payout: the released portion is payable now, same as a normal
+              // earned commission — only the withheld remainder is tracked as forfeited.
+              bucket = 'quota_partial';
+            }
+          }
         }
 
         // ADJUSTMENT CARRY-FORWARD: force the unlock month to the override (so the invoice lands
