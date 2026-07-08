@@ -666,6 +666,22 @@ async function initializeDatabase() {
     // discount into sub_total (discount_total=0, sub_total < line sum) and sometimes reports it
     // separately — dividing the real net pre-tax by our gross line sum handles both.
     await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS gross_line_total NUMERIC(12,2)`);
+    // One-time correction: gross_line_total used to be summed from each line's net `amount`,
+    // which is already net of item-level (per-line) discounts — silently hiding them from the
+    // ≥25%-discount hardware-rate-halving rule (only invoice-level discounts were ever caught).
+    // Recompute as TRUE pre-discount rate × qty from already-stored line_items — no Zoho calls
+    // needed. Idempotent (IS DISTINCT FROM), cheap, safe to run on every boot (user decision
+    // 2026-07-08).
+    await pool.query(`
+      UPDATE invoices SET gross_line_total = sub.s
+      FROM (
+        SELECT id, ROUND(SUM((li->>'rate')::numeric * COALESCE((li->>'quantity')::numeric, 1)), 2) AS s
+        FROM invoices, jsonb_array_elements(line_items) li
+        WHERE line_items IS NOT NULL AND jsonb_typeof(line_items) = 'array'
+        GROUP BY id
+      ) sub
+      WHERE invoices.id = sub.id AND invoices.gross_line_total IS DISTINCT FROM sub.s
+    `);
     // Manual override of a deal's lead source group. Sync only writes lead_source_group, so this
     // override survives re-syncs. Effective source = COALESCE(override, lead_source_group).
     await pool.query(`ALTER TABLE crm_sold_deals ADD COLUMN IF NOT EXISTS lead_source_group_override VARCHAR(255)`);
@@ -7966,10 +7982,11 @@ app.post('/api/admin/backfill-subtotals', async (req, res) => {
       const orgId = process.env.ZOHO_ORG_ID;
 
       // Pre-step (no Zoho): populate gross_line_total from already-stored line_items. Instant.
+      // rate × qty = TRUE pre-discount total; 'amount' is already net of item-level discounts.
       await pool.query(
         `UPDATE invoices SET gross_line_total = sub.s
          FROM (
-           SELECT id, ROUND(SUM((li->>'amount')::numeric), 2) AS s
+           SELECT id, ROUND(SUM((li->>'rate')::numeric * COALESCE((li->>'quantity')::numeric, 1)), 2) AS s
            FROM invoices, jsonb_array_elements(line_items) li
            WHERE line_items IS NOT NULL AND jsonb_typeof(line_items) = 'array'
            GROUP BY id
@@ -12188,7 +12205,10 @@ async function runEnrichInvoices({ onlyMissing = true, source = 'manual', extraW
         // hardware_amount = hardware lines ONLY (noncommission lines excluded from both → pay $0)
         const saasAmount = classified.filter(l => l.type === 'saas').reduce((s, l) => s + l.amount, 0);
         const hardwareAmount = classified.filter(l => l.type === 'hardware').reduce((s, l) => s + l.amount, 0);
-        const grossLineTotal = classified.reduce((s, l) => s + (parseFloat(l.amount) || 0), 0); // incl. noncommission
+        // TRUE pre-discount total (rate × qty, before any per-line Rabais) — using l.amount here
+        // would already be net of item-level discounts, silently hiding them from the ≥25%
+        // discount-halves-the-hardware-rate rule (user decision 2026-07-08).
+        const grossLineTotal = classified.reduce((s, l) => s + (parseFloat(l.rate) || 0) * (parseInt(l.quantity) || 1), 0); // incl. noncommission
         const totalAmount = saasAmount + hardwareAmount;
         const paidDate = det.last_payment_date || (det.status === 'paid' ? det.date : null);
 
@@ -12405,7 +12425,8 @@ app.post('/api/admin/reenrich-invoices', async (req, res) => {
       });
       const saasAmount = classified.filter(l => l.type === 'saas').reduce((s, l) => s + l.amount, 0);
       const hardwareAmount = classified.filter(l => l.type === 'hardware').reduce((s, l) => s + l.amount, 0);
-      const grossLineTotal = classified.reduce((s, l) => s + (parseFloat(l.amount) || 0), 0);
+      // TRUE pre-discount total (rate × qty) — see runEnrichInvoices for why this can't use amount.
+      const grossLineTotal = classified.reduce((s, l) => s + (parseFloat(l.rate) || 0) * (parseInt(l.quantity) || 1), 0);
       const subTotal  = parseFloat(det.sub_total) || 0;
       const discTotal = det.discount_type === 'item_level' ? 0 : (parseFloat(det.discount_total) || 0);
       await pool.query(
