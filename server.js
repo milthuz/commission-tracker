@@ -1038,6 +1038,12 @@ async function initializeDatabase() {
     // Lines paid per the file but whose invoice is NOT in our DB (pre-2025, out of sync scope).
     // Stored anyway so the pay stub reflects the FULL real payout; flagged for display.
     await pool.query(`ALTER TABLE commission_payment_lines ADD COLUMN IF NOT EXISTS not_in_db BOOLEAN DEFAULT false`);
+    // Was this line a quota-gate PARTIAL release (only part of the commission paid, the rest
+    // forfeited)? Stored at commit time so the rep still sees this on the frozen pay stub —
+    // otherwise a halved amount reads as a normal payment with no explanation (user feedback
+    // 2026-07-08: "should it be more clear for the rep that we only paid 50%?").
+    await pool.query(`ALTER TABLE commission_payment_lines ADD COLUMN IF NOT EXISTS quota_partial BOOLEAN DEFAULT false`);
+    await pool.query(`ALTER TABLE commission_payment_lines ADD COLUMN IF NOT EXISTS quota_forfeited NUMERIC(12,2) DEFAULT 0`);
 
     // Webhook activity log — every call to our webhook endpoints lands a row here
     // so we can audit/debug who fired what without needing Heroku log access.
@@ -13424,7 +13430,9 @@ async function snapshotAppGeneratedStub(repName, year, month, actor) {
     [repName, periodStart, periodEnd])).rows[0];
   if (real) return null; // a real pay file is the source of truth — don't overwrite
   const invRows = (await pool.query(
-    `SELECT invoice_number, customer_name, commission::float AS commission FROM invoices
+    `SELECT invoice_number, customer_name, commission::float AS commission,
+            commission_status, quota_forfeited_amount::float AS quota_forfeited_amount
+       FROM invoices
      WHERE salesperson_name = $1 AND organization_id = $2 AND commission_payable_date >= $3
        AND commission_payable_date < $4 AND commission > 0
        AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial') AND approval_status = 'paid'
@@ -13471,8 +13479,11 @@ async function snapshotAppGeneratedStub(repName, year, month, actor) {
       [filename, repName, periodDate, actor, invRows.length, bonusRows.length, bonusTotal, perfBonus + manualTotal + adjTotal, total,
        JSON.stringify({ source: 'app-generated', via: 'mark-paid', period: `${year}-${mm}`, performance_points: perfPts })])).rows[0];
     for (const r of invRows) {
-      await client.query(`INSERT INTO commission_payment_lines (import_id, invoice_number, customer, paid_amount, app_commission) VALUES ($1,$2,$3,$4,$4)`,
-        [imp.id, r.invoice_number, r.customer_name || null, r.commission || 0]);
+      await client.query(
+        `INSERT INTO commission_payment_lines (import_id, invoice_number, customer, paid_amount, app_commission, quota_partial, quota_forfeited)
+         VALUES ($1,$2,$3,$4,$4,$5,$6)`,
+        [imp.id, r.invoice_number, r.customer_name || null, r.commission || 0,
+         r.commission_status === 'quota_partial', r.quota_forfeited_amount || 0]);
     }
     for (const b of bonusRows) {
       await client.query(`INSERT INTO commission_bonuses (import_id, rep_name, bonus_type, merchant_name, matched_zentact_id, amount, paid_for_period, report_date) VALUES ($1,$2,'signup',$3,$4,$5,$6::date,$7::date)`,
@@ -13598,7 +13609,7 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
         app_commission: r.commission || 0,
         approval_status: r.approval_status || 'pending',
         quota_partial: r.commission_status === 'quota_partial',
-        quota_forfeited_amount: r.quota_forfeited_amount || 0,
+        quota_forfeited: r.quota_forfeited_amount || 0,
       }));
     };
     // Committed bi-annual processing bonuses (platform commit = import_id NULL) whose payout
@@ -13692,7 +13703,8 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
 
     if (imp) {
       const lines = (await pool.query(
-        `SELECT invoice_number, customer, paid_amount::float AS paid_amount, app_commission::float AS app_commission, not_in_db
+        `SELECT invoice_number, customer, paid_amount::float AS paid_amount, app_commission::float AS app_commission,
+                not_in_db, quota_partial, quota_forfeited::float AS quota_forfeited
          FROM commission_payment_lines WHERE import_id = $1 ORDER BY not_in_db ASC, paid_amount DESC`,
         [imp.id]
       )).rows;
@@ -13720,7 +13732,7 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
       const missed   = appLines.filter(l => l.approval_status !== 'paid')
         .map(l => ({
           invoice_number: l.invoice_number, customer: l.customer, app_commission: l.app_commission,
-          quotaPartial: l.quota_partial, quotaForfeited: l.quota_forfeited_amount,
+          quotaPartial: l.quota_partial, quotaForfeited: l.quota_forfeited,
         }));
       const outLines = (linesStored ? lines : appLines)
         .map(l => canAudit ? l : { ...l, app_commission: null });
@@ -14487,7 +14499,8 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
     await client.query('BEGIN');
 
     const invRows = (await client.query(
-      `SELECT invoice_number, customer_name, commission::float AS commission
+      `SELECT invoice_number, customer_name, commission::float AS commission,
+              commission_status, quota_forfeited_amount::float AS quota_forfeited_amount
        FROM invoices
        WHERE salesperson_name = $1 AND organization_id = $2
          AND commission_payable_date >= $3 AND commission_payable_date < $4
@@ -14560,9 +14573,10 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
         [r.invoice_number, actor, periodDate, `paystub:${filename}`]
       );
       await client.query(
-        `INSERT INTO commission_payment_lines (import_id, invoice_number, customer, paid_amount, app_commission)
-         VALUES ($1, $2, $3, $4, $4)`,
-        [imp.id, r.invoice_number, r.customer_name || null, r.commission || 0]
+        `INSERT INTO commission_payment_lines (import_id, invoice_number, customer, paid_amount, app_commission, quota_partial, quota_forfeited)
+         VALUES ($1, $2, $3, $4, $4, $5, $6)`,
+        [imp.id, r.invoice_number, r.customer_name || null, r.commission || 0,
+         r.commission_status === 'quota_partial', r.quota_forfeited_amount || 0]
       );
     }
     for (const b of bonusRows) {
