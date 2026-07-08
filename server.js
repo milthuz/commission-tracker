@@ -14349,6 +14349,29 @@ app.get('/api/commissions/quota-review', authenticateToken, async (req, res) => 
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/commissions/quota-review/invoices?repName=&year=&month= — the actual invoices
+// behind one rep×month's quota-gate forfeiture (what the "N invoices" count in the review
+// queue is made of). Distinct from the pay-stub view, which shows what was actually PAID
+// (correctly $0/partial for a gated month) — this shows the underlying invoices instead.
+app.get('/api/commissions/quota-review/invoices', authenticateToken, async (req, res) => {
+  if (!(await requirePermAny(req, res, ['report:quota_review', 'report:mark_paid']))) return;
+  const { repName, year, month } = req.query;
+  if (!repName || !year || !month) return res.status(400).json({ error: 'repName, year, month required' });
+  const period = `${year}-${String(month).padStart(2, '0')}-01`;
+  try {
+    const rows = (await pool.query(
+      `SELECT invoice_number, customer_name AS customer, total::float AS total,
+              commission::float AS commission, quota_forfeited_amount::float AS forfeited,
+              commission_status
+         FROM invoices
+        WHERE salesperson_name = $1 AND quota_forfeited_period = $2::date AND quota_forfeited_amount > 0
+        ORDER BY quota_forfeited_amount DESC, invoice_number`,
+      [repName, period]
+    )).rows;
+    res.json({ invoices: rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /api/commissions/quota-review/acknowledge { repName, year, month, note? } — admin has
 // reviewed this rep+month's quota-gated forfeiture and confirms it stays at $0 (no waiver).
 // Pure audit trail — no money moves. Use POST /api/commissions/quota-waiver instead to pay
