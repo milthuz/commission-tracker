@@ -16001,18 +16001,22 @@ async function runRecalcV2(source = 'manual') {
           payableDate = null;
         }
 
-        // QUOTA GATE: from the platform era (PLAN_START_DATE), commissions whose unlock
-        // month missed the rep's quota are forfeited (plan v7.7 §2 — base salary only),
-        // UNLESS an admin set a partial "payer quand même" override for that rep+month
-        // (quotaPayoutFactor: 1 = quota met/no gate, 0 = fully forfeited, between = partial
-        // payout — user decision 2026-07-07). Carried-forward adjustments (payable_override)
-        // are NOT re-gated — already earned.
-        if (commission > 0 && payableDate && payableDate >= PLAN_START_DATE && !inv.payable_override) {
-          const quotaFactor = quotaPayoutFactor(inv.salesperson_name, payableDate);
+        // QUOTA GATE: gated by the SALE's own date, not by whichever month the commission
+        // happens to unlock (plan v7.7 §2 — base salary only). A June sale paid in August must
+        // still be judged against June's quota — not August's, which the rep may have hit or
+        // missed for entirely unrelated reasons — and a pre-May-1 sale must NEVER be gated even
+        // if it unlocks after May 1st, since quota didn't exist yet when it was sold (user
+        // decision 2026-07-08). UNLESS an admin set a partial "payer quand même" override for
+        // that rep+month (quotaPayoutFactor: 1 = quota met/no gate, 0 = fully forfeited, between
+        // = partial payout — user decision 2026-07-07). Carried-forward adjustments
+        // (payable_override) are NOT re-gated — already earned.
+        const saleDate = toDate(inv.date);
+        if (commission > 0 && payableDate && saleDate && saleDate >= PLAN_START_DATE && !inv.payable_override) {
+          const quotaFactor = quotaPayoutFactor(inv.salesperson_name, saleDate);
           if (quotaFactor < 1) {
             const fullCommission = commission;
             quotaForfeitedAmount = Math.round(fullCommission * (1 - quotaFactor) * 100) / 100;
-            quotaForfeitedPeriod = new Date(Date.UTC(payableDate.getUTCFullYear(), payableDate.getUTCMonth(), 1));
+            quotaForfeitedPeriod = new Date(Date.UTC(saleDate.getUTCFullYear(), saleDate.getUTCMonth(), 1));
             commission = Math.round(fullCommission * quotaFactor * 100) / 100;
             if (quotaFactor === 0) {
               bucket = 'quota_not_met';
