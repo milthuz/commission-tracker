@@ -440,6 +440,20 @@ async function initializeDatabase() {
     // before this column existed), 0 = same as no waiver, anything between = partial payout
     // (user decision 2026-07-07: "pay anyway" doesn't have to mean all-or-nothing).
     await pool.query(`ALTER TABLE quota_month_waivers ADD COLUMN IF NOT EXISTS percent NUMERIC(5,2) NOT NULL DEFAULT 100`);
+    // Append-only audit log of every "payer quand même" decision (set/changed/removed) — the
+    // quota_month_waivers table above only holds the CURRENT percent per rep+month, so this is
+    // the only place history survives a later change (user request 2026-07-08).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS quota_waiver_log (
+        id         SERIAL PRIMARY KEY,
+        rep_name   VARCHAR(255) NOT NULL,
+        period     DATE NOT NULL,
+        percent    NUMERIC(5,2),
+        action     VARCHAR(20) NOT NULL,
+        created_by VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
     // Quota-gate forfeitures the admin has explicitly reviewed and confirmed (kept at $0,
     // no waiver). Purely an audit trail — doesn't change any money. A rep+month NOT in this
     // table but with a live forfeiture shows up in the quota-review queue as "needs a decision".
@@ -14291,12 +14305,20 @@ app.post('/api/commissions/quota-waiver', authenticateToken, async (req, res) =>
   try {
     if (waived === false) {
       await pool.query(`DELETE FROM quota_month_waivers WHERE rep_name = $1 AND period = $2::date`, [repName, period]);
+      await pool.query(
+        `INSERT INTO quota_waiver_log (rep_name, period, percent, action, created_by) VALUES ($1, $2::date, NULL, 'removed', $3)`,
+        [repName, period, actor]
+      );
     } else {
       await pool.query(
         `INSERT INTO quota_month_waivers (rep_name, period, created_by, percent)
          VALUES ($1, $2::date, $3, $4)
          ON CONFLICT (rep_name, period) DO UPDATE SET percent = EXCLUDED.percent, created_by = EXCLUDED.created_by, created_at = NOW()`,
         [repName, period, actor, percent]
+      );
+      await pool.query(
+        `INSERT INTO quota_waiver_log (rep_name, period, percent, action, created_by) VALUES ($1, $2::date, $3, 'set', $4)`,
+        [repName, period, percent, actor]
       );
     }
     res.json({ success: true, waived: waived !== false, percent, recalc: 'started' });
@@ -14369,6 +14391,27 @@ app.get('/api/commissions/quota-review/invoices', authenticateToken, async (req,
       [repName, period]
     )).rows;
     res.json({ invoices: rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/commissions/quota-waiver-log?repName=&limit= — audit trail of every "payer quand
+// même" decision ever made (set/changed/removed), newest first. repName optional (all reps).
+app.get('/api/commissions/quota-waiver-log', authenticateToken, async (req, res) => {
+  if (!(await requirePermAny(req, res, ['report:quota_review', 'report:mark_paid']))) return;
+  const limit = Math.min(500, parseInt(req.query.limit) || 200);
+  try {
+    const params = [];
+    let where = '';
+    if (req.query.repName) { params.push(req.query.repName); where = ' WHERE rep_name = $1'; }
+    params.push(limit);
+    const rows = (await pool.query(
+      `SELECT id, rep_name AS rep, to_char(period, 'YYYY-MM') AS ym, percent::float AS percent,
+              action, created_by, created_at
+         FROM quota_waiver_log${where}
+        ORDER BY created_at DESC LIMIT $${params.length}`,
+      params
+    )).rows;
+    res.json({ rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
