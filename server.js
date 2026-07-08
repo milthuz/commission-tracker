@@ -15463,7 +15463,7 @@ async function runRecalcV2(source = 'manual') {
   try {
       // Load rep rates + quota-gate config (plan v7.7)
       const spRes = await pool.query(
-        'SELECT name, commission_rate, monthly_quota, hire_date, quota_gate_enabled FROM salespeople'
+        'SELECT name, commission_rate, monthly_quota, hire_date, quota_gate_enabled, is_active FROM salespeople'
       );
       const rateMap = {};
       const spInfo = new Map();
@@ -15472,7 +15472,9 @@ async function runRecalcV2(source = 'manual') {
         spInfo.set(r.name, {
           quota:    r.monthly_quota == null ? MONTHLY_QUOTA : parseInt(r.monthly_quota),
           hireDate: r.hire_date ? new Date(r.hire_date) : null,
-          gated:    r.quota_gate_enabled !== false,
+          // Inactive reps (departed, or pseudo/fallback names like "Zoho Admin") are exempt —
+          // they never had a real quota obligation to begin with (user decision 2026-07-07).
+          gated:    r.quota_gate_enabled !== false && r.is_active === true,
         });
       });
 
