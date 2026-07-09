@@ -2281,7 +2281,7 @@ ADMINISTRATOR CONTEXT — this user IS an administrator, so you may also explain
 const ASSISTANT_SYSTEM_NONADMIN = `
 IMPORTANT — this user is NOT an administrator. Do not describe, explain, or walk them through admin-only features (the Admin Panel, imports, approving/marking commissions paid, managing salespeople/teams/roles/users, impersonation, configuration). If they ask about those, briefly say that it's handled by administrators and suggest contacting their administrator or saleshub@clustersystems.com — without detailing how the admin feature works.`;
 
-// Recently published release notes, fed to Cleo so it AUTOMATICALLY learns about new
+// Recently published release notes, fed to Sofia so it AUTOMATICALLY learns about new
 // features the moment an admin publishes a release — no prompt edits needed. Cached in
 // memory for a few minutes (releases change rarely) to avoid a DB hit on every message.
 let _assistantUpdatesCache = { text: '', at: 0 };
