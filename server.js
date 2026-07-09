@@ -1781,7 +1781,7 @@ async function sendMail(to, subject, html, opts = {}) {
     return { sent: false, reason: e.message };
   }
 }
-// Shared branded email chrome: dark header with the Cluster logo, orange accent bar,
+// Shared branded email chrome: dark header with the Sales Hub logo, orange accent bar,
 // white content card, and a bilingual footer. `inner` is arbitrary trusted HTML (already
 // escaped by the caller). Every transactional email funnels through here so they all look
 // identical — pay stubs and payroll included.
@@ -1801,7 +1801,7 @@ function mailChrome(inner, preheaderRaw) {
           <tr><td style="background:#0f1722;padding:22px 36px">
             <table role="presentation" cellpadding="0" cellspacing="0"><tr>
               <td style="padding-right:12px;vertical-align:middle">
-                <img src="${base}/cluster-favicon-256.png" width="36" height="36" alt="Cluster" style="display:block;border:0;border-radius:9px">
+                <img src="${base}/saleshub-icon-192.png" width="36" height="36" alt="Sales Hub" style="display:block;border:0;border-radius:9px">
               </td>
               <td style="vertical-align:middle">
                 <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-.3px">Sales&nbsp;Hub</span><span style="color:#f97316;font-size:22px;font-weight:700">.</span>
@@ -9468,8 +9468,9 @@ function buildSavingsPdf({ merchant, lang, results, dateStr }) {
   const W = 612, M = 56;
   // Header
   doc.rect(0, 0, W, 92).fill('#0f1722');
-  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(22).text('Sales Hub', M, 30, { continued: true }).fillColor('#f97316').text('.');
-  doc.fillColor('#8a99af').font('Helvetica').fontSize(10).text('by Cluster Systems', M, 60);
+  try { doc.image(require('path').join(__dirname, 'assets', 'brand', 'saleshub-mark-192.png'), M, 24, { width: 34, height: 34 }); } catch (_e) { /* optional */ }
+  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(22).text('Sales Hub', M + 44, 30, { continued: true }).fillColor('#f97316').text('.');
+  doc.fillColor('#8a99af').font('Helvetica').fontSize(10).text('by Cluster Systems', M + 44, 60);
   doc.rect(0, 92, W, 4).fill('#f97316');
   // Title + merchant
   doc.fillColor('#0f1722').font('Helvetica-Bold').fontSize(18).text(T.title, M, 124);
@@ -14932,12 +14933,14 @@ function buildPayrollPdf(periodLabel, reps, lang) {
       const L = 40, R = 572, W = R - L, AMT_X = R - 96;     // content area + amount column
       const C = { dark: '#1c2434', orange: '#f2682c', gray: '#475569', light: '#94a3b8', zebra: '#fafbfd', line: '#e8edf3' };
       const ensure = (h) => { if (doc.y + h > 748) doc.addPage(); };
+      const brandMark = require('path').join(__dirname, 'assets', 'brand', 'saleshub-mark-192.png');
 
       const header = (r) => {
         doc.rect(0, 0, 612, 6).fill(C.orange);
         doc.rect(0, 6, 612, 74).fill(C.dark);
-        doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(21).text('Sales Hub', L, 24);
-        doc.fillColor('#8a99af').font('Helvetica').fontSize(9).text('by Cluster Systems', L, 50);
+        try { doc.image(brandMark, L, 20, { width: 34, height: 34 }); } catch (_e) { /* optional */ }
+        doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(21).text('Sales Hub', L + 44, 24);
+        doc.fillColor('#8a99af').font('Helvetica').fontSize(9).text('by Cluster Systems', L + 44, 50);
         doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text(T.payStubTitle, L, 26, { width: W, align: 'right', characterSpacing: 1.5 });
         doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(17).text(periodLabel, L, 42, { width: W, align: 'right' });
         // meta row
