@@ -13459,10 +13459,18 @@ async function snapshotAppGeneratedStub(repName, year, month, actor) {
        AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial') AND approval_status = 'paid'
      ORDER BY commission DESC`,
     [repName, orgId, periodStart, periodEnd])).rows;
+  // Signup bonus is the REP'S CURRENT config (salespeople.signup_bonus_enabled/_amount), not the
+  // stored zentact_merchants.bonus_amount — that column is just whatever the DEFAULT was at
+  // ingestion time and is never customized per-merchant. Matches the CRM-points dashboard's
+  // live computation (user report 2026-07-08: a disabled rep still showed $100/signup here).
   const bonusRows = (await pool.query(
-    `SELECT merchant_account_id, business_name, bonus_amount::float AS bonus_amount, activated_at::date AS activated_at
-     FROM zentact_merchants WHERE LOWER(sales_rep_name) = LOWER($1) AND status = 'ACTIVE'
-       AND activated_at >= $2 AND activated_at < $3`,
+    `SELECT zm.merchant_account_id, zm.business_name,
+            (CASE WHEN sp.signup_bonus_enabled IS FALSE THEN 0 ELSE COALESCE(sp.signup_bonus_amount, 100) END)::float AS bonus_amount,
+            zm.activated_at::date AS activated_at
+     FROM zentact_merchants zm
+     LEFT JOIN salespeople sp ON LOWER(sp.name) = LOWER(zm.sales_rep_name)
+     WHERE LOWER(zm.sales_rep_name) = LOWER($1) AND zm.status = 'ACTIVE'
+       AND zm.activated_at >= $2 AND zm.activated_at < $3`,
     [repName, periodStart, periodEnd])).rows;
   if (!invRows.length && !bonusRows.length) return null; // nothing to record
   const bonusTotal = bonusRows.reduce((a, r) => a + (r.bonus_amount || 0), 0);
@@ -13650,12 +13658,16 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
     };
 
     // App-generated signup bonuses: Zentact merchants this rep activated in the period.
+    // Amount is the REP'S CURRENT config, not the stored (never-customized) bonus_amount column.
     const genBonuses = async () => {
       const rows = (await pool.query(
-        `SELECT business_name AS merchant_name, bonus_amount::float AS bonus_amount, activated_at::date AS activated_at
-         FROM zentact_merchants
-         WHERE LOWER(sales_rep_name) = LOWER($1) AND status = 'ACTIVE'
-           AND activated_at >= $2 AND activated_at < $3`,
+        `SELECT zm.business_name AS merchant_name,
+                (CASE WHEN sp.signup_bonus_enabled IS FALSE THEN 0 ELSE COALESCE(sp.signup_bonus_amount, 100) END)::float AS bonus_amount,
+                zm.activated_at::date AS activated_at
+         FROM zentact_merchants zm
+         LEFT JOIN salespeople sp ON LOWER(sp.name) = LOWER(zm.sales_rep_name)
+         WHERE LOWER(zm.sales_rep_name) = LOWER($1) AND zm.status = 'ACTIVE'
+           AND zm.activated_at >= $2 AND zm.activated_at < $3`,
         [targetRep, periodStart, periodEnd]
       )).rows;
       const bonuses = rows.map(r => ({
@@ -14530,11 +14542,15 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
        ORDER BY commission DESC`,
       [repName, process.env.ZOHO_ORG_ID, periodStart, periodEnd]
     )).rows;
+    // Signup bonus is the REP'S CURRENT config, not the stored (never-customized) bonus_amount.
     const bonusRows = (await client.query(
-      `SELECT merchant_account_id, business_name, bonus_amount::float AS bonus_amount, activated_at::date AS activated_at
-       FROM zentact_merchants
-       WHERE LOWER(sales_rep_name) = LOWER($1) AND status = 'ACTIVE'
-         AND activated_at >= $2 AND activated_at < $3`,
+      `SELECT zm.merchant_account_id, zm.business_name,
+              (CASE WHEN sp.signup_bonus_enabled IS FALSE THEN 0 ELSE COALESCE(sp.signup_bonus_amount, 100) END)::float AS bonus_amount,
+              zm.activated_at::date AS activated_at
+       FROM zentact_merchants zm
+       LEFT JOIN salespeople sp ON LOWER(sp.name) = LOWER(zm.sales_rep_name)
+       WHERE LOWER(zm.sales_rep_name) = LOWER($1) AND zm.status = 'ACTIVE'
+         AND zm.activated_at >= $2 AND zm.activated_at < $3`,
       [repName, periodStart, periodEnd]
     )).rows;
 
@@ -14725,7 +14741,7 @@ async function payrollDataForMonth(year, month) {
   const platform = periodStart >= PLAN_START_DATE;
   const ptsMap = platform ? await getMonthlyPointsByRep(periodStart) : new Map();
 
-  const reps = (await pool.query(`SELECT name, monthly_quota FROM salespeople WHERE is_active = true ORDER BY name`)).rows;
+  const reps = (await pool.query(`SELECT name, monthly_quota, signup_bonus_enabled, signup_bonus_amount FROM salespeople WHERE is_active = true ORDER BY name`)).rows;
   const out = [];
   for (const sp of reps) {
     const rep = sp.name;
@@ -14763,11 +14779,13 @@ async function payrollDataForMonth(year, month) {
            AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
            AND approval_status <> 'paid' ORDER BY commission DESC`,
         [rep, orgId, periodStart, periodEnd])).rows;
+      // Signup bonus is the REP'S CURRENT config, not the stored (never-customized) bonus_amount.
+      const signupCfg = { enabled: sp.signup_bonus_enabled !== false, amount: sp.signup_bonus_amount == null ? 100 : parseFloat(sp.signup_bonus_amount) };
       const signups = (await pool.query(
-        `SELECT business_name AS merchant_name, bonus_amount::float AS amount FROM zentact_merchants
+        `SELECT business_name AS merchant_name FROM zentact_merchants
          WHERE LOWER(sales_rep_name) = LOWER($1) AND status = 'ACTIVE' AND activated_at >= $2 AND activated_at < $3`,
         [rep, periodStart, periodEnd])).rows;
-      bonuses = signups.map(b => ({ bonus_type: 'signup', merchant_name: b.merchant_name, amount: b.amount }));
+      bonuses = signups.map(b => ({ bonus_type: 'signup', merchant_name: b.merchant_name, amount: signupCfg.enabled ? signupCfg.amount : 0 }));
       if (platform) {
         const pts = ptsMap.get(`${rep}|${year}-${mm}`) || 0;
         const quota = sp.monthly_quota == null ? MONTHLY_QUOTA : parseInt(sp.monthly_quota);
@@ -14965,12 +14983,14 @@ app.get('/api/commissions/annual-reconciliation', authenticateToken, async (req,
          AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
          AND commission_payable_date >= $1::date AND commission_payable_date < $2::date
        GROUP BY 1, 2`, [yearStart, yearEnd, orgId])).rows;
+    // Signup bonus is the rep's CURRENT config, not the stored (never-customized) bonus_amount.
     const signupRows = (await pool.query(`
-      SELECT LOWER(sales_rep_name) AS rep, to_char(activated_at, 'YYYY-MM') AS ym,
-             SUM(bonus_amount)::float AS total
-        FROM zentact_merchants
-       WHERE status = 'ACTIVE' AND sales_rep_name IS NOT NULL
-         AND activated_at >= $1::date AND activated_at < $2::date
+      SELECT LOWER(zm.sales_rep_name) AS rep, to_char(zm.activated_at, 'YYYY-MM') AS ym,
+             SUM(CASE WHEN sp.signup_bonus_enabled IS FALSE THEN 0 ELSE COALESCE(sp.signup_bonus_amount, 100) END)::float AS total
+        FROM zentact_merchants zm
+        LEFT JOIN salespeople sp ON LOWER(sp.name) = LOWER(zm.sales_rep_name)
+       WHERE zm.status = 'ACTIVE' AND zm.sales_rep_name IS NOT NULL
+         AND zm.activated_at >= $1::date AND zm.activated_at < $2::date
        GROUP BY 1, 2`, [yearStart, yearEnd])).rows;
     const manualRows = (await pool.query(`
       SELECT rep_name, to_char(period, 'YYYY-MM') AS ym, SUM(amount)::float AS total
