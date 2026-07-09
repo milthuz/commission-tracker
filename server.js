@@ -14763,7 +14763,8 @@ async function payrollDataForMonth(year, month) {
     if (imp) {
       source = 'imported';
       lines = (await pool.query(
-        `SELECT invoice_number, customer, paid_amount::float AS paid_amount FROM commission_payment_lines
+        `SELECT invoice_number, customer, paid_amount::float AS paid_amount, quota_partial, quota_forfeited::float AS quota_forfeited
+         FROM commission_payment_lines
          WHERE import_id = $1 ORDER BY paid_amount DESC`, [imp.id])).rows;
       bonuses = (await pool.query(
         `SELECT bonus_type, merchant_name, amount::float AS amount FROM commission_bonuses
@@ -14773,7 +14774,9 @@ async function payrollDataForMonth(year, month) {
     } else {
       source = 'generated';
       lines = (await pool.query(
-        `SELECT invoice_number, customer_name AS customer, commission::float AS paid_amount FROM invoices
+        `SELECT invoice_number, customer_name AS customer, commission::float AS paid_amount,
+                (commission_status = 'quota_partial') AS quota_partial, quota_forfeited_amount::float AS quota_forfeited
+         FROM invoices
          WHERE salesperson_name = $1 AND organization_id = $2
            AND commission_payable_date >= $3 AND commission_payable_date < $4
            AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
@@ -14886,13 +14889,21 @@ function buildPayrollPdf(periodLabel, reps, lang) {
         doc.moveTo(L, doc.y).lineTo(R, doc.y).strokeColor(C.dark).lineWidth(1).stroke();
         doc.y += 5;
       };
-      const row = (c0, c1, amt, i, neg) => {
+      const row = (c0, c1, amt, i, neg, badgePct) => {
         ensure(18);
         const y = doc.y;
         if (i % 2) doc.rect(L, y - 3, W, 17).fill(C.zebra);
         doc.fillColor(C.dark).font('Helvetica').fontSize(9).text(String(c0 || ''), L + 2, y, { width: 122, ellipsis: true });
-        doc.fillColor(C.gray).text(String(c1 || '—'), L + 130, y, { width: AMT_X - (L + 130) - 8, ellipsis: true });
-        doc.fillColor(neg ? '#d34053' : C.dark).font('Helvetica-Bold').text(amt, AMT_X, y, { width: 92, align: 'right' });
+        const custW = AMT_X - (L + 130) - (badgePct != null ? 40 : 8);
+        doc.fillColor(C.gray).text(String(c1 || '—'), L + 130, y, { width: custW, ellipsis: true });
+        // Quota-gate partial-release marker — a rep should see WHY this line is less than
+        // the full commission, not just a smaller number (user report 2026-07-08).
+        if (badgePct != null) {
+          const bx = AMT_X - 34, bw = 30;
+          doc.roundedRect(bx, y - 1, bw, 12, 3).fill('#fff1e8');
+          doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(6.5).text(`${badgePct}%`, bx, y + 1.5, { width: bw, align: 'center' });
+        }
+        doc.fillColor(neg ? '#d34053' : C.dark).font('Helvetica-Bold').fontSize(9).text(amt, AMT_X, y, { width: 92, align: 'right' });
         doc.y = y + 17;
       };
       const subtotal = (label, amt, neg) => {
@@ -14909,7 +14920,10 @@ function buildPayrollPdf(periodLabel, reps, lang) {
         header(r);
         if (r.lines.length) {
           sectionHead(T.commissions, T.invoice, T.customer);
-          r.lines.forEach((l, i) => row(l.invoice_number, l.customer, money(l.paid_amount), i));
+          r.lines.forEach((l, i) => {
+            const pct = l.quota_partial ? Math.round((l.paid_amount / ((l.paid_amount || 0) + (l.quota_forfeited || 0))) * 100) : null;
+            row(l.invoice_number, l.customer, money(l.paid_amount), i, false, pct);
+          });
           subtotal(T.subtotalCommissions, money(r.lines.reduce((s, l) => s + (l.paid_amount || 0), 0)));
         }
         // Adjustments (corrections on past periods) print in their OWN section, after bonuses.
