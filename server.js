@@ -7421,7 +7421,31 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
     // Open-tracking pixel: the /track endpoint logs the open when the client's mail client loads
     // this 1×1 image. (Imperfect — Gmail/Outlook proxy-cache images, so opens under-count.)
     const pixel = `<img src="${apiBase}/api/proposals/track/${trackToken}.gif" width="1" height="1" alt="" style="display:none;width:1px;height:1px;border:0;max-height:0;overflow:hidden">`;
-    const html = `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#1c2434;line-height:1.5"><div style="white-space:pre-wrap">${esc(bodyText)}</div>${acceptBtn}</div>${pixel}`;
+    // Cluster-branded chrome (NOT mailChrome/Sales Hub — this goes to the CUSTOMER accepting a
+    // Cluster quote, so it wears Cluster's own brand, matching the proposal deck/PDF cover which
+    // uses the same navy+orange palette and cluster_logo.png; user decision 2026-07-09).
+    const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+    const html = `<!doctype html><html><body style="margin:0;padding:0;background:#eef1f6;font-family:Arial,Helvetica,sans-serif">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f6;padding:32px 12px">
+        <tr><td align="center">
+          <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(16,23,34,.08),0 10px 28px rgba(16,23,34,.07)">
+            <tr><td style="background:#1c2434;padding:22px 36px">
+              <img src="${frontendBase}/cluster-logo-email.png" width="118" height="28" alt="Cluster" style="display:block;border:0">
+            </td></tr>
+            <tr><td style="height:4px;background:#fe6523;font-size:0;line-height:0">&nbsp;</td></tr>
+            <tr><td style="padding:32px 36px 8px;font-size:14px;color:#1c2434;line-height:1.6">
+              <div style="white-space:pre-wrap">${esc(bodyText)}</div>
+              ${acceptBtn}
+            </td></tr>
+            <tr><td style="padding:22px 36px 0"><div style="border-top:1px solid #eef1f6;font-size:0;line-height:0">&nbsp;</div></td></tr>
+            <tr><td style="padding:16px 36px 30px">
+              <p style="margin:0;color:#94a3b8;font-size:12px">Cluster Systems · <a href="https://clusterpos.com" style="color:#94a3b8;text-decoration:none">clusterpos.com</a></p>
+            </td></tr>
+          </table>
+        </td></tr>
+      </table>
+      ${pixel}
+    </body></html>`;
 
     // From: send AS the Sales Hub rep when their email domain is SendGrid-authenticated
     // (env VERIFIED_SENDER_DOMAINS, comma-list). Until the domain is verified, keep the verified
