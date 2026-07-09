@@ -166,6 +166,20 @@ function probationInfo(hireDate) {
   return { inProbation: daysLeft > 0, endDate: end.toISOString().slice(0, 10), daysLeft };
 }
 
+// Append one row to the generic activity timeline (Zoho-style "Quote Activity" feed). Never
+// throws — a logging failure must never break the action it's describing. entityType is one of
+// 'invoice' | 'proposal' | 'rep_pay'; entityId is the invoice_number, proposal id, or rep_name.
+async function logActivity(entityType, entityId, eventType, description, actor, extra = {}) {
+  try {
+    await pool.query(
+      `INSERT INTO activity_log (entity_type, entity_id, event_type, description, actor, amount, metadata)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+      [entityType, String(entityId), eventType, description, actor || 'system',
+       extra.amount == null ? null : Math.round(extra.amount * 100) / 100, JSON.stringify(extra.metadata || {})]
+    );
+  } catch (e) { console.error('logActivity error:', e.message); }
+}
+
 async function getManagedTeamIds(email) {
   if (!email) return [];
   try {
@@ -481,6 +495,23 @@ async function initializeDatabase() {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_manual_bonus_period ON manual_bonuses(rep_name, period)`);
+    // Generic activity timeline (Zoho-style "Quote Activity" feed) — one row per discrete,
+    // human- or system-caused event on an entity (invoice, proposal, rep pay record). Polymorphic
+    // by design so every domain shares one table + one UI component (user request 2026-07-09).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS activity_log (
+        id          SERIAL PRIMARY KEY,
+        entity_type VARCHAR(30) NOT NULL,
+        entity_id   VARCHAR(255) NOT NULL,
+        event_type  VARCHAR(50) NOT NULL,
+        description TEXT NOT NULL,
+        actor       VARCHAR(255),
+        amount      NUMERIC(12,2),
+        metadata    JSONB,
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_log_entity ON activity_log(entity_type, entity_id, created_at DESC)`);
     // Commission adjustments: carry an unpaid/missed commission from a past month forward to
     // a chosen target pay period (e.g. pay a missed March invoice in May). Creating one marks
     // the source invoice settled (clears the radar) and adds an "adjustment" line to the
@@ -13400,6 +13431,7 @@ app.post('/api/commissions/invoice/:number/commission-excluded', authenticateTok
   if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
   const number = req.params.number;
   const excluded = req.body.excluded !== false;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
   try {
     const inv = (await pool.query(
       `SELECT approval_status FROM invoices WHERE invoice_number = $1 AND organization_id = $2`,
@@ -13414,6 +13446,7 @@ app.post('/api/commissions/invoice/:number/commission-excluded', authenticateTok
          WHERE invoice_number = $1 AND organization_id = $2`,
         [number, process.env.ZOHO_ORG_ID]
       );
+      logActivity('invoice', number, 'excluded', `Commission refused by ${actor}`, actor);
       return res.json({ success: true, excluded: true });
     }
     // Restore: clear the flag, then a background recalc recomputes the real commission.
@@ -13422,6 +13455,7 @@ app.post('/api/commissions/invoice/:number/commission-excluded', authenticateTok
        WHERE invoice_number = $1 AND organization_id = $2`,
       [number, process.env.ZOHO_ORG_ID]
     );
+    logActivity('invoice', number, 'restored', `Commission restored by ${actor} — recalculating`, actor);
     runRecalcV2('exclude-restore').catch(e => console.error('exclude-restore recalc error:', e));
     res.json({ success: true, excluded: false, note: 'recalc-v2 starting — commission recomputes in ~1-3 min' });
   } catch (error) {
@@ -13573,6 +13607,9 @@ app.post('/api/commissions/mark-paid', authenticateToken, async (req, res) => {
       catch (e) { console.error('snapshotAppGeneratedStub error:', e.message); }
     } else {
       return res.status(400).json({ error: 'Provide repName+year+month or invoiceNumbers' });
+    }
+    for (const r of result.rows) {
+      logActivity('invoice', r.invoice_number, 'paid', `Commission marked paid by ${payerEmail}`, payerEmail);
     }
     res.json({ success: true, invoicesUpdated: result.rowCount });
   } catch (error) {
@@ -14188,6 +14225,9 @@ app.post('/api/commissions/adjustments', authenticateToken, async (req, res) => 
       created.push({ invoice_number: inv.invoice_number, amount: inv.commission });
     }
     await client.query('COMMIT');
+    for (const c of created) {
+      logActivity('invoice', c.invoice_number, 'adjusted', `Carried forward to ${year}-${String(month).padStart(2, '0')} by ${actor}`, actor, { amount: c.amount });
+    }
     res.json({ success: true, created: created.length, total: Math.round(created.reduce((a, c) => a + c.amount, 0) * 100) / 100, items: created });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
@@ -14198,6 +14238,7 @@ app.post('/api/commissions/adjustments', authenticateToken, async (req, res) => 
 // DELETE /api/commissions/adjustments/:id  — undo: move the invoice back to its original month.
 app.delete('/api/commissions/adjustments/:id', authenticateToken, async (req, res) => {
   if (!(await requirePermAny(req, res, ['report:adjustments', 'report:mark_paid']))) return;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -14212,6 +14253,9 @@ app.delete('/api/commissions/adjustments/:id', authenticateToken, async (req, re
     }
     await client.query(`DELETE FROM commission_adjustments WHERE id = $1`, [parseInt(req.params.id)]);
     await client.query('COMMIT');
+    if (adj && adj.invoice_number) {
+      logActivity('invoice', adj.invoice_number, 'adjustment_undone', `Carry-forward adjustment undone by ${actor}`, actor);
+    }
     res.json({ success: true });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
@@ -14470,6 +14514,32 @@ app.get('/api/commissions/quota-waiver-log', authenticateToken, async (req, res)
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/activity-log?entityType=invoice|proposal|rep_pay&entityId=... — the Zoho-style
+// activity timeline for one entity, newest first. Permission depends on entityType since the
+// three domains have different owners (commissions vs proposals).
+app.get('/api/activity-log', authenticateToken, async (req, res) => {
+  const { entityType, entityId } = req.query;
+  if (!entityType || !entityId) return res.status(400).json({ error: 'entityType and entityId required' });
+  const permByType = {
+    invoice: ['report:mark_paid', 'report:adjustments', 'report:quota_review'],
+    rep_pay: ['report:mark_paid', 'report:quota_review'],
+    proposal: ['proposals:send'],
+  };
+  const perms = permByType[entityType];
+  if (!perms) return res.status(400).json({ error: 'invalid entityType' });
+  if (!(await requirePermAny(req, res, perms))) return;
+  try {
+    const rows = (await pool.query(
+      `SELECT id, event_type, description, actor, amount::float AS amount, metadata, created_at
+         FROM activity_log
+        WHERE entity_type = $1 AND entity_id = $2
+        ORDER BY created_at DESC LIMIT 200`,
+      [entityType, String(entityId)]
+    )).rows;
+    res.json({ rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /api/commissions/quota-review/acknowledge { repName, year, month, note? } — admin has
 // reviewed this rep+month's quota-gated forfeiture and confirms it stays at $0 (no waiver).
 // Pure audit trail — no money moves. Use POST /api/commissions/quota-waiver instead to pay
@@ -14650,6 +14720,9 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
     }
 
     await client.query('COMMIT');
+    for (const r of invRows) {
+      logActivity('invoice', r.invoice_number, 'paid', `Commission marked paid by ${actor} (${year}-${mm} pay stub)`, actor, { amount: r.commission });
+    }
     res.json({ success: true, invoicesMarked: invRows.length, bonuses: bonusRows.length, total });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
@@ -14668,6 +14741,7 @@ app.post('/api/commissions/pay-stub/uncommit', authenticateToken, async (req, re
   const { repName, year, month } = req.body;
   if (!repName || !year || !month) return res.status(400).json({ error: 'repName, year, month required' });
   const periodDate = `${year}-${String(month).padStart(2, '0')}-01`;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -14687,12 +14761,16 @@ app.post('/api/commissions/pay-stub/uncommit', authenticateToken, async (req, re
          approved_by = NULL, approved_at = NULL, payout_paid_by = NULL, payout_paid_at = NULL,
          updated_at = CURRENT_TIMESTAMP
        WHERE organization_id = $1
-         AND invoice_number IN (SELECT invoice_number FROM commission_payment_lines WHERE import_id = $2)`,
+         AND invoice_number IN (SELECT invoice_number FROM commission_payment_lines WHERE import_id = $2)
+       RETURNING invoice_number`,
       [process.env.ZOHO_ORG_ID, imp.id]
     );
     // Delete the import row → cascades commission_payment_lines + commission_bonuses.
     await client.query(`DELETE FROM commission_payment_imports WHERE id = $1`, [imp.id]);
     await client.query('COMMIT');
+    for (const r of reverted.rows) {
+      logActivity('invoice', r.invoice_number, 'payment_undone', `Payment undone by ${actor} — reverted to pending`, actor);
+    }
     res.json({ success: true, reverted: reverted.rowCount });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
