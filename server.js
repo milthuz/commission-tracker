@@ -15852,13 +15852,17 @@ async function runRecalcV2(source = 'manual') {
         )).rows;
         for (const row of liRows) {
           const items = Array.isArray(row.line_items) ? row.line_items : [];
+          // li.amount is already net for an item-level discount (baked in per line) — rescaling
+          // by the gross-based factor again would double-discount. Only an entity-level discount
+          // (nonzero discount_total) still needs it, since those lines stay at gross value.
           const factor = discountFactorOf(row.sub_total, row.discount_total, row.gross_line_total);
+          const amountFactor = (parseFloat(row.discount_total) || 0) > 0 ? factor : 1;
           let base = 0, sawSaas = false;
           for (const li of items) {
             if (li.type !== 'saas') continue;
             if (isAnnualLine(li)) continue; // annual subs follow their own 10%-first-year rule
             sawSaas = true;
-            const amt   = (parseFloat(li.amount) || 0) * factor;
+            const amt   = (parseFloat(li.amount) || 0) * amountFactor;
             const qty   = parseInt(li.quantity) || 1;
             const price = li.plan_code ? (planPrices.get(String(li.plan_code).toLowerCase()) || 0) : 0;
             base += Math.max(amt, price * qty);
@@ -15902,11 +15906,17 @@ async function runRecalcV2(source = 'manual') {
 
         const rate = rateMap[inv.salesperson_name] || 10;
         // Invoice-level discount (plan v7.7): bases are scaled to the discounted pre-tax
-        // value, and the HARDWARE rate halves (10%→5%) when the discount is ≥ 25%.
+        // value, and the HARDWARE rate halves (10%→5%) when the discount is ≥ 25% — counting
+        // BOTH item-level and entity-level discounts (user decision 2026-07-08).
         const factor = discountFactorOf(inv.sub_total, inv.discount_total, inv.gross_line_total);
         const discountPct = 1 - factor;   // effective discount (0 when no discount captured)
         const hwRate = discountPct >= 0.25 ? rate / 2 : rate;
-        const hardwareAmount = (parseFloat(inv.hardware_amount) || 0) * factor;
+        // hardware_amount/saas_amount are already NET when the discount is item-level (baked
+        // in per line) — rescaling by `factor` again would double-discount. Only an
+        // entity-level discount (nonzero discount_total) still needs it, since those lines stay
+        // at gross value until scaled here.
+        const amountFactor = (parseFloat(inv.discount_total) || 0) > 0 ? factor : 1;
+        const hardwareAmount = (parseFloat(inv.hardware_amount) || 0) * amountFactor;
         const saasAmount     = parseFloat(inv.saas_amount)     || 0;
         const annualInfo = annualByInvoice.get(inv.id);
         const annualAmount      = annualInfo ? annualInfo.total : 0;
@@ -15995,7 +16005,7 @@ async function runRecalcV2(source = 'manual') {
         // invoice-level discount), unlocked when the invoice is paid. Annual renewals earn
         // nothing (annualFirstAmount = 0 for them).
         if (annualFirstAmount > 0 && inv.status === 'paid' && invPaidDate) {
-          commission += annualFirstAmount * factor * (rate / 100);
+          commission += annualFirstAmount * amountFactor * (rate / 100);
           if (bucket !== 'saas_first' && bucket !== 'hardware') bucket = 'saas_annual';
           if (!payableDate) payableDate = invPaidDate;
         }
