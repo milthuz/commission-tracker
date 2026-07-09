@@ -113,6 +113,7 @@ const PERMISSION_CATALOG = [
 
   // Demo (AppStream-streamed Kaizen POS for sales demos)
   { key: 'demo:kaizen',                label: 'Access the Kaizen POS demo (streamed POS)',                      category: 'Demo' },
+  { key: 'demo:kaizen_manage',         label: 'Turn the Kaizen POS demo on/off + set the maintenance message',  category: 'Demo' },
 
   // Proposals (build + send a client proposal from a Zoho Books estimate)
   { key: 'proposals:send',             label: 'Build & send client proposals (from Zoho estimates)',            category: 'Proposals' },
@@ -2453,9 +2454,48 @@ function appstreamUserId(req) {
   return clean.length >= 2 ? clean : 'demo-user';
 }
 
+// app_settings key 'kaizen_demo' — admin on/off switch + custom message, so the AppStream image
+// can be rebuilt/updated (see 2026-07-09 Image Builder discussion) without reps hitting a raw
+// AWS error. Defaults to enabled with no message when the row doesn't exist yet.
+async function getKaizenDemoSettings() {
+  try {
+    const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'kaizen_demo'`);
+    if (!r.rows[0]) return { enabled: true, message: '' };
+    const v = JSON.parse(r.rows[0].value);
+    return { enabled: v.enabled !== false, message: (v.message || '').toString() };
+  } catch { return { enabled: true, message: '' }; }
+}
+
+// GET /api/demo/kaizen-status — whether the demo is enabled + the maintenance message, so the
+// frontend can show a friendly card instead of letting a rep hit "Launch" and get an AWS error.
+app.get('/api/demo/kaizen-status', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'demo:kaizen'))) return;
+  res.json(await getKaizenDemoSettings());
+});
+
+// PUT /api/admin/kaizen-demo-settings { enabled, message } — admin on/off switch (demo:kaizen_manage).
+app.put('/api/admin/kaizen-demo-settings', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'demo:kaizen_manage'))) return;
+  const enabled = req.body.enabled !== false;
+  const message = (req.body.message || '').toString().slice(0, 500);
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('kaizen_demo', $1, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()`,
+      [JSON.stringify({ enabled, message })]
+    );
+    res.json({ success: true, enabled, message });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /api/demo/kaizen-url — mint a temporary AppStream streaming URL (embedded in an iframe client-side).
 app.post('/api/demo/kaizen-url', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'demo:kaizen'))) return;
+  // Belt-and-suspenders: block the actual URL mint server-side too, not just the frontend's
+  // upfront status check — an admin taking the image down for maintenance means the fleet may
+  // genuinely be stopped/mid-update, so this also avoids a confusing raw AWS error underneath.
+  const kd = await getKaizenDemoSettings();
+  if (!kd.enabled) return res.status(503).json({ error: 'maintenance', message: kd.message });
   const client = getAppStream();
   if (!client) return res.status(503).json({ error: 'demo_not_configured' });
   try {
