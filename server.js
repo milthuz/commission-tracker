@@ -90,6 +90,8 @@ const PERMISSION_CATALOG = [
   { key: 'admin:data_health',          label: 'View the "Needs attention" data-health page', category: 'Admin Panel' },
   { key: 'admin:notifications',        label: 'Configure notification recipients & email templates', category: 'Admin Panel' },
   { key: 'admin:demo_mode',            label: 'Toggle demo mode on user accounts',            category: 'Admin Panel' },
+  { key: 'admin:audit_dashboard',      label: 'View who is connected + connection-time stats', category: 'Admin Panel' },
+  { key: 'admin:audit_logs',           label: 'View the full action log across the app',      category: 'Admin Panel' },
 
   // Syncs
   { key: 'sync:books',                 label: 'Trigger Zoho Books sync manually',            category: 'Syncs' },
@@ -178,6 +180,36 @@ async function logActivity(entityType, entityId, eventType, description, actor, 
        extra.amount == null ? null : Math.round(extra.amount * 100) / 100, JSON.stringify(extra.metadata || {})]
     );
   } catch (e) { console.error('logActivity error:', e.message); }
+}
+
+// Coarse "is this person connected right now / how long have they been connected" tracking for
+// the Admin → Audit dashboard. Called fire-and-forget from authenticateToken on every request, so
+// it must stay cheap: an in-memory per-email throttle skips the DB round-trip unless >60s have
+// passed since we last touched that email's session. A session EXTENDS (last_seen_at bumped) if
+// the gap since its last touch is under SESSION_IDLE_GAP_MS; otherwise a NEW session row starts —
+// this is what keeps "connected hours" from counting overnight/weekend gaps as connected time.
+const sessionTouchCache = new Map(); // email -> last DB-touch Date.now()
+const SESSION_TOUCH_THROTTLE_MS = 60 * 1000;
+const SESSION_IDLE_GAP_MS = 15 * 60 * 1000;
+async function touchSession(email, ip, userAgent) {
+  if (!email) return;
+  const now = Date.now();
+  const last = sessionTouchCache.get(email) || 0;
+  if (now - last < SESSION_TOUCH_THROTTLE_MS) return;
+  sessionTouchCache.set(email, now);
+  try {
+    const cur = (await pool.query(
+      `SELECT id, last_seen_at FROM user_sessions WHERE email = $1 ORDER BY last_seen_at DESC LIMIT 1`, [email]
+    )).rows[0];
+    if (cur && (Date.now() - new Date(cur.last_seen_at).getTime()) < SESSION_IDLE_GAP_MS) {
+      await pool.query(`UPDATE user_sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE id = $1`, [cur.id]);
+    } else {
+      await pool.query(
+        `INSERT INTO user_sessions (email, ip, user_agent) VALUES ($1, $2, $3)`,
+        [email, ip || null, (userAgent || '').slice(0, 255) || null]
+      );
+    }
+  } catch (e) { console.error('touchSession error:', e.message); }
 }
 
 async function getManagedTeamIds(email) {
@@ -512,6 +544,22 @@ async function initializeDatabase() {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_log_entity ON activity_log(entity_type, entity_id, created_at DESC)`);
+    // Coarse connection-time tracking for the Admin → Audit dashboard ("who's online, how many
+    // hours"). One row per continuous session: started at first request after an idle gap,
+    // extended (last_seen_at bumped) on subsequent requests, never explicitly closed (JWTs are
+    // stateless — there's no logout event to end a session on). "Connected hours" = SUM(last_seen_at
+    // - started_at); "online now" = last_seen_at within the last few minutes. See touchSession().
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_sessions (
+        id           SERIAL PRIMARY KEY,
+        email        VARCHAR(255) NOT NULL,
+        started_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        last_seen_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        ip           VARCHAR(64),
+        user_agent   VARCHAR(255)
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_sessions_email ON user_sessions(email, last_seen_at DESC)`);
     // Commission adjustments: carry an unpaid/missed commission from a past month forward to
     // a chosen target pay period (e.g. pay a missed March invoice in May). Creating one marks
     // the source invoice settled (clears the radar) and adds an "adjustment" line to the
@@ -1377,6 +1425,10 @@ const authenticateToken = async (req, res, next) => {
     if (req.user.isDemo) {
       if (!applyDemoGuards(req, res)) return; // request already answered with 403
     }
+    // Track connection time against the REAL account (user.email, before impersonation may have
+    // overwritten req.user.email) — impersonating an account shouldn't count as that account's
+    // connected time. Fire-and-forget: never let session tracking slow down or fail a request.
+    touchSession(user.email, req.ip, req.headers['user-agent']).catch(() => {});
     next();
   } catch (error) {
     res.status(401).json({ error: 'Invalid token' });
@@ -1628,6 +1680,7 @@ app.get('/api/auth/callback', async (req, res) => {
     // First login and still no role after the auto-assign above → the user sees an empty
     // menu; alert the configured admins so they assign one (fire-and-forget).
     if (isFirstLogin) notifyNewUserWithoutRole(userEmail, userName, 'Zoho');
+    logActivity('auth', userEmail, 'login', `${userName || userEmail} logged in via Zoho`, userEmail, { metadata: { via: 'zoho' } });
 
     // Create JWT — photo stored in DB, not JWT (base64 would be too large for URL)
     const jwtToken = jwt.sign(
@@ -1897,6 +1950,7 @@ app.post('/api/admin/local-users/invite', authenticateToken, async (req, res) =>
         inviteUrl
       )
     );
+    logActivity('user', email, 'invited', `${email}${name ? ` (${name})` : ''} invited by ${actor}`, actor);
     res.json({ success: true, inviteUrl, emailSent: mail.sent, emailError: mail.sent ? null : mail.reason });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -2159,6 +2213,7 @@ app.post('/api/auth/login/verify-2fa', async (req, res) => {
       return res.status(401).json({ error: 'Invalid code' });
     }
     await pool.query(`UPDATE local_users SET last_login_at = CURRENT_TIMESTAMP WHERE id = $1`, [u.id]);
+    logActivity('auth', u.email, 'login', `${u.display_name || u.email} logged in`, u.email, { metadata: { via: 'local' } });
     res.json({ success: true, token: signLocalJwt(u) });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -7466,11 +7521,13 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
     });
     if (!r.sent) return res.status(502).json({ error: r.reason === 'smtp_not_configured' ? 'smtp_not_configured' : 'mail_failed', reason: r.reason });
     // Record the send for the status board (best-effort).
+    const proposalActor = req.user.realAdminEmail || req.user.email || 'unknown';
     try {
       await pool.query(
         `INSERT INTO proposals_sent (estimate_id, estimate_number, customer_name, rep_email, to_email, lang, track_token, accept_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-        [estimateId, (det && det.number) || '', clientName, (req.user.realAdminEmail || req.user.email || ''), to, lang, trackToken, acceptUrl || null]);
+        [estimateId, (det && det.number) || '', clientName, proposalActor, to, lang, trackToken, acceptUrl || null]);
     } catch (e) { console.warn('[proposal/send] record:', e.message); }
+    logActivity('proposal', estimateId, 'sent', `Proposal ${(det && det.number) || ''} sent to ${to} by ${proposalActor}`.trim(), proposalActor, { metadata: { clientName, to } });
     res.json({ success: true, acceptLinkIncluded: !!acceptUrl, sentFrom: fromAddr });
   } catch (e) { console.warn('[proposal/send]', e.message); res.status(500).json({ error: e.message }); }
 });
@@ -7551,7 +7608,11 @@ app.delete('/api/proposals/sent/:id', authenticateToken, async (req, res) => {
   }
   if (!effAdmin) return res.status(403).json({ error: 'Admin required' });
   try {
-    await pool.query('DELETE FROM proposals_sent WHERE id = $1', [req.params.id]);
+    const row = (await pool.query('DELETE FROM proposals_sent WHERE id = $1 RETURNING estimate_id, estimate_number', [req.params.id])).rows[0];
+    if (row) {
+      const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+      logActivity('proposal', row.estimate_id, 'deleted', `Sent-proposal record ${row.estimate_number || ''} deleted by ${actor}`.trim(), actor);
+    }
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -11593,6 +11654,7 @@ app.put('/api/users/:email/roles', authenticateToken, async (req, res) => {
   const roleIds = Array.isArray(req.body?.roleIds) ? req.body.roleIds.map(Number).filter(n => !isNaN(n)) : null;
   if (roleIds === null) return res.status(400).json({ error: 'roleIds array required' });
   const email = req.params.email;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
   try {
     await pool.query('BEGIN');
     await pool.query('DELETE FROM user_roles WHERE LOWER(user_email) = LOWER($1)', [email]);
@@ -11603,6 +11665,10 @@ app.put('/api/users/:email/roles', authenticateToken, async (req, res) => {
       );
     }
     await pool.query('COMMIT');
+    const roleNames = roleIds.length
+      ? (await pool.query('SELECT name FROM roles WHERE id = ANY($1)', [roleIds])).rows.map(r => r.name)
+      : [];
+    logActivity('user', email, 'roles_changed', `Roles for ${email} set to [${roleNames.join(', ') || 'none'}] by ${actor}`, actor);
     res.json({ success: true, assigned: roleIds.length });
   } catch (error) {
     await pool.query('ROLLBACK');
@@ -14121,14 +14187,17 @@ app.post('/api/commissions/manual-bonus', authenticateToken, async (req, res) =>
        VALUES ($1, $2::date, $3, $4, $5) RETURNING id`,
       [repName, period, Math.round(amt * 100) / 100, (description || '').toString().slice(0, 500), actor]
     )).rows[0];
+    logActivity('rep_pay', repName, 'manual_bonus_added', `Manual bonus of $${amt.toFixed(2)} added for ${year}-${String(month).padStart(2, '0')} by ${actor}${description ? ` — ${description}` : ''}`, actor, { amount: amt });
     res.json({ success: true, id: r.id });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/commissions/manual-bonus/:id', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
   try {
-    await pool.query(`DELETE FROM manual_bonuses WHERE id = $1`, [parseInt(req.params.id)]);
+    const row = (await pool.query(`DELETE FROM manual_bonuses WHERE id = $1 RETURNING rep_name, amount::float AS amount, to_char(period,'YYYY-MM') AS ym`, [parseInt(req.params.id)])).rows[0];
+    if (row) logActivity('rep_pay', row.rep_name, 'manual_bonus_removed', `Manual bonus of $${row.amount.toFixed(2)} for ${row.ym} removed by ${actor}`, actor, { amount: -row.amount });
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -14220,6 +14289,7 @@ app.post('/api/commissions/adjustments', authenticateToken, async (req, res) => 
          VALUES ($1, $2::date, NULL, $3, $4, $5::date, $6, $7) RETURNING id`,
         [repName, target, refCustomer ? String(refCustomer).slice(0, 255) : null,
          Math.round(freeAmount * 100) / 100, src, desc, actor])).rows[0];
+      logActivity('rep_pay', repName, 'adjustment_added', `Free-form adjustment of $${freeAmount.toFixed(2)} for ${year}-${String(month).padStart(2, '0')} by ${actor} — ${desc}`, actor, { amount: freeAmount });
       return res.json({ success: true, created: 1, total: freeAmount, freeForm: true, id: row.id });
     } catch (e) {
       return res.status(500).json({ error: e.message });
@@ -14271,7 +14341,7 @@ app.delete('/api/commissions/adjustments/:id', authenticateToken, async (req, re
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const adj = (await client.query(`SELECT invoice_number, source_period::date AS source_period FROM commission_adjustments WHERE id = $1`, [parseInt(req.params.id)])).rows[0];
+    const adj = (await client.query(`SELECT invoice_number, rep_name, amount::float AS amount, source_period::date AS source_period FROM commission_adjustments WHERE id = $1`, [parseInt(req.params.id)])).rows[0];
     if (adj && adj.invoice_number) {
       await client.query(
         `UPDATE invoices SET payable_override = NULL, commission_payable_date = COALESCE($3::date, commission_payable_date),
@@ -14284,6 +14354,8 @@ app.delete('/api/commissions/adjustments/:id', authenticateToken, async (req, re
     await client.query('COMMIT');
     if (adj && adj.invoice_number) {
       logActivity('invoice', adj.invoice_number, 'adjustment_undone', `Carry-forward adjustment undone by ${actor}`, actor);
+    } else if (adj) {
+      logActivity('rep_pay', adj.rep_name, 'adjustment_removed', `Free-form adjustment of $${adj.amount.toFixed(2)} removed by ${actor}`, actor, { amount: -adj.amount });
     }
     res.json({ success: true });
   } catch (e) {
@@ -14433,6 +14505,7 @@ app.post('/api/commissions/quota-waiver', authenticateToken, async (req, res) =>
         `INSERT INTO quota_waiver_log (rep_name, period, percent, action, created_by) VALUES ($1, $2::date, NULL, 'removed', $3)`,
         [repName, period, actor]
       );
+      logActivity('rep_pay', repName, 'quota_waiver_removed', `Quota waiver for ${year}-${String(month).padStart(2, '0')} removed by ${actor}`, actor);
     } else {
       await pool.query(
         `INSERT INTO quota_month_waivers (rep_name, period, created_by, percent)
@@ -14448,6 +14521,7 @@ app.post('/api/commissions/quota-waiver', authenticateToken, async (req, res) =>
       // waiver now overrides that decision, so the old ack is stale and would otherwise hide
       // this rep+month from the default queue even though real money is still involved.
       await pool.query(`DELETE FROM quota_review_acknowledgements WHERE rep_name = $1 AND period = $2::date`, [repName, period]);
+      logActivity('rep_pay', repName, 'quota_waiver_set', `Quota waiver set to ${percent}% for ${year}-${String(month).padStart(2, '0')} by ${actor}`, actor, { metadata: { percent } });
     }
     res.json({ success: true, waived: waived !== false, percent, recalc: 'started' });
     runRecalcV2('quota-waiver').catch(e => console.error('waiver recalc error:', e.message));
@@ -14569,6 +14643,120 @@ app.get('/api/activity-log', authenticateToken, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ============================================================================
+// ADMIN → AUDIT — who's connected (+ how long) and the full cross-domain action log.
+// ============================================================================
+
+// GET /api/admin/audit/sessions?range=today|7d|30d — who's online now + connection-time totals
+// over the window. Coarse (see touchSession's throttling/idle-gap logic) but good enough to spot
+// who's active and roughly how much.
+app.get('/api/admin/audit/sessions', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:audit_dashboard'))) return;
+  const range = ['today', '7d', '30d'].includes(req.query.range) ? req.query.range : '7d';
+  const rangeStart = range === 'today' ? `date_trunc('day', CURRENT_TIMESTAMP)`
+    : range === '30d' ? `CURRENT_TIMESTAMP - interval '30 days'` : `CURRENT_TIMESTAMP - interval '7 days'`;
+  try {
+    const rows = (await pool.query(`
+      WITH windowed AS (
+        SELECT email, GREATEST(started_at, ${rangeStart}) AS clip_start, last_seen_at
+          FROM user_sessions WHERE last_seen_at >= ${rangeStart}
+      )
+      SELECT email, COUNT(*)::int AS session_count,
+             SUM(EXTRACT(EPOCH FROM (last_seen_at - clip_start)))::float AS seconds,
+             MAX(last_seen_at) AS last_seen_at
+        FROM windowed WHERE last_seen_at > clip_start
+       GROUP BY email
+    `)).rows;
+    const emails = rows.map(r => r.email);
+    let profiles = [];
+    if (emails.length) {
+      profiles = (await pool.query(`
+        SELECT e.email,
+               COALESCE(ut.display_name, lu.display_name, sp.name, e.email) AS display_name,
+               CASE WHEN ut.email IS NOT NULL THEN 'zoho' WHEN lu.email IS NOT NULL THEN 'local' ELSE 'unknown' END AS account_type,
+               COALESCE(ut.is_admin, false) AS is_admin
+          FROM unnest($1::text[]) AS e(email)
+          LEFT JOIN user_tokens ut ON LOWER(ut.email) = LOWER(e.email)
+          LEFT JOIN local_users lu ON LOWER(lu.email) = LOWER(e.email)
+          LEFT JOIN salespeople sp ON LOWER(sp.email) = LOWER(e.email)
+      `, [emails])).rows;
+    }
+    const profileMap = new Map(profiles.map(p => [p.email.toLowerCase(), p]));
+    const now = Date.now();
+    const ONLINE_WINDOW_MS = 5 * 60 * 1000;
+    const out = rows.map(r => {
+      const p = profileMap.get(r.email.toLowerCase()) || {};
+      return {
+        email: r.email,
+        displayName: p.display_name || r.email,
+        accountType: p.account_type || 'unknown',
+        isAdmin: !!p.is_admin,
+        sessionCount: r.session_count,
+        hours: Math.round((r.seconds / 3600) * 10) / 10,
+        lastSeenAt: r.last_seen_at,
+        online: (now - new Date(r.last_seen_at).getTime()) < ONLINE_WINDOW_MS,
+      };
+    });
+    out.sort((a, b) => b.hours - a.hours);
+    res.json({
+      range,
+      users: out,
+      onlineNow: out.filter(u => u.online).length,
+      activeUsers: out.length,
+      totalHours: Math.round(out.reduce((a, u) => a + u.hours, 0) * 10) / 10,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/admin/audit/logs?actor=&entityType=&eventType=&q=&from=&to=&page=&pageSize= — the
+// full action-log feed across every domain (invoices, proposals, rep pay, auth, user mgmt).
+// Distinct from GET /api/activity-log above, which is scoped to ONE entity's timeline.
+app.get('/api/admin/audit/logs', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:audit_logs'))) return;
+  const { actor, entityType, eventType, q, from, to } = req.query;
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize) || 50));
+  const clauses = [];
+  const params = [];
+  const add = (clause, value) => { params.push(value); clauses.push(clause.replace('?', `$${params.length}`)); };
+  if (actor) add('actor = ?', actor);
+  if (entityType) add('entity_type = ?', entityType);
+  if (eventType) add('event_type = ?', eventType);
+  if (q) add('description ILIKE ?', `%${q}%`);
+  if (from) add('created_at >= ?', from);
+  if (to) add('created_at <= ?', to);
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  try {
+    const total = (await pool.query(`SELECT COUNT(*)::int AS n FROM activity_log ${where}`, params)).rows[0].n;
+    const rows = (await pool.query(
+      `SELECT id, entity_type, entity_id, event_type, description, actor, amount::float AS amount, metadata, created_at
+         FROM activity_log ${where}
+        ORDER BY created_at DESC
+        LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`,
+      params
+    )).rows;
+    res.json({ rows, total, page, pageSize });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/admin/audit/logs/facets — distinct actor/entityType/eventType values, for the Logs
+// filter dropdowns.
+app.get('/api/admin/audit/logs/facets', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'admin:audit_logs'))) return;
+  try {
+    const [actors, entityTypes, eventTypes] = await Promise.all([
+      pool.query(`SELECT DISTINCT actor FROM activity_log WHERE actor IS NOT NULL ORDER BY actor`),
+      pool.query(`SELECT DISTINCT entity_type FROM activity_log ORDER BY entity_type`),
+      pool.query(`SELECT DISTINCT event_type FROM activity_log ORDER BY event_type`),
+    ]);
+    res.json({
+      actors: actors.rows.map(r => r.actor),
+      entityTypes: entityTypes.rows.map(r => r.entity_type),
+      eventTypes: eventTypes.rows.map(r => r.event_type),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /api/commissions/quota-review/acknowledge { repName, year, month, note? } — admin has
 // reviewed this rep+month's quota-gated forfeiture and confirms it stays at $0 (no waiver).
 // Pure audit trail — no money moves. Use POST /api/commissions/quota-waiver instead to pay
@@ -14586,6 +14774,7 @@ app.post('/api/commissions/quota-review/acknowledge', authenticateToken, async (
        ON CONFLICT (rep_name, period) DO UPDATE SET note = EXCLUDED.note, acknowledged_by = EXCLUDED.acknowledged_by, acknowledged_at = NOW()`,
       [repName, period, (note || '').toString().slice(0, 300), actor]
     );
+    logActivity('rep_pay', repName, 'quota_forfeit_confirmed', `Quota-gate forfeiture for ${year}-${String(month).padStart(2, '0')} confirmed (stays $0) by ${actor}`, actor);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -14594,8 +14783,10 @@ app.post('/api/commissions/quota-review/acknowledge', authenticateToken, async (
 // active quota-review queue.
 app.delete('/api/commissions/quota-review/acknowledge/:id', authenticateToken, async (req, res) => {
   if (!(await requirePermAny(req, res, ['report:quota_review', 'report:mark_paid']))) return;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
   try {
-    await pool.query(`DELETE FROM quota_review_acknowledgements WHERE id = $1`, [parseInt(req.params.id)]);
+    const row = (await pool.query(`DELETE FROM quota_review_acknowledgements WHERE id = $1 RETURNING rep_name, to_char(period,'YYYY-MM') AS ym`, [parseInt(req.params.id)])).rows[0];
+    if (row) logActivity('rep_pay', row.rep_name, 'quota_forfeit_ack_undone', `Quota-gate forfeiture confirmation for ${row.ym} undone by ${actor}`, actor);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -14752,6 +14943,7 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
     for (const r of invRows) {
       logActivity('invoice', r.invoice_number, 'paid', `Commission marked paid by ${actor} (${year}-${mm} pay stub)`, actor, { amount: r.commission });
     }
+    logActivity('rep_pay', repName, 'stub_committed', `Pay stub committed for ${year}-${mm} by ${actor}: $${total.toFixed(2)} (${invRows.length} invoices)`, actor, { amount: total });
     res.json({ success: true, invoicesMarked: invRows.length, bonuses: bonusRows.length, total });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
@@ -14800,6 +14992,7 @@ app.post('/api/commissions/pay-stub/uncommit', authenticateToken, async (req, re
     for (const r of reverted.rows) {
       logActivity('invoice', r.invoice_number, 'payment_undone', `Payment undone by ${actor} — reverted to pending`, actor);
     }
+    logActivity('rep_pay', repName, 'stub_uncommitted', `Pay stub commit for ${year}-${String(month).padStart(2, '0')} undone by ${actor} (${reverted.rowCount} invoices reverted)`, actor);
     res.json({ success: true, reverted: reverted.rowCount });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
@@ -15497,6 +15690,7 @@ app.post('/api/commissions/processing-bonus/commit', authenticateToken, async (r
   const year = parseInt(req.body.year), month = parseInt(req.body.month);
   if (!year || (month !== 6 && month !== 12)) return res.status(400).json({ error: 'year + month (6 or 12) required' });
   const period = `${year}-${String(month).padStart(2, '0')}-01`;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
   const client = await pool.connect();
   try {
     const result = await computeProcessingBonuses(year, month);
@@ -15514,6 +15708,10 @@ app.post('/api/commissions/processing-bonus/commit', authenticateToken, async (r
       }
     }
     await client.query('COMMIT');
+    for (const [rep, v] of result.byRep.entries()) {
+      const repTotal = v.accounts.reduce((s, a) => s + a.bonus, 0);
+      if (repTotal > 0) logActivity('rep_pay', rep, 'processing_bonus_committed', `${year}-${month === 6 ? '06' : '12'} bi-annual processing bonus committed by ${actor}: $${repTotal.toFixed(2)} (${v.accounts.length} accounts)`, actor, { amount: repTotal });
+    }
     res.json({ committed: true, accounts: count, total: Math.round(total * 100) / 100 });
   } catch (e) {
     await client.query('ROLLBACK');
@@ -15532,12 +15730,22 @@ app.post('/api/commissions/processing-bonus/uncommit', authenticateToken, async 
   const year = parseInt(req.body.year), month = parseInt(req.body.month);
   if (!year || (month !== 6 && month !== 12)) return res.status(400).json({ error: 'year + month (6 or 12) required' });
   const period = `${year}-${String(month).padStart(2, '0')}-01`;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
   try {
+    const byRep = (await pool.query(
+      `SELECT rep_name, SUM(amount)::float AS total FROM commission_bonuses
+        WHERE bonus_type = 'processing' AND import_id IS NULL AND paid_for_period = $1::date
+        GROUP BY rep_name`,
+      [period]
+    )).rows;
     const r = await pool.query(
       `DELETE FROM commission_bonuses
         WHERE bonus_type = 'processing' AND import_id IS NULL AND paid_for_period = $1::date`,
       [period]
     );
+    for (const row of byRep) {
+      logActivity('rep_pay', row.rep_name, 'processing_bonus_uncommitted', `${year}-${month === 6 ? '06' : '12'} bi-annual processing bonus commit undone by ${actor}: -$${row.total.toFixed(2)}`, actor, { amount: -row.total });
+    }
     res.json({ uncommitted: r.rowCount });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
