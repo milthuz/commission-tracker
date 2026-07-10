@@ -2461,7 +2461,9 @@ async function getKaizenDemoSettings() {
   try {
     const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'kaizen_demo'`);
     if (!r.rows[0]) return { enabled: true, message: '' };
-    const v = JSON.parse(r.rows[0].value);
+    // app_settings.value is JSONB — node-postgres already parses it into a JS object, so
+    // JSON.parse()'ing it again throws (was silently caught below, always fail-open "enabled").
+    const v = r.rows[0].value;
     return { enabled: v.enabled !== false, message: (v.message || '').toString() };
   } catch { return { enabled: true, message: '' }; }
 }
@@ -2480,8 +2482,8 @@ app.put('/api/admin/kaizen-demo-settings', authenticateToken, async (req, res) =
   const message = (req.body.message || '').toString().slice(0, 500);
   try {
     await pool.query(
-      `INSERT INTO app_settings (key, value, updated_at) VALUES ('kaizen_demo', $1, NOW())
-       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()`,
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('kaizen_demo', $1::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = $1::jsonb, updated_at = NOW()`,
       [JSON.stringify({ enabled, message })]
     );
     res.json({ success: true, enabled, message });
