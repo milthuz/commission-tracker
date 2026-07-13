@@ -4361,6 +4361,43 @@ app.get('/api/admin/rep-config', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/rep-role-debug?secret=&name=<rep name>  — diagnoses "assigned a role but the
+// Data Health 'reps with no role' card still flags them": shows exactly which login email the
+// repsNoRole query resolves to (user_tokens.display_name match, else salespeople.email) and
+// whether any user_roles row exists for THAT email — the two usually diverge on an accent/name
+// mismatch between the Zoho display name and the salespeople row.
+app.get('/api/admin/rep-role-debug', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const name = String(req.query.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'name required' });
+  try {
+    const sp = (await pool.query(`SELECT name, email, is_active FROM salespeople WHERE name ILIKE '%'||$1||'%'`, [name])).rows;
+    const tokens = (await pool.query(`SELECT email, display_name, is_admin FROM user_tokens WHERE display_name ILIKE '%'||$1||'%'`, [name])).rows;
+    const out = [];
+    for (const s of sp) {
+      const matchedToken = tokens.find(t => (t.display_name || '').toLowerCase() === s.name.toLowerCase());
+      const resolvedEmail = (matchedToken && matchedToken.email) || s.email || null;
+      const roles = resolvedEmail
+        ? (await pool.query(
+            `SELECT r.id, r.name FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE LOWER(ur.user_email) = LOWER($1)`,
+            [resolvedEmail]
+          )).rows
+        : [];
+      out.push({
+        salesperson: s,
+        matchedUserToken: matchedToken || null,
+        allTokensLike: tokens,
+        resolvedLoginEmail: resolvedEmail,
+        rolesForResolvedEmail: roles,
+      });
+    }
+    res.json({ rows: out });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/payroll-sends-dump?secret=  — raw rows from payroll_sends (diagnostic).
 app.get('/api/admin/payroll-sends-dump', async (req, res) => {
   const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
