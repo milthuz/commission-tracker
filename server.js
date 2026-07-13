@@ -4276,6 +4276,54 @@ app.get('/api/admin/saas-first-audit', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/too-late-audit?secret=  — every frozen (paid) too_late invoice, with the
+// hardware commission it would now earn under the no-window rule (2026-07-13), for deciding
+// whether/how to retroactively carry them forward.
+app.get('/api/admin/too-late-audit', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const spRes = await pool.query('SELECT name, commission_rate FROM salespeople');
+    const rateMap = {};
+    spRes.rows.forEach(r => { rateMap[r.name] = parseFloat(r.commission_rate) || 10; });
+    const rows = (await pool.query(`
+      SELECT invoice_number, customer_name, salesperson_name,
+             date::date AS date, paid_date::date AS paid_date,
+             total::float AS total, hardware_amount::float AS hardware_amount,
+             sub_total::float AS sub_total, discount_total::float AS discount_total,
+             gross_line_total::float AS gross_line_total
+        FROM invoices
+       WHERE organization_id = $1 AND commission_status = 'too_late'
+       ORDER BY salesperson_name, date`, [process.env.ZOHO_ORG_ID])).rows;
+    const out = rows.map(r => {
+      const st = r.sub_total || 0, dt = r.discount_total || 0, gross = r.gross_line_total || 0;
+      let factor = 1;
+      if (st > 0 && gross > 0) {
+        const net = st - dt;
+        if (net > 0 && net < gross) factor = net / gross;
+      }
+      const discountPct = 1 - factor;
+      const rate = rateMap[r.salesperson_name] || 10;
+      const hwRate = discountPct >= 0.25 ? rate / 2 : rate;
+      const amountFactor = dt > 0 ? factor : 1;
+      const hwAmt = (r.hardware_amount || 0) * amountFactor;
+      const would_be_commission = Math.round(hwAmt * (hwRate / 100) * 100) / 100;
+      return { ...r, would_be_commission };
+    });
+    res.json({
+      count: out.length,
+      total_would_be_commission: Math.round(out.reduce((s, r) => s + r.would_be_commission, 0) * 100) / 100,
+      by_rep: Object.entries(out.reduce((m, r) => {
+        m[r.salesperson_name] = (m[r.salesperson_name] || 0) + r.would_be_commission;
+        return m;
+      }, {})).map(([rep, amount]) => ({ rep, amount: Math.round(amount * 100) / 100 })),
+      rows: out,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/exclude-add?secret=&name=  — replicate the exclude-customer INSERT at the DB
 // level (diagnose why the UI add doesn't persist) AND actually exclude the customer.
 app.get('/api/admin/exclude-add', async (req, res) => {
