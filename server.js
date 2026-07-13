@@ -7902,6 +7902,10 @@ app.get('/api/admin/unassigned-invoices', (req, res, next) => {
   return authenticateToken(req, res, next);
 }, async (req, res) => {
   if (!req.viaSecret && !(await requirePermAny(req, res, ['admin:notifications', 'admin:data_health']))) return;
+  // Default scope matches the Data Health card exactly (unassigned invoices from 2026-01-01
+  // on — the old pre-2026 backlog is accepted, permanent noise per the 2026-06-08 "leave as-is"
+  // decision, not something to chase). Pass ?all=1 for the full historical dump if ever needed.
+  const sinceClause = req.query.all === '1' ? '' : `AND date >= '2026-01-01'`;
   try {
     const norm = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
     const [invRes, sameCustRes, crmRes, zenRes] = await Promise.all([
@@ -7910,7 +7914,7 @@ app.get('/api/admin/unassigned-invoices', (req, res, next) => {
                 total::float AS total, commission::float AS commission,
                 commission_status, status, approval_status
          FROM invoices
-         WHERE salesperson_name = 'Unassigned' AND commission > 0
+         WHERE salesperson_name = 'Unassigned' AND commission > 0 ${sinceClause}
          ORDER BY commission DESC`
       ),
       // Strongest signal: the SAME customer's other invoices that DO have a salesperson.
