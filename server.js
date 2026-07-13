@@ -4398,6 +4398,37 @@ app.get('/api/admin/rep-role-debug', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/invoice-payment-source?secret=&number=<invoice number>  — "which pay report
+// was this invoice actually paid on?" Shows the invoices row's own approval/payout columns plus
+// any commission_payment_lines row(s) joined to their import (filename, rep, period) — an
+// invoice can only be in ONE commission_payment_lines row (the import that settled it), so this
+// answers disputes like "Gabriella says X wasn't paid" definitively instead of guessing from
+// commission_status alone.
+app.get('/api/admin/invoice-payment-source', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const number = String(req.query.number || '').trim();
+  if (!number) return res.status(400).json({ error: 'number required' });
+  try {
+    const inv = (await pool.query(
+      `SELECT invoice_number, salesperson_name, commission::float AS commission, commission_status,
+              approval_status, approved_by, approved_at, payout_paid_by, payout_paid_at
+         FROM invoices WHERE invoice_number = $1`, [number]
+    )).rows[0] || null;
+    const paymentLines = (await pool.query(
+      `SELECT l.paid_amount::float AS paid_amount, l.app_commission::float AS app_commission,
+              l.not_in_db, l.quota_partial, l.quota_forfeited::float AS quota_forfeited,
+              i.id AS import_id, i.filename, i.rep_name, i.paid_for_period::date AS paid_for_period,
+              i.imported_at, i.imported_by
+         FROM commission_payment_lines l JOIN commission_payment_imports i ON i.id = l.import_id
+        WHERE l.invoice_number = $1`, [number]
+    )).rows;
+    res.json({ invoice: inv, paymentLines });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/payroll-sends-dump?secret=  — raw rows from payroll_sends (diagnostic).
 app.get('/api/admin/payroll-sends-dump', async (req, res) => {
   const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
