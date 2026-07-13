@@ -12633,6 +12633,8 @@ app.get('/api/admin/zoho-invoice-raw', async (req, res) => {
     if (!inv) return res.status(500).json({ error: 'No detail', body: detail.data });
     res.json({
       invoice_number: inv.invoice_number,
+      salesperson_name: inv.salesperson_name, salesperson_id: inv.salesperson_id,
+      last_modified_time: inv.last_modified_time,
       sub_total: inv.sub_total, total: inv.total, discount: inv.discount,
       discount_total: inv.discount_total, discount_type: inv.discount_type, is_discount_before_tax: inv.is_discount_before_tax,
       line_items: (inv.line_items || []).map(li => ({
