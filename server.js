@@ -7072,6 +7072,51 @@ async function fetchEstimatePdfBytes(estimateId) {
   return { buffer: Buffer.from(r.data), contentType: r.headers['content-type'] || 'application/pdf' };
 }
 
+// GET /api/proposals/estimate/:estimateId/preview?token=... — inline render for an iframe on the
+// Proposals page (click a quote/customer to preview the raw Zoho estimate PDF before building a
+// proposal from it). Mirrors GET /api/invoices/:invoiceNumber/preview's query-token pattern —
+// iframes can't set an Authorization header.
+app.get('/api/proposals/estimate/:estimateId/preview', async (req, res) => {
+  const token = req.query.token;
+  if (!token) return res.status(401).send('Missing token');
+  let tokenEmail = null;
+  try {
+    tokenEmail = jwt.verify(String(token), JWT_SECRET)?.email || null;
+  } catch {
+    return res.status(401).send('Invalid token');
+  }
+  if (tokenEmail) {
+    try {
+      const d = await pool.query(
+        `SELECT COALESCE((SELECT is_admin  FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1), false) AS is_admin,
+                COALESCE((SELECT demo_mode FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1),
+                         (SELECT demo_mode FROM local_users WHERE LOWER(email) = LOWER($1) LIMIT 1),
+                         false) AS demo_mode`, [tokenEmail]);
+      if (d.rows[0]?.demo_mode === true) {
+        return res.status(403).send('<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>Aperçu désactivé en mode démo / Preview disabled in demo mode</h3></body></html>');
+      }
+      if (d.rows[0]?.is_admin !== true) {
+        const perms = await getUserPermissions(tokenEmail);
+        if (!userHasPermission(perms, 'proposals:send')) {
+          return res.status(403).send('<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>Permission requise / Permission required</h3></body></html>');
+        }
+      }
+    } catch { /* fail open on DB hiccup — same as the invoice-preview route */ }
+  }
+  try {
+    const result = await fetchEstimatePdfBytes(req.params.estimateId);
+    if (result.error) {
+      return res.status(result.status || 500).send(`<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>Could not fetch this estimate from Zoho Books</h3><pre style="font-size:11px;color:#888;white-space:pre-wrap">${result.body || ''}</pre></body></html>`);
+    }
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${req.params.estimateId}.pdf"`);
+    return res.send(result.buffer);
+  } catch (e) {
+    console.error('Estimate preview error:', e.message);
+    return res.status(500).send(`<html><body style="font-family:sans-serif;padding:2rem"><p>Error loading preview: ${e.message}</p></body></html>`);
+  }
+});
+
 // GET /api/proposals/estimates?q= — list recent Zoho Books estimates (devis) for the rep to pick from.
 // (Phase 1 of the proposal builder.) Returns light metadata; the PDF + customer email are fetched at prepare time.
 app.get('/api/proposals/estimates', authenticateToken, async (req, res) => {
