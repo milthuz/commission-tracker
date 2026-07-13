@@ -7891,15 +7891,17 @@ app.post('/api/webhooks/zoho-books/invoice', async (req, res) => {
 // GET /api/admin/db-stats?secret=<shared>
 // Returns row counts per table + invoice breakdown by status. Gated by the
 // same shared secret as the webhook so we don't need a JWT to query it.
-// GET /api/admin/unassigned-invoices?secret=<shared>
+// GET /api/admin/unassigned-invoices?secret=<shared> — also usable by a logged-in admin
+// (admin:data_health) so the Data Health page can export this list, not just curl diagnostics.
 // Full dump of every "Unassigned" earned-commission invoice (no salesperson on the Zoho
 // invoice), with a SUGGESTED rep where the customer name matches a Zentact merchant that
 // has one. Working list for fixing attribution IN ZOHO (sync overwrites local edits).
-app.get('/api/admin/unassigned-invoices', async (req, res) => {
+app.get('/api/admin/unassigned-invoices', (req, res, next) => {
   const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) { req.viaSecret = true; return next(); }
+  return authenticateToken(req, res, next);
+}, async (req, res) => {
+  if (!req.viaSecret && !(await requirePermAny(req, res, ['admin:notifications', 'admin:data_health']))) return;
   try {
     const norm = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
     const [invRes, sameCustRes, crmRes, zenRes] = await Promise.all([
