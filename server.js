@@ -14525,6 +14525,30 @@ app.post('/api/commissions/adjustments', authenticateToken, async (req, res) => 
   } finally { client.release(); }
 });
 
+// PUT /api/commissions/adjustments/:id { description }  — correct the description/reason line
+// after the fact (e.g. a typo, or clarifying why the adjustment was made). Does NOT touch the
+// amount, invoice, or target period — those require deleting and recreating the adjustment.
+app.put('/api/commissions/adjustments/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePermAny(req, res, ['report:adjustments', 'report:mark_paid']))) return;
+  const description = (req.body.description || '').toString().trim().slice(0, 300);
+  if (!description) return res.status(400).json({ error: 'description required' });
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  try {
+    const row = (await pool.query(
+      `UPDATE commission_adjustments SET description = $1 WHERE id = $2
+       RETURNING invoice_number, rep_name`,
+      [description, parseInt(req.params.id)]
+    )).rows[0];
+    if (!row) return res.status(404).json({ error: 'not_found' });
+    if (row.invoice_number) {
+      logActivity('invoice', row.invoice_number, 'adjustment_description_edited', `Adjustment description edited by ${actor}: "${description}"`, actor);
+    } else {
+      logActivity('rep_pay', row.rep_name, 'adjustment_description_edited', `Adjustment description edited by ${actor}: "${description}"`, actor);
+    }
+    res.json({ success: true, description });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // DELETE /api/commissions/adjustments/:id  — undo: move the invoice back to its original month.
 app.delete('/api/commissions/adjustments/:id', authenticateToken, async (req, res) => {
   if (!(await requirePermAny(req, res, ['report:adjustments', 'report:mark_paid']))) return;
