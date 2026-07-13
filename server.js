@@ -4425,7 +4425,14 @@ app.get('/api/admin/invoice-payment-source', async (req, res) => {
          FROM commission_payment_lines l JOIN commission_payment_imports i ON i.id = l.import_id
         WHERE l.invoice_number = $1`, [number]
     )).rows;
-    res.json({ invoice: inv, paymentLines });
+    // Who excluded/restored/adjusted this invoice and when (activity_log) — explains e.g. a
+    // commission_status='excluded' row that a rep is disputing.
+    const activity = (await pool.query(
+      `SELECT event_type, description, actor, amount::float AS amount, created_at
+         FROM activity_log WHERE entity_type = 'invoice' AND entity_id = $1
+        ORDER BY created_at DESC`, [number]
+    )).rows;
+    res.json({ invoice: inv, paymentLines, activity });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
