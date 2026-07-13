@@ -4413,7 +4413,7 @@ app.get('/api/admin/invoice-payment-source', async (req, res) => {
   if (!number) return res.status(400).json({ error: 'number required' });
   try {
     const inv = (await pool.query(
-      `SELECT invoice_number, salesperson_name, commission::float AS commission, commission_status,
+      `SELECT invoice_number, salesperson_name, organization_id, commission::float AS commission, commission_status,
               approval_status, approved_by, approved_at, payout_paid_by, payout_paid_at
          FROM invoices WHERE invoice_number = $1`, [number]
     )).rows[0] || null;
