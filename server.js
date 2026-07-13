@@ -16231,13 +16231,7 @@ async function runRecalcV2(source = 'manual') {
         if (d instanceof Date) return d;
         return new Date(d);
       };
-      const monthsLater = (d, n) => {
-        const x = new Date(d.getTime());
-        x.setMonth(x.getMonth() + n);
-        return x;
-      };
-
-      // PASS 1: first paid SaaS per customer (anchors the hardware 6-month window).
+      // PASS 1: first paid SaaS per customer (gates hardware on the customer having any SaaS).
       // First-month/activation detection moved to PASS 1d (needs the annual-line map).
       const firstSaasPaidByCustomer = new Map();
       for (const inv of invRes.rows) {
@@ -16525,22 +16519,20 @@ async function runRecalcV2(source = 'manual') {
             bucket = 'saas_renewal';
           }
         } else if (hardwareAmount > 0 && monthlySaas === 0) {
-          // Pure hardware — eligible if paid before OR within 6 months after first SaaS
+          // Pure hardware — eligible once the customer has a first paid SaaS invoice, no
+          // matter how much later the hardware sells (6-month window removed — user decision
+          // 2026-07-13).
           const firstSaasPaid = firstSaasPaidByCustomer.get(inv.customer_name);
           if (!firstSaasPaid) {
             bucket = 'pending_saas';
           } else {
-            const windowEnd = monthsLater(firstSaasPaid.paidDate, 6);
-            if (invPaidDate <= windowEnd) {
-              commission = hardwareAmount * (hwRate / 100);
-              bucket = 'hardware';
-              payableDate = invPaidDate > firstSaasPaid.paidDate ? invPaidDate : firstSaasPaid.paidDate;
-            } else {
-              bucket = 'too_late';
-            }
+            commission = hardwareAmount * (hwRate / 100);
+            bucket = 'hardware';
+            payableDate = invPaidDate > firstSaasPaid.paidDate ? invPaidDate : firstSaasPaid.paidDate;
           }
         } else if (hardwareAmount > 0 && monthlySaas > 0) {
-          // Mixed — monthly-SaaS portion follows first-month rule, hardware portion needs window
+          // Mixed — monthly-SaaS portion follows first-month rule, hardware portion pays once
+          // the customer has a first paid SaaS invoice (no time window — user decision 2026-07-13).
           const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
           // 100% activation only on the INITIAL sale's group — later add-ons are renewals.
           const isFirstMonth = firstMonthByGroup.get(key) === inv.id
@@ -16554,14 +16546,11 @@ async function runRecalcV2(source = 'manual') {
             bucket = 'saas_renewal';
           }
           if (firstSaasPaid) {
-            const windowEnd = monthsLater(firstSaasPaid.paidDate, 6);
-            if (invPaidDate <= windowEnd) {
-              commission += hardwareAmount * (hwRate / 100);
-              // If the SaaS portion didn't already set a payable date (renewal w/ HW), use the
-              // later of this invoice's paid_date and the first-SaaS paid_date.
-              if (!payableDate) {
-                payableDate = invPaidDate > firstSaasPaid.paidDate ? invPaidDate : firstSaasPaid.paidDate;
-              }
+            commission += hardwareAmount * (hwRate / 100);
+            // If the SaaS portion didn't already set a payable date (renewal w/ HW), use the
+            // later of this invoice's paid_date and the first-SaaS paid_date.
+            if (!payableDate) {
+              payableDate = invPaidDate > firstSaasPaid.paidDate ? invPaidDate : firstSaasPaid.paidDate;
             }
           }
         } else if (annualAmount > 0) {
