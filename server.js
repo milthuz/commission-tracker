@@ -4429,6 +4429,29 @@ app.get('/api/admin/invoice-payment-source', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/rep-imports?secret=&rep=<name>  — every commission_payment_imports row for a
+// rep, ordered by period. Answers "does a pay file even exist for month X?" (vs a specific
+// invoice just being omitted from an otherwise-complete import) when reconciling a dispute.
+app.get('/api/admin/rep-imports', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  const rep = String(req.query.rep || '').trim();
+  if (!rep) return res.status(400).json({ error: 'rep required' });
+  try {
+    const rows = (await pool.query(
+      `SELECT id, filename, paid_for_period::date AS paid_for_period, total_amount::float AS total_amount,
+              invoices_marked, invoices_skipped, invoices_not_found, imported_at, imported_by
+         FROM commission_payment_imports
+        WHERE rep_name ILIKE '%'||$1||'%'
+        ORDER BY paid_for_period`,
+      [rep]
+    )).rows;
+    res.json({ rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/payroll-sends-dump?secret=  — raw rows from payroll_sends (diagnostic).
 app.get('/api/admin/payroll-sends-dump', async (req, res) => {
   const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
