@@ -14692,6 +14692,16 @@ app.post('/api/commissions/adjustments', authenticateToken, async (req, res) => 
     const desc = [refInvoiceNumber ? `[${String(refInvoiceNumber).slice(0, 40)}]` : '',
                   (description || '').toString()].filter(Boolean).join(' ').slice(0, 300);
     try {
+      // Same duplicate-submit guard as the carry-forward path — a referenced invoice (e.g.
+      // from a suggestion or bulk-add) should never get a second free-form row.
+      if (refInvoiceNumber) {
+        const already = (await pool.query(
+          `SELECT 1 FROM commission_adjustments
+             WHERE invoice_number = $1 OR description LIKE '[' || $1 || ']%' LIMIT 1`,
+          [String(refInvoiceNumber)]
+        )).rows[0];
+        if (already) return res.json({ success: true, created: 0, duplicate: true, freeForm: true });
+      }
       const row = (await pool.query(
         `INSERT INTO commission_adjustments
            (rep_name, target_period, invoice_number, customer, amount, source_period, description, created_by)
@@ -14716,6 +14726,12 @@ app.post('/api/commissions/adjustments', authenticateToken, async (req, res) => 
         [num, process.env.ZOHO_ORG_ID]
       )).rows[0];
       if (!inv || !(inv.commission > 0) || inv.approval_status === 'paid') continue; // skip missing/paid
+      // Guard against a duplicate submit (e.g. Apply clicked again before the suggestions
+      // list refreshed) — an invoice already carried forward once should never get a second row.
+      const already = (await client.query(
+        `SELECT 1 FROM commission_adjustments WHERE invoice_number = $1 LIMIT 1`, [num]
+      )).rows[0];
+      if (already) continue;
       await client.query(
         `INSERT INTO commission_adjustments
            (rep_name, target_period, invoice_number, customer, amount, source_period, description, created_by)
