@@ -709,6 +709,22 @@ async function initializeDatabase() {
         created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    // Authoritative per-customer tenure fact (2026-07-14): the customer's TRUE earliest invoice
+    // ever, fetched directly from Zoho with no date bound — unlike our own invoices table, which
+    // only has whatever fell inside the sync window, so an old customer's real first sale can be
+    // missing entirely. Replaces the fragile "infer tenure from what happens to be in our DB"
+    // logic that caused both directions of failure today (Yolks/Centre Eaton underpaid because
+    // their real first invoice looked too recent; Habaneros/Gattusso/Bistro Arôme/Ches's overpaid
+    // because our DB's earliest record for them wasn't actually their first ever). One row per
+    // customer, set once, good forever — see backfillCustomerFirstSale().
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS customer_first_sale (
+        customer_name        VARCHAR(500) PRIMARY KEY,
+        first_invoice_date   DATE,
+        first_invoice_number VARCHAR(50),
+        checked_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
     // Invoice-level (entity) discount facts — captured by enrich from the Zoho detail.
     // Comp plan v7.7: commission base = pre-tax value AFTER discount; hardware rate
     // halves (10%→5%) when the discount is ≥ 25%. NULL = not captured yet.
@@ -5302,7 +5318,7 @@ async function autoSyncInvoices() {
 
     console.log(`✅ [AUTO-SYNC] Successfully synced ${syncedCount} invoices, ${deletedCount} deleted at ${new Date().toISOString()}`);
 
-    // Auto-pipeline: sync → enrich-missing → backfill-activation-dates → recalc-v2
+    // Auto-pipeline: sync → enrich-missing → backfill-activation-dates → backfill-customer-first-sale → recalc-v2
     // This runs ONLY in the worker dyno (Procfile: ROLE=worker), so even if it
     // OOMs, the web dyno keeps serving HTTP. Each step has a 'already running'
     // guard so overlap is safe.
@@ -5315,6 +5331,11 @@ async function autoSyncInvoices() {
           // a few cycles instead of staying a permanent renewal.
           if (typeof backfillActivationDates === 'function') {
             await backfillActivationDates().catch(e => console.warn('[AUTO-SYNC] activation backfill failed:', e.message));
+          }
+          // Resolves each customer's true tenure directly from Zoho (2026-07-14 fix) — batched,
+          // works through the whole customer base over several sync cycles.
+          if (typeof backfillCustomerFirstSale === 'function') {
+            await backfillCustomerFirstSale().catch(e => console.warn('[AUTO-SYNC] customer-first-sale backfill failed:', e.message));
           }
           await runRecalcV2('post-sync');
         } catch (e) {
@@ -12679,6 +12700,76 @@ app.post('/api/invoices/enrich/backfill-activation-dates', (req, res, next) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Fetch each customer's TRUE earliest invoice ever, directly from Zoho with no date bound — see
+// the customer_first_sale table comment. Small batches, safe to re-run repeatedly; once a
+// customer_name is resolved (row exists, even with a null date) it's never re-queried, so this
+// naturally works through the whole customer base over a handful of sync cycles and then goes
+// quiet — only genuinely new customer_names show up in future runs.
+const CUSTOMER_FIRST_SALE_BATCH_LIMIT = 300;
+async function backfillCustomerFirstSale() {
+  const adminResult = await pool.query(
+    'SELECT email, access_token, api_domain FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
+  );
+  const admin = adminResult.rows[0];
+  if (!admin) return { checked: 0, resolved: 0 };
+  const tokenData = await ensureValidToken(admin.email);
+  const accessToken = typeof tokenData === 'string' ? tokenData : tokenData?.access_token;
+  const apiDomain = admin.api_domain;
+  const orgId = process.env.ZOHO_ORG_ID;
+
+  const rows = (await pool.query(
+    `SELECT DISTINCT i.customer_name FROM invoices i
+      WHERE i.organization_id = $1 AND i.customer_name IS NOT NULL AND i.customer_name <> ''
+        AND NOT EXISTS (SELECT 1 FROM customer_first_sale c WHERE c.customer_name = i.customer_name)
+      LIMIT ${CUSTOMER_FIRST_SALE_BATCH_LIMIT}`,
+    [orgId]
+  )).rows;
+
+  let resolved = 0;
+  for (const row of rows) {
+    try {
+      const r = await axios.get(`${apiDomain}/books/v3/invoices`, {
+        params: {
+          organization_id: orgId, customer_name: row.customer_name,
+          sort_column: 'date', sort_order: 'A', per_page: 1,
+        },
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+        validateStatus: () => true,
+      });
+      if (r.status !== 200) continue; // transient error — retry next run, don't mark as checked
+      const first = r.data?.invoices?.[0];
+      await pool.query(
+        `INSERT INTO customer_first_sale (customer_name, first_invoice_date, first_invoice_number)
+           VALUES ($1, $2, $3)
+         ON CONFLICT (customer_name) DO UPDATE SET
+           first_invoice_date = EXCLUDED.first_invoice_date,
+           first_invoice_number = EXCLUDED.first_invoice_number,
+           checked_at = CURRENT_TIMESTAMP`,
+        [row.customer_name, first?.date || null, first?.invoice_number || null]
+      );
+      if (first?.date) resolved++;
+    } catch (_e) { /* leave unresolved — retried next run */ }
+  }
+  return { checked: rows.length, resolved };
+}
+
+// POST /api/invoices/enrich/backfill-customer-first-sale — manual trigger (also runs
+// automatically after every sync). Dual-gated like recalc-v2/start.
+app.post('/api/invoices/enrich/backfill-customer-first-sale', (req, res, next) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) {
+    req.viaSecret = true;
+    return next();
+  }
+  return authenticateToken(req, res, next);
+}, async (req, res) => {
+  if (!req.viaSecret && !req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const result = await backfillCustomerFirstSale();
+    res.json({ success: true, ...result });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /api/invoices/enrich/start — runs batch enrichment in background
 // Query params:
 //   onlyMissing=true (default) — skip invoices already enriched (line_items populated)
@@ -16583,6 +16674,15 @@ async function runRecalcV2(source = 'manual') {
         )).rows;
         for (const r of saasRows) if (r.first_date) firstSaasByCustomer.set(r.customer_name, new Date(r.first_date).getTime());
       }
+      // Authoritative tenure fact (2026-07-14) — the customer's TRUE earliest invoice, fetched
+      // directly from Zoho with no date bound (see backfillCustomerFirstSale / customer_first_sale
+      // table comment). Once a customer is resolved here, this replaces the fragile in-DB
+      // inference (firstSaasByCustomer / activation-date preExistingSub) for them entirely —
+      // customers not yet resolved keep falling back to the old logic below.
+      const customerFirstSale = new Map(
+        (await pool.query(`SELECT customer_name, first_invoice_date FROM customer_first_sale WHERE first_invoice_date IS NOT NULL`))
+          .rows.map(r => [r.customer_name, new Date(r.first_invoice_date).getTime()])
+      );
       // Data floor = earliest invoice date we have. A sub activated BEFORE it means its first
       // annual cycle (and commission) predate our data → any in-DB annual = renewal → 0%.
       const dataFloor = (await pool.query(`SELECT MIN(date) AS d FROM invoices WHERE organization_id = $1`, [process.env.ZOHO_ORG_ID])).rows[0]?.d;
@@ -16621,22 +16721,28 @@ async function runRecalcV2(source = 'manual') {
             //   (b) the annual sub wasn't activated long before this invoice (>~9 months ⇒ a
             //       renewal cycle whose real first + commission predate our data — e.g. activated
             //       in 2024, first in-DB annual invoice 2025).
-            const firstSaas = firstSaasByCustomer.get(r.customer_name);
             const annualDate = r.date ? new Date(r.date).getTime() : Infinity;
-            const act = r.subscription_activation_date ? new Date(r.subscription_activation_date).getTime() : null;
-            // REVERTED (2026-07-14): a 45-day grace period was tried here to fix Centre Eaton
-            // (a genuinely new customer whose hardware+small-integration invoice landed days
-            // before the annual sale), but it produced real false positives — two RENEWAL
-            // invoices from the same long-standing subscription (customer since 2020, confirmed
-            // via a sibling invoice's activation_date) can coincidentally land within 45 days of
-            // each other, which isn't "same onboarding." Unlike the monthly-SaaS initial-group
-            // slack, an annual invoice's neighbors don't reliably indicate new-vs-existing here.
-            // Back to strict: ANY prior SaaS invoice disqualifies it. Genuinely new bundled sales
-            // (Centre Eaton) get a manual one-off adjustment instead, verified per customer.
-            const hadPriorSaas = firstSaas && firstSaas < annualDate;
-            // Pre-existing sub: activated before our data floor (its first cycle/commission is
-            // out-of-system, e.g. 2024) OR activated >~9 months before this invoice (renewal cycle).
-            const preExistingSub = act != null && ((dataFloorTs && act < dataFloorTs) || (annualDate - act) > 270 * 86400000);
+            let hadPriorSaas, preExistingSub;
+            const trueFirst = customerFirstSale.get(r.customer_name);
+            if (trueFirst != null) {
+              // Authoritative (2026-07-14): Zoho's own earliest invoice for this customer, no
+              // date bound — a single robust fact replaces both fallback checks below. Fixes
+              // both failure directions seen today: Centre Eaton's real first sale wasn't
+              // missed (it genuinely had a prior SaaS sale, correctly $0), and long-standing
+              // customers (Gattusso, Bistro Arôme, Ches's) are no longer mistaken for new ones
+              // just because our own synced invoice history doesn't reach back far enough.
+              hadPriorSaas = trueFirst < annualDate;
+              preExistingSub = false;
+            } else {
+              // Fallback while backfillCustomerFirstSale works through the customer base — same
+              // strict logic as before (no grace period; that was tried and reverted after
+              // producing false positives on long-standing customers whose renewal invoices
+              // happened to land within the grace window of each other).
+              const firstSaas = firstSaasByCustomer.get(r.customer_name);
+              hadPriorSaas = firstSaas && firstSaas < annualDate;
+              const act = r.subscription_activation_date ? new Date(r.subscription_activation_date).getTime() : null;
+              preExistingSub = act != null && ((dataFloorTs && act < dataFloorTs) || (annualDate - act) > 270 * 86400000);
+            }
             if (!hadPriorSaas && !preExistingSub) rec.firstTotal += r.amount;
           }
           annualByInvoice.set(r.id, rec);
