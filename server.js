@@ -4241,6 +4241,30 @@ app.get('/api/admin/customer-invoices', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/adjustments-audit?secret=&year=&month=  — read-only peek at commission_adjustments
+// for a target period, without needing a JWT session. Used to verify a delete/bulk-add actually
+// persisted server-side.
+app.get('/api/admin/adjustments-audit', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const year = parseInt(req.query.year), month = parseInt(req.query.month);
+    const params = []; let where = '';
+    if (year && month) {
+      params.push(`${year}-${String(month).padStart(2, '0')}-01`);
+      where = ' WHERE target_period = $1::date';
+    }
+    const rows = (await pool.query(
+      `SELECT id, rep_name, target_period::date AS target_period, invoice_number, customer,
+              amount::float AS amount, description, created_by, created_at
+         FROM commission_adjustments${where}
+        ORDER BY target_period DESC, created_at DESC`, params)).rows;
+    res.json({ count: rows.length, total: Math.round(rows.reduce((s, r) => s + r.amount, 0) * 100) / 100, rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/saas-first-audit?secret=  — every saas_first invoice, flagged when the customer
 // already had a MUCH older SaaS invoice (suspect: an old customer re-classified as a new
 // activation because only their latest invoice got a subscription_activation_date).
