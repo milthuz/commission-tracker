@@ -4432,6 +4432,24 @@ app.get('/api/admin/saas-annual-paid-audit', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/customer-first-sale?secret=&q=  — read-only peek at customer_first_sale rows,
+// optionally filtered by a customer-name substring.
+app.get('/api/admin/customer-first-sale', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const q = String(req.query.q || '').trim();
+    const params = []; let where = '';
+    if (q) { params.push(`%${q}%`); where = ' WHERE customer_name ILIKE $1'; }
+    const rows = (await pool.query(
+      `SELECT customer_name, first_invoice_date::date AS first_invoice_date, first_invoice_number, checked_at
+         FROM customer_first_sale${where} ORDER BY checked_at DESC`, params)).rows;
+    res.json({ count: rows.length, rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/too-late-audit?secret=  — every frozen (paid) too_late invoice, with the
 // hardware commission it would now earn under the no-window rule (2026-07-13), for deciding
 // whether/how to retroactively carry them forward.
