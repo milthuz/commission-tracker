@@ -4397,6 +4397,25 @@ app.get('/api/admin/annual-slack-preview', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/saas-annual-paid-audit?secret=  — every saas_annual invoice currently earning
+// real (>0) commission, with rep/active status — used to reconcile the actual recalc-v2 impact
+// against the annual-slack-preview's estimate.
+app.get('/api/admin/saas-annual-paid-audit', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const rows = (await pool.query(`
+      SELECT i.invoice_number, i.customer_name, i.salesperson_name, i.commission::float AS commission,
+             i.date::date AS date, i.approval_status, COALESCE(s.is_active, false) AS rep_active, (s.name IS NULL) AS no_rep_row
+        FROM invoices i LEFT JOIN salespeople s ON s.name = i.salesperson_name
+       WHERE i.organization_id = $1 AND i.commission_status = 'saas_annual' AND i.commission > 0
+       ORDER BY i.commission DESC`, [process.env.ZOHO_ORG_ID])).rows;
+    res.json({ count: rows.length, total: Math.round(rows.reduce((s, r) => s + r.commission, 0) * 100) / 100, rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/too-late-audit?secret=  — every frozen (paid) too_late invoice, with the
 // hardware commission it would now earn under the no-window rule (2026-07-13), for deciding
 // whether/how to retroactively carry them forward.
