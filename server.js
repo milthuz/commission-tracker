@@ -4369,7 +4369,7 @@ app.get('/api/admin/annual-slack-preview', async (req, res) => {
          GROUP BY customer_name
       ),
       annual_invoices AS (
-        SELECT DISTINCT i.id, i.invoice_number, i.customer_name, i.date, i.saas_amount
+        SELECT DISTINCT i.id, i.invoice_number, i.customer_name, i.date, i.saas_amount, i.salesperson_name
           FROM invoices i CROSS JOIN LATERAL jsonb_array_elements(i.line_items) AS li
          WHERE i.organization_id = $1 AND i.status NOT IN ('void','deleted')
            AND i.line_items IS NOT NULL AND i.saas_amount > 0 AND li->>'type' = 'saas'
@@ -4380,11 +4380,20 @@ app.get('/api/admin/annual-slack-preview', async (req, res) => {
       )
       SELECT ai.invoice_number, ai.customer_name, ai.date::date AS annual_date,
              fs.first_date::date AS first_saas_date,
-             (ai.date::date - fs.first_date::date) AS gap_days, ai.saas_amount::float AS saas_amount
+             (ai.date::date - fs.first_date::date) AS gap_days, ai.saas_amount::float AS saas_amount,
+             ai.salesperson_name,
+             COALESCE(s.is_active, false) AS rep_active, (s.name IS NULL) AS no_rep_row
         FROM annual_invoices ai JOIN first_saas fs ON fs.customer_name = ai.customer_name
+        LEFT JOIN salespeople s ON s.name = ai.salesperson_name
        WHERE fs.first_date < ai.date AND (ai.date::date - fs.first_date::date) <= 45
        ORDER BY gap_days`, [process.env.ZOHO_ORG_ID])).rows;
-    res.json({ count: rows.length, total_saas_amount: Math.round(rows.reduce((s, r) => s + r.saas_amount, 0) * 100) / 100, rows });
+    const payrollAffecting = rows.filter(r => r.salesperson_name !== 'Unassigned' && (r.rep_active || r.no_rep_row));
+    res.json({
+      count: rows.length, total_saas_amount: Math.round(rows.reduce((s, r) => s + r.saas_amount, 0) * 100) / 100,
+      payroll_affecting_count: payrollAffecting.length,
+      payroll_affecting_saas_amount: Math.round(payrollAffecting.reduce((s, r) => s + r.saas_amount, 0) * 100) / 100,
+      rows,
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
