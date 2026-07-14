@@ -4300,6 +4300,56 @@ app.get('/api/admin/saas-first-audit', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/first-month-fallback-preview?secret=  — DRY RUN (no writes) approximation of
+// the 2026-07-14 recalc-v2 fallback: which customers currently have NO initial-sale group (stuck
+// as permanent renewals) and would newly qualify via their earliest monthly-SaaS invoice, given
+// the 270-day recency guard. Used to sanity-check blast radius before trusting the live recalc.
+app.get('/api/admin/first-month-fallback-preview', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const rows = (await pool.query(`
+      WITH earliest_saas AS (
+        SELECT customer_name, MIN(date) AS first_saas_date
+          FROM invoices
+         WHERE organization_id = $1 AND status NOT IN ('void','deleted') AND saas_amount > 0.005
+         GROUP BY customer_name
+      ),
+      earliest_monthly AS (
+        SELECT DISTINCT ON (i.customer_name) i.customer_name, i.id, i.invoice_number, i.date, i.saas_amount
+          FROM invoices i
+         WHERE i.organization_id = $1 AND i.status NOT IN ('void','deleted') AND i.saas_amount > 0.005
+           AND NOT EXISTS (
+             SELECT 1 FROM jsonb_array_elements(i.line_items) li
+              WHERE li->>'type' = 'saas' AND li->>'name' ~* '(annual|annuel|yearly|par ann)'
+           )
+         ORDER BY i.customer_name, i.date ASC, i.id ASC
+      ),
+      has_group AS (
+        SELECT DISTINCT i.customer_name
+          FROM invoices i JOIN earliest_saas es ON es.customer_name = i.customer_name
+         WHERE i.organization_id = $1 AND i.status NOT IN ('void','deleted')
+           AND i.subscription_activation_date IS NOT NULL
+           AND ABS(EXTRACT(EPOCH FROM (i.date - es.first_saas_date))) <= 45*86400
+      ),
+      tenure AS (
+        SELECT customer_name, COUNT(*)::int AS total_invoices, MIN(date) AS earliest_invoice_any_type
+          FROM invoices WHERE organization_id = $1 AND status NOT IN ('void','deleted')
+         GROUP BY customer_name
+      )
+      SELECT em.customer_name, em.invoice_number, em.date::date AS date, em.saas_amount::float AS saas_amount,
+             t.total_invoices, t.earliest_invoice_any_type::date AS earliest_invoice_any_type
+        FROM earliest_monthly em
+        JOIN tenure t ON t.customer_name = em.customer_name
+       WHERE em.customer_name NOT IN (SELECT customer_name FROM has_group)
+         AND em.date >= (CURRENT_DATE - INTERVAL '270 days')
+       ORDER BY em.date`, [process.env.ZOHO_ORG_ID])).rows;
+    res.json({ count: rows.length, total_saas_amount: Math.round(rows.reduce((s, r) => s + r.saas_amount, 0) * 100) / 100, rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/too-late-audit?secret=  — every frozen (paid) too_late invoice, with the
 // hardware commission it would now earn under the no-window rule (2026-07-13), for deciding
 // whether/how to retroactively carry them forward.
@@ -16440,17 +16490,22 @@ async function runRecalcV2(source = 'manual') {
 
       const firstMonthByGroup = new Map();
       const initialGroupByCustomer = new Map();
+      const earliestMonthlySaasInvoice = new Map(); // customer_name → { date, id } — feeds the fallback below
       for (const inv of invRes.rows) {
         if (inv.status === 'void' || inv.status === 'deleted') continue;
         const saasAmt = parseFloat(inv.saas_amount) || 0;
         const annualTot = annualByInvoice.get(inv.id)?.total || 0;
         if (saasAmt - annualTot <= 0.005) continue; // no monthly-SaaS portion
+        const d = toDate(inv.date);
+        if (d) {
+          const cur = earliestMonthlySaasInvoice.get(inv.customer_name);
+          if (!cur || d < cur.date) earliestMonthlySaasInvoice.set(inv.customer_name, { date: d, id: inv.id });
+        }
         if (inv.subscription_activation_date) {
           const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
           if (!firstMonthByGroup.has(key)) firstMonthByGroup.set(key, inv.id);
           if (!initialGroupByCustomer.has(inv.customer_name)) {
             const earliest = earliestSaasByCustomer.get(inv.customer_name);
-            const d = toDate(inv.date);
             // Only a group that starts near the customer's very first monthly-SaaS invoice
             // can be the initial sale. An old customer whose early invoices never got an
             // activation date ends up with NO initial group → everything stays a renewal.
@@ -16459,6 +16514,22 @@ async function runRecalcV2(source = 'manual') {
             }
           }
         }
+      }
+      // Fallback (2026-07-14): a customer can end up with NO initial group at all when their
+      // triggering invoice never got a subscription_activation_date anywhere near it (enrichment
+      // gap — confirmed on Yolks/Nicosia/Centre Eaton). Rather than stay a renewal forever, grant
+      // the 100% first-month bonus directly to their earliest monthly-SaaS invoice — but ONLY when
+      // that invoice is RECENT (within the last 270 days, the same "renewal cycle" threshold used
+      // by the annual preExistingSub check below). This deliberately does NOT cover old customers
+      // whose true first invoice is stale/long-ago (the Habaneros/Presotea Bleury failure modes
+      // this file's activation-date doctrine was built to avoid) — those still correctly fall
+      // through to a renewal until a human reviews them individually.
+      const FALLBACK_RECENCY_MS = 270 * 24 * 3600 * 1000;
+      const fallbackFirstMonthId = new Map(); // customer_name → invoice id
+      for (const [customer, rec] of earliestMonthlySaasInvoice.entries()) {
+        if (initialGroupByCustomer.has(customer)) continue; // already has a normal, working group
+        if (Date.now() - rec.date.getTime() > FALLBACK_RECENCY_MS) continue; // too old to trust as "new"
+        fallbackFirstMonthId.set(customer, rec.id);
       }
 
       // Invoice-level discount factor: scale billed amounts to what the customer actually
@@ -16478,7 +16549,7 @@ async function runRecalcV2(source = 'manual') {
       };
 
       const saasFirstBase = new Map();
-      const firstIds = [...new Set(firstMonthByGroup.values())];
+      const firstIds = [...new Set([...firstMonthByGroup.values(), ...fallbackFirstMonthId.values()])];
       if (firstIds.length && planPrices.size) {
         const liRows = (await pool.query(
           `SELECT id, line_items, sub_total, discount_total, gross_line_total FROM invoices WHERE id = ANY($1) AND line_items IS NOT NULL`,
@@ -16580,8 +16651,9 @@ async function runRecalcV2(source = 'manual') {
           // Pure monthly SaaS — first month gets 100% (of the PLAN price when known), renewals get 0
           const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
           // 100% activation only on the INITIAL sale's group — later add-ons are renewals.
-          const isFirstMonth = firstMonthByGroup.get(key) === inv.id
-            && initialGroupByCustomer.get(inv.customer_name) === key;
+          const isFirstMonth = (firstMonthByGroup.get(key) === inv.id
+            && initialGroupByCustomer.get(inv.customer_name) === key)
+            || fallbackFirstMonthId.get(inv.customer_name) === inv.id;
           if (isFirstMonth) {
             commission = saasFirstBase.get(inv.id) ?? monthlySaas;
             bucket = 'saas_first';
@@ -16607,8 +16679,9 @@ async function runRecalcV2(source = 'manual') {
           // the customer has a first paid SaaS invoice (no time window — user decision 2026-07-13).
           const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
           // 100% activation only on the INITIAL sale's group — later add-ons are renewals.
-          const isFirstMonth = firstMonthByGroup.get(key) === inv.id
-            && initialGroupByCustomer.get(inv.customer_name) === key;
+          const isFirstMonth = (firstMonthByGroup.get(key) === inv.id
+            && initialGroupByCustomer.get(inv.customer_name) === key)
+            || fallbackFirstMonthId.get(inv.customer_name) === inv.id;
           const firstSaasPaid = firstSaasPaidByCustomer.get(inv.customer_name);
           if (isFirstMonth) {
             commission += saasFirstBase.get(inv.id) ?? monthlySaas;
