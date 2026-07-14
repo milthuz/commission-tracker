@@ -4300,10 +4300,11 @@ app.get('/api/admin/saas-first-audit', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /api/admin/first-month-fallback-preview?secret=  — DRY RUN (no writes) approximation of
-// the 2026-07-14 recalc-v2 fallback: which customers currently have NO initial-sale group (stuck
-// as permanent renewals) and would newly qualify via their earliest monthly-SaaS invoice, given
-// the 270-day recency guard. Used to sanity-check blast radius before trusting the live recalc.
+// GET /api/admin/first-month-fallback-preview?secret=  — read-only: which customers currently
+// have NO initial-sale group at all (permanently stuck as renewals — the Yolks/Nicosia/Centre
+// Eaton failure mode), among those with a recent (≤270d) monthly-SaaS invoice. Use this to check
+// backfillActivationDates() progress (customers should drop off this list once their activation
+// date resolves) and to flag anything that still needs a human review afterward.
 app.get('/api/admin/first-month-fallback-preview', async (req, res) => {
   const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
   if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
@@ -5236,7 +5237,7 @@ async function autoSyncInvoices() {
 
     console.log(`✅ [AUTO-SYNC] Successfully synced ${syncedCount} invoices, ${deletedCount} deleted at ${new Date().toISOString()}`);
 
-    // Auto-pipeline: sync → enrich-missing → recalc-v2
+    // Auto-pipeline: sync → enrich-missing → backfill-activation-dates → recalc-v2
     // This runs ONLY in the worker dyno (Procfile: ROLE=worker), so even if it
     // OOMs, the web dyno keeps serving HTTP. Each step has a 'already running'
     // guard so overlap is safe.
@@ -5244,6 +5245,12 @@ async function autoSyncInvoices() {
       (async () => {
         try {
           await runEnrichInvoices({ onlyMissing: true, source: 'post-sync' });
+          // Retries the activation-date lookup for invoices enrichment missed the first time
+          // (2026-07-14 fix) — runs every sync so a late-linking subscription self-heals within
+          // a few cycles instead of staying a permanent renewal.
+          if (typeof backfillActivationDates === 'function') {
+            await backfillActivationDates().catch(e => console.warn('[AUTO-SYNC] activation backfill failed:', e.message));
+          }
           await runRecalcV2('post-sync');
         } catch (e) {
           console.warn('[AUTO-SYNC] post-sync enrich+recalc failed:', e.message);
@@ -12520,6 +12527,85 @@ async function fetchSubActivation(subscriptionId, apiDomain, accessToken, cache)
   }
 }
 
+// Backfill subscription_activation_date for invoices whose SaaS content never got one on their
+// (one-shot) enrichment pass — either a timing race (Zoho hadn't linked recurring_invoice_id
+// yet) or a mixed hardware+SaaS invoice where the majority-line-count 'type' classification
+// skipped the lookup entirely (2026-07-14: Yolks/Nicosia/Centre Eaton). Runs as its own small,
+// targeted retry — bounded to a recent window and a batch cap — so it can safely re-run on
+// every sync without re-enriching (and re-billing the Zoho API for) the whole invoice.
+const ACTIVATION_BACKFILL_WINDOW_DAYS = 365;
+const ACTIVATION_BACKFILL_BATCH_LIMIT = 300;
+async function backfillActivationDates() {
+  const adminResult = await pool.query(
+    'SELECT email, access_token, api_domain FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
+  );
+  const admin = adminResult.rows[0];
+  if (!admin) return { checked: 0, updated: 0 };
+  const tokenData = await ensureValidToken(admin.email);
+  const accessToken = typeof tokenData === 'string' ? tokenData : tokenData?.access_token;
+  const apiDomain = admin.api_domain;
+  const orgId = process.env.ZOHO_ORG_ID;
+
+  const rows = (await pool.query(
+    `SELECT invoice_number FROM invoices
+      WHERE organization_id = $1 AND status = 'paid' AND saas_amount > 0.005
+        AND subscription_activation_date IS NULL AND line_items IS NOT NULL
+        AND date >= (CURRENT_DATE - INTERVAL '${ACTIVATION_BACKFILL_WINDOW_DAYS} days')
+      ORDER BY date DESC
+      LIMIT ${ACTIVATION_BACKFILL_BATCH_LIMIT}`,
+    [orgId]
+  )).rows;
+
+  const subCache = new Map();
+  let updated = 0;
+  for (const row of rows) {
+    try {
+      const searchRes = await axios.get(`${apiDomain}/books/v3/invoices`, {
+        params: { organization_id: orgId, invoice_number: row.invoice_number },
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+        validateStatus: () => true,
+      });
+      const stub = searchRes.data?.invoices?.[0];
+      if (!stub) continue;
+      const detRes = await axios.get(`${apiDomain}/books/v3/invoices/${stub.invoice_id}`, {
+        params: { organization_id: orgId },
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+        validateStatus: () => true,
+      });
+      const det = detRes.data?.invoice;
+      // No type==='saas' gate here on purpose — a mixed invoice with hardware majority still
+      // deserves the lookup attempt (that gate is what caused the Centre Eaton gap).
+      if (!det || !det.recurring_invoice_id) continue;
+      const iso = await fetchSubActivation(det.recurring_invoice_id, apiDomain, accessToken, subCache);
+      if (iso) {
+        await pool.query(
+          `UPDATE invoices SET subscription_activation_date = $1::date, updated_at = CURRENT_TIMESTAMP WHERE invoice_number = $2`,
+          [iso, row.invoice_number]
+        );
+        updated++;
+      }
+    } catch (_e) { /* leave it null — retried again next run */ }
+  }
+  return { checked: rows.length, updated };
+}
+
+// POST /api/invoices/enrich/backfill-activation-dates — manual trigger for the retry pass above
+// (it also runs automatically after every sync). Dual-gated like recalc-v2/start.
+app.post('/api/invoices/enrich/backfill-activation-dates', (req, res, next) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) {
+    req.viaSecret = true;
+    return next();
+  }
+  return authenticateToken(req, res, next);
+}, async (req, res) => {
+  if (!req.viaSecret && !req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  try {
+    const result = await backfillActivationDates();
+    res.json({ success: true, ...result });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /api/invoices/enrich/start — runs batch enrichment in background
 // Query params:
 //   onlyMissing=true (default) — skip invoices already enriched (line_items populated)
@@ -16490,46 +16576,27 @@ async function runRecalcV2(source = 'manual') {
 
       const firstMonthByGroup = new Map();
       const initialGroupByCustomer = new Map();
-      const earliestMonthlySaasInvoice = new Map(); // customer_name → { date, id } — feeds the fallback below
       for (const inv of invRes.rows) {
         if (inv.status === 'void' || inv.status === 'deleted') continue;
         const saasAmt = parseFloat(inv.saas_amount) || 0;
         const annualTot = annualByInvoice.get(inv.id)?.total || 0;
         if (saasAmt - annualTot <= 0.005) continue; // no monthly-SaaS portion
-        const d = toDate(inv.date);
-        if (d) {
-          const cur = earliestMonthlySaasInvoice.get(inv.customer_name);
-          if (!cur || d < cur.date) earliestMonthlySaasInvoice.set(inv.customer_name, { date: d, id: inv.id });
-        }
         if (inv.subscription_activation_date) {
           const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
           if (!firstMonthByGroup.has(key)) firstMonthByGroup.set(key, inv.id);
           if (!initialGroupByCustomer.has(inv.customer_name)) {
             const earliest = earliestSaasByCustomer.get(inv.customer_name);
+            const d = toDate(inv.date);
             // Only a group that starts near the customer's very first monthly-SaaS invoice
             // can be the initial sale. An old customer whose early invoices never got an
-            // activation date ends up with NO initial group → everything stays a renewal.
+            // activation date ends up with NO initial group → everything stays a renewal —
+            // FIXED AT THE SOURCE by backfillActivationDates() (2026-07-14), which retries the
+            // Zoho lookup on every sync until it lands, instead of guessing here.
             if (earliest && d && (d.getTime() - earliest.getTime()) <= INITIAL_GROUP_SLACK_MS) {
               initialGroupByCustomer.set(inv.customer_name, key);
             }
           }
         }
-      }
-      // Fallback (2026-07-14): a customer can end up with NO initial group at all when their
-      // triggering invoice never got a subscription_activation_date anywhere near it (enrichment
-      // gap — confirmed on Yolks/Nicosia/Centre Eaton). Rather than stay a renewal forever, grant
-      // the 100% first-month bonus directly to their earliest monthly-SaaS invoice — but ONLY when
-      // that invoice is RECENT (within the last 270 days, the same "renewal cycle" threshold used
-      // by the annual preExistingSub check below). This deliberately does NOT cover old customers
-      // whose true first invoice is stale/long-ago (the Habaneros/Presotea Bleury failure modes
-      // this file's activation-date doctrine was built to avoid) — those still correctly fall
-      // through to a renewal until a human reviews them individually.
-      const FALLBACK_RECENCY_MS = 270 * 24 * 3600 * 1000;
-      const fallbackFirstMonthId = new Map(); // customer_name → invoice id
-      for (const [customer, rec] of earliestMonthlySaasInvoice.entries()) {
-        if (initialGroupByCustomer.has(customer)) continue; // already has a normal, working group
-        if (Date.now() - rec.date.getTime() > FALLBACK_RECENCY_MS) continue; // too old to trust as "new"
-        fallbackFirstMonthId.set(customer, rec.id);
       }
 
       // Invoice-level discount factor: scale billed amounts to what the customer actually
@@ -16549,7 +16616,7 @@ async function runRecalcV2(source = 'manual') {
       };
 
       const saasFirstBase = new Map();
-      const firstIds = [...new Set([...firstMonthByGroup.values(), ...fallbackFirstMonthId.values()])];
+      const firstIds = [...new Set(firstMonthByGroup.values())];
       if (firstIds.length && planPrices.size) {
         const liRows = (await pool.query(
           `SELECT id, line_items, sub_total, discount_total, gross_line_total FROM invoices WHERE id = ANY($1) AND line_items IS NOT NULL`,
@@ -16651,9 +16718,8 @@ async function runRecalcV2(source = 'manual') {
           // Pure monthly SaaS — first month gets 100% (of the PLAN price when known), renewals get 0
           const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
           // 100% activation only on the INITIAL sale's group — later add-ons are renewals.
-          const isFirstMonth = (firstMonthByGroup.get(key) === inv.id
-            && initialGroupByCustomer.get(inv.customer_name) === key)
-            || fallbackFirstMonthId.get(inv.customer_name) === inv.id;
+          const isFirstMonth = firstMonthByGroup.get(key) === inv.id
+            && initialGroupByCustomer.get(inv.customer_name) === key;
           if (isFirstMonth) {
             commission = saasFirstBase.get(inv.id) ?? monthlySaas;
             bucket = 'saas_first';
@@ -16679,9 +16745,8 @@ async function runRecalcV2(source = 'manual') {
           // the customer has a first paid SaaS invoice (no time window — user decision 2026-07-13).
           const key = `${inv.customer_name}|${inv.subscription_activation_date}`;
           // 100% activation only on the INITIAL sale's group — later add-ons are renewals.
-          const isFirstMonth = (firstMonthByGroup.get(key) === inv.id
-            && initialGroupByCustomer.get(inv.customer_name) === key)
-            || fallbackFirstMonthId.get(inv.customer_name) === inv.id;
+          const isFirstMonth = firstMonthByGroup.get(key) === inv.id
+            && initialGroupByCustomer.get(inv.customer_name) === key;
           const firstSaasPaid = firstSaasPaidByCustomer.get(inv.customer_name);
           if (isFirstMonth) {
             commission += saasFirstBase.get(inv.id) ?? monthlySaas;
