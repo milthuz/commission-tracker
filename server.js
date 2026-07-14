@@ -16624,11 +16624,16 @@ async function runRecalcV2(source = 'manual') {
             const firstSaas = firstSaasByCustomer.get(r.customer_name);
             const annualDate = r.date ? new Date(r.date).getTime() : Infinity;
             const act = r.subscription_activation_date ? new Date(r.subscription_activation_date).getTime() : null;
-            // 45-day grace period (2026-07-14, same slack as INITIAL_GROUP_SLACK_MS below) — a
-            // prior SaaS invoice within the same onboarding window (e.g. a hardware invoice with
-            // a small integration line days before the annual sale, Centre Eaton) doesn't count
-            // as "already an existing customer"; only a genuinely pre-existing SaaS history does.
-            const hadPriorSaas = firstSaas && (annualDate - firstSaas) > 45 * 24 * 3600 * 1000;
+            // REVERTED (2026-07-14): a 45-day grace period was tried here to fix Centre Eaton
+            // (a genuinely new customer whose hardware+small-integration invoice landed days
+            // before the annual sale), but it produced real false positives — two RENEWAL
+            // invoices from the same long-standing subscription (customer since 2020, confirmed
+            // via a sibling invoice's activation_date) can coincidentally land within 45 days of
+            // each other, which isn't "same onboarding." Unlike the monthly-SaaS initial-group
+            // slack, an annual invoice's neighbors don't reliably indicate new-vs-existing here.
+            // Back to strict: ANY prior SaaS invoice disqualifies it. Genuinely new bundled sales
+            // (Centre Eaton) get a manual one-off adjustment instead, verified per customer.
+            const hadPriorSaas = firstSaas && firstSaas < annualDate;
             // Pre-existing sub: activated before our data floor (its first cycle/commission is
             // out-of-system, e.g. 2024) OR activated >~9 months before this invoice (renewal cycle).
             const preExistingSub = act != null && ((dataFloorTs && act < dataFloorTs) || (annualDate - act) > 270 * 86400000);
