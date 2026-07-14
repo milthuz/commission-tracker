@@ -4351,6 +4351,43 @@ app.get('/api/admin/first-month-fallback-preview', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/admin/annual-slack-preview?secret=  — DRY RUN (no writes): which annual invoices are
+// currently disqualified from the 10% first-year bonus (hadPriorSaas=true, no grace period) where
+// the "prior" SaaS invoice is actually within 45 days beforehand — i.e. same onboarding week, not
+// a genuinely pre-existing customer. Used to size the blast radius of adding the same slack this
+// file already uses for the monthly-SaaS equivalent (INITIAL_GROUP_SLACK_MS) before touching it.
+app.get('/api/admin/annual-slack-preview', async (req, res) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: 'invalid secret' });
+  }
+  try {
+    const rows = (await pool.query(`
+      WITH first_saas AS (
+        SELECT customer_name, MIN(date) AS first_date
+          FROM invoices WHERE organization_id = $1 AND status NOT IN ('void','deleted') AND saas_amount > 0.005
+         GROUP BY customer_name
+      ),
+      annual_invoices AS (
+        SELECT DISTINCT i.id, i.invoice_number, i.customer_name, i.date, i.saas_amount
+          FROM invoices i CROSS JOIN LATERAL jsonb_array_elements(i.line_items) AS li
+         WHERE i.organization_id = $1 AND i.status NOT IN ('void','deleted')
+           AND i.line_items IS NOT NULL AND i.saas_amount > 0 AND li->>'type' = 'saas'
+           AND (
+             LOWER(TRIM(li->>'plan_code')) IN (SELECT LOWER(plan_code) FROM zoho_plans WHERE interval_unit ILIKE 'year%')
+             OR li->>'name' ~* '(annual|annuel|yearly|par ann)'
+           )
+      )
+      SELECT ai.invoice_number, ai.customer_name, ai.date::date AS annual_date,
+             fs.first_date::date AS first_saas_date,
+             (ai.date::date - fs.first_date::date) AS gap_days, ai.saas_amount::float AS saas_amount
+        FROM annual_invoices ai JOIN first_saas fs ON fs.customer_name = ai.customer_name
+       WHERE fs.first_date < ai.date AND (ai.date::date - fs.first_date::date) <= 45
+       ORDER BY gap_days`, [process.env.ZOHO_ORG_ID])).rows;
+    res.json({ count: rows.length, total_saas_amount: Math.round(rows.reduce((s, r) => s + r.saas_amount, 0) * 100) / 100, rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/too-late-audit?secret=  — every frozen (paid) too_late invoice, with the
 // hardware commission it would now earn under the no-window rule (2026-07-13), for deciding
 // whether/how to retroactively carry them forward.
