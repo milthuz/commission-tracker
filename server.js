@@ -12535,7 +12535,7 @@ async function fetchSubActivation(subscriptionId, apiDomain, accessToken, cache)
 // every sync without re-enriching (and re-billing the Zoho API for) the whole invoice.
 const ACTIVATION_BACKFILL_WINDOW_DAYS = 365;
 const ACTIVATION_BACKFILL_BATCH_LIMIT = 300;
-async function backfillActivationDates() {
+async function backfillActivationDates(onlyNumbers = null) {
   const adminResult = await pool.query(
     'SELECT email, access_token, api_domain FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
   );
@@ -12546,15 +12546,22 @@ async function backfillActivationDates() {
   const apiDomain = admin.api_domain;
   const orgId = process.env.ZOHO_ORG_ID;
 
-  const rows = (await pool.query(
-    `SELECT invoice_number FROM invoices
-      WHERE organization_id = $1 AND status = 'paid' AND saas_amount > 0.005
-        AND subscription_activation_date IS NULL AND line_items IS NOT NULL
-        AND date >= (CURRENT_DATE - INTERVAL '${ACTIVATION_BACKFILL_WINDOW_DAYS} days')
-      ORDER BY date DESC
-      LIMIT ${ACTIVATION_BACKFILL_BATCH_LIMIT}`,
-    [orgId]
-  )).rows;
+  // onlyNumbers lets a caller jump specific invoices to the front of the queue instead of
+  // waiting for the recency-ordered batch to reach them (the backlog can be large).
+  const rows = onlyNumbers && onlyNumbers.length
+    ? (await pool.query(
+        `SELECT invoice_number FROM invoices WHERE organization_id = $1 AND invoice_number = ANY($2)`,
+        [orgId, onlyNumbers]
+      )).rows
+    : (await pool.query(
+        `SELECT invoice_number FROM invoices
+          WHERE organization_id = $1 AND status = 'paid' AND saas_amount > 0.005
+            AND subscription_activation_date IS NULL AND line_items IS NOT NULL
+            AND date >= (CURRENT_DATE - INTERVAL '${ACTIVATION_BACKFILL_WINDOW_DAYS} days')
+          ORDER BY date DESC
+          LIMIT ${ACTIVATION_BACKFILL_BATCH_LIMIT}`,
+        [orgId]
+      )).rows;
 
   const subCache = new Map();
   let updated = 0;
@@ -12601,7 +12608,8 @@ app.post('/api/invoices/enrich/backfill-activation-dates', (req, res, next) => {
 }, async (req, res) => {
   if (!req.viaSecret && !req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   try {
-    const result = await backfillActivationDates();
+    const numbers = Array.isArray(req.body?.invoiceNumbers) ? req.body.invoiceNumbers.map(String) : null;
+    const result = await backfillActivationDates(numbers);
     res.json({ success: true, ...result });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
