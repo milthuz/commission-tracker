@@ -12706,7 +12706,7 @@ app.post('/api/invoices/enrich/backfill-activation-dates', (req, res, next) => {
 // naturally works through the whole customer base over a handful of sync cycles and then goes
 // quiet — only genuinely new customer_names show up in future runs.
 const CUSTOMER_FIRST_SALE_BATCH_LIMIT = 300;
-async function backfillCustomerFirstSale() {
+async function backfillCustomerFirstSale(onlyNames = null) {
   const adminResult = await pool.query(
     'SELECT email, access_token, api_domain FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
   );
@@ -12717,13 +12717,17 @@ async function backfillCustomerFirstSale() {
   const apiDomain = admin.api_domain;
   const orgId = process.env.ZOHO_ORG_ID;
 
-  const rows = (await pool.query(
-    `SELECT DISTINCT i.customer_name FROM invoices i
-      WHERE i.organization_id = $1 AND i.customer_name IS NOT NULL AND i.customer_name <> ''
-        AND NOT EXISTS (SELECT 1 FROM customer_first_sale c WHERE c.customer_name = i.customer_name)
-      LIMIT ${CUSTOMER_FIRST_SALE_BATCH_LIMIT}`,
-    [orgId]
-  )).rows;
+  // onlyNames lets a caller jump specific customers to the front (and re-resolve them even if
+  // already checked) instead of waiting for the bulk batch to reach them.
+  const rows = onlyNames && onlyNames.length
+    ? onlyNames.map(n => ({ customer_name: n }))
+    : (await pool.query(
+        `SELECT DISTINCT i.customer_name FROM invoices i
+          WHERE i.organization_id = $1 AND i.customer_name IS NOT NULL AND i.customer_name <> ''
+            AND NOT EXISTS (SELECT 1 FROM customer_first_sale c WHERE c.customer_name = i.customer_name)
+          LIMIT ${CUSTOMER_FIRST_SALE_BATCH_LIMIT}`,
+        [orgId]
+      )).rows;
 
   let resolved = 0;
   for (const row of rows) {
@@ -12765,7 +12769,8 @@ app.post('/api/invoices/enrich/backfill-customer-first-sale', (req, res, next) =
 }, async (req, res) => {
   if (!req.viaSecret && !req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   try {
-    const result = await backfillCustomerFirstSale();
+    const names = Array.isArray(req.body?.customerNames) ? req.body.customerNames.map(String) : null;
+    const result = await backfillCustomerFirstSale(names);
     res.json({ success: true, ...result });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
