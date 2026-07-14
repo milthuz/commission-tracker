@@ -16605,7 +16605,11 @@ async function runRecalcV2(source = 'manual') {
             const firstSaas = firstSaasByCustomer.get(r.customer_name);
             const annualDate = r.date ? new Date(r.date).getTime() : Infinity;
             const act = r.subscription_activation_date ? new Date(r.subscription_activation_date).getTime() : null;
-            const hadPriorSaas = firstSaas && firstSaas < annualDate;
+            // 45-day grace period (2026-07-14, same slack as INITIAL_GROUP_SLACK_MS below) — a
+            // prior SaaS invoice within the same onboarding window (e.g. a hardware invoice with
+            // a small integration line days before the annual sale, Centre Eaton) doesn't count
+            // as "already an existing customer"; only a genuinely pre-existing SaaS history does.
+            const hadPriorSaas = firstSaas && (annualDate - firstSaas) > 45 * 24 * 3600 * 1000;
             // Pre-existing sub: activated before our data floor (its first cycle/commission is
             // out-of-system, e.g. 2024) OR activated >~9 months before this invoice (renewal cycle).
             const preExistingSub = act != null && ((dataFloorTs && act < dataFloorTs) || (annualDate - act) > 270 * 86400000);
