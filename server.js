@@ -16510,10 +16510,10 @@ async function computeProcessingBonuses(payoutYear, payoutMonth) {
          )
      )
      SELECT e.merchant_account_id, e.business_name, e.rep, e.win_start,
-            SUM(r.transaction_profit_cents + COALESCE(r.other_revenue_cents,0))::bigint AS total_cents,
-            COUNT(*) FILTER (WHERE (r.transaction_profit_cents + COALESCE(r.other_revenue_cents,0)) > 0)::int AS active_months
+            COALESCE(SUM(r.transaction_profit_cents + COALESCE(r.other_revenue_cents,0)),0)::bigint AS total_cents,
+            COUNT(*) FILTER (WHERE r.merchant_account_id IS NOT NULL AND (r.transaction_profit_cents + COALESCE(r.other_revenue_cents,0)) > 0)::int AS active_months
      FROM eligible e
-     JOIN zentact_merchant_revenue r ON r.merchant_account_id = e.merchant_account_id
+     LEFT JOIN zentact_merchant_revenue r ON r.merchant_account_id = e.merchant_account_id
        AND make_date(r.year, r.month, 1) >= e.win_start
        AND make_date(r.year, r.month, 1) < e.win_start + interval '6 months'
      GROUP BY e.merchant_account_id, e.business_name, e.rep, e.win_start`,
@@ -16541,11 +16541,14 @@ async function computeProcessingBonuses(payoutYear, payoutMonth) {
   for (const r of rows) {
     if (alreadyPaidByName(r.business_name)) continue;     // already paid via import (name fallback)
     const activeMonths = parseInt(r.active_months) || 0;
-    if (activeMonths < 3) continue;                       // need revenue in >= 3 of the 6 window months
-    const avg = (Number(r.total_cents) / 100) / activeMonths;
-    if (avg < PROCESSING_THRESHOLD) continue;             // below $100/mo average → nothing
-    const bonus = Math.min(Math.round((avg - PROCESSING_THRESHOLD) * 100) / 100, PROCESSING_CAP);
-    if (bonus <= 0) continue;
+    const avg = activeMonths > 0 ? (Number(r.total_cents) / 100) / activeMonths : 0;
+    // Every account whose window has closed is listed, even at $0 (< 3 active months, or below
+    // the $100/mo average) — the rep should see every account that was reviewed, not just the
+    // ones that happened to pay out (2026-07-16). The window still only evaluates once per
+    // account (see the NOT EXISTS above), so a $0 result here is final, same as a real payout.
+    const bonus = activeMonths >= 3
+      ? Math.max(0, Math.min(Math.round((avg - PROCESSING_THRESHOLD) * 100) / 100, PROCESSING_CAP))
+      : 0;
     const ws = new Date(r.win_start);
     const we = new Date(Date.UTC(ws.getUTCFullYear(), ws.getUTCMonth() + 5, 1));
     if (!byRep.has(r.rep)) byRep.set(r.rep, { accounts: [], total: 0 });
