@@ -16255,8 +16255,12 @@ app.post('/api/commissions/payroll/send', authenticateToken, async (req, res) =>
 // GET /api/commissions/processing-bonus/committed?year=&month=  (month must be 6 or 12)
 // Read-only per-rep breakdown of the ALREADY-COMMITTED bi-annual bonus for a period — what the
 // send action below would actually email, without sending anything.
-app.get('/api/commissions/processing-bonus/committed', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+app.get('/api/commissions/processing-bonus/committed', (req, res, next) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) { req.viaSecret = true; return next(); }
+  return authenticateToken(req, res, next);
+}, async (req, res) => {
+  if (!req.viaSecret && !(await requirePerm(req, res, 'report:mark_paid'))) return;
   const year = parseInt(req.query.year), month = parseInt(req.query.month);
   if (!year || (month !== 6 && month !== 12)) return res.status(400).json({ error: 'year + month (6 or 12) required' });
   try {
