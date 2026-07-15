@@ -15736,15 +15736,9 @@ async function payrollDataForMonth(year, month) {
        WHERE rep_name = $1 AND paid_for_period >= $2::date AND paid_for_period < $3::date
        ORDER BY imported_at DESC LIMIT 1`, [rep, periodStart, periodEnd]
     )).rows[0];
-    // Accepted bi-annual processing payout (platform commit = import_id NULL) for this month.
-    // Added to BOTH stub branches so the June/December payroll matches the on-screen stub.
-    const committedProc = (await pool.query(
-      `SELECT merchant_name, amount::float AS amount FROM commission_bonuses
-        WHERE rep_name = $1 AND bonus_type = 'processing' AND import_id IS NULL
-          AND paid_for_period >= $2::date AND paid_for_period < $3::date`,
-      [rep, periodStart, periodEnd]
-    )).rows.map(p => ({ bonus_type: 'processing', merchant_name: p.merchant_name, amount: p.amount }));
-    const committedProcTotal = committedProc.reduce((s, b) => s + b.amount, 0);
+    // The bi-annual processing bonus is deliberately excluded from the monthly payroll send —
+    // it has its own dedicated statement/send flow, separate from regular monthly commissions
+    // (2026-07-15, same change as GET /api/commissions/pay-stub).
     let lines = [], bonuses = [], total = 0, source;
     if (imp) {
       source = 'imported';
@@ -15755,8 +15749,7 @@ async function payrollDataForMonth(year, month) {
       bonuses = (await pool.query(
         `SELECT bonus_type, merchant_name, amount::float AS amount FROM commission_bonuses
          WHERE import_id = $1 ORDER BY bonus_type`, [imp.id])).rows;
-      bonuses.push(...committedProc);
-      total = (parseFloat(imp.total_amount) || 0) + committedProcTotal;
+      total = parseFloat(imp.total_amount) || 0;
     } else {
       source = 'generated';
       lines = (await pool.query(
@@ -15793,8 +15786,6 @@ async function payrollDataForMonth(year, month) {
         [rep, periodStart]
       )).rows;
       for (const a of freeAdj) bonuses.push({ bonus_type: 'adjustment', merchant_name: a.description, amount: a.amount });
-      // Accepted bi-annual processing payout (June/December) — same rows the stub shows.
-      bonuses.push(...committedProc);
       total = lines.reduce((s, l) => s + (l.paid_amount || 0), 0) + bonuses.reduce((s, b) => s + (b.amount || 0), 0);
     }
     total = Math.round(total * 100) / 100;
