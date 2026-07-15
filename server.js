@@ -14804,7 +14804,13 @@ app.get('/api/commissions/unpaid-commissions', authenticateToken, async (req, re
               commission_status, commission_payable_date::date AS payable_date
        FROM invoices
        WHERE salesperson_name = $1 AND organization_id = $2
-         AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
+         AND commission > 0
+         -- 'saas_renewal' is included here on purpose: a mixed hardware+SaaS invoice whose SaaS
+         -- portion is a renewal (0%) still earns real hardware commission on top, but the bucket
+         -- label reflects the SaaS side (2026-07-15 fix — Poke Monster Lasalle's hardware $ was
+         -- invisible to this list because of it). Safe: recalc-v2 never adds commission to a
+         -- 'saas_renewal' bucket except via that hardware add-on.
+         AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial','saas_renewal')
          AND approval_status <> 'paid'
        ORDER BY commission_payable_date, invoice_number`,
       [rep, process.env.ZOHO_ORG_ID]
