@@ -16252,6 +16252,39 @@ app.post('/api/commissions/payroll/send', authenticateToken, async (req, res) =>
 // own send action, own PDF, own history table (processing_bonus_sends), deliberately never
 // mixed with the regular monthly "Payroll -> send" flow (2026-07-15). Uses the same payroll
 // recipients list, since it's the same team, just a distinct notification.
+// GET /api/commissions/processing-bonus/committed?year=&month=  (month must be 6 or 12)
+// Read-only per-rep breakdown of the ALREADY-COMMITTED bi-annual bonus for a period — what the
+// send action below would actually email, without sending anything.
+app.get('/api/commissions/processing-bonus/committed', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const year = parseInt(req.query.year), month = parseInt(req.query.month);
+  if (!year || (month !== 6 && month !== 12)) return res.status(400).json({ error: 'year + month (6 or 12) required' });
+  try {
+    const period = `${year}-${String(month).padStart(2, '0')}-01`;
+    const rows = (await pool.query(
+      `SELECT rep_name, merchant_name, amount::float AS amount FROM commission_bonuses
+        WHERE bonus_type = 'processing' AND import_id IS NULL AND paid_for_period = $1::date
+        ORDER BY rep_name, amount DESC`,
+      [period]
+    )).rows;
+    const byRep = new Map();
+    for (const r of rows) {
+      if (!byRep.has(r.rep_name)) byRep.set(r.rep_name, { rep: r.rep_name, accounts: [], total: 0 });
+      const e = byRep.get(r.rep_name);
+      e.accounts.push({ merchant_name: r.merchant_name, amount: r.amount });
+      e.total = Math.round((e.total + r.amount) * 100) / 100;
+    }
+    const reps = [...byRep.values()].sort((a, b) => b.total - a.total);
+    const lastSent = (await pool.query(
+      `SELECT rep_name, MAX(sent_at) AS sent_at FROM processing_bonus_sends WHERE period = $1::date GROUP BY rep_name`,
+      [period]
+    )).rows;
+    const sentByRep = new Map(lastSent.map(r => [r.rep_name, r.sent_at]));
+    reps.forEach(r => { r.sentAt = sentByRep.get(r.rep) || null; });
+    res.json({ year, month, reps, grandTotal: Math.round(reps.reduce((s, r) => s + r.total, 0) * 100) / 100 });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/commissions/processing-bonus/send', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
   const year = parseInt(req.body.year), month = parseInt(req.body.month);
