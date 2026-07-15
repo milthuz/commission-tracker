@@ -14005,6 +14005,45 @@ app.get('/api/commissions/my-processing', authenticateToken, async (req, res) =>
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/commissions/processing-bonus-statement?repName=&year=&month=  (month must be 6 or 12)
+// A rep's own dedicated bi-annual processing-bonus statement — deliberately its OWN document,
+// separate from the monthly Pay Stub (which only ever carries the one-time $100 signup bonus).
+// Merging the two used to confuse admins when a bonus got committed for a month whose regular
+// payroll had already closed weeks/months earlier (2026-07-15). Rep-scoped via resolveTargetRep.
+app.get('/api/commissions/processing-bonus-statement', authenticateToken, async (req, res) => {
+  const { email, isAdmin, name: jwtName } = req.user;
+  const { repName, year, month } = req.query;
+  const y = parseInt(year), m = parseInt(month);
+  if (!y || (m !== 6 && m !== 12)) return res.status(400).json({ error: 'year + month (6 or 12) required' });
+  try {
+    if (!isAdmin) {
+      const perms = await getUserPermissions(email);
+      if (!userHasPermission(perms, 'report:view_paystub')) {
+        return res.status(403).json({ error: 'Permission required: report:view_paystub' });
+      }
+    }
+    const tokenResult = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
+    const myName    = tokenResult.rows[0]?.display_name || jwtName || email;
+    const targetRep = await resolveTargetRep(req, repName, myName);
+    const period = `${y}-${String(m).padStart(2, '0')}-01`;
+
+    const rows = (await pool.query(
+      `SELECT merchant_name, amount::float AS amount, report_date::date AS report_date
+         FROM commission_bonuses
+        WHERE rep_name = $1 AND bonus_type = 'processing' AND import_id IS NULL
+          AND paid_for_period = $2::date
+        ORDER BY amount DESC`,
+      [targetRep, period]
+    )).rows;
+    res.json({
+      repName: targetRep,
+      period: `${y}-${String(m).padStart(2, '0')}`,
+      accounts: rows.map(r => ({ merchantName: r.merchant_name, amount: r.amount, reportDate: r.report_date })),
+      total: Math.round(rows.reduce((a, r) => a + r.amount, 0) * 100) / 100,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /api/commissions/approve — supports { repName, year, month } OR { invoiceNumbers: [...] }
 // Locks a commission for payroll: sets approval_status='approved' (does NOT mark as paid).
 // Use /mark-paid afterwards to record actual rep payout.
@@ -14361,21 +14400,10 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
         quota_forfeited: r.quota_forfeited_amount || 0,
       }));
     };
-    // Committed bi-annual processing bonuses (platform commit = import_id NULL) whose payout
-    // period is this month. Shows on the June/December stub once the bi-annual payout is
-    // ACCEPTED via the Processing-bonus card commit. Read-only here (the card owns the rows),
-    // so it never double-counts. Empty for non-June/December months (no such rows exist).
-    const committedProcessing = async () => {
-      const rows = (await pool.query(
-        `SELECT merchant_name, amount::float AS amount, report_date::date AS report_date
-           FROM commission_bonuses
-          WHERE rep_name = $1 AND bonus_type = 'processing' AND import_id IS NULL
-            AND paid_for_period >= $2::date AND paid_for_period < $3::date
-          ORDER BY amount DESC`,
-        [targetRep, periodStart, periodEnd]
-      )).rows;
-      return rows.map(r => ({ bonus_type: 'processing', merchant_name: r.merchant_name, amount: r.amount, report_date: r.report_date }));
-    };
+    // The bi-annual processing bonus is deliberately NOT part of the monthly pay stub (see
+    // GET /api/commissions/processing-bonus-statement, its own dedicated document) — it used to
+    // be appended here, but merging a twice-yearly bonus into a specific month's stub confused
+    // admins when that month had already been committed weeks or months earlier (2026-07-15).
 
     // App-generated signup bonuses: Zentact merchants this rep activated in the period.
     // Amount is the REP'S CURRENT config, not the stored (never-customized) bonus_amount column.
@@ -14441,8 +14469,6 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
       for (const a of freeAdj) {
         bonuses.push({ bonus_type: 'adjustment', merchant_name: a.description || null, amount: a.amount, report_date: a.source_period || null });
       }
-      // Accepted bi-annual processing payout for this month (June/December).
-      bonuses.push(...(await committedProcessing()));
       return bonuses;
     };
 
@@ -14466,11 +14492,8 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
          FROM commission_bonuses WHERE import_id = $1 ORDER BY bonus_type, amount DESC`,
         [imp.id]
       )).rows;
-      // An accepted bi-annual processing payout (import_id NULL) for June/December isn't linked
-      // to this import row, but still belongs on the period's stub — append it + add to total.
-      const procExtra = await committedProcessing();
-      bonuses.push(...procExtra);
-      const procExtraTotal = procExtra.reduce((a, b) => a + b.amount, 0);
+      // The bi-annual processing bonus is deliberately NOT merged into this stub (own document —
+      // see GET /api/commissions/processing-bonus-statement).
       const isAppGenerated = String(imp.filename || '').startsWith('app-generated');
       // linesStored=false is only meaningful for a REAL historical pay file that predates
       // per-invoice storage (2026-06-09) — its lines table is empty even though it truly had
@@ -14499,7 +14522,7 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
         appGenerated: isAppGenerated,  // undoable via uncommit
         lines:       outLines,
         bonuses,
-        total:       (parseFloat(imp.total_amount) || 0) + procExtraTotal,
+        total:       parseFloat(imp.total_amount) || 0,
         missed:      canAudit ? missed : [],
         missedTotal: canAudit ? missed.reduce((a, l) => a + l.app_commission, 0) : 0,
       });
@@ -14593,6 +14616,35 @@ app.post('/api/commissions/pay-stub/email', authenticateToken, async (req, res) 
             <p style="margin:18px 0 0;color:#94a3b8;font-size:11px">Montants bruts, avant impôts et retenues. / Gross amounts, before tax and withholdings.</p>`;
     const html = mailChrome(inner, `Bulletin de paie / Pay Stub — ${esc(repName)} · ${esc(period)}`);
     const r = await sendMail(recipient, `Bulletin de paie / Pay Stub — ${repName} · ${period}`, html);
+    if (!r.sent) return res.status(502).json({ error: r.reason || 'send failed' });
+    res.json({ sent: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/commissions/processing-bonus-statement/email — email a branded copy of a rep's
+// bi-annual processing-bonus statement. Body: { repName, period, to, accounts[], total }.
+app.post('/api/commissions/processing-bonus-statement/email', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:view_paystub'))) return;
+  const { repName, period, to, accounts = [], total = 0 } = req.body || {};
+  const recipient = String(to || '').trim();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(recipient)) return res.status(400).json({ error: 'valid recipient email required' });
+  const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  try {
+    const rows = (accounts || []).map(a =>
+      `<tr><td style="padding:6px 10px;border-top:1px solid #eef1f6">${esc(a.merchantName) || '—'}</td>
+           <td style="padding:6px 10px;border-top:1px solid #eef1f6;text-align:right">${money(a.amount)}</td></tr>`).join('');
+    const inner = `<h1 style="margin:0 0 4px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${esc(repName)}</h1>
+            <p style="margin:0 0 4px;color:#64748b;font-size:13px">Bonus de volume bi-annuel / Bi-Annual Processing Bonus · ${esc(period)}</p>
+            <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:14px;font-size:13px;color:#1c2434;border-collapse:collapse">${rows}</table>
+            <table width="100%" style="margin-top:20px;border-top:2px solid #0f1722"><tr>
+              <td style="padding-top:12px;font-size:14px;font-weight:700;color:#0f1722">Total</td>
+              <td style="padding-top:12px;text-align:right;font-size:20px;font-weight:700;color:#f97316">${money(total)}</td></tr></table>
+            <p style="margin:18px 0 0;color:#94a3b8;font-size:11px">Montants bruts, avant impôts et retenues. / Gross amounts, before tax and withholdings.</p>`;
+    const html = mailChrome(inner, `Bonus bi-annuel / Bi-Annual Bonus — ${esc(repName)} · ${esc(period)}`);
+    const r = await sendMail(recipient, `Bonus bi-annuel / Bi-Annual Bonus — ${repName} · ${period}`, html);
     if (!r.sent) return res.status(502).json({ error: r.reason || 'send failed' });
     res.json({ sent: true });
   } catch (e) {
