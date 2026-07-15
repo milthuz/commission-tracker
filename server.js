@@ -603,6 +603,20 @@ async function initializeDatabase() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_payroll_sends ON payroll_sends(period, rep_name)`);
     // Record the $ amount sent per rep so the send-history can show totals as they were at send time.
     await pool.query(`ALTER TABLE payroll_sends ADD COLUMN IF NOT EXISTS total NUMERIC`);
+    // Its own send log for the bi-annual PROCESSING bonus — deliberately a separate table from
+    // payroll_sends so the two "sent to payroll" histories never mix (2026-07-15).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS processing_bonus_sends (
+        id        SERIAL PRIMARY KEY,
+        rep_name  VARCHAR(255) NOT NULL,
+        period    DATE NOT NULL,
+        sent_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        sent_to   TEXT,
+        sent_by   VARCHAR(255),
+        total     NUMERIC
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_processing_bonus_sends ON processing_bonus_sends(period, rep_name)`);
     // Comp plan v7.7: hire_date drives the 90-day ramp (quota gate waived);
     // quota_gate_enabled=false exempts a rep from the gate entirely (house
     // accounts, resellers, execs not on the rep plan).
@@ -15937,6 +15951,80 @@ function buildPayrollPdf(periodLabel, reps, lang) {
   });
 }
 
+// Build a combined PDF (one rep per page) for the bi-annual PROCESSING bonus specifically —
+// deliberately its own, clearly-labeled document rather than reusing buildPayrollPdf, whose
+// header always says "Pay Stub" (would undermine the point of separating the two). reps:
+// [{ rep, accounts: [{merchant_name, amount}], total }].
+function buildProcessingBonusPdf(periodLabel, reps, lang) {
+  const en = String(lang || '').toLowerCase().startsWith('en');
+  const T = en
+    ? { docTitle: 'BI-ANNUAL PROCESSING BONUS', rep: 'REP', period: 'PERIOD', merchant: 'MERCHANT', amount: 'AMOUNT', totalPaid: 'TOTAL PAID', note: 'One-time bi-annual bonus tied to Zentact merchant processing volume — separate from regular monthly commissions.' }
+    : { docTitle: 'BONUS DE VOLUME BI-ANNUEL', rep: 'VENDEUR', period: 'PÉRIODE', merchant: 'MARCHAND', amount: 'MONTANT', totalPaid: 'TOTAL VERSÉ', note: 'Bonus bi-annuel unique lié au volume de traitement des marchands Zentact — distinct des commissions mensuelles régulières.' };
+  return new Promise((resolve, reject) => {
+    try {
+      const doc = new PDFDocument({ size: 'LETTER', margin: 40 });
+      const chunks = [];
+      doc.on('data', c => chunks.push(c));
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const L = 40, R = 572, W = R - L, AMT_X = R - 96;
+      const C = { dark: '#1c2434', orange: '#f2682c', gray: '#475569', light: '#94a3b8', zebra: '#fafbfd', line: '#e8edf3' };
+      const ensure = (h) => { if (doc.y + h > 748) doc.addPage(); };
+      const brandMark = require('path').join(__dirname, 'assets', 'brand', 'saleshub-mark-192.png');
+
+      reps.forEach((r, idx) => {
+        if (idx > 0) doc.addPage();
+        doc.rect(0, 0, 612, 6).fill(C.orange);
+        doc.rect(0, 6, 612, 74).fill(C.dark);
+        try { doc.image(brandMark, L, 20, { width: 34, height: 34 }); } catch (_e) { /* optional */ }
+        doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(21).text('Sales Hub', L + 44, 24);
+        doc.fillColor('#8a99af').font('Helvetica').fontSize(9).text('by Cluster Systems', L + 44, 50);
+        doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text(T.docTitle, L, 26, { width: W, align: 'right', characterSpacing: 1.5 });
+        doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(17).text(periodLabel, L, 42, { width: W, align: 'right' });
+        const my = 96;
+        [[T.rep, r.rep], [T.period, periodLabel]].forEach((m, i) => {
+          const x = L + i * (W / 2);
+          doc.fillColor(C.light).font('Helvetica-Bold').fontSize(7).text(m[0], x, my, { characterSpacing: 1 });
+          doc.fillColor(C.dark).font('Helvetica-Bold').fontSize(11).text(m[1], x, my + 11, { width: W / 2 - 8 });
+        });
+        doc.y = my + 40;
+        doc.moveTo(L, doc.y).lineTo(R, doc.y).strokeColor(C.line).lineWidth(1).stroke();
+        doc.y += 16;
+
+        ensure(46);
+        doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text(T.merchant, L, doc.y, { characterSpacing: 1.5 });
+        doc.y += 15;
+        const hy = doc.y;
+        doc.fillColor(C.light).font('Helvetica-Bold').fontSize(7);
+        doc.text(T.merchant, L + 2, hy, { characterSpacing: 0.5 });
+        doc.text(T.amount, AMT_X, hy, { width: 92, align: 'right', characterSpacing: 0.5 });
+        doc.y = hy + 11;
+        doc.moveTo(L, doc.y).lineTo(R, doc.y).strokeColor(C.dark).lineWidth(1).stroke();
+        doc.y += 5;
+        (r.accounts || []).forEach((a, i) => {
+          ensure(18);
+          const y = doc.y;
+          if (i % 2) doc.rect(L, y - 3, W, 17).fill(C.zebra);
+          doc.fillColor(C.dark).font('Helvetica').fontSize(9).text(String(a.merchant_name || '—'), L + 2, y, { width: AMT_X - L - 10, ellipsis: true });
+          doc.fillColor(C.dark).font('Helvetica-Bold').fontSize(9).text(money(a.amount), AMT_X, y, { width: 92, align: 'right' });
+          doc.y = y + 17;
+        });
+
+        ensure(60);
+        doc.y += 12;
+        const by = doc.y, bx = R - 268;
+        doc.roundedRect(bx, by, 268, 40, 9).fillAndStroke('#fff4ec', '#f7c8ab');
+        doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text(T.totalPaid, bx + 16, by + 15, { characterSpacing: 1 });
+        doc.fillColor(C.dark).font('Helvetica-Bold').fontSize(18).text(money(r.total), bx + 16, by + 11, { width: 236, align: 'right' });
+        doc.y = by + 56;
+        doc.fillColor(C.light).font('Helvetica-Oblique').fontSize(7.5).text(T.note, L, doc.y, { width: W, continued: true })
+          .font('Helvetica').text('     Sales Hub · saleshub.clusterpos.com', { align: 'left' });
+      });
+      doc.end();
+    } catch (e) { reject(e); }
+  });
+}
+
 // GET /api/commissions/annual-reconciliation?year= — year-end books check: for every active
 // rep × month, what was PAID (pay-file/commit ledger) vs what the model CALCULATES vs the
 // delta. Pre-platform months (< May 2026) differ BY DESIGN (imported reports were the truth).
@@ -16156,6 +16244,124 @@ app.post('/api/commissions/payroll/send', authenticateToken, async (req, res) =>
     res.json({ sent: true, recipients: recipients.length, reps: reps.length, grandTotal: grand });
   } catch (e) {
     res.status(500).json({ error: 'Failed to send payroll', details: e.message });
+  }
+});
+
+// POST /api/commissions/processing-bonus/send { year, month }  (month must be 6 or 12)
+// Emails the payroll team the ALREADY-COMMITTED bi-annual processing bonus for a period — its
+// own send action, own PDF, own history table (processing_bonus_sends), deliberately never
+// mixed with the regular monthly "Payroll -> send" flow (2026-07-15). Uses the same payroll
+// recipients list, since it's the same team, just a distinct notification.
+app.post('/api/commissions/processing-bonus/send', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const year = parseInt(req.body.year), month = parseInt(req.body.month);
+  if (!year || (month !== 6 && month !== 12)) return res.status(400).json({ error: 'year + month (6 or 12) required' });
+  try {
+    const recipients = await getPayrollRecipients();
+    if (!recipients.length) return res.status(400).json({ error: 'no payroll recipients configured' });
+    const period = `${year}-${String(month).padStart(2, '0')}-01`;
+    const rows = (await pool.query(
+      `SELECT rep_name, merchant_name, amount::float AS amount FROM commission_bonuses
+        WHERE bonus_type = 'processing' AND import_id IS NULL AND paid_for_period = $1::date
+        ORDER BY rep_name, amount DESC`,
+      [period]
+    )).rows;
+    const byRep = new Map();
+    for (const r of rows) {
+      if (!byRep.has(r.rep_name)) byRep.set(r.rep_name, { rep: r.rep_name, accounts: [], total: 0 });
+      const e = byRep.get(r.rep_name);
+      e.accounts.push({ merchant_name: r.merchant_name, amount: r.amount });
+      e.total = Math.round((e.total + r.amount) * 100) / 100;
+    }
+    let reps = [...byRep.values()];
+    const repFilter = Array.isArray(req.body.reps) ? req.body.reps.map(String) : null;
+    if (repFilter && repFilter.length) reps = reps.filter(r => repFilter.includes(r.rep));
+    if (!reps.length) return res.status(400).json({ error: 'nothing committed to send for this period' });
+    const periodLabel = `${year}-${String(month).padStart(2, '0')}`;
+    const en = String(req.body.lang || '').toLowerCase().startsWith('en');
+    const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const grand = Math.round(reps.reduce((s, r) => s + r.total, 0) * 100) / 100;
+    const subject = en ? `Bi-Annual Processing Bonus — ${periodLabel}` : `Bonus de volume bi-annuel — ${periodLabel}`;
+    const rowsHtml = reps.map(r =>
+      `<tr><td style="padding:6px 10px;border-top:1px solid #eef1f6">${r.rep}</td>
+           <td style="padding:6px 10px;border-top:1px solid #eef1f6;text-align:right">${money(r.total)}</td></tr>`).join('');
+    const inner = `<h1 style="margin:0 0 14px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${subject}</h1>
+            <table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434;border-collapse:collapse">
+              <tr><th style="text-align:left;padding:6px 10px;color:#94a3b8;font-size:11px;letter-spacing:.4px">${en ? 'REP' : 'VENDEUR'}</th><th style="text-align:right;padding:6px 10px;color:#94a3b8;font-size:11px;letter-spacing:.4px">${en ? 'AMOUNT' : 'MONTANT'}</th></tr>
+              ${rowsHtml}
+              <tr><td style="padding:10px;border-top:2px solid #0f1722;font-weight:700">${en ? 'TOTAL' : 'TOTAL'}</td><td style="padding:10px;border-top:2px solid #0f1722;text-align:right;font-weight:700;color:#f97316">${money(grand)}</td></tr>
+            </table>
+            <p style="margin:18px 0 0;color:#94a3b8;font-size:11px">${en
+              ? 'One-time bi-annual bonus tied to Zentact merchant processing volume — SEPARATE from regular monthly commissions. Detailed statement attached (PDF).'
+              : 'Bonus bi-annuel unique lié au volume de traitement des marchands Zentact — DISTINCT des commissions mensuelles régulières. Relevé détaillé en pièce jointe (PDF).'}</p>`;
+    const html = mailChrome(inner, subject);
+    const pdf = await buildProcessingBonusPdf(periodLabel, reps, req.body.lang);
+    const t = getMailer();
+    if (!t) return res.status(502).json({ error: 'smtp_not_configured' });
+    await t.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: recipients.join(','),
+      subject,
+      html,
+      attachments: [{ filename: `Bonus_BiAnnuel_${periodLabel}.pdf`, content: pdf }],
+    });
+    const sentBy = req.user.realAdminEmail || req.user.email || 'unknown';
+    const sentTo = recipients.join(', ');
+    const values = [], params = [];
+    reps.forEach((r, i) => {
+      const b = i * 5;
+      values.push(`($${b + 1}, $${b + 2}::date, $${b + 3}, $${b + 4}, $${b + 5})`);
+      params.push(r.rep, period, sentTo, sentBy, r.total);
+    });
+    await pool.query(
+      `INSERT INTO processing_bonus_sends (rep_name, period, sent_to, sent_by, total) VALUES ${values.join(', ')}`,
+      params
+    );
+    res.json({ sent: true, recipients: recipients.length, reps: reps.length, grandTotal: grand });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to send processing bonus', details: e.message });
+  }
+});
+
+// GET /api/commissions/processing-bonus/sends — history of bi-annual bonus send batches, its
+// own history distinct from GET /api/commissions/payroll/sends.
+app.get('/api/commissions/processing-bonus/sends', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  try {
+    const rows = (await pool.query(`
+      SELECT period::date AS period, sent_at, sent_by, sent_to,
+             COUNT(*)::int AS rep_count,
+             COALESCE(SUM(total), 0)::float AS total,
+             ARRAY_AGG(rep_name ORDER BY rep_name) AS reps,
+             ARRAY_AGG(id) AS ids
+        FROM processing_bonus_sends
+       GROUP BY period, sent_at, sent_by, sent_to
+       ORDER BY sent_at DESC
+       LIMIT 200
+    `)).rows;
+    const sends = rows.map(r => ({
+      period: r.period, year: new Date(r.period).getUTCFullYear(), month: new Date(r.period).getUTCMonth() + 1,
+      sentAt: r.sent_at, sentBy: r.sent_by,
+      recipients: (r.sent_to || '').split(',').map(s => s.trim()).filter(Boolean),
+      repCount: r.rep_count, total: r.total, reps: r.reps || [], ids: r.ids || [],
+    }));
+    res.json({ sends });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load processing bonus send history', details: e.message });
+  }
+});
+
+// DELETE /api/commissions/processing-bonus/sends { ids: [..] } — remove one send-history batch
+// (history only — does not un-send the email already delivered).
+app.delete('/api/commissions/processing-bonus/sends', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
+  const ids = Array.isArray(req.body.ids) ? req.body.ids.map(n => parseInt(n)).filter(Number.isFinite) : [];
+  if (!ids.length) return res.status(400).json({ error: 'ids required' });
+  try {
+    const result = await pool.query(`DELETE FROM processing_bonus_sends WHERE id = ANY($1::int[])`, [ids]);
+    res.json({ deleted: result.rowCount });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to delete processing bonus history', details: e.message });
   }
 });
 
