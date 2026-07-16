@@ -6852,7 +6852,7 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
                 COALESCE(SUM(profit) FILTER (WHERE profit > 0), 0) AS total,
                 COUNT(*) FILTER (WHERE profit > 0) AS clients
               FROM (
-                SELECT merchant_account_id, SUM(transaction_profit_cents) / 100.0 AS profit
+                SELECT merchant_account_id, SUM(transaction_profit_cents + COALESCE(other_revenue_cents,0)) / 100.0 AS profit
                 FROM zentact_merchant_revenue WHERE year = $1 GROUP BY merchant_account_id
               ) m
             `, [year]),
@@ -7315,8 +7315,12 @@ const billingCustomersCache = makeDurableCache('billing_customers_durable_cache'
 const getBillingCustomers = (opts) => billingCustomersCache.get(computeBillingCustomers, opts);
 
 // Shared: per-merchant combined revenue (monthly processing + linked SaaS) using the curated
-// merchant_saas_links. SaaS resolution per merchant: manual link (exact sub > customer total) >
-// auto name-match > 0. `months` is how many months the year's profit is spread over (run-rate).
+// merchant_saas_links. "Processing" here is transaction_profit_cents + other_revenue_cents (the
+// PDF-parsed recurring/fixed fees) — matching the same definition already used by the bi-annual
+// processing bonus (computeProcessingBonuses); previously this only counted transaction_profit,
+// which under-counted merchants with real other-revenue but $0 transaction profit (2026-07-16).
+// SaaS resolution per merchant: manual link (exact sub > customer total) > auto name-match > 0.
+// `months` is how many months the year's profit is spread over (run-rate).
 async function computeMerchantRevenueRows(year) {
   const now = new Date();
   const months = year < now.getFullYear() ? 12 : (year > now.getFullYear() ? 0 : now.getMonth() + 1);
@@ -7325,7 +7329,7 @@ async function computeMerchantRevenueRows(year) {
   // on a cold cache), which is what made this the slowest piece of the dashboard.
   const [merchantsRes, profitRes, linksRes, billing] = await Promise.all([
     pool.query(`SELECT merchant_account_id, business_name, status, activated_at FROM zentact_merchants ORDER BY business_name`),
-    pool.query(`SELECT merchant_account_id, COALESCE(SUM(transaction_profit_cents),0)/100.0 AS profit FROM zentact_merchant_revenue WHERE year = $1 GROUP BY merchant_account_id`, [year]),
+    pool.query(`SELECT merchant_account_id, COALESCE(SUM(transaction_profit_cents + COALESCE(other_revenue_cents,0)),0)/100.0 AS profit FROM zentact_merchant_revenue WHERE year = $1 GROUP BY merchant_account_id`, [year]),
     pool.query(`SELECT * FROM merchant_saas_links`),
     getBillingCustomers(),
   ]);
