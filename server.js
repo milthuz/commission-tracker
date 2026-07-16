@@ -9846,11 +9846,16 @@ app.get('/api/resellers/:id/logo', async (req, res) => {
 
 // GET /api/hardware — full catalog. Reps (hardware:view only) see visible=true rows only;
 // hardware:manage (incl. admin) sees everything, since the Admin editor reuses this endpoint.
-app.get('/api/hardware', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'hardware:view'))) return;
+// Dual-gated (secret OR JWT) — read-only diagnostic access, same convention as other admin GETs.
+app.get('/api/hardware', (req, res, next) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) { req.viaSecret = true; return next(); }
+  return authenticateToken(req, res, next);
+}, async (req, res) => {
+  if (!req.viaSecret && !(await requirePerm(req, res, 'hardware:view'))) return;
   try {
-    let canManage = req.user.isAdmin === true;
-    if (!canManage && req.user.email) canManage = userHasPermission(await getUserPermissions(req.user.email), 'hardware:manage');
+    let canManage = req.viaSecret === true || req.user?.isAdmin === true;
+    if (!canManage && req.user?.email) canManage = userHasPermission(await getUserPermissions(req.user.email), 'hardware:manage');
     const cats = (await pool.query(`SELECT id, sort_order FROM hardware_categories ORDER BY sort_order`)).rows;
     const rows = (await pool.query(`
       SELECT id, cat_id, name_en, name_fr, specs_en, specs_fr, sku, price, compat, status,
@@ -9963,12 +9968,16 @@ app.get('/api/hardware/:id/image', async (req, res) => {
 // Services & Pricing Guide (rep-facing reference tool) + Admin Pricing editor
 // ============================================================================
 
-// GET /api/pricing — full pricing guide. Same visible-filter convention as /api/hardware.
-app.get('/api/pricing', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'pricing:view'))) return;
+// GET /api/pricing — full pricing guide. Same visible-filter + dual-gate convention as /api/hardware.
+app.get('/api/pricing', (req, res, next) => {
+  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
+  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) { req.viaSecret = true; return next(); }
+  return authenticateToken(req, res, next);
+}, async (req, res) => {
+  if (!req.viaSecret && !(await requirePerm(req, res, 'pricing:view'))) return;
   try {
-    let canManage = req.user.isAdmin === true;
-    if (!canManage && req.user.email) canManage = userHasPermission(await getUserPermissions(req.user.email), 'pricing:manage');
+    let canManage = req.viaSecret === true || req.user?.isAdmin === true;
+    if (!canManage && req.user?.email) canManage = userHasPermission(await getUserPermissions(req.user.email), 'pricing:manage');
     const cats = (await pool.query(
       `SELECT id, sort_order, hourly, note_en, note_fr, considerations_en, considerations_fr FROM pricing_categories ORDER BY sort_order`
     )).rows;
