@@ -6781,6 +6781,13 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
     const nowD = new Date();
     const monthsInPeriod = year < nowD.getFullYear() ? 12 : (year > nowD.getFullYear() ? 0 : (nowD.getMonth() + 1));
     const perMonth = (total, units) => (monthsInPeriod > 0 && units > 0) ? (total / monthsInPeriod / units) : 0;
+    // "Avg monthly processing / merchant" is compared directly against Zentact's own dashboard,
+    // which always shows a single-month snapshot — so for the current year we scope the processing
+    // query to the CURRENT calendar month (not a Jan-to-date run-rate) to match that framing
+    // (2026-07-16). Past years have no "current month" concept, so they keep the full-year/12
+    // run-rate average, same as before.
+    const isCurrentYear = year === nowD.getFullYear();
+    const procMonthFilter = isCurrentYear ? (nowD.getMonth() + 1) : null;
 
     // All of this section's queries are independent of each other — fire them all concurrently
     // in one batch instead of stacking round-trips (the DB is cross-cloud from this backend, so
@@ -6853,9 +6860,11 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
                 COUNT(*) FILTER (WHERE profit > 0) AS clients
               FROM (
                 SELECT merchant_account_id, SUM(transaction_profit_cents + COALESCE(other_revenue_cents,0)) / 100.0 AS profit
-                FROM zentact_merchant_revenue WHERE year = $1 GROUP BY merchant_account_id
+                FROM zentact_merchant_revenue
+                WHERE year = $1 AND ($2::int IS NULL OR month = $2)
+                GROUP BY merchant_account_id
               ) m
-            `, [year]),
+            `, [year, procMonthFilter]),
             computeMerchantRevenueRows(year),
           ])
         : Promise.resolve(null),
@@ -6882,7 +6891,13 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
       const [procAvgRes, mRows] = revenueExtras;
       const pa = procAvgRes.rows[0] || {};
       const procTotal = parseFloat(pa.total) || 0, procMerchants = parseInt(pa.clients) || 0;
-      avgProcessing = { total: procTotal, clients: procMerchants, monthly: perMonth(procTotal, procMerchants) };
+      // Current year: procTotal is already a single month's sum, so it IS the monthly figure —
+      // don't divide by monthsInPeriod again (that divisor is for averaging a multi-month total).
+      avgProcessing = {
+        total: procTotal,
+        clients: procMerchants,
+        monthly: isCurrentYear ? (procMerchants > 0 ? procTotal / procMerchants : 0) : perMonth(procTotal, procMerchants),
+      };
       // Combined SaaS + processing revenue, averaged per merchant per month — TRUE per-merchant
       // join via the curated merchant_saas_links (SH-14). Two populations, named explicitly since
       // they're easy to conflate: ACTIVE merchants = matched to a SaaS (saasMonthly > 0, manual
