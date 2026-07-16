@@ -7865,15 +7865,14 @@ app.get('/api/admin/mail-test', async (req, res) => {
 });
 
 // POST /api/proposals/prepare — build the merged PDF + a prefilled email draft (rep reviews before sending).
-// estimateId is optional — omit it to build a presentation-only proposal (cover+deck, no Zoho quote);
-// in that case clientName is required (there's no estimate to pull it from).
+// estimateId is optional — omit it to build a presentation-only proposal (cover+deck, no Zoho quote).
+// clientName is also optional in that case — a generic placeholder fills the cover when left blank.
 app.post('/api/proposals/prepare', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'proposals:send'))) return;
   const lang = String(req.body.lang || 'fr').toLowerCase() === 'en' ? 'en' : 'fr';
   const estimateId = String(req.body.estimateId || '').trim();
   const title = String(req.body.title || '').trim();
   const bodyClientName = String(req.body.clientName || '').trim();
-  if (!estimateId && !bodyClientName) return res.status(400).json({ error: 'clientName required when no estimate is selected' });
   try {
     let det = null;
     if (estimateId) {
@@ -7910,14 +7909,15 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
   const bodyText = String(req.body.body || '');
   const bodyClientName = String(req.body.clientName || '').trim();
   if (!to || !subject) return res.status(400).json({ error: 'to and subject are required' });
-  if (!estimateId && !bodyClientName) return res.status(400).json({ error: 'clientName required when no estimate is selected' });
   try {
     let det = null;
     if (estimateId) {
       det = await getEstimateDetail(estimateId);
       if (!(await assertEstimateOwnership(req, res, det))) return;
     }
-    const clientName = bodyClientName || (det && det.customerName) || '';
+    // Same fallback as /prepare — without it, a blank client name here would rebuild the PDF with
+    // different cover text than what the rep just previewed.
+    const clientName = bodyClientName || (det && det.customerName) || (lang === 'en' ? 'your business' : 'votre entreprise');
     const repName = req.user.name || req.user.email || '';
     const pageOrder = Array.isArray(req.body.pageOrder) ? req.body.pageOrder.map(Number).filter(Boolean) : null;
     const includeEstimate = req.body.includeEstimate !== false;
