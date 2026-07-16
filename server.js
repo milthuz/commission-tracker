@@ -683,6 +683,8 @@ async function initializeDatabase() {
       lang VARCHAR(5),
       sent_at TIMESTAMPTZ DEFAULT NOW()
     )`);
+    // A proposal no longer requires a Zoho estimate (presentation-only proposals are allowed).
+    await pool.query(`ALTER TABLE proposals_sent ALTER COLUMN estimate_id DROP NOT NULL`);
     // Email open-tracking (pixel): a per-send token + when/how often the client opened the email.
     await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS track_token VARCHAR(64)`);
     await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ`);
@@ -7598,25 +7600,31 @@ async function fetchRenderedPresentation(clientName, lang, logoDataUrl, pages) {
   return null;
 }
 
-// Merge: the proposal presentation + the Zoho estimate PDF → one PDF (Uint8Array).
+// Merge: the proposal presentation (cover+deck) + the Zoho estimate PDF (optional) → one PDF.
 // Presentation source, in order of preference: (1) the rendered Claude Design document from the
 // Puppeteer service (PROPOSAL_RENDER_URL) — personalized + branded, REPLACES cover+deck;
-// (2) generated pdf-lib cover + in-app custom deck; (3) cover + committed company_{lang}.pdf.
+// (2) generated pdf-lib cover + committed company_{lang}.pdf deck.
 // Returns { bytes, presentationPageCount, estimatePageCount }.
-// selectedPages: optional 1-based indices into the PRESENTATION to include (null/empty = all).
-// includeEstimate: append the Zoho estimate PDF (default true).
-async function buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes, logoDataUrl, selectedPages, includeEstimate = true }) {
+// pageOrder: optional ORDERED array of 1-based indices into the FULL page range — 1..presentationPageCount
+// is the presentation, presentationPageCount+1..+estimatePageCount is the estimate. The rep can freely
+// reorder AND include/exclude any page from either source; indices omitted from the array are dropped.
+// Applied the SAME way regardless of presentation source, so a custom order/selection works whether the
+// render service or the pdf-lib fallback produced the deck. Default (no pageOrder) = every page,
+// presentation then estimate, original order.
+// includeEstimate: skip even FETCHING the Zoho estimate when false (estimateId may still be set — e.g.
+// the rep unchecked "attach the quote", but the estimate is still what gets marked "sent" in Zoho).
+// estimateId is optional — a proposal can be presentation-only (cover+deck), no Zoho estimate at all.
+async function buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes, logoDataUrl, pageOrder, includeEstimate = true }) {
   const fs = require('fs');
   const { PDFDocument } = require('pdf-lib');
   const out = await PDFDocument.create();
 
-  // (1) Build the presentation. When the render service is used it already drops the unselected
-  // design pages AND renumbers the footers, so we must NOT re-filter it with pdf-lib afterwards.
-  const wantPages = (Array.isArray(selectedPages) && selectedPages.length) ? selectedPages.map(Number).filter(n => n > 0) : undefined;
-  let presDoc = null, fromService = false;
-  const rendered = await fetchRenderedPresentation(clientName, lang, logoDataUrl, wantPages);
+  // (1) Build the presentation — always UNFILTERED here; page selection/ordering is applied
+  // uniformly below, once both documents exist.
+  let presDoc = null;
+  const rendered = await fetchRenderedPresentation(clientName, lang, logoDataUrl, null);
   if (rendered) {
-    try { presDoc = await PDFDocument.load(rendered); fromService = true; }
+    try { presDoc = await PDFDocument.load(rendered); }
     catch (e) { console.warn('[proposal] rendered presentation load failed, falling back:', e.message); }
   }
   if (!presDoc) {
@@ -7631,25 +7639,31 @@ async function buildProposalPdf({ estimateId, lang, clientName, repName, title, 
     const comp = await PDFDocument.load(compBytes);
     (await presDoc.copyPages(comp, comp.getPageIndices())).forEach(p => presDoc.addPage(p));
   }
-
   const presentationPageCount = presDoc.getPageCount();
-  // The service already applied the page selection (+ renumbered). Only the pdf-lib fallback
-  // needs to filter here (it can't renumber, but at least drops the unselected pages).
-  let idxs = presDoc.getPageIndices();
-  if (!fromService && wantPages) {
-    const want = new Set(wantPages.map(n => n - 1));
-    const filtered = idxs.filter(i => want.has(i));
-    if (filtered.length) idxs = filtered;
-  }
-  (await out.copyPages(presDoc, idxs)).forEach(p => out.addPage(p));
 
-  // (2) The Zoho estimate (best-effort), unless the rep excluded it.
-  let estimatePageCount = 0;
+  // (2) The Zoho estimate (best-effort), unless the rep excluded it entirely or there is none.
+  let estDoc = null, estimatePageCount = 0;
   if (includeEstimate && estimateId) {
     const est = await fetchEstimatePdfBytes(estimateId);
     if (est && est.buffer) {
-      try { const ed = await PDFDocument.load(est.buffer); estimatePageCount = ed.getPageCount(); (await out.copyPages(ed, ed.getPageIndices())).forEach(p => out.addPage(p)); }
-      catch (e) { console.warn('[proposal] estimate PDF merge skipped:', e.message); }
+      try { estDoc = await PDFDocument.load(est.buffer); estimatePageCount = estDoc.getPageCount(); }
+      catch (e) { console.warn('[proposal] estimate PDF load skipped:', e.message); }
+    }
+  }
+
+  // (3) Assemble the final document in the requested order (default: presentation then estimate,
+  // original order — identical to the pre-reordering behavior).
+  const totalPages = presentationPageCount + estimatePageCount;
+  const order = (Array.isArray(pageOrder) && pageOrder.length)
+    ? pageOrder.map(Number).filter(n => n >= 1 && n <= totalPages)
+    : Array.from({ length: totalPages }, (_, i) => i + 1);
+  for (const num of order) {
+    if (num <= presentationPageCount) {
+      const [p] = await out.copyPages(presDoc, [num - 1]);
+      out.addPage(p);
+    } else if (estDoc) {
+      const [p] = await out.copyPages(estDoc, [num - presentationPageCount - 1]);
+      out.addPage(p);
     }
   }
   return { bytes: await out.save(), presentationPageCount, estimatePageCount };
@@ -7851,24 +7865,30 @@ app.get('/api/admin/mail-test', async (req, res) => {
 });
 
 // POST /api/proposals/prepare — build the merged PDF + a prefilled email draft (rep reviews before sending).
+// estimateId is optional — omit it to build a presentation-only proposal (cover+deck, no Zoho quote);
+// in that case clientName is required (there's no estimate to pull it from).
 app.post('/api/proposals/prepare', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'proposals:send'))) return;
   const lang = String(req.body.lang || 'fr').toLowerCase() === 'en' ? 'en' : 'fr';
   const estimateId = String(req.body.estimateId || '').trim();
   const title = String(req.body.title || '').trim();
-  if (!estimateId) return res.status(400).json({ error: 'estimateId required' });
+  const bodyClientName = String(req.body.clientName || '').trim();
+  if (!estimateId && !bodyClientName) return res.status(400).json({ error: 'clientName required when no estimate is selected' });
   try {
-    const det = await getEstimateDetail(estimateId);
-    if (!(await assertEstimateOwnership(req, res, det))) return;
-    const clientName = (req.body.clientName || '').trim() || (det && det.customerName) || (lang === 'en' ? 'your business' : 'votre entreprise');
+    let det = null;
+    if (estimateId) {
+      det = await getEstimateDetail(estimateId);
+      if (!(await assertEstimateOwnership(req, res, det))) return;
+    }
+    const clientName = bodyClientName || (det && det.customerName) || (lang === 'en' ? 'your business' : 'votre entreprise');
     const repName = req.user.name || req.user.email || '';
-    const selectedPages = Array.isArray(req.body.selectedPages) ? req.body.selectedPages.map(Number).filter(Boolean) : null;
+    const pageOrder = Array.isArray(req.body.pageOrder) ? req.body.pageOrder.map(Number).filter(Boolean) : null;
     const includeEstimate = req.body.includeEstimate !== false;
-    const built = await buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64), logoDataUrl: req.body.logoBase64, selectedPages, includeEstimate });
+    const built = await buildProposalPdf({ estimateId: estimateId || null, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64), logoDataUrl: req.body.logoBase64, pageOrder, includeEstimate });
     const subject = lang === 'en' ? `Cluster POS proposal — ${clientName}` : `Proposition Cluster POS — ${clientName}`;
     const body = lang === 'en'
-      ? `Hello,\n\nThank you for your interest in Cluster POS. Please find attached our proposal prepared for ${clientName}, including your quote.\n\nI'd be glad to walk you through it — just reply to this email.\n\nBest regards,\n${repName}\nCluster Systems`
-      : `Bonjour,\n\nMerci de votre intérêt envers Cluster POS. Vous trouverez ci-joint notre proposition préparée pour ${clientName}, incluant votre soumission.\n\nJe me ferai un plaisir de vous la présenter — répondez simplement à ce courriel.\n\nCordialement,\n${repName}\nCluster Systems`;
+      ? `Hello,\n\nThank you for your interest in Cluster POS. Please find attached our proposal prepared for ${clientName}${estimateId ? ', including your quote' : ''}.\n\nI'd be glad to walk you through it — just reply to this email.\n\nBest regards,\n${repName}\nCluster Systems`
+      : `Bonjour,\n\nMerci de votre intérêt envers Cluster POS. Vous trouverez ci-joint notre proposition préparée pour ${clientName}${estimateId ? ', incluant votre soumission' : ''}.\n\nJe me ferai un plaisir de vous la présenter — répondez simplement à ce courriel.\n\nCordialement,\n${repName}\nCluster Systems`;
     res.json({
       pdfBase64: Buffer.from(built.bytes).toString('base64'), fileName: proposalFileName(clientName),
       presentationPageCount: built.presentationPageCount, estimatePageCount: built.estimatePageCount,
@@ -7878,6 +7898,8 @@ app.post('/api/proposals/prepare', authenticateToken, async (req, res) => {
 });
 
 // POST /api/proposals/send — rebuild + email the proposal to the client (rep-reviewed fields).
+// estimateId is optional — a presentation-only proposal has no Zoho record to mark "sent" or track
+// acceptance for, but still sends (with email-open tracking) and appears on the sent-proposals board.
 app.post('/api/proposals/send', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'proposals:send'))) return;
   const lang = String(req.body.lang || 'fr').toLowerCase() === 'en' ? 'en' : 'fr';
@@ -7886,20 +7908,29 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
   const to = String(req.body.to || '').trim();
   const subject = String(req.body.subject || '').trim();
   const bodyText = String(req.body.body || '');
-  if (!estimateId || !to || !subject) return res.status(400).json({ error: 'estimateId, to and subject are required' });
+  const bodyClientName = String(req.body.clientName || '').trim();
+  if (!to || !subject) return res.status(400).json({ error: 'to and subject are required' });
+  if (!estimateId && !bodyClientName) return res.status(400).json({ error: 'clientName required when no estimate is selected' });
   try {
-    const det = await getEstimateDetail(estimateId);
-    if (!(await assertEstimateOwnership(req, res, det))) return;
-    const clientName = (req.body.clientName || '').trim() || (det && det.customerName) || '';
+    let det = null;
+    if (estimateId) {
+      det = await getEstimateDetail(estimateId);
+      if (!(await assertEstimateOwnership(req, res, det))) return;
+    }
+    const clientName = bodyClientName || (det && det.customerName) || '';
     const repName = req.user.name || req.user.email || '';
-    const selectedPages = Array.isArray(req.body.selectedPages) ? req.body.selectedPages.map(Number).filter(Boolean) : null;
+    const pageOrder = Array.isArray(req.body.pageOrder) ? req.body.pageOrder.map(Number).filter(Boolean) : null;
     const includeEstimate = req.body.includeEstimate !== false;
-    const built = await buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64), logoDataUrl: req.body.logoBase64, selectedPages, includeEstimate });
+    const built = await buildProposalPdf({ estimateId: estimateId || null, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64), logoDataUrl: req.body.logoBase64, pageOrder, includeEstimate });
     const pdf = built.bytes;
     // Mark the estimate "sent" in Zoho (enables client acceptance + viewed/accepted tracking),
-    // then try to surface its accept link to add as a button in our email.
-    await markEstimateSent(estimateId);
-    const acceptUrl = await getEstimateAcceptUrl(estimateId);
+    // then try to surface its accept link to add as a button in our email. Only applies when a
+    // real Zoho estimate is attached — a presentation-only proposal has nothing to mark/track there.
+    let acceptUrl = null;
+    if (estimateId) {
+      await markEstimateSent(estimateId);
+      acceptUrl = await getEstimateAcceptUrl(estimateId);
+    }
     const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     // A unique token per send drives both the open pixel and the accept-link click redirect.
     const trackToken = require('crypto').randomUUID().replace(/-/g, '');
@@ -7954,12 +7985,17 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
     if (!r.sent) return res.status(502).json({ error: r.reason === 'smtp_not_configured' ? 'smtp_not_configured' : 'mail_failed', reason: r.reason });
     // Record the send for the status board (best-effort).
     const proposalActor = req.user.realAdminEmail || req.user.email || 'unknown';
+    let insertedId = null;
     try {
-      await pool.query(
-        `INSERT INTO proposals_sent (estimate_id, estimate_number, customer_name, rep_email, to_email, lang, track_token, accept_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-        [estimateId, (det && det.number) || '', clientName, proposalActor, to, lang, trackToken, acceptUrl || null]);
+      const ins = await pool.query(
+        `INSERT INTO proposals_sent (estimate_id, estimate_number, customer_name, rep_email, to_email, lang, track_token, accept_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+        [estimateId || null, (det && det.number) || '', clientName, proposalActor, to, lang, trackToken, acceptUrl || null]);
+      insertedId = ins.rows[0]?.id || null;
     } catch (e) { console.warn('[proposal/send] record:', e.message); }
-    logActivity('proposal', estimateId, 'sent', `Proposal ${(det && det.number) || ''} sent to ${to} by ${proposalActor}`.trim(), proposalActor, { metadata: { clientName, to } });
+    // A presentation-only proposal has no Zoho estimate id to key the activity log on — fall back
+    // to the local sent-proposals row id.
+    const activityEntityId = estimateId || (insertedId ? `blank-${insertedId}` : trackToken);
+    logActivity('proposal', activityEntityId, 'sent', `Proposal ${(det && det.number) || (estimateId ? '' : '(no estimate)')} sent to ${to} by ${proposalActor}`.trim(), proposalActor, { metadata: { clientName, to } });
     res.json({ success: true, acceptLinkIncluded: !!acceptUrl, sentFrom: fromAddr });
   } catch (e) { console.warn('[proposal/send]', e.message); res.status(500).json({ error: e.message }); }
 });
@@ -8016,7 +8052,7 @@ app.get('/api/proposals/sent', authenticateToken, async (req, res) => {
       : (await pool.query(`SELECT * FROM proposals_sent WHERE LOWER(rep_email) = $1 ORDER BY sent_at DESC LIMIT 100`, [me])).rows;
     const out = [];
     for (const r0 of rows.slice(0, 40)) {
-      const st = await getEstimateStatus(r0.estimate_id);
+      const st = r0.estimate_id ? await getEstimateStatus(r0.estimate_id) : null;
       out.push({
         id: r0.id, estimateId: r0.estimate_id, number: r0.estimate_number, customerName: r0.customer_name,
         repEmail: r0.rep_email, toEmail: r0.to_email, sentAt: r0.sent_at,
