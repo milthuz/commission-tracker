@@ -2510,6 +2510,11 @@ THE APP'S SECTIONS (left sidebar):
 - Commission Report: a rep's commissions month by month for a year. Months show EARNED commission grouped by "Unlock Month" (when the commission becomes payable). The "Pay stub / Bulletin de paie" button shows the pay stub for the selected month: invoices paid, bonuses, total. A "Total Compensation" banner shows base salary accrued by pay period (26 bi-weekly periods/year) + YTD commission + annual bonus + signup payments.
 - Reseller Activation: POS activations attributed to external resellers.
 - Processing Revenue (Revenus de paiements): monthly payment-processing revenue per rep/reseller (transaction profit + other revenue).
+- Resources: the shared sales-document library — search, browse and download guides and templates. Two featured tiles here open the Hardware Overview and Services & Pricing Guide (see below).
+- Hardware Overview: the full Cluster hardware catalog (POS terminals, printers, payment devices, displays, networking, peripherals) — searchable, filterable by Kaizen(V2)/V1 compatibility and lifecycle status, with a compare tool (up to 4 side by side) and one-click SKU copy.
+- Services & Pricing Guide: Cluster's pricing reference (SaaS, Rental, Menu Build, Installation, Support, Online Ordering, Shipping, On-Site/XPERIO) with a monthly/yearly toggle and a built-in quote builder that totals recurring vs one-time costs.
+- Proposals: build and send a branded sales proposal (cover + company deck + optional Zoho Books estimate) to a client, with open/click tracking.
+- Savings calculator: turn a competitor's payment statement into a savings offer for a prospect.
 - What each user sees depends on their permissions — some sections may not be visible to everyone.
 
 THE COMMISSION MODEL:
