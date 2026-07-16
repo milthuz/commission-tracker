@@ -121,6 +121,14 @@ const PERMISSION_CATALOG = [
   // Rate / Savings calculator (analyze a competitor merchant statement → savings offer)
   { key: 'savings:use',                label: 'Use the payment savings calculator',                             category: 'Rate Calculator' },
   { key: 'savings:manage_pricing',     label: 'Manage pricing templates + assign them to reps',                 category: 'Rate Calculator' },
+
+  // Hardware (product catalog reference tool)
+  { key: 'hardware:view',              label: 'View the Hardware Overview catalog',                             category: 'Hardware' },
+  { key: 'hardware:manage',            label: 'Add, edit and hide hardware products',                           category: 'Hardware' },
+
+  // Pricing (Services & Pricing Guide)
+  { key: 'pricing:view',               label: 'View the Services & Pricing Guide',                              category: 'Pricing' },
+  { key: 'pricing:manage',             label: 'Edit prices, SKUs and visibility in the Pricing Guide',           category: 'Pricing' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -725,6 +733,166 @@ async function initializeDatabase() {
         created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
+
+    // ---- Hardware Overview catalog (rep-facing reference tool + Admin Hardware editor) ----
+    // Bilingual (EN/FR) product content; images are bytea (mirrors the reseller-logo pattern —
+    // no object storage in this app). Categories are a small fixed list, not admin-editable.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS hardware_categories (
+        id         TEXT PRIMARY KEY,
+        sort_order INT DEFAULT 0
+      );
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS hardware_products (
+        id            TEXT PRIMARY KEY,
+        cat_id        TEXT REFERENCES hardware_categories(id),
+        name_en       TEXT NOT NULL,
+        name_fr       TEXT,
+        specs_en      TEXT[] DEFAULT '{}',
+        specs_fr      TEXT[] DEFAULT '{}',
+        sku           TEXT,
+        price         TEXT,
+        compat        TEXT[] DEFAULT '{}',
+        status        TEXT[] DEFAULT '{}',
+        use_en        TEXT,
+        use_fr        TEXT,
+        warranty_en   TEXT,
+        warranty_fr   TEXT,
+        note_en       TEXT,
+        note_fr       TEXT,
+        img_data      BYTEA,
+        img_mime_type VARCHAR(100),
+        img_file_name VARCHAR(200),
+        visible       BOOLEAN DEFAULT true,
+        sort_order    INT DEFAULT 0,
+        created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_hardware_products_cat ON hardware_products(cat_id)`);
+
+    // ---- Services & Pricing Guide (rep-facing reference tool + Admin Pricing editor) ----
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS pricing_categories (
+        id                 TEXT PRIMARY KEY,
+        sort_order         INT DEFAULT 0,
+        hourly             NUMERIC,
+        note_en            TEXT,
+        note_fr            TEXT,
+        considerations_en  TEXT[],
+        considerations_fr  TEXT[]
+      );
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS pricing_packages (
+        id             TEXT PRIMARY KEY,
+        cat_id         TEXT REFERENCES pricing_categories(id),
+        name_en        TEXT NOT NULL,
+        name_fr        TEXT,
+        sku            TEXT,
+        sku_year       TEXT,
+        compat         TEXT,
+        pos            TEXT,
+        price_monthly  NUMERIC,
+        price_yearly   NUMERIC,
+        price_flat     NUMERIC,
+        unit           TEXT,
+        activation     NUMERIC,
+        includes_en    TEXT[] DEFAULT '{}',
+        includes_fr    TEXT[] DEFAULT '{}',
+        internal_en    JSONB,
+        internal_fr    JSONB,
+        status         TEXT,
+        group_name     TEXT,
+        tier           TEXT,
+        mode           TEXT,
+        rates          JSONB,
+        visible        BOOLEAN DEFAULT true,
+        sort_order     INT DEFAULT 0,
+        created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_pricing_packages_cat ON pricing_packages(cat_id)`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS pricing_guides (
+        id         TEXT PRIMARY KEY,
+        title_en   TEXT,
+        title_fr   TEXT,
+        body_en    TEXT,
+        body_fr    TEXT,
+        sort_order INT DEFAULT 0
+      );
+    `);
+
+    // One-time seed (idempotent — ON CONFLICT DO NOTHING) from the design-handoff data, transcribed
+    // into seed/hardwareSeed.js + seed/pricingSeed.js. French columns start as a copy of English
+    // (no ready translation exists yet) — translate via the Admin Hardware/Pricing editors' FR toggle.
+    const hardwareSeed = require('./seed/hardwareSeed');
+    for (const c of hardwareSeed.categories) {
+      await pool.query(`INSERT INTO hardware_categories (id, sort_order) VALUES ($1,$2) ON CONFLICT (id) DO NOTHING`, [c.id, c.sort]);
+    }
+    for (const p of hardwareSeed.products) {
+      const ext = p.img ? (hardwareSeed.imgJpg.includes(p.img) ? 'jpg' : 'png') : null;
+      await pool.query(
+        `INSERT INTO hardware_products
+           (id, cat_id, name_en, name_fr, specs_en, specs_fr, sku, price, compat, status, use_en, use_fr, warranty_en, warranty_fr, note_en, note_fr, img_file_name)
+         VALUES ($1,$2,$3,$3,$4,$4,$5,$6,$7,$8,$9,$9,$10,$10,$11,$11,$12)
+         ON CONFLICT (id) DO NOTHING`,
+        [p.id, p.cat, p.name, p.specs, p.sku, p.price, p.compat, p.status, p.use, p.warranty, p.note || null, ext ? `${p.img}.${ext}` : null]
+      );
+    }
+    const pricingSeed = require('./seed/pricingSeed');
+    for (const c of pricingSeed.categories) {
+      await pool.query(
+        `INSERT INTO pricing_categories (id, sort_order, hourly, note_en, note_fr, considerations_en, considerations_fr)
+         VALUES ($1,$2,$3,$4,$4,$5,$5) ON CONFLICT (id) DO NOTHING`,
+        [c.id, c.sort, c.hourly, c.note, c.considerations]
+      );
+    }
+    for (const p of pricingSeed.packages) {
+      await pool.query(
+        `INSERT INTO pricing_packages
+           (id, cat_id, name_en, name_fr, sku, sku_year, compat, pos, price_monthly, price_yearly, price_flat, unit, activation,
+            includes_en, includes_fr, internal_en, internal_fr, status, group_name, tier, mode, rates)
+         VALUES ($1,$2,$3,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,$14,$14,$15,$16,$17,$18,$19)
+         ON CONFLICT (id) DO NOTHING`,
+        [p.id, p.cat, p.name, p.sku || null, p.skuYear || null, p.compat || null, p.pos || null,
+         p.priceMonthly ?? null, p.priceYearly ?? null, p.priceFlat ?? null, p.unit || null, p.activation ?? null,
+         p.includes || [], p.internal ? JSON.stringify(p.internal) : null, p.status || null, p.group || null, p.tier || null, p.mode || null,
+         p.rates ? JSON.stringify(p.rates) : null]
+      );
+    }
+    for (const g of pricingSeed.guides) {
+      await pool.query(
+        `INSERT INTO pricing_guides (id, title_en, title_fr, body_en, body_fr, sort_order) VALUES ($1,$2,$2,$3,$3,$4) ON CONFLICT (id) DO NOTHING`,
+        [g.id, g.title, g.body, pricingSeed.guides.indexOf(g)]
+      );
+    }
+    // Backfill hardware product photos into bytea — only touches rows that don't have image data
+    // yet, so it's a no-op after the first successful run (and harmless to re-run on every boot).
+    try {
+      const needImg = (await pool.query(
+        `SELECT id, img_file_name FROM hardware_products WHERE img_data IS NULL AND img_file_name IS NOT NULL`
+      )).rows;
+      if (needImg.length) {
+        const fs = require('fs');
+        const path = require('path');
+        const seedImgDir = path.join(__dirname, 'assets', 'hardware-seed-img');
+        let backfilled = 0;
+        for (const row of needImg) {
+          const filePath = path.join(seedImgDir, row.img_file_name);
+          if (!fs.existsSync(filePath)) continue;
+          const buf = fs.readFileSync(filePath);
+          const mime = row.img_file_name.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg';
+          await pool.query(`UPDATE hardware_products SET img_data = $1, img_mime_type = $2 WHERE id = $3`, [buf, mime, row.id]);
+          backfilled++;
+        }
+        if (backfilled) console.log(`✅ Backfilled ${backfilled} hardware product photo(s) into bytea`);
+      }
+    } catch (e) { console.warn('[hardware-seed] image backfill:', e.message); }
+
     // Authoritative per-customer tenure fact (2026-07-14): the customer's TRUE earliest invoice
     // ever, fetched directly from Zoho with no date bound — unlike our own invoices table, which
     // only has whatever fell inside the sync window, so an old customer's real first sale can be
@@ -938,6 +1106,16 @@ async function initializeDatabase() {
     await pool.query(`
       UPDATE roles SET permissions = permissions || '["dashboard:view_own"]'::jsonb
       WHERE name IN ('Sales Rep', 'Manager') AND NOT (permissions ? 'dashboard:view_own')
+    `);
+    // Hardware Overview + Services & Pricing Guide are reference tools every rep can view
+    // out of the box (admins adjust per role); :manage stays admin-only until explicitly granted.
+    await pool.query(`
+      UPDATE roles SET permissions = permissions || '["hardware:view"]'::jsonb
+      WHERE name IN ('Sales Rep', 'Manager') AND NOT (permissions ? 'hardware:view')
+    `);
+    await pool.query(`
+      UPDATE roles SET permissions = permissions || '["pricing:view"]'::jsonb
+      WHERE name IN ('Sales Rep', 'Manager') AND NOT (permissions ? 'pricing:view')
     `);
     // Auto-assign 'Administrator' role to existing is_admin users
     await pool.query(`
@@ -9660,6 +9838,215 @@ app.get('/api/resellers/:id/logo', async (req, res) => {
     res.setHeader('Cache-Control', 'public, max-age=300');
     res.send(r.logo_data);
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ============================================================================
+// Hardware Overview catalog (rep-facing reference tool) + Admin Hardware editor
+// ============================================================================
+
+// GET /api/hardware — full catalog. Reps (hardware:view only) see visible=true rows only;
+// hardware:manage (incl. admin) sees everything, since the Admin editor reuses this endpoint.
+app.get('/api/hardware', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'hardware:view'))) return;
+  try {
+    let canManage = req.user.isAdmin === true;
+    if (!canManage && req.user.email) canManage = userHasPermission(await getUserPermissions(req.user.email), 'hardware:manage');
+    const cats = (await pool.query(`SELECT id, sort_order FROM hardware_categories ORDER BY sort_order`)).rows;
+    const rows = (await pool.query(`
+      SELECT id, cat_id, name_en, name_fr, specs_en, specs_fr, sku, price, compat, status,
+             use_en, use_fr, warranty_en, warranty_fr, note_en, note_fr,
+             (img_data IS NOT NULL) AS has_image, visible, sort_order
+        FROM hardware_products
+        ${canManage ? '' : 'WHERE visible = true'}
+       ORDER BY sort_order, name_en
+    `)).rows;
+    res.json({
+      categories: cats.map(c => ({ id: c.id, sortOrder: c.sort_order })),
+      products: rows.map(r => ({
+        id: r.id, catId: r.cat_id, nameEn: r.name_en, nameFr: r.name_fr,
+        specsEn: r.specs_en || [], specsFr: r.specs_fr || [],
+        sku: r.sku, price: r.price, compat: r.compat || [], status: r.status || [],
+        useEn: r.use_en, useFr: r.use_fr, warrantyEn: r.warranty_en, warrantyFr: r.warranty_fr,
+        noteEn: r.note_en, noteFr: r.note_fr,
+        hasImage: r.has_image, visible: r.visible,
+      })),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/hardware — bulk-publish staged Admin Hardware edits: { updated:[], added:[], removed:[],
+// hidden:{id:boolean} } (hidden value true = hide it). Transactional — all or nothing.
+app.put('/api/hardware', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'hardware:manage'))) return;
+  const { updated = [], added = [], removed = [], hidden = {} } = req.body || {};
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const p of updated) {
+      await client.query(
+        `UPDATE hardware_products SET cat_id=$2, name_en=$3, name_fr=$4, specs_en=$5, specs_fr=$6, sku=$7, price=$8,
+                compat=$9, status=$10, use_en=$11, use_fr=$12, warranty_en=$13, warranty_fr=$14, note_en=$15, note_fr=$16,
+                updated_at=CURRENT_TIMESTAMP
+         WHERE id = $1`,
+        [p.id, p.catId, p.nameEn, p.nameFr || p.nameEn, p.specsEn || [], p.specsFr || p.specsEn || [], p.sku || null, p.price || null,
+         p.compat || [], p.status || [], p.useEn || null, p.useFr || p.useEn || null, p.warrantyEn || null, p.warrantyFr || p.warrantyEn || null,
+         p.noteEn || null, p.noteFr || p.noteEn || null]
+      );
+    }
+    for (const p of added) {
+      await client.query(
+        `INSERT INTO hardware_products (id, cat_id, name_en, name_fr, specs_en, specs_fr, sku, price, compat, status, use_en, use_fr, warranty_en, warranty_fr, note_en, note_fr)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+        [p.id, p.catId, p.nameEn, p.nameFr || p.nameEn, p.specsEn || [], p.specsFr || p.specsEn || [], p.sku || null, p.price || null,
+         p.compat || [], p.status || [], p.useEn || null, p.useFr || p.useEn || null, p.warrantyEn || null, p.warrantyFr || p.warrantyEn || null,
+         p.noteEn || null, p.noteFr || p.noteEn || null]
+      );
+    }
+    for (const id of removed) await client.query(`DELETE FROM hardware_products WHERE id = $1`, [id]);
+    for (const [id, hide] of Object.entries(hidden)) {
+      await client.query(`UPDATE hardware_products SET visible = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [id, !hide]);
+    }
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: e.message });
+  } finally { client.release(); }
+});
+
+// Hardware product photos — small images, 2 MB cap, kept in memory then written to bytea
+// (mirrors the reseller-logo pattern; no object storage in this app).
+const uploadHardwareImg = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
+
+// POST /api/hardware/:id/image — upload/replace a product photo (multipart field "file").
+app.post('/api/hardware/:id/image', authenticateToken, uploadHardwareImg.single('file'), async (req, res) => {
+  if (!(await requirePerm(req, res, 'hardware:manage'))) return;
+  const file = req.file;
+  if (!file) return res.status(400).json({ error: 'file required (multipart field "file")' });
+  if (!/^image\//.test(file.mimetype)) return res.status(400).json({ error: 'file must be an image' });
+  try {
+    const r = await pool.query(
+      `UPDATE hardware_products SET img_data = $2, img_mime_type = $3, img_file_name = $4, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 RETURNING id`,
+      [req.params.id, file.buffer, file.mimetype, file.originalname]
+    );
+    if (!r.rows[0]) return res.status(404).json({ error: 'product not found' });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/hardware/:id/image — clear a product's photo.
+app.delete('/api/hardware/:id/image', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'hardware:manage'))) return;
+  try {
+    await pool.query(
+      `UPDATE hardware_products SET img_data = NULL, img_mime_type = NULL, img_file_name = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [req.params.id]
+    );
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/hardware/:id/image — serve the photo. Intentionally UNAUTHENTICATED, same reasoning as
+// reseller logos: a product photo is not sensitive, and <img src> can't send a bearer token.
+app.get('/api/hardware/:id/image', async (req, res) => {
+  try {
+    const r = (await pool.query(`SELECT img_data, img_mime_type FROM hardware_products WHERE id = $1`, [req.params.id])).rows[0];
+    if (!r || !r.img_data) return res.status(404).end();
+    res.setHeader('Content-Type', r.img_mime_type || 'image/png');
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    res.send(r.img_data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ============================================================================
+// Services & Pricing Guide (rep-facing reference tool) + Admin Pricing editor
+// ============================================================================
+
+// GET /api/pricing — full pricing guide. Same visible-filter convention as /api/hardware.
+app.get('/api/pricing', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'pricing:view'))) return;
+  try {
+    let canManage = req.user.isAdmin === true;
+    if (!canManage && req.user.email) canManage = userHasPermission(await getUserPermissions(req.user.email), 'pricing:manage');
+    const cats = (await pool.query(
+      `SELECT id, sort_order, hourly, note_en, note_fr, considerations_en, considerations_fr FROM pricing_categories ORDER BY sort_order`
+    )).rows;
+    const pkgs = (await pool.query(`
+      SELECT id, cat_id, name_en, name_fr, sku, sku_year, compat, pos, price_monthly, price_yearly, price_flat, unit, activation,
+             includes_en, includes_fr, internal_en, internal_fr, status, group_name, tier, mode, rates, visible, sort_order
+        FROM pricing_packages
+        ${canManage ? '' : 'WHERE visible = true'}
+       ORDER BY sort_order, name_en
+    `)).rows;
+    const guides = (await pool.query(`SELECT id, title_en, title_fr, body_en, body_fr FROM pricing_guides ORDER BY sort_order`)).rows;
+    res.json({
+      categories: cats.map(c => ({
+        id: c.id, sortOrder: c.sort_order, hourly: c.hourly != null ? parseFloat(c.hourly) : null,
+        noteEn: c.note_en, noteFr: c.note_fr,
+        considerationsEn: c.considerations_en || [], considerationsFr: c.considerations_fr || [],
+      })),
+      packages: pkgs.map(p => ({
+        id: p.id, catId: p.cat_id, nameEn: p.name_en, nameFr: p.name_fr, sku: p.sku, skuYear: p.sku_year,
+        compat: p.compat, pos: p.pos,
+        priceMonthly: p.price_monthly != null ? parseFloat(p.price_monthly) : null,
+        priceYearly: p.price_yearly != null ? parseFloat(p.price_yearly) : null,
+        priceFlat: p.price_flat != null ? parseFloat(p.price_flat) : null,
+        unit: p.unit, activation: p.activation != null ? parseFloat(p.activation) : null,
+        includesEn: p.includes_en || [], includesFr: p.includes_fr || [],
+        internalEn: p.internal_en || null, internalFr: p.internal_fr || null,
+        status: p.status, groupName: p.group_name, tier: p.tier, mode: p.mode, rates: p.rates || null, visible: p.visible,
+      })),
+      guides: guides.map(g => ({ id: g.id, titleEn: g.title_en, titleFr: g.title_fr, bodyEn: g.body_en, bodyFr: g.body_fr })),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/pricing — bulk-publish staged Admin Pricing edits, same shape/semantics as /api/hardware.
+app.put('/api/pricing', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'pricing:manage'))) return;
+  const { updated = [], added = [], removed = [], hidden = {} } = req.body || {};
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const p of updated.concat(added)) {
+      const isNew = added.includes(p);
+      const internalEnJson = p.internalEn ? JSON.stringify(p.internalEn) : null;
+      const vals = [
+        p.catId, p.nameEn, p.nameFr || p.nameEn, p.sku || null, p.skuYear || null, p.compat || null, p.pos || null,
+        p.priceMonthly ?? null, p.priceYearly ?? null, p.priceFlat ?? null, p.unit || null, p.activation ?? null,
+        p.includesEn || [], p.includesFr || p.includesEn || [],
+        internalEnJson, p.internalFr ? JSON.stringify(p.internalFr) : internalEnJson,
+        p.status || null, p.groupName || null, p.tier || null, p.mode || null, p.rates ? JSON.stringify(p.rates) : null,
+      ];
+      if (isNew) {
+        await client.query(
+          `INSERT INTO pricing_packages
+             (id, cat_id, name_en, name_fr, sku, sku_year, compat, pos, price_monthly, price_yearly, price_flat, unit, activation,
+              includes_en, includes_fr, internal_en, internal_fr, status, group_name, tier, mode, rates)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
+          [p.id, ...vals]
+        );
+      } else {
+        await client.query(
+          `UPDATE pricing_packages SET cat_id=$2, name_en=$3, name_fr=$4, sku=$5, sku_year=$6, compat=$7, pos=$8,
+                  price_monthly=$9, price_yearly=$10, price_flat=$11, unit=$12, activation=$13, includes_en=$14, includes_fr=$15,
+                  internal_en=$16, internal_fr=$17, status=$18, group_name=$19, tier=$20, mode=$21, rates=$22, updated_at=CURRENT_TIMESTAMP
+           WHERE id = $1`,
+          [p.id, ...vals]
+        );
+      }
+    }
+    for (const id of removed) await client.query(`DELETE FROM pricing_packages WHERE id = $1`, [id]);
+    for (const [id, hide] of Object.entries(hidden)) {
+      await client.query(`UPDATE pricing_packages SET visible = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [id, !hide]);
+    }
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: e.message });
+  } finally { client.release(); }
 });
 
 // GET /api/resellers/unassigned-emails — reseller emails seen in activations but not mapped to any reseller
