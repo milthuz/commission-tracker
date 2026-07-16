@@ -870,6 +870,26 @@ async function initializeDatabase() {
         [g.id, g.title, g.body, pricingSeed.guides.indexOf(g)]
       );
     }
+    // 2026-07-16 one-time price correction: Menu Build Small/Medium/Large moved from "ask for
+    // quote" to fixed flat prices ($250/$625/$1,125) + a category-count line + Floor Plan/2nd
+    // Consultation add-on pricing, per the updated Excel sheet. Guarded on the row still holding
+    // its EXACT original seeded includes_en array, so this only touches untouched rows — never
+    // re-fires, and never clobbers a later admin edit made via the Pricing editor.
+    const menuCorrections = [
+      { id: 'menu-small', price: 250, oldIncludes: ['~50 items','~100 modifiers','1 consultation (30 min)','1 review (30 min)'],
+        newIncludes: ['10–15 categories','~50 items','~100 modifiers','1 consultation (30 min)','1 review (30 min)','Floor plan: +$125','2nd consultation: +$125'] },
+      { id: 'menu-medium', price: 625, oldIncludes: ['50–150 items','100–200 modifiers','15–20 categories','1 consultation (1 hr)','1 review (1 hr)'],
+        newIncludes: ['15–20 categories','50–150 items','100–200 modifiers','1 consultation (1 hr)','1 review (1 hr)','Floor plan: +$125','2nd consultation: +$125'] },
+      { id: 'menu-large', price: 1125, oldIncludes: ['150–300 items','200–300 modifiers','20–30 categories','1 consultation (1 hr)','1 review (2 hr)'],
+        newIncludes: ['20–30 categories','150–300 items','200–300 modifiers','1 consultation (1 hr)','1 review (2 hr)','Floor plan: +$125','2nd consultation: +$125'] },
+    ];
+    for (const m of menuCorrections) {
+      await pool.query(
+        `UPDATE pricing_packages SET price_flat = $2, includes_en = $3, includes_fr = $3, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1 AND includes_en = $4::text[] AND includes_fr = $4::text[]`,
+        [m.id, m.price, m.newIncludes, m.oldIncludes]
+      );
+    }
     // Backfill hardware product photos into bytea — only touches rows that don't have image data
     // yet, so it's a no-op after the first successful run (and harmless to re-run on every boot).
     try {

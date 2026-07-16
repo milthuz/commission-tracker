@@ -65,14 +65,14 @@ const packages = [
   // --------------------------------------------------------------- Menu
   { id:'menu-diy', cat:'menu', name:'Menu Build · Do-It-Yourself', sku:'CLU-MENU-PKG-DIY', priceFlat:0, tier:'DIY',
     includes:['Client builds their own menu','1 menu consultation (45 min)','Still requires an Install Package'], internal:{ effort:'0 build hrs · 1 meeting', requirements:'Client needs time between install and go-live. Good fit for new businesses only.' } },
-  { id:'menu-small', cat:'menu', name:'Menu Build · Small (Starter / QSR)', sku:'CLU-MENU-PKG-STA-QSR', priceFlat:null, tier:'Small', scope:'Quick Service',
-    includes:['~50 items','~100 modifiers','1 consultation (30 min)','1 review (30 min)'], internal:{ effort:'1 build hr · 1 meeting', requirements:'3-day min lead time. Final menu in digital format.' } },
-  { id:'menu-medium', cat:'menu', name:'Menu Build · Medium (Business / Small Sit-Down)', sku:'CLU-MENU-PKG-BUS-SSD', priceFlat:null, tier:'Medium', scope:'Small Sit Down',
-    includes:['50–150 items','100–200 modifiers','15–20 categories','1 consultation (1 hr)','1 review (1 hr)'], internal:{ effort:'3 build hrs · 2 meetings', requirements:'5-day min lead time.' } },
-  { id:'menu-large', cat:'menu', name:'Menu Build · Large (Enterprise)', sku:'CLU-MENU-PKG-ENT-LG', priceFlat:null, tier:'Large', scope:'Pizza / Breakfast',
-    includes:['150–300 items','200–300 modifiers','20–30 categories','1 consultation (1 hr)','1 review (2 hr)'], internal:{ effort:'6 build hrs · 3 meetings', requirements:'7-day min lead time.' } },
+  { id:'menu-small', cat:'menu', name:'Menu Build · Small (Starter / QSR)', sku:'CLU-MENU-PKG-STA-QSR', priceFlat:250, tier:'Small', scope:'Quick Service',
+    includes:['10–15 categories','~50 items','~100 modifiers','1 consultation (30 min)','1 review (30 min)','Floor plan: +$125','2nd consultation: +$125'], internal:{ effort:'1 build hr · 1 meeting', requirements:'3-day min lead time. Final menu in digital format.' } },
+  { id:'menu-medium', cat:'menu', name:'Menu Build · Medium (Business / Small Sit-Down)', sku:'CLU-MENU-PKG-BUS-SSD', priceFlat:625, tier:'Medium', scope:'Small Sit Down',
+    includes:['15–20 categories','50–150 items','100–200 modifiers','1 consultation (1 hr)','1 review (1 hr)','Floor plan: +$125','2nd consultation: +$125'], internal:{ effort:'3 build hrs · 2 meetings', requirements:'5-day min lead time.' } },
+  { id:'menu-large', cat:'menu', name:'Menu Build · Large (Enterprise)', sku:'CLU-MENU-PKG-ENT-LG', priceFlat:1125, tier:'Large', scope:'Pizza / Breakfast',
+    includes:['20–30 categories','150–300 items','200–300 modifiers','1 consultation (1 hr)','1 review (2 hr)','Floor plan: +$125','2nd consultation: +$125'], internal:{ effort:'6 build hrs · 3 meetings', requirements:'7-day min lead time.' } },
   { id:'menu-custom', cat:'menu', name:'Menu Build · Custom Quote', sku:'CLU-MENU-PKG-CUS', priceFlat:null, tier:'Custom', scope:'Groceries / Chain / Enterprise',
-    includes:['300+ items','300+ modifiers','30+ categories','Floor plan available'], internal:{ effort:'TBD', requirements:'Ask for quote. Guidelines approximate.' } },
+    includes:['30+ categories','300+ items','300+ modifiers','Floor plan available'], internal:{ effort:'TBD', requirements:'Ask for quote. Guidelines approximate.' } },
 
   // ------------------------------------------------------- Installation
   { id:'ins-onsite-sta', cat:'install', name:'Installation · Starter (Onsite)', sku:'INS-INP', pos:'1 POS', priceFlat:798, mode:'Onsite',
