@@ -6701,18 +6701,22 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
       const procTotal = parseFloat(pa.total) || 0, procMerchants = parseInt(pa.clients) || 0;
       avgProcessing = { total: procTotal, clients: procMerchants, monthly: perMonth(procTotal, procMerchants) };
       // Combined SaaS + processing revenue, averaged per merchant per month — TRUE per-merchant
-      // join via the curated merchant_saas_links (SH-14). Denominator = merchants we ASSOCIATED to
-      // a SaaS (saasMonthly > 0, i.e. manual link or auto name-match); for each we sum its monthly
-      // SaaS + its processing profit. So the tile reads "for merchants we matched to a SaaS, the
-      // average monthly combined revenue". Merchants with only processing (no SaaS yet) are excluded.
-      const withSaas = mRows.filter(r => r.saasMonthly > 0);
-      const combinedMonthlyTotal = withSaas.reduce((s, r) => s + r.combinedMonthly, 0);
+      // join via the curated merchant_saas_links (SH-14). Two populations, named explicitly since
+      // they're easy to conflate: ACTIVE merchants = matched to a SaaS (saasMonthly > 0, manual
+      // link or auto name-match); PROCESSING merchants = the subset of those that also have real
+      // transaction revenue this period (processingMonthly > 0). The average is computed over
+      // PROCESSING merchants only (2026-07-16) — a SaaS-matched merchant with $0 processing this
+      // period was diluting the "revenue per merchant" run-rate despite not actually processing.
+      const active = mRows.filter(r => r.saasMonthly > 0);
+      const processingMerchants = active.filter(r => r.processingMonthly > 0);
+      const combinedMonthlyTotal = processingMerchants.reduce((s, r) => s + r.combinedMonthly, 0);
       avgRevenuePerMerchant = {
-        total:     Math.round(combinedMonthlyTotal * monthsInPeriod * 100) / 100,
-        merchants: withSaas.length,
-        monthly:   withSaas.length ? Math.round((combinedMonthlyTotal / withSaas.length) * 100) / 100 : 0,
-        saasMonthly:       Math.round(withSaas.reduce((s, r) => s + r.saasMonthly, 0) * 100) / 100,
-        processingMonthly: Math.round(withSaas.reduce((s, r) => s + r.processingMonthly, 0) * 100) / 100,
+        total:           Math.round(combinedMonthlyTotal * monthsInPeriod * 100) / 100,
+        merchants:       processingMerchants.length,
+        activeMerchants: active.length,
+        monthly:         processingMerchants.length ? Math.round((combinedMonthlyTotal / processingMerchants.length) * 100) / 100 : 0,
+        saasMonthly:       Math.round(processingMerchants.reduce((s, r) => s + r.saasMonthly, 0) * 100) / 100,
+        processingMonthly: Math.round(processingMerchants.reduce((s, r) => s + r.processingMonthly, 0) * 100) / 100,
       };
     }
 
