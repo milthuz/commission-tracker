@@ -7913,6 +7913,53 @@ function buildSignatureHtml({ name, role, role2, phone, email }) {
   </table>`;
 }
 
+// Cluster-branded email chrome shared by /api/proposals/send and /api/proposals/preview-email —
+// keeping this in one place means the preview a rep sees is byte-identical to what actually goes
+// out (NOT mailChrome/Sales Hub — this goes to the CUSTOMER accepting a Cluster quote, so it wears
+// Cluster's own brand, matching the proposal deck/PDF cover; user decision 2026-07-09).
+function buildProposalEmailHtml({ bodyText, acceptBtn, signatureHtml, pixel, frontendBase }) {
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return `<!doctype html><html><body style="margin:0;padding:0;background:#eef1f6;font-family:Arial,Helvetica,sans-serif">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f6;padding:32px 12px">
+        <tr><td align="center">
+          <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(16,23,34,.08),0 10px 28px rgba(16,23,34,.07)">
+            <tr><td style="background:#1c2434;padding:22px 36px">
+              <img src="${frontendBase}/cluster-logo-email.png" width="118" height="28" alt="Cluster" style="display:block;border:0">
+            </td></tr>
+            <tr><td style="height:4px;background:#fe6523;font-size:0;line-height:0">&nbsp;</td></tr>
+            <tr><td style="padding:32px 36px 8px;font-size:14px;color:#1c2434;line-height:1.6">
+              <div style="white-space:pre-wrap">${esc(bodyText)}</div>
+              ${acceptBtn || ''}
+              ${signatureHtml || ''}
+            </td></tr>
+            <tr><td style="padding:22px 36px 0"><div style="border-top:1px solid #eef1f6;font-size:0;line-height:0">&nbsp;</div></td></tr>
+            <tr><td style="padding:16px 36px 30px">
+              <p style="margin:0;color:#94a3b8;font-size:12px">Cluster Systems · <a href="https://clusterpos.com" style="color:#94a3b8;text-decoration:none">clusterpos.com</a></p>
+            </td></tr>
+          </table>
+        </td></tr>
+      </table>
+      ${pixel || ''}
+    </body></html>`;
+}
+
+// Resolves the sender's signature the same way GET /api/user/profile and PUT /api/user/signature
+// do (by display name, not salespeople.email — that column is a separate, often-unset admin
+// field). Returns '' when signature_role is unset. Shared by /send and /preview-email.
+async function resolveSignatureHtml(reqUser, repName) {
+  const sigTokenResult = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [reqUser.email]);
+  const sigRepName = sigTokenResult.rows[0]?.display_name || reqUser.name || reqUser.email;
+  const sigRow = (await pool.query(
+    `SELECT signature_role, signature_role2, signature_phone FROM salespeople WHERE name = $1`,
+    [sigRepName]
+  )).rows[0];
+  if (!sigRow) return '';
+  return buildSignatureHtml({
+    name: repName, role: sigRow.signature_role, role2: sigRow.signature_role2,
+    phone: sigRow.signature_phone, email: reqUser.email,
+  });
+}
+
 // Returns { bytes, presentationPageCount, estimatePageCount }.
 // pageOrder: optional ORDERED array of 1-based indices into the FULL page range — 1..presentationPageCount
 // is the presentation, presentationPageCount+1..+estimatePageCount is the estimate. The rep can freely
@@ -8205,6 +8252,34 @@ app.post('/api/proposals/prepare', authenticateToken, async (req, res) => {
   } catch (e) { console.warn('[proposal/prepare]', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// POST /api/proposals/preview-email — read-only: returns the exact HTML that /send would email,
+// built from the SAME shared template + signature resolution, minus anything with a side effect
+// (no markEstimateSent, no send, no proposals_sent row, no PDF rebuild — the rep already sees the
+// PDF via the thumbnail preview, this is specifically for checking the email body/signature).
+app.post('/api/proposals/preview-email', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'proposals:send'))) return;
+  const lang = String(req.body.lang || 'fr').toLowerCase() === 'en' ? 'en' : 'fr';
+  const estimateId = String(req.body.estimateId || '').trim();
+  const bodyText = String(req.body.body || '');
+  try {
+    let acceptUrl = null;
+    if (estimateId) {
+      const det = await getEstimateDetail(estimateId);
+      if (!(await assertEstimateOwnership(req, res, det))) return;
+      acceptUrl = await getEstimateAcceptUrl(estimateId);
+    }
+    const repName = req.user.name || req.user.email || '';
+    const signatureHtml = await resolveSignatureHtml(req.user, repName);
+    const apiBase = process.env.PUBLIC_API_URL || `https://${req.get('host')}`;
+    const acceptBtn = acceptUrl
+      ? `<div style="margin:22px 0"><a href="#" style="display:inline-block;background:#fe6523;color:#fff;text-decoration:none;font-weight:700;font-family:Arial,Helvetica,sans-serif;font-size:14px;padding:13px 26px;border-radius:8px">${lang === 'en' ? 'Review & accept the quote online →' : 'Voir et accepter le devis en ligne →'}</a></div>`
+      : '';
+    const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+    const html = buildProposalEmailHtml({ bodyText, acceptBtn, signatureHtml, pixel: '', frontendBase });
+    res.json({ html });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /api/proposals/send — rebuild + email the proposal to the client (rep-reviewed fields).
 // estimateId is optional — a presentation-only proposal has no Zoho record to mark "sent" or track
 // acceptance for, but still sends (with email-open tracking) and appears on the sent-proposals board.
@@ -8240,22 +8315,8 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
       await markEstimateSent(estimateId);
       acceptUrl = await getEstimateAcceptUrl(estimateId);
     }
-    const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    // Signature appended below the message — looked up by the sender's own login email, set via
-    // Admin -> Salespeople. Returns '' (nothing appended) when signature_role is unset.
-    let signatureHtml = '';
-    if (req.user.email) {
-      const sigRow = (await pool.query(
-        `SELECT signature_role, signature_role2, signature_phone FROM salespeople WHERE LOWER(email) = LOWER($1)`,
-        [req.user.email]
-      )).rows[0];
-      if (sigRow) {
-        signatureHtml = buildSignatureHtml({
-          name: repName, role: sigRow.signature_role, role2: sigRow.signature_role2,
-          phone: sigRow.signature_phone, email: req.user.email,
-        });
-      }
-    }
+    // Signature appended below the message — see resolveSignatureHtml for the resolution rule.
+    const signatureHtml = await resolveSignatureHtml(req.user, repName);
     // A unique token per send drives both the open pixel and the accept-link click redirect.
     const trackToken = require('crypto').randomUUID().replace(/-/g, '');
     const apiBase = process.env.PUBLIC_API_URL || `https://${req.get('host')}`;
@@ -8267,32 +8328,8 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
     // Open-tracking pixel: the /track endpoint logs the open when the client's mail client loads
     // this 1×1 image. (Imperfect — Gmail/Outlook proxy-cache images, so opens under-count.)
     const pixel = `<img src="${apiBase}/api/proposals/track/${trackToken}.gif" width="1" height="1" alt="" style="display:none;width:1px;height:1px;border:0;max-height:0;overflow:hidden">`;
-    // Cluster-branded chrome (NOT mailChrome/Sales Hub — this goes to the CUSTOMER accepting a
-    // Cluster quote, so it wears Cluster's own brand, matching the proposal deck/PDF cover which
-    // uses the same navy+orange palette and cluster_logo.png; user decision 2026-07-09).
     const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
-    const html = `<!doctype html><html><body style="margin:0;padding:0;background:#eef1f6;font-family:Arial,Helvetica,sans-serif">
-      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f6;padding:32px 12px">
-        <tr><td align="center">
-          <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(16,23,34,.08),0 10px 28px rgba(16,23,34,.07)">
-            <tr><td style="background:#1c2434;padding:22px 36px">
-              <img src="${frontendBase}/cluster-logo-email.png" width="118" height="28" alt="Cluster" style="display:block;border:0">
-            </td></tr>
-            <tr><td style="height:4px;background:#fe6523;font-size:0;line-height:0">&nbsp;</td></tr>
-            <tr><td style="padding:32px 36px 8px;font-size:14px;color:#1c2434;line-height:1.6">
-              <div style="white-space:pre-wrap">${esc(bodyText)}</div>
-              ${acceptBtn}
-              ${signatureHtml}
-            </td></tr>
-            <tr><td style="padding:22px 36px 0"><div style="border-top:1px solid #eef1f6;font-size:0;line-height:0">&nbsp;</div></td></tr>
-            <tr><td style="padding:16px 36px 30px">
-              <p style="margin:0;color:#94a3b8;font-size:12px">Cluster Systems · <a href="https://clusterpos.com" style="color:#94a3b8;text-decoration:none">clusterpos.com</a></p>
-            </td></tr>
-          </table>
-        </td></tr>
-      </table>
-      ${pixel}
-    </body></html>`;
+    const html = buildProposalEmailHtml({ bodyText, acceptBtn, signatureHtml, pixel, frontendBase });
 
     // From: send AS the Sales Hub rep when their email domain is SendGrid-authenticated
     // (env VERIFIED_SENDER_DOMAINS, comma-list). Until the domain is verified, keep the verified
