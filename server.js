@@ -132,6 +132,7 @@ const PERMISSION_CATALOG = [
 
   // SaaS Increase (simulate + push SaaS subscription price increases in Zoho Billing)
   { key: 'saas_increase:manage',       label: 'Build & simulate SaaS price-increase scenarios',                 category: 'SaaS Increase' },
+  { key: 'saas_increase:notify',       label: 'Send merchant notification emails about a SaaS price increase', category: 'SaaS Increase' },
   { key: 'saas_increase:execute',      label: 'Push SaaS price increases into live Zoho subscriptions',        category: 'SaaS Increase' },
 ];
 
@@ -1647,6 +1648,15 @@ async function initializeDatabase() {
         UNIQUE (scenario_id, subscription_number)
       );
     `);
+    // Merchant notification (communication engine) — added after the table shipped, so ensure
+    // these exist on the live table too (a no-op where the column is already there).
+    await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notify_to VARCHAR(500)`);
+    await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notify_subject VARCHAR(500)`);
+    await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notify_body TEXT`);
+    await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notify_status VARCHAR(20) NOT NULL DEFAULT 'not_sent'`);
+    await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notify_error TEXT`);
+    await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notified_by VARCHAR(255)`);
+    await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notified_at TIMESTAMP`);
 
     // Dedup log for probation-ending manager notifications (one row per rep/end-date/milestone).
     await pool.query(`
@@ -7585,6 +7595,9 @@ function serializeSaasIncreaseItem(row) {
     currentMonthly: Number(row.current_monthly), increaseType: row.increase_type, increaseValue: Number(row.increase_value),
     newMonthly: Number(row.new_monthly), status: row.status, pushError: row.push_error,
     pushedBy: row.pushed_by, pushedAt: row.pushed_at,
+    notifyTo: row.notify_to, notifySubject: row.notify_subject, notifyBody: row.notify_body,
+    notifyStatus: row.notify_status, notifyError: row.notify_error,
+    notifiedBy: row.notified_by, notifiedAt: row.notified_at,
   };
 }
 
@@ -7730,6 +7743,121 @@ app.get('/api/admin/saas-increase/scenarios/:id/export', authenticateToken, asyn
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', `attachment; filename="saas-increase-${scenario.name.replace(/[^a-z0-9]+/gi, '-').slice(0, 40) || 'scenario'}.csv"`);
     res.send(lines.join('\n'));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── SaaS Increase: merchant notification (communication engine) ────────────────────────────
+// Same human-in-the-loop shape as /api/proposals (prepare → preview-email → send): a draft is
+// generated server-side but never trusted blindly — /send always takes to/subject/body fresh
+// from the request, so whatever the admin edited is exactly what goes out. Reuses the
+// Cluster-branded chrome (buildProposalEmailHtml) rather than mailChrome/Sales Hub, since this
+// goes to an external merchant, not an internal Sales Hub user (same rule Proposal Builder
+// follows for quotes — see buildProposalEmailHtml's comment).
+function saasIncreaseDraftCopy({ customerName, planName, currentMonthly, newMonthly, lang }) {
+  const money = (n) => `$${Number(n || 0).toFixed(2)}`;
+  const greeting = customerName ? ` ${customerName}` : '';
+  const plan = planName || (lang === 'en' ? 'subscription' : 'abonnement');
+  const subject = lang === 'en' ? `An update to your ${plan} pricing` : `Une mise à jour du prix de votre ${plan}`;
+  const body = lang === 'en'
+    ? `Hello${greeting},\n\nWe're writing to let you know that the monthly price of your ${plan} will change from ${money(currentMonthly)} to ${money(newMonthly)} per month, effective at your next renewal.\n\nIf you have any questions about this change, just reply to this email — we're happy to help.\n\nThank you for being a Cluster Systems customer.\n\nBest regards,`
+    : `Bonjour${greeting},\n\nNous vous écrivons pour vous informer que le prix mensuel de votre ${plan} passera de ${money(currentMonthly)} à ${money(newMonthly)} par mois, à compter de votre prochain renouvellement.\n\nPour toute question à ce sujet, répondez simplement à ce courriel — il nous fera plaisir de vous aider.\n\nMerci d'être client de Cluster Systems.\n\nCordialement,`;
+  return { subject, body };
+}
+
+// POST /api/admin/saas-increase/scenarios/:id/notifications/draft — body { itemIds: [...], lang }.
+// Resolves each item's merchant contact email (best-effort, always editable) and generates a
+// subject/body draft, persisting both so a multi-session review survives a page refresh. Never sends.
+app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  const itemIds = Array.isArray(req.body?.itemIds) ? req.body.itemIds.map(Number).filter(Number.isFinite) : [];
+  const lang = String(req.body?.lang || 'fr').toLowerCase() === 'en' ? 'en' : 'fr';
+  if (!itemIds.length) return res.status(400).json({ error: 'itemIds required' });
+  try {
+    const items = (await pool.query(
+      `SELECT * FROM saas_increase_items WHERE scenario_id = $1 AND id = ANY($2::int[])`,
+      [req.params.id, itemIds]
+    )).rows;
+    const results = [];
+    for (const it of items) {
+      const to = await resolveMerchantContactEmail(it.customer_id, it.customer_name);
+      const { subject, body } = saasIncreaseDraftCopy({
+        customerName: it.customer_name, planName: it.plan_name,
+        currentMonthly: it.current_monthly, newMonthly: it.new_monthly, lang,
+      });
+      const row = (await pool.query(
+        `UPDATE saas_increase_items SET notify_to = $1, notify_subject = $2, notify_body = $3, notify_status = 'drafted', notify_error = NULL
+         WHERE id = $4 RETURNING *`,
+        [to, subject, body, it.id]
+      )).rows[0];
+      results.push(serializeSaasIncreaseItem(row));
+    }
+    res.json({ items: results });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/admin/saas-increase/scenarios/:id/notifications/preview — read-only: returns the
+// exact HTML /send would email for the given (possibly hand-edited) to/subject/body. Mirrors
+// /api/proposals/preview-email — byte-identical to what a real send produces, no side effects.
+app.post('/api/admin/saas-increase/scenarios/:id/notifications/preview', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  const bodyText = String(req.body?.body || '');
+  try {
+    const repName = req.user.name || req.user.email || '';
+    const signatureHtml = await resolveSignatureHtml(req.user, repName);
+    const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+    const html = buildProposalEmailHtml({ bodyText, acceptBtn: '', signatureHtml, pixel: '', frontendBase });
+    res.json({ html });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/admin/saas-increase/scenarios/:id/notifications/send — body { items: [{ itemId, to,
+// subject, body }, ...] }. Content is taken fresh from the request (never re-read from the
+// stored draft) so a hand-edit is guaranteed to be exactly what's sent — same guarantee as
+// /api/proposals/send. Continues past individual failures; returns per-item results.
+app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:notify'))) return;
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  if (!items.length) return res.status(400).json({ error: 'items required' });
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  const repName = req.user.name || req.user.email || '';
+  const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+  const repEmail = (req.user.email || '').trim();
+  const verifiedDomains = (process.env.VERIFIED_SENDER_DOMAINS || '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
+  const repDomain = repEmail.includes('@') ? repEmail.split('@')[1].toLowerCase() : '';
+  const fromAddr = (repEmail && verifiedDomains.includes(repDomain)) ? repEmail : (process.env.SMTP_FROM || process.env.SMTP_USER);
+  let signatureHtml = '';
+  try { signatureHtml = await resolveSignatureHtml(req.user, repName); } catch { /* fall back to no signature */ }
+  const results = [];
+  try {
+    for (const it of items) {
+      const itemId = Number(it.itemId);
+      const to = String(it.to || '').trim();
+      const subject = String(it.subject || '').trim();
+      const bodyText = String(it.body || '');
+      if (!to || !subject) {
+        await pool.query(
+          `UPDATE saas_increase_items SET notify_status = 'send_failed', notify_error = $1 WHERE id = $2 AND scenario_id = $3`,
+          ['to and subject are required', itemId, req.params.id]
+        );
+        results.push({ itemId, sent: false, reason: 'to and subject are required' });
+        continue;
+      }
+      const html = buildProposalEmailHtml({ bodyText, acceptBtn: '', signatureHtml, pixel: '', frontendBase });
+      const r = await sendMail(to, subject, html, { from: { name: repName || 'Cluster Systems', address: fromAddr }, replyTo: repEmail || undefined });
+      if (r.sent) {
+        await pool.query(
+          `UPDATE saas_increase_items SET notify_to = $1, notify_subject = $2, notify_body = $3, notify_status = 'sent', notify_error = NULL, notified_by = $4, notified_at = NOW() WHERE id = $5 AND scenario_id = $6`,
+          [to, subject, bodyText, actor, itemId, req.params.id]
+        );
+      } else {
+        await pool.query(
+          `UPDATE saas_increase_items SET notify_status = 'send_failed', notify_error = $1 WHERE id = $2 AND scenario_id = $3`,
+          [r.reason || 'send failed', itemId, req.params.id]
+        );
+      }
+      results.push({ itemId, sent: r.sent, reason: r.reason });
+    }
+    res.json({ results });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -8424,6 +8552,36 @@ async function findCrmEmailByName(name) {
     }
   } catch (e) { console.warn('[proposal] CRM email lookup:', e.message); }
   return null;
+}
+
+// Best-effort merchant contact email for a SaaS Increase notification — same fallback chain as
+// getEstimateDetail's contact lookup above (Zoho Billing and Books share contact records in the
+// same org, so a subscription's customer_id is tried directly as a Books contact_id), then the
+// CRM-by-name failover. Never throws; returns '' so the UI always leaves the "to" field editable
+// rather than blocking a draft on a missing email.
+async function resolveMerchantContactEmail(customerId, customerName) {
+  try {
+    if (customerId) {
+      const { accessToken, apiDomain } = await getAdminBooksAuth();
+      const c = await axios.get(`${apiDomain}/books/v3/contacts/${customerId}`, {
+        params: { organization_id: process.env.ZOHO_ORG_ID },
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
+      });
+      if (c.status === 200) {
+        const ct = c.data.contact || {};
+        if (ct.email) return ct.email;
+        if (Array.isArray(ct.contact_persons)) {
+          const cp = ct.contact_persons.find(p => p.is_primary_contact && p.email) || ct.contact_persons.find(p => p.email);
+          if (cp) return cp.email;
+        }
+      }
+    }
+  } catch (e) { console.warn('[saas-increase] contact email lookup:', e.message); }
+  if (customerName) {
+    const em = await findCrmEmailByName(customerName);
+    if (em) return em;
+  }
+  return '';
 }
 
 // Ownership guard: non-admins (incl. impersonated reps) may only act on THEIR OWN estimates.
