@@ -7553,6 +7553,168 @@ app.get('/api/admin/saas-increase/subscriptions', authenticateToken, async (req,
   } catch (e) { res.status(502).json({ error: 'saas_increase_subs_failed', detail: e.message }); }
 });
 
+function r2Money(n) { return Math.round((Number(n) || 0) * 100) / 100; }
+function saasIncreaseNewMonthly(current, type, value) {
+  const c = Number(current) || 0;
+  const v = Number(value) || 0;
+  return r2Money(type === 'flat' ? c + v : c * (1 + v / 100));
+}
+function serializeSaasIncreaseItem(row) {
+  return {
+    id: row.id, orgId: row.org_id, subscriptionNumber: row.subscription_number,
+    customerId: row.customer_id, customerName: row.customer_name, merchantAccountId: row.merchant_account_id,
+    planCode: row.plan_code, planName: row.plan_name,
+    currentMonthly: Number(row.current_monthly), increaseType: row.increase_type, increaseValue: Number(row.increase_value),
+    newMonthly: Number(row.new_monthly), status: row.status, pushError: row.push_error,
+    pushedBy: row.pushed_by, pushedAt: row.pushed_at,
+  };
+}
+
+// GET /api/admin/saas-increase/scenarios — list scenarios with a rollup (item count, MRR delta).
+app.get('/api/admin/saas-increase/scenarios', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  try {
+    const rows = (await pool.query(`
+      SELECT s.*, COUNT(i.id) AS item_count,
+             COALESCE(SUM(i.new_monthly - i.current_monthly), 0) AS mrr_delta
+      FROM saas_increase_scenarios s
+      LEFT JOIN saas_increase_items i ON i.scenario_id = s.id
+      GROUP BY s.id ORDER BY s.created_at DESC
+    `)).rows;
+    res.json({ scenarios: rows.map(r => ({
+      id: r.id, name: r.name, targetMrr: Number(r.target_mrr), status: r.status,
+      createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
+      itemCount: parseInt(r.item_count), mrrDelta: r2Money(r.mrr_delta),
+    })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/admin/saas-increase/scenarios — create a new scenario. Body: { name, targetMrr }
+app.post('/api/admin/saas-increase/scenarios', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  const name = String(req.body?.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'name required' });
+  const targetMrr = Number(req.body?.targetMrr) || 100000;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  try {
+    const row = (await pool.query(
+      `INSERT INTO saas_increase_scenarios (name, target_mrr, created_by) VALUES ($1, $2, $3) RETURNING *`,
+      [name, targetMrr, actor]
+    )).rows[0];
+    res.json({ scenario: { id: row.id, name: row.name, targetMrr: Number(row.target_mrr), status: row.status, createdBy: row.created_by, createdAt: row.created_at } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/admin/saas-increase/scenarios/:id — scenario + its items
+app.get('/api/admin/saas-increase/scenarios/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  try {
+    const scenario = (await pool.query(`SELECT * FROM saas_increase_scenarios WHERE id = $1`, [req.params.id])).rows[0];
+    if (!scenario) return res.status(404).json({ error: 'scenario not found' });
+    const items = (await pool.query(`SELECT * FROM saas_increase_items WHERE scenario_id = $1 ORDER BY customer_name`, [req.params.id])).rows;
+    res.json({
+      scenario: { id: scenario.id, name: scenario.name, targetMrr: Number(scenario.target_mrr), status: scenario.status, createdBy: scenario.created_by, createdAt: scenario.created_at },
+      items: items.map(serializeSaasIncreaseItem),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/admin/saas-increase/scenarios/:id — rename / retarget / change status
+app.put('/api/admin/saas-increase/scenarios/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  const { name, targetMrr, status } = req.body || {};
+  try {
+    const row = (await pool.query(
+      `UPDATE saas_increase_scenarios SET
+         name = COALESCE($1, name), target_mrr = COALESCE($2, target_mrr), status = COALESCE($3, status), updated_at = NOW()
+       WHERE id = $4 RETURNING *`,
+      [name || null, targetMrr != null ? Number(targetMrr) : null, status || null, req.params.id]
+    )).rows[0];
+    if (!row) return res.status(404).json({ error: 'scenario not found' });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/admin/saas-increase/scenarios/:id — remove a scenario (and its items, via CASCADE)
+app.delete('/api/admin/saas-increase/scenarios/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  try {
+    await pool.query(`DELETE FROM saas_increase_scenarios WHERE id = $1`, [req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/admin/saas-increase/scenarios/:id/items — upsert one or more rows (a bulk-apply rule
+// or individual edits both land here as an explicit item list). Body: { items: [{ orgId,
+// subscriptionNumber, customerId, customerName, merchantAccountId, planCode, planName,
+// currentMonthly, increaseType, increaseValue }, ...] }. new_monthly is computed server-side.
+app.post('/api/admin/saas-increase/scenarios/:id/items', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  if (!items.length) return res.status(400).json({ error: 'items required' });
+  try {
+    const scenario = (await pool.query(`SELECT id FROM saas_increase_scenarios WHERE id = $1`, [req.params.id])).rows[0];
+    if (!scenario) return res.status(404).json({ error: 'scenario not found' });
+    const saved = [];
+    for (const it of items) {
+      const subscriptionNumber = String(it.subscriptionNumber || '').trim();
+      if (!subscriptionNumber) continue;
+      const increaseType = it.increaseType === 'flat' ? 'flat' : 'percent';
+      const currentMonthly = r2Money(it.currentMonthly);
+      const increaseValue = Number(it.increaseValue) || 0;
+      const newMonthly = saasIncreaseNewMonthly(currentMonthly, increaseType, increaseValue);
+      const row = (await pool.query(`
+        INSERT INTO saas_increase_items
+          (scenario_id, org_id, subscription_number, customer_id, customer_name, merchant_account_id,
+           plan_code, plan_name, current_monthly, increase_type, increase_value, new_monthly)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+        ON CONFLICT (scenario_id, subscription_number) DO UPDATE SET
+          org_id = $2, customer_id = $4, customer_name = $5, merchant_account_id = $6,
+          plan_code = $7, plan_name = $8, current_monthly = $9, increase_type = $10,
+          increase_value = $11, new_monthly = $12, status = 'pending', push_error = NULL
+        RETURNING *`,
+        [req.params.id, String(it.orgId || ''), subscriptionNumber, it.customerId || null, it.customerName || null,
+         it.merchantAccountId || null, it.planCode || null, it.planName || null, currentMonthly, increaseType, increaseValue, newMonthly]
+      )).rows[0];
+      saved.push(serializeSaasIncreaseItem(row));
+    }
+    res.json({ items: saved });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/admin/saas-increase/scenarios/:id/items/:itemId — drop one row from a scenario
+app.delete('/api/admin/saas-increase/scenarios/:id/items/:itemId', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  try {
+    await pool.query(`DELETE FROM saas_increase_items WHERE id = $1 AND scenario_id = $2`, [req.params.itemId, req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/admin/saas-increase/scenarios/:id/export — CSV of the scenario's items, for
+// record-keeping or a manual fallback if a push ever needs to be actioned by hand.
+app.get('/api/admin/saas-increase/scenarios/:id/export', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  try {
+    const scenario = (await pool.query(`SELECT * FROM saas_increase_scenarios WHERE id = $1`, [req.params.id])).rows[0];
+    if (!scenario) return res.status(404).json({ error: 'scenario not found' });
+    const items = (await pool.query(`SELECT * FROM saas_increase_items WHERE scenario_id = $1 ORDER BY customer_name`, [req.params.id])).rows;
+    const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const header = ['Org', 'Subscription #', 'Customer', 'Merchant Account ID', 'Plan', 'Current Monthly', 'Increase Type', 'Increase Value', 'New Monthly', 'Delta', 'Status'];
+    const lines = [header.map(esc).join(',')];
+    for (const it of items) {
+      lines.push([
+        it.org_id, it.subscription_number, it.customer_name, it.merchant_account_id || '', it.plan_name || '',
+        Number(it.current_monthly).toFixed(2), it.increase_type, it.increase_value, Number(it.new_monthly).toFixed(2),
+        (Number(it.new_monthly) - Number(it.current_monthly)).toFixed(2), it.status,
+      ].map(esc).join(','));
+    }
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="saas-increase-${scenario.name.replace(/[^a-z0-9]+/gi, '-').slice(0, 40) || 'scenario'}.csv"`);
+    res.send(lines.join('\n'));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Shared: per-merchant combined revenue (monthly processing + linked SaaS) using the curated
 // merchant_saas_links. "Processing" here is transaction_profit_cents + other_revenue_cents (the
 // PDF-parsed recurring/fixed fees) — matching the same definition already used by the bi-annual
@@ -8398,9 +8560,12 @@ app.post('/api/proposals/prepare', authenticateToken, async (req, res) => {
     const includeEstimate = req.body.includeEstimate !== false;
     const built = await buildProposalPdf({ estimateId: estimateId || null, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64), logoDataUrl: req.body.logoBase64, pageOrder, includeEstimate });
     const subject = lang === 'en' ? `Cluster POS proposal — ${clientName}` : `Proposition Cluster POS — ${clientName}`;
+    // No name/company after the sign-off line — the signature block appended below (or the
+    // "Cluster Systems" footer when no signature is set) already covers that; repeating it here
+    // duplicated the rep's name right above their own signature.
     const body = lang === 'en'
-      ? `Hello,\n\nThank you for your interest in Cluster POS. Please find attached our proposal prepared for ${clientName}${estimateId ? ', including your quote' : ''}.\n\nI'd be glad to walk you through it — just reply to this email.\n\nBest regards,\n${repName}\nCluster Systems`
-      : `Bonjour,\n\nMerci de votre intérêt envers Cluster POS. Vous trouverez ci-joint notre proposition préparée pour ${clientName}${estimateId ? ', incluant votre soumission' : ''}.\n\nJe me ferai un plaisir de vous la présenter — répondez simplement à ce courriel.\n\nCordialement,\n${repName}\nCluster Systems`;
+      ? `Hello,\n\nThank you for your interest in Cluster POS. Please find attached our proposal prepared for ${clientName}${estimateId ? ', including your quote' : ''}.\n\nI'd be glad to walk you through it — just reply to this email.\n\nBest regards,`
+      : `Bonjour,\n\nMerci de votre intérêt envers Cluster POS. Vous trouverez ci-joint notre proposition préparée pour ${clientName}${estimateId ? ', incluant votre soumission' : ''}.\n\nJe me ferai un plaisir de vous la présenter — répondez simplement à ce courriel.\n\nCordialement,`;
     res.json({
       pdfBase64: Buffer.from(built.bytes).toString('base64'), fileName: proposalFileName(clientName),
       presentationPageCount: built.presentationPageCount, estimatePageCount: built.estimatePageCount,
