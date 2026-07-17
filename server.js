@@ -797,7 +797,7 @@ async function initializeDatabase() {
         name_fr        TEXT,
         sku            TEXT,
         sku_year       TEXT,
-        compat         TEXT,
+        compat         TEXT[] DEFAULT '{}',
         pos            TEXT,
         price_monthly  NUMERIC,
         price_yearly   NUMERIC,
@@ -808,7 +808,7 @@ async function initializeDatabase() {
         includes_fr    TEXT[] DEFAULT '{}',
         internal_en    JSONB,
         internal_fr    JSONB,
-        status         TEXT,
+        status         TEXT[] DEFAULT '{}',
         group_name     TEXT,
         tier           TEXT,
         mode           TEXT,
@@ -820,6 +820,19 @@ async function initializeDatabase() {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_pricing_packages_cat ON pricing_packages(cat_id)`);
+    // One-time migration: compat/status used to be single-value TEXT (a package could only be
+    // tagged V1 OR V2, "new" OR "legacy"), preventing multi-select in the admin editor. Widen to
+    // TEXT[] so a package can carry more than one tag, matching hardware_products' pattern.
+    // Guarded on the column still being 'text' so this never re-runs after the first deploy.
+    for (const col of ['compat', 'status']) {
+      const colType = (await pool.query(
+        `SELECT data_type FROM information_schema.columns WHERE table_name = 'pricing_packages' AND column_name = $1`,
+        [col]
+      )).rows[0]?.data_type;
+      if (colType === 'text') {
+        await pool.query(`ALTER TABLE pricing_packages ALTER COLUMN ${col} TYPE TEXT[] USING CASE WHEN ${col} IS NULL THEN NULL ELSE ARRAY[${col}] END`);
+      }
+    }
     await pool.query(`
       CREATE TABLE IF NOT EXISTS pricing_guides (
         id         TEXT PRIMARY KEY,
@@ -863,9 +876,9 @@ async function initializeDatabase() {
             includes_en, includes_fr, internal_en, internal_fr, status, group_name, tier, mode, rates)
          VALUES ($1,$2,$3,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,$14,$14,$15,$16,$17,$18,$19)
          ON CONFLICT (id) DO NOTHING`,
-        [p.id, p.cat, p.name, p.sku || null, p.skuYear || null, p.compat || null, p.pos || null,
+        [p.id, p.cat, p.name, p.sku || null, p.skuYear || null, p.compat ? [p.compat] : [], p.pos || null,
          p.priceMonthly ?? null, p.priceYearly ?? null, p.priceFlat ?? null, p.unit || null, p.activation ?? null,
-         p.includes || [], p.internal ? JSON.stringify(p.internal) : null, p.status || null, p.group || null, p.tier || null, p.mode || null,
+         p.includes || [], p.internal ? JSON.stringify(p.internal) : null, p.status ? [p.status] : [], p.group || null, p.tier || null, p.mode || null,
          p.rates ? JSON.stringify(p.rates) : null]
       );
     }
@@ -10089,14 +10102,14 @@ app.get('/api/pricing', authenticateToken, async (req, res) => {
       })),
       packages: pkgs.map(p => ({
         id: p.id, catId: p.cat_id, nameEn: p.name_en, nameFr: p.name_fr, sku: p.sku, skuYear: p.sku_year,
-        compat: p.compat, pos: p.pos,
+        compat: p.compat || [], pos: p.pos,
         priceMonthly: p.price_monthly != null ? parseFloat(p.price_monthly) : null,
         priceYearly: p.price_yearly != null ? parseFloat(p.price_yearly) : null,
         priceFlat: p.price_flat != null ? parseFloat(p.price_flat) : null,
         unit: p.unit, activation: p.activation != null ? parseFloat(p.activation) : null,
         includesEn: p.includes_en || [], includesFr: p.includes_fr || [],
         internalEn: p.internal_en || null, internalFr: p.internal_fr || null,
-        status: p.status, groupName: p.group_name, tier: p.tier, mode: p.mode, rates: p.rates || null, visible: p.visible,
+        status: p.status || [], groupName: p.group_name, tier: p.tier, mode: p.mode, rates: p.rates || null, visible: p.visible,
       })),
       guides: guides.map(g => ({ id: g.id, titleEn: g.title_en, titleFr: g.title_fr, bodyEn: g.body_en, bodyFr: g.body_fr })),
     });
@@ -10114,11 +10127,11 @@ app.put('/api/pricing', authenticateToken, async (req, res) => {
       const isNew = added.includes(p);
       const internalEnJson = p.internalEn ? JSON.stringify(p.internalEn) : null;
       const vals = [
-        p.catId, p.nameEn, p.nameFr || p.nameEn, p.sku || null, p.skuYear || null, p.compat || null, p.pos || null,
+        p.catId, p.nameEn, p.nameFr || p.nameEn, p.sku || null, p.skuYear || null, p.compat || [], p.pos || null,
         p.priceMonthly ?? null, p.priceYearly ?? null, p.priceFlat ?? null, p.unit || null, p.activation ?? null,
         p.includesEn || [], p.includesFr || p.includesEn || [],
         internalEnJson, p.internalFr ? JSON.stringify(p.internalFr) : internalEnJson,
-        p.status || null, p.groupName || null, p.tier || null, p.mode || null, p.rates ? JSON.stringify(p.rates) : null,
+        p.status || [], p.groupName || null, p.tier || null, p.mode || null, p.rates ? JSON.stringify(p.rates) : null,
       ];
       if (isNew) {
         await client.query(
