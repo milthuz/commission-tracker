@@ -1672,6 +1672,10 @@ async function initializeDatabase() {
         check_error           TEXT
       );
     `);
+    // How many matching invoices were actually compared — distinguishes "checked a full lookback
+    // window, price never moved" from "barely any invoice history existed to compare" (both would
+    // otherwise look identical as last_price_change_at = NULL).
+    await pool.query(`ALTER TABLE saas_subscription_insights ADD COLUMN IF NOT EXISTS price_points_checked INTEGER`);
 
     // Dedup log for probation-ending manager notifications (one row per rep/end-date/milestone).
     await pool.query(`
@@ -7609,6 +7613,7 @@ app.get('/api/admin/saas-increase/subscriptions', authenticateToken, async (req,
         lastPriceChangeAt: i?.last_price_change_at || null,
         lastPriceBefore: i?.last_price_before != null ? Number(i.last_price_before) : null,
         lastPriceAfter: i?.last_price_after != null ? Number(i.last_price_after) : null,
+        pricePointsChecked: i?.price_points_checked != null ? Number(i.price_points_checked) : null,
         insightsCheckedAt: i?.checked_at || null,
       };
     });
@@ -7942,8 +7947,12 @@ async function fetchSaasSubscriptionTenure(apiDomain, accessToken, orgId, subscr
 // point where that amount differs from the invoice right before it. Null = no change found
 // within the lookback window (not necessarily "never changed" — see the check_error/lookback
 // cap caveat in the plan).
+// Returns { points, change }. `points` is how many matching invoices were actually found and
+// compared (lets the caller tell "checked 24 invoices, price never moved" apart from "barely any
+// invoice history to compare" — both would otherwise look identical as change === null).
+// `change` is { date, before, after } for the most recent differing pair, or null if none found.
 async function fetchSaasPriceChange(apiDomain, accessToken, orgId, subscriptionId, customerId, planCodes, planNames) {
-  if (!customerId || !subscriptionId) return null;
+  if (!customerId || !subscriptionId) return { points: 0, change: null };
   const listRes = await axios.get(`${apiDomain}/books/v3/invoices`, {
     params: { organization_id: orgId, customer_id: customerId, sort_column: 'date', sort_order: 'D', per_page: SAAS_INSIGHTS_INVOICE_LOOKBACK },
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
@@ -7982,10 +7991,10 @@ async function fetchSaasPriceChange(apiDomain, accessToken, orgId, subscriptionI
   }
   for (let i = 0; i < points.length - 1; i++) {
     if (points[i].amount !== points[i + 1].amount) {
-      return { date: points[i].date, before: points[i + 1].amount, after: points[i].amount };
+      return { points: points.length, change: { date: points[i].date, before: points[i + 1].amount, after: points[i].amount } };
     }
   }
-  return null;
+  return { points: points.length, change: null };
 }
 
 let saasInsightsScanRunning = false;
@@ -8012,13 +8021,13 @@ async function runSaasSubscriptionInsightsScan() {
     for (const s of subs) {
       try {
         const activatedAt = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
-        const change = await fetchSaasPriceChange(apiDomain, accessToken, booksOrgId, s.subscriptionId, s.customerId, planCodes, planNames);
+        const { points, change } = await fetchSaasPriceChange(apiDomain, accessToken, booksOrgId, s.subscriptionId, s.customerId, planCodes, planNames);
         await pool.query(`
-          INSERT INTO saas_subscription_insights (subscription_number, activated_at, last_price_change_at, last_price_before, last_price_after, checked_at, check_error)
-          VALUES ($1, $2, $3, $4, $5, NOW(), NULL)
+          INSERT INTO saas_subscription_insights (subscription_number, activated_at, last_price_change_at, last_price_before, last_price_after, price_points_checked, checked_at, check_error)
+          VALUES ($1, $2, $3, $4, $5, $6, NOW(), NULL)
           ON CONFLICT (subscription_number) DO UPDATE SET
-            activated_at = $2, last_price_change_at = $3, last_price_before = $4, last_price_after = $5, checked_at = NOW(), check_error = NULL`,
-          [s.subscriptionNumber, activatedAt, change?.date || null, change?.before ?? null, change?.after ?? null]
+            activated_at = $2, last_price_change_at = $3, last_price_before = $4, last_price_after = $5, price_points_checked = $6, checked_at = NOW(), check_error = NULL`,
+          [s.subscriptionNumber, activatedAt, change?.date || null, change?.before ?? null, change?.after ?? null, points]
         );
         ok++;
       } catch (e) {
