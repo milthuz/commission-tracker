@@ -635,6 +635,11 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS processing_bonus_enabled BOOLEAN DEFAULT true`);
     // annual_bonus_enabled=false excludes a rep from the year-end annual points bonus.
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS annual_bonus_enabled BOOLEAN DEFAULT true`);
+    // Email signature (Admin -> Salespeople): appended to proposal emails when signature_role is
+    // set — an unset role means the signature isn't configured yet, so nothing is appended.
+    await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS signature_role TEXT`);
+    await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS signature_role2 TEXT`);
+    await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS signature_phone TEXT`);
     // Configurable bonus tiers (monthly + annual). Seeded once from the code defaults; editable in
     // Admin → Salespeople → Bonuses. calculate*Bonus read the in-memory arrays kept in sync below.
     await pool.query(`
@@ -7830,6 +7835,42 @@ async function fetchRenderedPresentation(clientName, lang, logoDataUrl, pages) {
 // Presentation source, in order of preference: (1) the rendered Claude Design document from the
 // Puppeteer service (PROPOSAL_RENDER_URL) — personalized + branded, REPLACES cover+deck;
 // (2) generated pdf-lib cover + committed company_{lang}.pdf deck.
+// Email signature appended to proposal emails (Admin -> Salespeople sets role/role2/phone per
+// rep). Markup transcribed from the company's own generator at signatures.clustersystems.com
+// ("Basic" template) so it renders identically — table-based + inline styles for email-client
+// compatibility. Returns '' when signatureRole is unset (signature not configured for this rep).
+function buildSignatureHtml({ name, role, role2, phone, email }) {
+  if (!role) return '';
+  const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const telHref = phone ? `tel:${phone.replace(/[^\d+]/g, '')}` : '';
+  const phoneRow = phone ? `<tr><td style="padding:2px 0"><table cellpadding="0" cellspacing="0" role="presentation"><tr><td style="padding-right:4px;vertical-align:middle"><img width="14" height="14" alt="Phone" src="https://cdn.prod.website-files.com/68adb5d81e5dac369515019c/68dee034ed90a4a71d1db2e6_phone.png" style="display:block;border:0"></td><td style="vertical-align:middle"><a href="${telHref}" style="font-size:14px;font-weight:500;color:#fe6523;text-decoration:none">${esc(phone)}</a></td></tr></table></td></tr>` : '';
+  const emailRow = email ? `<tr><td style="padding:2px 0"><table cellpadding="0" cellspacing="0" role="presentation"><tr><td style="padding-right:4px;vertical-align:middle"><img width="14" height="14" alt="Email" src="https://cdn.prod.website-files.com/68adb5d81e5dac369515019c/68dee034a92e407f339aa167_send.png" style="display:block;border:0"></td><td style="vertical-align:middle"><a href="mailto:${esc(email)}" style="font-size:14px;color:#1d1d1d;text-decoration:none">${esc(email)}</a></td></tr></table></td></tr>` : '';
+  return `<table cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;background:#ffffff;margin-top:24px;padding:0;width:100%;font-family:Helvetica,Arial,sans-serif;color:#1d1d1d;font-size:16px;line-height:1.4">
+    <tr><td style="padding:0 24px 20px 0;vertical-align:top;width:181px;border-right:1px solid #eeeeee">
+      <table cellpadding="0" cellspacing="0" role="presentation" style="width:100%;padding:14px 0">
+        <tr><td style="padding:0 0 12px"><img alt="ClusterPOS logo" width="141" src="https://cdn.prod.website-files.com/68adb5d81e5dac369515019c/68dd780834037661c940f070_cluster-on-light.png" style="display:block;width:141px;height:auto;margin:0"></td></tr>
+        <tr><td style="font-size:12px;line-height:1.2;color:#1d1d1d;padding:0 0 12px">8585 Decarie Blvd, Montreal<br>Quebec H4P 2J4, Canada</td></tr>
+        <tr><td style="padding-top:24px"><table cellpadding="0" cellspacing="0" role="presentation"><tr>
+          <td style="padding:0"><a href="https://www.instagram.com/clusterpos" style="display:block;width:32px;height:32px"><img alt="Instagram" width="32" height="32" src="https://cdn.prod.website-files.com/68adb5d81e5dac369515019c/68dd780809f3c47f603c9173_Instagram-Icon.png" style="display:block;width:32px;height:32px"></a></td>
+          <td style="padding:0 0 0 8px"><a href="https://www.linkedin.com/company/cluster-systems-inc-/" style="display:block;width:32px;height:32px"><img alt="Linkedin" width="32" height="32" src="https://cdn.prod.website-files.com/68adb5d81e5dac369515019c/68dd7808a3746ed2d9bf1b2f_Linkedin-Icon.png" style="display:block;width:32px;height:32px"></a></td>
+          <td style="padding:0 0 0 8px"><a href="https://www.facebook.com/clusterPOS/" style="display:block;width:32px;height:32px"><img alt="Facebook" width="32" height="32" src="https://cdn.prod.website-files.com/68adb5d81e5dac369515019c/68dd7808a0f2c0d12c90e406_Facebook-Icon.png.png" style="display:block;width:32px;height:32px"></a></td>
+        </tr></table></td></tr>
+      </table>
+    </td>
+    <td style="padding:12px 0 8px 24px;vertical-align:top">
+      <table cellpadding="0" cellspacing="0" role="presentation" style="width:100%;padding:12px 0 8px">
+        <tr><td style="font-weight:500;font-size:20px;line-height:1.2;padding:0 0 2px;color:#1d1d1d">${esc(name)}</td></tr>
+        <tr><td style="font-size:14px;line-height:1.2;color:#1d1d1d;padding:0 0 12px">${esc(role)}${role2 ? `<br><span style="font-size:12px;color:#424242;margin-top:2px;display:block">${esc(role2)}</span>` : ''}</td></tr>
+        <tr><td style="padding-top:16px"><table cellpadding="0" cellspacing="0" role="presentation">
+          ${phoneRow}
+          ${emailRow}
+          <tr><td><table cellpadding="0" cellspacing="0" role="presentation"><tr><td style="padding:0 4px 0 0;vertical-align:middle"><img width="14" height="14" alt="Website" src="https://cdn.prod.website-files.com/68adb5d81e5dac369515019c/68dd78080d6e9b10ade232e1_global.png" style="display:block;border:0"></td><td style="font-size:14px;line-height:1.2"><a href="https://www.clusterpos.com" style="color:#1d1d1d;text-decoration:none">www.clusterpos.com</a></td></tr></table></td></tr>
+        </table></td></tr>
+      </table>
+    </td></tr>
+  </table>`;
+}
+
 // Returns { bytes, presentationPageCount, estimatePageCount }.
 // pageOrder: optional ORDERED array of 1-based indices into the FULL page range — 1..presentationPageCount
 // is the presentation, presentationPageCount+1..+estimatePageCount is the estimate. The rep can freely
@@ -8158,6 +8199,21 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
       acceptUrl = await getEstimateAcceptUrl(estimateId);
     }
     const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // Signature appended below the message — looked up by the sender's own login email, set via
+    // Admin -> Salespeople. Returns '' (nothing appended) when signature_role is unset.
+    let signatureHtml = '';
+    if (req.user.email) {
+      const sigRow = (await pool.query(
+        `SELECT signature_role, signature_role2, signature_phone FROM salespeople WHERE LOWER(email) = LOWER($1)`,
+        [req.user.email]
+      )).rows[0];
+      if (sigRow) {
+        signatureHtml = buildSignatureHtml({
+          name: repName, role: sigRow.signature_role, role2: sigRow.signature_role2,
+          phone: sigRow.signature_phone, email: req.user.email,
+        });
+      }
+    }
     // A unique token per send drives both the open pixel and the accept-link click redirect.
     const trackToken = require('crypto').randomUUID().replace(/-/g, '');
     const apiBase = process.env.PUBLIC_API_URL || `https://${req.get('host')}`;
@@ -8184,6 +8240,7 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
             <tr><td style="padding:32px 36px 8px;font-size:14px;color:#1c2434;line-height:1.6">
               <div style="white-space:pre-wrap">${esc(bodyText)}</div>
               ${acceptBtn}
+              ${signatureHtml}
             </td></tr>
             <tr><td style="padding:22px 36px 0"><div style="border-top:1px solid #eef1f6;font-size:0;line-height:0">&nbsp;</div></td></tr>
             <tr><td style="padding:16px 36px 30px">
@@ -11321,6 +11378,7 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
       `SELECT s.name, s.is_active, s.commission_rate, s.base_salary, s.invoice_count, s.aliases,
               s.signup_bonus_amount, s.signup_bonus_enabled, s.monthly_quota, s.team_id, s.email,
               s.hire_date, s.quota_gate_enabled, s.processing_bonus_enabled, s.annual_bonus_enabled, t.name AS team_name,
+              s.signature_role, s.signature_role2, s.signature_phone,
               (SELECT ut.email FROM user_tokens ut WHERE LOWER(ut.display_name) = LOWER(s.name) LIMIT 1) AS resolved_login_email
        FROM salespeople s LEFT JOIN teams t ON t.id = s.team_id
        ORDER BY s.name`
@@ -11345,6 +11403,9 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
         resolvedLoginEmail: r.resolved_login_email || null,  // actual Zoho login (by name) when no manual override
         teamId:             r.team_id || null,
         teamName:           r.team_name || null,
+        signatureRole:      r.signature_role || null,
+        signatureRole2:     r.signature_role2 || null,
+        signaturePhone:     r.signature_phone || null,
       }))
     });
   } catch (error) {
@@ -11398,6 +11459,26 @@ app.put('/api/salespeople/:name/hire-date', authenticateToken, async (req, res) 
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update hire date', details: error.message });
+  }
+});
+
+// PUT /api/salespeople/:name/signature — role/role-line-2/phone shown in the email signature
+// appended to proposal emails. An empty signatureRole means "not configured" — no signature sent.
+app.put('/api/salespeople/:name/signature', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+  const role = (req.body.signatureRole || '').trim() || null;
+  const role2 = (req.body.signatureRole2 || '').trim() || null;
+  const phone = (req.body.signaturePhone || '').trim() || null;
+  try {
+    const r = await pool.query(
+      `UPDATE salespeople SET signature_role = $1, signature_role2 = $2, signature_phone = $3, updated_at = CURRENT_TIMESTAMP
+       WHERE name = $4 RETURNING name`,
+      [role, role2, phone, req.params.name]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Salesperson not found' });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update signature', details: error.message });
   }
 });
 
