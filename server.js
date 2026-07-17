@@ -635,8 +635,9 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS processing_bonus_enabled BOOLEAN DEFAULT true`);
     // annual_bonus_enabled=false excludes a rep from the year-end annual points bonus.
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS annual_bonus_enabled BOOLEAN DEFAULT true`);
-    // Email signature (Admin -> Salespeople): appended to proposal emails when signature_role is
-    // set — an unset role means the signature isn't configured yet, so nothing is appended.
+    // Email signature (self-service via Profile page, PUT /api/user/signature): appended to
+    // proposal emails when signature_role is set — an unset role means the signature isn't
+    // configured yet, so nothing is appended.
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS signature_role TEXT`);
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS signature_role2 TEXT`);
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS signature_phone TEXT`);
@@ -6720,7 +6721,7 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
     const stats = statsResult.rows[0] || {};
 
     const spResult = await pool.query(
-      'SELECT name, is_active, commission_rate FROM salespeople WHERE name = $1',
+      'SELECT name, is_active, commission_rate, signature_role, signature_role2, signature_phone FROM salespeople WHERE name = $1',
       [repName]
     );
     const sp = spResult.rows[0];
@@ -6747,6 +6748,9 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
         name:           sp.name,
         isActive:       sp.is_active,
         commissionRate: parseFloat(sp.commission_rate) || 10,
+        signatureRole:  sp.signature_role || null,
+        signatureRole2: sp.signature_role2 || null,
+        signaturePhone: sp.signature_phone || null,
       } : null,
       stats: {
         paidInvoices:    parseInt(stats.paid_invoices)    || 0,
@@ -6784,6 +6788,31 @@ app.put('/api/user/preferences', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Preferences error:', error);
     res.status(500).json({ error: 'Failed to save preferences', details: error.message });
+  }
+});
+
+// PUT /api/user/signature — self-service: a user sets their OWN email signature (role/role2/phone
+// appended to proposal emails), resolved to their salespeople row the same way GET /api/user/profile
+// does (by display name, not admin-gated). No-op with a clear error if the user isn't linked to a
+// salesperson record yet (admin hasn't set them up in Admin -> Salespeople).
+app.put('/api/user/signature', authenticateToken, async (req, res) => {
+  const { email } = req.user;
+  const role = (req.body.signatureRole || '').trim() || null;
+  const role2 = (req.body.signatureRole2 || '').trim() || null;
+  const phone = (req.body.signaturePhone || '').trim() || null;
+  try {
+    const tokenResult = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
+    const repName = tokenResult.rows[0]?.display_name || req.user.name || email;
+    const r = await pool.query(
+      `UPDATE salespeople SET signature_role = $1, signature_role2 = $2, signature_phone = $3, updated_at = CURRENT_TIMESTAMP
+       WHERE name = $4 RETURNING name`,
+      [role, role2, phone, repName]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'No linked salesperson record — contact an admin to set one up first.' });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Signature error:', error);
+    res.status(500).json({ error: 'Failed to save signature', details: error.message });
   }
 });
 
@@ -11391,7 +11420,6 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
       `SELECT s.name, s.is_active, s.commission_rate, s.base_salary, s.invoice_count, s.aliases,
               s.signup_bonus_amount, s.signup_bonus_enabled, s.monthly_quota, s.team_id, s.email,
               s.hire_date, s.quota_gate_enabled, s.processing_bonus_enabled, s.annual_bonus_enabled, t.name AS team_name,
-              s.signature_role, s.signature_role2, s.signature_phone,
               (SELECT ut.email FROM user_tokens ut WHERE LOWER(ut.display_name) = LOWER(s.name) LIMIT 1) AS resolved_login_email
        FROM salespeople s LEFT JOIN teams t ON t.id = s.team_id
        ORDER BY s.name`
@@ -11416,9 +11444,6 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
         resolvedLoginEmail: r.resolved_login_email || null,  // actual Zoho login (by name) when no manual override
         teamId:             r.team_id || null,
         teamName:           r.team_name || null,
-        signatureRole:      r.signature_role || null,
-        signatureRole2:     r.signature_role2 || null,
-        signaturePhone:     r.signature_phone || null,
       }))
     });
   } catch (error) {
@@ -11472,26 +11497,6 @@ app.put('/api/salespeople/:name/hire-date', authenticateToken, async (req, res) 
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update hire date', details: error.message });
-  }
-});
-
-// PUT /api/salespeople/:name/signature — role/role-line-2/phone shown in the email signature
-// appended to proposal emails. An empty signatureRole means "not configured" — no signature sent.
-app.put('/api/salespeople/:name/signature', authenticateToken, async (req, res) => {
-  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
-  const role = (req.body.signatureRole || '').trim() || null;
-  const role2 = (req.body.signatureRole2 || '').trim() || null;
-  const phone = (req.body.signaturePhone || '').trim() || null;
-  try {
-    const r = await pool.query(
-      `UPDATE salespeople SET signature_role = $1, signature_role2 = $2, signature_phone = $3, updated_at = CURRENT_TIMESTAMP
-       WHERE name = $4 RETURNING name`,
-      [role, role2, phone, req.params.name]
-    );
-    if (r.rowCount === 0) return res.status(404).json({ error: 'Salesperson not found' });
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to update signature', details: error.message });
   }
 });
 
