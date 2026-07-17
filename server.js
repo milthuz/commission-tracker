@@ -129,6 +129,10 @@ const PERMISSION_CATALOG = [
   // Pricing (Services & Pricing Guide)
   { key: 'pricing:view',               label: 'View the Services & Pricing Guide',                              category: 'Pricing' },
   { key: 'pricing:manage',             label: 'Edit prices, SKUs and visibility in the Pricing Guide',           category: 'Pricing' },
+
+  // SaaS Increase (simulate + push SaaS subscription price increases in Zoho Billing)
+  { key: 'saas_increase:manage',       label: 'Build & simulate SaaS price-increase scenarios',                 category: 'SaaS Increase' },
+  { key: 'saas_increase:execute',      label: 'Push SaaS price increases into live Zoho subscriptions',        category: 'SaaS Increase' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -782,6 +786,8 @@ async function initializeDatabase() {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS pricing_categories (
         id                 TEXT PRIMARY KEY,
+        name_en            TEXT,
+        name_fr            TEXT,
         sort_order         INT DEFAULT 0,
         hourly             NUMERIC,
         note_en            TEXT,
@@ -790,6 +796,23 @@ async function initializeDatabase() {
         considerations_fr  TEXT[]
       );
     `);
+    await pool.query(`ALTER TABLE pricing_categories ADD COLUMN IF NOT EXISTS name_en TEXT`);
+    await pool.query(`ALTER TABLE pricing_categories ADD COLUMN IF NOT EXISTS name_fr TEXT`);
+    // One-time backfill for the 8 original categories, which only ever had a title via i18n keys
+    // (pricingGuide.categories.*.title) — now that admins can add their OWN categories, every
+    // category needs a real name in the DB. Guarded on name_en still being NULL so it never
+    // clobbers an admin rename.
+    {
+      const catNames = {
+        saas: ['SaaS Packages', 'Forfaits SaaS'], rental: ['Rental Packages', 'Forfaits de location'],
+        menu: ['Menu Build Services', 'Services de montage de menu'], install: ['Installation Services', "Services d’installation"],
+        support: ['Support Packages', 'Forfaits de soutien'], olo: ['Online Ordering', 'Commande en ligne'],
+        shipping: ['Shipping Cost Guidelines', "Grille des frais d’expédition"], xperio: ['On-Site & XPERIO Fees', 'Frais sur place et XPERIO'],
+      };
+      for (const [id, [en, fr]] of Object.entries(catNames)) {
+        await pool.query(`UPDATE pricing_categories SET name_en = $2, name_fr = $3 WHERE id = $1 AND name_en IS NULL`, [id, en, fr]);
+      }
+    }
     await pool.query(`
       CREATE TABLE IF NOT EXISTS pricing_packages (
         id             TEXT PRIMARY KEY,
@@ -857,17 +880,31 @@ async function initializeDatabase() {
       await pool.query(
         `INSERT INTO hardware_products
            (id, cat_id, name_en, name_fr, specs_en, specs_fr, sku, price, compat, status, use_en, use_fr, warranty_en, warranty_fr, note_en, note_fr, img_file_name)
-         VALUES ($1,$2,$3,$3,$4,$4,$5,$6,$7,$8,$9,$9,$10,$10,$11,$11,$12)
+         VALUES ($1,$2,$3,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
          ON CONFLICT (id) DO NOTHING`,
-        [p.id, p.cat, p.name, p.specs, p.sku, p.price, p.compat, p.status, p.use, p.warranty, p.note || null, ext ? `${p.img}.${ext}` : null]
+        [p.id, p.cat, p.name, p.specs, p.specsFr || p.specs, p.sku, p.price, p.compat, p.status,
+         p.use, p.useFr || p.use, p.warranty, p.warrantyFr || p.warranty, p.note || null, p.noteFr || p.note || null,
+         ext ? `${p.img}.${ext}` : null]
+      );
+    }
+    // One-time backfill: translate specs/use/warranty/note for the 52 products seeded before FR
+    // content was written (guarded on the FR column still exactly matching the EN column, i.e.
+    // still the placeholder copy — never touches a row an admin has since translated by hand).
+    for (const p of hardwareSeed.products) {
+      if (!p.specsFr && !p.useFr && !p.warrantyFr && !p.noteFr) continue;
+      await pool.query(
+        `UPDATE hardware_products SET specs_fr = $2, use_fr = $3, warranty_fr = $4, note_fr = $5, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1 AND specs_fr = specs_en AND use_fr = use_en AND warranty_fr = warranty_en
+               AND (note_fr = note_en OR (note_fr IS NULL AND note_en IS NULL))`,
+        [p.id, p.specsFr || p.specs, p.useFr || p.use, p.warrantyFr || p.warranty, p.noteFr || p.note || null]
       );
     }
     const pricingSeed = require('./seed/pricingSeed');
     for (const c of pricingSeed.categories) {
       await pool.query(
-        `INSERT INTO pricing_categories (id, sort_order, hourly, note_en, note_fr, considerations_en, considerations_fr)
-         VALUES ($1,$2,$3,$4,$4,$5,$5) ON CONFLICT (id) DO NOTHING`,
-        [c.id, c.sort, c.hourly, c.note, c.considerations]
+        `INSERT INTO pricing_categories (id, name_en, name_fr, sort_order, hourly, note_en, note_fr, considerations_en, considerations_fr)
+         VALUES ($1,$2,$2,$3,$4,$5,$5,$6,$6) ON CONFLICT (id) DO NOTHING`,
+        [c.id, c.name, c.sort, c.hourly, c.note, c.considerations]
       );
     }
     for (const p of pricingSeed.packages) {
@@ -875,18 +912,44 @@ async function initializeDatabase() {
         `INSERT INTO pricing_packages
            (id, cat_id, name_en, name_fr, sku, sku_year, compat, pos, price_monthly, price_yearly, price_flat, unit, activation,
             includes_en, includes_fr, internal_en, internal_fr, status, group_name, tier, mode, rates)
-         VALUES ($1,$2,$3,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,$14,$14,$15,$16,$17,$18,$19)
+         VALUES ($1,$2,$3,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
          ON CONFLICT (id) DO NOTHING`,
         [p.id, p.cat, p.name, p.sku || null, p.skuYear || null, p.compat ? [p.compat] : [], p.pos || null,
          p.priceMonthly ?? null, p.priceYearly ?? null, p.priceFlat ?? null, p.unit || null, p.activation ?? null,
-         p.includes || [], p.internal ? JSON.stringify(p.internal) : null, p.status ? [p.status] : [], p.group || null, p.tier || null, p.mode || null,
+         p.includes || [], p.includesFr || p.includes || [],
+         p.internal ? JSON.stringify(p.internal) : null, p.internalFr ? JSON.stringify(p.internalFr) : (p.internal ? JSON.stringify(p.internal) : null),
+         p.status ? [p.status] : [], p.group || null, p.tier || null, p.mode || null,
          p.rates ? JSON.stringify(p.rates) : null]
+      );
+    }
+    // One-time backfill: translate includes/internal notes for packages seeded before FR content
+    // was written (guarded on the FR column still exactly matching the EN column — never touches
+    // a row an admin has since translated by hand via the Pricing editor's FR toggle).
+    for (const p of pricingSeed.packages) {
+      if (!p.includesFr && !p.internalFr) continue;
+      const newIncludesFr = p.includesFr || p.includes || [];
+      const newInternalFr = p.internalFr ? JSON.stringify(p.internalFr) : (p.internal ? JSON.stringify(p.internal) : null);
+      await pool.query(
+        `UPDATE pricing_packages SET includes_fr = $2, internal_fr = $3, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1 AND includes_fr = includes_en
+               AND (internal_fr = internal_en OR (internal_fr IS NULL AND internal_en IS NULL))`,
+        [p.id, newIncludesFr, newInternalFr]
       );
     }
     for (const g of pricingSeed.guides) {
       await pool.query(
-        `INSERT INTO pricing_guides (id, title_en, title_fr, body_en, body_fr, sort_order) VALUES ($1,$2,$2,$3,$3,$4) ON CONFLICT (id) DO NOTHING`,
-        [g.id, g.title, g.body, pricingSeed.guides.indexOf(g)]
+        `INSERT INTO pricing_guides (id, title_en, title_fr, body_en, body_fr, sort_order) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO NOTHING`,
+        [g.id, g.title, g.titleFr || g.title, g.body, g.bodyFr || g.body, pricingSeed.guides.indexOf(g)]
+      );
+    }
+    // One-time backfill: translate guide title/body for rows seeded before FR content was written
+    // (guarded on the FR columns still exactly matching EN — never clobbers a manual admin edit).
+    for (const g of pricingSeed.guides) {
+      if (!g.titleFr && !g.bodyFr) continue;
+      await pool.query(
+        `UPDATE pricing_guides SET title_fr = $2, body_fr = $3
+         WHERE id = $1 AND title_fr = title_en AND body_fr = body_en`,
+        [g.id, g.titleFr || g.title, g.bodyFr || g.body]
       );
     }
     // 2026-07-16 one-time price correction: Menu Build Small/Medium/Large moved from "ask for
@@ -1527,6 +1590,43 @@ async function initializeDatabase() {
         status                VARCHAR(20) NOT NULL DEFAULT 'linked',
         linked_by             VARCHAR(255),
         linked_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // SaaS Increase — scenarios of planned SaaS price increases across Zoho Billing
+    // subscriptions, built to hit a target MRR add. Draft scenarios simulate; committed
+    // items get pushed to Zoho (see saas_increase:execute).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS saas_increase_scenarios (
+        id            SERIAL PRIMARY KEY,
+        name          VARCHAR(255) NOT NULL,
+        target_mrr    NUMERIC(12,2) NOT NULL DEFAULT 100000,
+        status        VARCHAR(20) NOT NULL DEFAULT 'draft',
+        created_by    VARCHAR(255),
+        created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS saas_increase_items (
+        id                   SERIAL PRIMARY KEY,
+        scenario_id          INTEGER NOT NULL REFERENCES saas_increase_scenarios(id) ON DELETE CASCADE,
+        org_id               VARCHAR(20) NOT NULL,
+        subscription_number  VARCHAR(255) NOT NULL,
+        customer_id          VARCHAR(255),
+        customer_name        VARCHAR(500),
+        merchant_account_id  VARCHAR(255),
+        plan_code            VARCHAR(255),
+        plan_name            VARCHAR(255),
+        current_monthly      NUMERIC(12,2) NOT NULL,
+        increase_type        VARCHAR(10) NOT NULL DEFAULT 'percent',
+        increase_value       NUMERIC(12,2) NOT NULL DEFAULT 0,
+        new_monthly          NUMERIC(12,2) NOT NULL,
+        status               VARCHAR(20) NOT NULL DEFAULT 'pending',
+        push_error           TEXT,
+        pushed_by            VARCHAR(255),
+        pushed_at            TIMESTAMP,
+        UNIQUE (scenario_id, subscription_number)
       );
     `);
 
@@ -7353,9 +7453,11 @@ async function warmBillingCache() {
   const results = await Promise.allSettled([
     billingMetricsCache.warm(computeBillingMetrics),
     billingCustomersCache.warm(computeBillingCustomers),
+    saasIncreaseSubsCache.warm(computeSaasIncreaseSubscriptions),
   ]);
   if (results[0].status === 'rejected') console.warn('[billing] metrics cache warm failed:', results[0].reason?.message);
   if (results[1].status === 'rejected') console.warn('[billing] customers cache warm failed:', results[1].reason?.message);
+  if (results[2].status === 'rejected') console.warn('[billing] saas-increase subs cache warm failed:', results[2].reason?.message);
 }
 if (process.env.ROLE !== 'worker') {
   setTimeout(warmBillingCache, 20000);
@@ -7395,6 +7497,61 @@ const billingCustomersCache = makeDurableCache('billing_customers_durable_cache'
   deserialize: (v) => ({ byName: new Map(v.byName), subByNumber: new Map(v.subByNumber), subList: v.subList }),
 });
 const getBillingCustomers = (opts) => billingCustomersCache.get(computeBillingCustomers, opts);
+
+// ── SaaS Increase: read-only subscription list for the price-increase simulator ──
+// Reuses fetchBillingSubs (same underlying Zoho call as computeBillingCustomers above) but keeps
+// the extra per-subscription fields the simulator needs (org, customer/subscription ids,
+// plan_code) that the MRR-matching cache doesn't retain.
+async function computeSaasIncreaseSubscriptions() {
+  const { accessToken, apiDomain } = await getAdminBooksAuth();
+  const perOrgAll = await Promise.all(
+    ZOHO_BILLING_ORG_IDS.map(orgId =>
+      fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.All').then(subs => ({ orgId, subs })))
+  );
+  const linksRes = await pool.query(
+    `SELECT subscription_number, merchant_account_id FROM merchant_saas_links WHERE subscription_number IS NOT NULL`
+  );
+  const merchantBySub = new Map(linksRes.rows.map(r => [String(r.subscription_number), r.merchant_account_id]));
+  const subscriptions = [];
+  for (const { orgId, subs } of perOrgAll) {
+    for (const s of subs) {
+      if (!ACTIVE_STATUSES.has(String(s.status || '').toLowerCase())) continue;
+      const num = String(s.subscription_number || '').trim();
+      if (!num) continue;
+      subscriptions.push({
+        orgId,
+        orgName: ZOHO_BILLING_ORG_NAMES[orgId] || orgId,
+        subscriptionId: s.subscription_id || null,
+        subscriptionNumber: num,
+        customerId: s.customer_id || null,
+        customerName: String(s.customer_name || '').trim(),
+        merchantAccountId: merchantBySub.get(num) || null,
+        planCode: s.plan_code || s.plan?.plan_code || '',
+        planName: s.plan_name || '',
+        status: String(s.status || '').toLowerCase(),
+        currentMonthly: Math.round(subMonthlyAmount(s.sub_total != null ? s.sub_total : s.amount, s.interval, s.interval_unit) * 100) / 100,
+      });
+    }
+  }
+  return subscriptions;
+}
+const saasIncreaseSubsCache = makeDurableCache('saas_increase_subs_durable_cache');
+const getSaasIncreaseSubscriptions = (opts) => saasIncreaseSubsCache.get(computeSaasIncreaseSubscriptions, opts);
+
+// GET /api/admin/saas-increase/subscriptions?q=&org=&plan= — every live/active subscription
+// eligible for a SaaS price increase, with merchant identity attached via merchant_saas_links.
+// Cached the same way as the other Billing reads (see makeDurableCache).
+app.get('/api/admin/saas-increase/subscriptions', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  try {
+    let rows = await getSaasIncreaseSubscriptions({ fresh: req.query.fresh === '1' });
+    const q = normName(req.query.q || '');
+    if (q) rows = rows.filter(s => normName(s.customerName).includes(q) || normName(s.subscriptionNumber).includes(q) || normName(s.merchantAccountId || '').includes(q));
+    if (req.query.org) rows = rows.filter(s => s.orgId === String(req.query.org));
+    if (req.query.plan) rows = rows.filter(s => s.planCode === String(req.query.plan));
+    res.json({ subscriptions: rows, orgs: ZOHO_BILLING_ORG_IDS.map(id => ({ id, name: ZOHO_BILLING_ORG_NAMES[id] || id })) });
+  } catch (e) { res.status(502).json({ error: 'saas_increase_subs_failed', detail: e.message }); }
+});
 
 // Shared: per-merchant combined revenue (monthly processing + linked SaaS) using the curated
 // merchant_saas_links. "Processing" here is transaction_profit_cents + other_revenue_cents (the
@@ -10150,7 +10307,7 @@ app.get('/api/pricing', authenticateToken, async (req, res) => {
     let canManage = req.user.isAdmin === true;
     if (!canManage && req.user.email) canManage = userHasPermission(await getUserPermissions(req.user.email), 'pricing:manage');
     const cats = (await pool.query(
-      `SELECT id, sort_order, hourly, note_en, note_fr, considerations_en, considerations_fr FROM pricing_categories ORDER BY sort_order`
+      `SELECT id, name_en, name_fr, sort_order, hourly, note_en, note_fr, considerations_en, considerations_fr FROM pricing_categories ORDER BY sort_order`
     )).rows;
     const pkgs = (await pool.query(`
       SELECT id, cat_id, name_en, name_fr, sku, sku_year, compat, pos, price_monthly, price_yearly, price_flat, unit, activation,
@@ -10162,7 +10319,8 @@ app.get('/api/pricing', authenticateToken, async (req, res) => {
     const guides = (await pool.query(`SELECT id, title_en, title_fr, body_en, body_fr FROM pricing_guides ORDER BY sort_order`)).rows;
     res.json({
       categories: cats.map(c => ({
-        id: c.id, sortOrder: c.sort_order, hourly: c.hourly != null ? parseFloat(c.hourly) : null,
+        id: c.id, nameEn: c.name_en || c.id, nameFr: c.name_fr || c.name_en || c.id,
+        sortOrder: c.sort_order, hourly: c.hourly != null ? parseFloat(c.hourly) : null,
         noteEn: c.note_en, noteFr: c.note_fr,
         considerationsEn: c.considerations_en || [], considerationsFr: c.considerations_fr || [],
       })),
@@ -10179,6 +10337,49 @@ app.get('/api/pricing', authenticateToken, async (req, res) => {
       })),
       guides: guides.map(g => ({ id: g.id, titleEn: g.title_en, titleFr: g.title_fr, bodyEn: g.body_en, bodyFr: g.body_fr })),
     });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/pricing/categories — add a new price-list category (id auto-derived from the EN
+// name). Saves immediately (categories are edited far less often than packages, so this skips
+// the stage/publish flow the package list uses).
+app.post('/api/pricing/categories', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'pricing:manage'))) return;
+  const nameEn = (req.body.nameEn || '').trim();
+  const nameFr = (req.body.nameFr || '').trim();
+  const hourly = req.body.hourly === '' || req.body.hourly == null ? null : parseFloat(req.body.hourly);
+  const noteEn = (req.body.noteEn || '').trim() || null;
+  const noteFr = (req.body.noteFr || '').trim() || null;
+  if (!nameEn) return res.status(400).json({ error: 'nameEn is required' });
+  const id = nameEn.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || `cat-${Date.now()}`;
+  try {
+    const maxSort = (await pool.query(`SELECT COALESCE(MAX(sort_order), -1) AS m FROM pricing_categories`)).rows[0].m;
+    const r = await pool.query(
+      `INSERT INTO pricing_categories (id, name_en, name_fr, sort_order, hourly, note_en, note_fr)
+       VALUES ($1,$2,$3,$4,$5,$6,$6) ON CONFLICT (id) DO NOTHING RETURNING id`,
+      [id, nameEn, nameFr || nameEn, maxSort + 1, hourly, noteEn]
+    );
+    if (r.rowCount === 0) return res.status(409).json({ error: 'A category with that name already exists' });
+    res.json({ success: true, id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/pricing/categories/:id — edit an existing category's name/hourly rate/note.
+app.put('/api/pricing/categories/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'pricing:manage'))) return;
+  const nameEn = (req.body.nameEn || '').trim();
+  const nameFr = (req.body.nameFr || '').trim();
+  const hourly = req.body.hourly === '' || req.body.hourly == null ? null : parseFloat(req.body.hourly);
+  const noteEn = (req.body.noteEn || '').trim() || null;
+  const noteFr = (req.body.noteFr || '').trim() || null;
+  if (!nameEn) return res.status(400).json({ error: 'nameEn is required' });
+  try {
+    const r = await pool.query(
+      `UPDATE pricing_categories SET name_en = $2, name_fr = $3, hourly = $4, note_en = $5, note_fr = $6 WHERE id = $1 RETURNING id`,
+      [req.params.id, nameEn, nameFr || nameEn, hourly, noteEn, noteFr || noteEn]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Category not found' });
+    res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
