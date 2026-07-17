@@ -888,16 +888,24 @@ async function initializeDatabase() {
       );
     }
     // One-time backfill: translate specs/use/warranty/note for the 52 products seeded before FR
-    // content was written (guarded on the FR column still exactly matching the EN column, i.e.
-    // still the placeholder copy — never touches a row an admin has since translated by hand).
+    // content was written. Guarded on each FR column still being either NULL or an exact copy of
+    // the EN column (the two shapes a never-translated row can be in) — never touches a row an
+    // admin has since translated by hand via the FR toggle, since a real translation won't match
+    // either shape.
     for (const p of hardwareSeed.products) {
       if (!p.specsFr && !p.useFr && !p.warrantyFr && !p.noteFr) continue;
-      await pool.query(
+      const r = await pool.query(
         `UPDATE hardware_products SET specs_fr = $2, use_fr = $3, warranty_fr = $4, note_fr = $5, updated_at = CURRENT_TIMESTAMP
-         WHERE id = $1 AND specs_fr = specs_en AND use_fr = use_en AND warranty_fr = warranty_en
-               AND (note_fr = note_en OR (note_fr IS NULL AND note_en IS NULL))`,
+         WHERE id = $1
+               AND (specs_fr = specs_en OR specs_fr IS NULL)
+               AND (use_fr = use_en OR use_fr IS NULL)
+               AND (warranty_fr = warranty_en OR warranty_fr IS NULL)
+               AND (note_fr = note_en OR note_fr IS NULL OR note_en IS NULL)`,
         [p.id, p.specsFr || p.specs, p.useFr || p.use, p.warrantyFr || p.warranty, p.noteFr || p.note || null]
       );
+      if (r.rowCount === 0) {
+        console.warn(`[fr-backfill] hardware_products ${p.id} not updated — FR content already diverges from EN (likely a manual admin edit, skipped as intended)`);
+      }
     }
     const pricingSeed = require('./seed/pricingSeed');
     for (const c of pricingSeed.categories) {
@@ -923,18 +931,22 @@ async function initializeDatabase() {
       );
     }
     // One-time backfill: translate includes/internal notes for packages seeded before FR content
-    // was written (guarded on the FR column still exactly matching the EN column — never touches
-    // a row an admin has since translated by hand via the Pricing editor's FR toggle).
+    // was written. Guarded on each FR column still being either NULL or an exact copy of the EN
+    // column — never touches a row an admin has since translated by hand.
     for (const p of pricingSeed.packages) {
       if (!p.includesFr && !p.internalFr) continue;
       const newIncludesFr = p.includesFr || p.includes || [];
       const newInternalFr = p.internalFr ? JSON.stringify(p.internalFr) : (p.internal ? JSON.stringify(p.internal) : null);
-      await pool.query(
+      const r = await pool.query(
         `UPDATE pricing_packages SET includes_fr = $2, internal_fr = $3, updated_at = CURRENT_TIMESTAMP
-         WHERE id = $1 AND includes_fr = includes_en
-               AND (internal_fr = internal_en OR (internal_fr IS NULL AND internal_en IS NULL))`,
+         WHERE id = $1
+               AND (includes_fr = includes_en OR includes_fr IS NULL)
+               AND (internal_fr = internal_en OR internal_fr IS NULL OR internal_en IS NULL)`,
         [p.id, newIncludesFr, newInternalFr]
       );
+      if (r.rowCount === 0) {
+        console.warn(`[fr-backfill] pricing_packages ${p.id} not updated — FR content already diverges from EN (likely a manual admin edit, skipped as intended)`);
+      }
     }
     for (const g of pricingSeed.guides) {
       await pool.query(
@@ -942,15 +954,21 @@ async function initializeDatabase() {
         [g.id, g.title, g.titleFr || g.title, g.body, g.bodyFr || g.body, pricingSeed.guides.indexOf(g)]
       );
     }
-    // One-time backfill: translate guide title/body for rows seeded before FR content was written
-    // (guarded on the FR columns still exactly matching EN — never clobbers a manual admin edit).
+    // One-time backfill: translate guide title/body for rows seeded before FR content was written.
+    // Guarded on each FR column still being either NULL or an exact copy of EN — never clobbers a
+    // manual admin edit.
     for (const g of pricingSeed.guides) {
       if (!g.titleFr && !g.bodyFr) continue;
-      await pool.query(
+      const r = await pool.query(
         `UPDATE pricing_guides SET title_fr = $2, body_fr = $3
-         WHERE id = $1 AND title_fr = title_en AND body_fr = body_en`,
+         WHERE id = $1
+               AND (title_fr = title_en OR title_fr IS NULL)
+               AND (body_fr = body_en OR body_fr IS NULL)`,
         [g.id, g.titleFr || g.title, g.bodyFr || g.body]
       );
+      if (r.rowCount === 0) {
+        console.warn(`[fr-backfill] pricing_guides ${g.id} not updated — FR content already diverges from EN (likely a manual admin edit, skipped as intended)`);
+      }
     }
     // 2026-07-16 one-time price correction: Menu Build Small/Medium/Large moved from "ask for
     // quote" to fixed flat prices ($250/$625/$1,125) + a category-count line + Floor Plan/2nd
