@@ -1658,6 +1658,21 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notified_by VARCHAR(255)`);
     await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notified_at TIMESTAMP`);
 
+    // Per-subscription insights for the SaaS Increase tool — subscription tenure + when the
+    // SaaS line's price last changed, both requiring a live Zoho call so they're precomputed by
+    // a nightly background job (runSaasSubscriptionInsightsScan) rather than fetched per page load.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS saas_subscription_insights (
+        subscription_number   VARCHAR(255) PRIMARY KEY,
+        activated_at          DATE,
+        last_price_change_at  DATE,
+        last_price_before     NUMERIC(12,2),
+        last_price_after      NUMERIC(12,2),
+        checked_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        check_error           TEXT
+      );
+    `);
+
     // Dedup log for probation-ending manager notifications (one row per rep/end-date/milestone).
     await pool.query(`
       CREATE TABLE IF NOT EXISTS probation_notifications (
@@ -6010,6 +6025,15 @@ function startAutoSync() {
     checkProbationNotifications();
     setInterval(checkProbationNotifications, 24 * 60 * 60 * 1000);
   }, 3 * 60 * 1000);
+
+  // SaaS Increase insights (subscription tenure + last price change) — one live Zoho call per
+  // subscription, so nightly not hourly. First run ~20 min after boot, then every 24h.
+  setTimeout(() => {
+    runSaasSubscriptionInsightsScan().catch(e => console.warn('[saas-insights] scheduled run failed:', e.message));
+    setInterval(() => {
+      runSaasSubscriptionInsightsScan().catch(e => console.warn('[saas-insights] scheduled run failed:', e.message));
+    }, 24 * 60 * 60 * 1000);
+  }, 20 * 60 * 1000);
 }
 
 function stopAutoSync() {
@@ -7573,12 +7597,35 @@ app.get('/api/admin/saas-increase/subscriptions', authenticateToken, async (req,
   if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
   try {
     let rows = await getSaasIncreaseSubscriptions({ fresh: req.query.fresh === '1' });
+    // Attach the nightly-precomputed insights (tenure + last price change) — null until the
+    // first background scan completes for a given subscription (see runSaasSubscriptionInsightsScan).
+    const insightsRes = await pool.query(`SELECT * FROM saas_subscription_insights`);
+    const insightsByNum = new Map(insightsRes.rows.map(r => [r.subscription_number, r]));
+    rows = rows.map(s => {
+      const i = insightsByNum.get(s.subscriptionNumber);
+      return {
+        ...s,
+        activatedAt: i?.activated_at || null,
+        lastPriceChangeAt: i?.last_price_change_at || null,
+        lastPriceBefore: i?.last_price_before != null ? Number(i.last_price_before) : null,
+        lastPriceAfter: i?.last_price_after != null ? Number(i.last_price_after) : null,
+        insightsCheckedAt: i?.checked_at || null,
+      };
+    });
     const q = normName(req.query.q || '');
     if (q) rows = rows.filter(s => normName(s.customerName).includes(q) || normName(s.subscriptionNumber).includes(q) || normName(s.merchantAccountId || '').includes(q));
     if (req.query.org) rows = rows.filter(s => s.orgId === String(req.query.org));
     if (req.query.plan) rows = rows.filter(s => s.planCode === String(req.query.plan));
     res.json({ subscriptions: rows, orgs: ZOHO_BILLING_ORG_IDS.map(id => ({ id, name: ZOHO_BILLING_ORG_NAMES[id] || id })) });
   } catch (e) { res.status(502).json({ error: 'saas_increase_subs_failed', detail: e.message }); }
+});
+
+// POST /api/admin/saas-increase/insights/refresh — fire-and-forget: kicks off the nightly
+// tenure + last-price-change scan on demand instead of waiting for the next scheduled run.
+app.post('/api/admin/saas-increase/insights/refresh', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  runSaasSubscriptionInsightsScan().catch(e => console.error('[saas-insights] manual run failed:', e.message));
+  res.json({ started: true });
 });
 
 function r2Money(n) { return Math.round((Number(n) || 0) * 100) / 100; }
@@ -7860,6 +7907,127 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
     res.json({ results });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// ── SaaS Increase: nightly subscription insights (tenure + last price change) ──────────────
+// Both need a live per-subscription Zoho call, so — per a 2026-07 decision — they're
+// precomputed by this background job (registered on the worker dyno in startAutoSync) rather
+// than fetched per page load. classifyLineType/zoho_plans are the same SaaS/hardware
+// classification already used by invoice enrichment (see PHASE 1b above).
+const SAAS_INSIGHTS_INVOICE_LOOKBACK = 24; // most recent N invoices per customer — bounds worst-case API cost
+const SAAS_INSIGHTS_DELAY_MS = 250; // per-subscription throttle, rate-limit friendly for an overnight job
+
+async function fetchSaasSubscriptionTenure(apiDomain, accessToken, orgId, subscriptionId) {
+  if (!subscriptionId) return null;
+  const r = await axios.get(`${apiDomain}/billing/v1/subscriptions/${subscriptionId}`, {
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, 'X-com-zoho-subscriptions-organizationid': orgId },
+    validateStatus: () => true,
+  });
+  if (r.status !== 200) return null;
+  const sub = r.data?.subscription;
+  const raw = sub?.activated_at || sub?.current_term_starts_at || sub?.start_date;
+  if (!raw) return null;
+  const d = (typeof raw === 'number' || /^\d+$/.test(String(raw))) ? new Date(parseInt(raw) * 1000) : new Date(raw);
+  return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+}
+
+// Walks a customer's Books invoices (newest-first, capped at SAAS_INSIGHTS_INVOICE_LOOKBACK)
+// that belong to THIS subscription (recurring_invoice_id match), isolates the SaaS line's
+// amount per invoice via the existing classifyLineType helper, and returns the most recent
+// point where that amount differs from the invoice right before it. Null = no change found
+// within the lookback window (not necessarily "never changed" — see the check_error/lookback
+// cap caveat in the plan).
+async function fetchSaasPriceChange(apiDomain, accessToken, orgId, subscriptionId, customerId, planCodes, planNames) {
+  if (!customerId || !subscriptionId) return null;
+  const listRes = await axios.get(`${apiDomain}/books/v3/invoices`, {
+    params: { organization_id: orgId, customer_id: customerId, sort_column: 'date', sort_order: 'D', per_page: SAAS_INSIGHTS_INVOICE_LOOKBACK },
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+    validateStatus: () => true,
+  });
+  if (listRes.status !== 200) throw new Error(`invoice list HTTP ${listRes.status}`);
+  const stubs = listRes.data?.invoices || [];
+  const points = []; // { date, amount } newest-first
+  for (const stub of stubs) {
+    let full = stub;
+    // Fetch detail only if we don't already know this invoice belongs to our subscription
+    // (some Zoho Books list responses omit recurring_invoice_id on the summary object).
+    if (full.recurring_invoice_id === undefined) {
+      const detRes = await axios.get(`${apiDomain}/books/v3/invoices/${stub.invoice_id}`, {
+        params: { organization_id: orgId }, headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
+      });
+      if (detRes.status !== 200) continue;
+      full = detRes.data?.invoice;
+      if (!full) continue;
+    }
+    if (String(full.recurring_invoice_id || '') !== String(subscriptionId)) continue;
+    // Need line items to isolate the SaaS amount — fetch detail if all we had was the list stub.
+    if (!Array.isArray(full.line_items)) {
+      const detRes = await axios.get(`${apiDomain}/books/v3/invoices/${stub.invoice_id}`, {
+        params: { organization_id: orgId }, headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
+      });
+      if (detRes.status !== 200) continue;
+      full = detRes.data?.invoice;
+      if (!full) continue;
+    }
+    const saasAmount = (full.line_items || [])
+      .filter(li => classifyLineType(li.name, li.sku || li.item_code, planCodes, planNames) === 'saas')
+      .reduce((s, li) => { const it = parseFloat(li.item_total); return s + (Number.isFinite(it) ? it : ((parseFloat(li.rate) * parseInt(li.quantity)) || 0)); }, 0);
+    points.push({ date: full.date, amount: Math.round(saasAmount * 100) / 100 });
+    await new Promise(r => setTimeout(r, 150));
+  }
+  for (let i = 0; i < points.length - 1; i++) {
+    if (points[i].amount !== points[i + 1].amount) {
+      return { date: points[i].date, before: points[i + 1].amount, after: points[i].amount };
+    }
+  }
+  return null;
+}
+
+let saasInsightsScanRunning = false;
+async function runSaasSubscriptionInsightsScan() {
+  if (saasInsightsScanRunning) { console.log('[saas-insights] scan already running, skipping'); return; }
+  saasInsightsScanRunning = true;
+  try {
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    const booksOrgId = process.env.ZOHO_ORG_ID;
+    const plansRes = await pool.query('SELECT plan_code, name FROM zoho_plans');
+    const planCodes = new Set(plansRes.rows.map(r => (r.plan_code || '').toLowerCase().trim()));
+    const normalizeName = (s) => (s || '').toLowerCase().replace(/^\*+/, '').replace(/\s+/g, ' ').trim();
+    const planNames = new Map();
+    for (const p of plansRes.rows) { const k = normalizeName(p.name); if (k) planNames.set(k, p.plan_code); }
+
+    const subs = await getSaasIncreaseSubscriptions();
+    console.log(`[saas-insights] scanning ${subs.length} subscriptions...`);
+    let ok = 0, failed = 0;
+    for (const s of subs) {
+      try {
+        const activatedAt = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
+        const change = await fetchSaasPriceChange(apiDomain, accessToken, booksOrgId, s.subscriptionId, s.customerId, planCodes, planNames);
+        await pool.query(`
+          INSERT INTO saas_subscription_insights (subscription_number, activated_at, last_price_change_at, last_price_before, last_price_after, checked_at, check_error)
+          VALUES ($1, $2, $3, $4, $5, NOW(), NULL)
+          ON CONFLICT (subscription_number) DO UPDATE SET
+            activated_at = $2, last_price_change_at = $3, last_price_before = $4, last_price_after = $5, checked_at = NOW(), check_error = NULL`,
+          [s.subscriptionNumber, activatedAt, change?.date || null, change?.before ?? null, change?.after ?? null]
+        );
+        ok++;
+      } catch (e) {
+        failed++;
+        await pool.query(`
+          INSERT INTO saas_subscription_insights (subscription_number, checked_at, check_error)
+          VALUES ($1, NOW(), $2)
+          ON CONFLICT (subscription_number) DO UPDATE SET checked_at = NOW(), check_error = $2`,
+          [s.subscriptionNumber, e.message]
+        ).catch(() => {});
+      }
+      await new Promise(r => setTimeout(r, SAAS_INSIGHTS_DELAY_MS));
+    }
+    console.log(`[saas-insights] scan complete: ${ok} ok, ${failed} failed`);
+  } catch (e) {
+    console.error('[saas-insights] scan failed:', e.message);
+  } finally {
+    saasInsightsScanRunning = false;
+  }
+}
 
 // Shared: per-merchant combined revenue (monthly processing + linked SaaS) using the curated
 // merchant_saas_links. "Processing" here is transaction_profit_cents + other_revenue_cents (the
