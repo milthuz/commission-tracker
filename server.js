@@ -7915,6 +7915,12 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
 // classification already used by invoice enrichment (see PHASE 1b above).
 const SAAS_INSIGHTS_INVOICE_LOOKBACK = 24; // most recent N invoices per customer — bounds worst-case API cost
 const SAAS_INSIGHTS_DELAY_MS = 250; // per-subscription throttle, rate-limit friendly for an overnight job
+// Skip subscriptions checked more recently than this — without it, every run (nightly or manual)
+// rescans EVERY subscription from scratch, which at real-world scale (thousands of subscriptions,
+// each needing several Zoho calls) can take hours and burn through a large share of the org's daily
+// API quota on every single invocation. 20h (not 24h) keeps a manual refresh the day after a
+// scheduled run from being a no-op while still preventing back-to-back full rescans.
+const SAAS_INSIGHTS_RESCAN_AFTER_HOURS = 20;
 
 async function fetchSaasSubscriptionTenure(apiDomain, accessToken, orgId, subscriptionId) {
   if (!subscriptionId) return null;
@@ -7995,8 +8001,13 @@ async function runSaasSubscriptionInsightsScan() {
     const planNames = new Map();
     for (const p of plansRes.rows) { const k = normalizeName(p.name); if (k) planNames.set(k, p.plan_code); }
 
-    const subs = await getSaasIncreaseSubscriptions();
-    console.log(`[saas-insights] scanning ${subs.length} subscriptions...`);
+    const allSubs = await getSaasIncreaseSubscriptions();
+    const freshRes = await pool.query(
+      `SELECT subscription_number FROM saas_subscription_insights WHERE checked_at > NOW() - INTERVAL '${SAAS_INSIGHTS_RESCAN_AFTER_HOURS} hours'`
+    );
+    const freshNumbers = new Set(freshRes.rows.map(r => r.subscription_number));
+    const subs = allSubs.filter(s => !freshNumbers.has(s.subscriptionNumber));
+    console.log(`[saas-insights] scanning ${subs.length} of ${allSubs.length} subscriptions (${freshNumbers.size} skipped, checked within ${SAAS_INSIGHTS_RESCAN_AFTER_HOURS}h)...`);
     let ok = 0, failed = 0;
     for (const s of subs) {
       try {
