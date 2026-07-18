@@ -7558,6 +7558,11 @@ const getBillingCustomers = (opts) => billingCustomersCache.get(computeBillingCu
 // Reuses fetchBillingSubs (same underlying Zoho call as computeBillingCustomers above) but keeps
 // the extra per-subscription fields the simulator needs (org, customer/subscription ids,
 // plan_code) that the MRR-matching cache doesn't retain.
+// Filtered to MRR_STATUSES (not the broader ACTIVE_STATUSES used elsewhere) — paused
+// subscriptions bring in $0/mo, so they're excluded here entirely rather than left in the table
+// as editable-but-not-counted rows (which would mean typing an increase on one silently didn't
+// move the MRR stats/progress bar). This also keeps "Current MRR" comparable to the board
+// dashboard's official MRR tile, which uses the same MRR_STATUSES definition.
 async function computeSaasIncreaseSubscriptions() {
   const { accessToken, apiDomain } = await getAdminBooksAuth();
   const perOrgAll = await Promise.all(
@@ -7571,7 +7576,7 @@ async function computeSaasIncreaseSubscriptions() {
   const subscriptions = [];
   for (const { orgId, subs } of perOrgAll) {
     for (const s of subs) {
-      if (!ACTIVE_STATUSES.has(String(s.status || '').toLowerCase())) continue;
+      if (!MRR_STATUSES.has(String(s.status || '').toLowerCase())) continue;
       const num = String(s.subscription_number || '').trim();
       if (!num) continue;
       subscriptions.push({
