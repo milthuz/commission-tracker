@@ -10959,6 +10959,164 @@ app.put('/api/pricing', authenticateToken, async (req, res) => {
   } finally { client.release(); }
 });
 
+// Cluster-branded (not Sales Hub) quote PDF — same navy/orange palette and layout idiom as
+// buildPayrollPdf, but wearing the CUSTOMER-facing Cluster brand (cluster_logo.png, #fe6523)
+// since this document goes to a merchant, matching the Proposal Builder's cover convention.
+function buildQuotePdf({ items, clientName, repName, repEmail, lang, billing }) {
+  const isFr = lang === 'fr';
+  return new Promise((resolve, reject) => {
+    try {
+      const doc = new PDFDocument({ size: 'LETTER', margin: 40 });
+      const chunks = [];
+      doc.on('data', (c) => chunks.push(c));
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const L = 40, R = 572, W = R - L, AMT_X = R - 96;
+      const C = { navy: '#1c2434', orange: '#fe6523', gray: '#475569', light: '#94a3b8', zebra: '#fafbfd', line: '#e8edf3' };
+      const ensure = (h) => { if (doc.y + h > 730) doc.addPage(); };
+      const logoPath = require('path').join(PROPOSAL_ASSETS, 'cluster_logo.png');
+      const locale = isFr ? 'fr-CA' : 'en-CA';
+      const now = new Date();
+      const validUntil = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+      const fmtDate = (d) => d.toLocaleDateString(locale, { year: 'numeric', month: 'long', day: 'numeric' });
+
+      const T = isFr ? {
+        title: 'Soumission', preparedFor: 'Préparé pour', preparedBy: 'Préparé par', validUntil: 'Valide jusqu’au',
+        item: 'Article', qty: 'Qté', unitPrice: 'Prix unitaire', amount: 'Montant', noSku: 'Aucun NP',
+        recurring: billing === 'yearly' ? 'Récurrent — annuel' : 'Récurrent — mensuel',
+        oneTime: 'Frais uniques', totalRecurring: billing === 'yearly' ? 'Total récurrent / an' : 'Total récurrent / mois',
+        totalOneTime: 'Total frais uniques',
+        footer: 'Cette soumission est une estimation et sujette à confirmation. Valide 30 jours.',
+      } : {
+        title: 'Quote', preparedFor: 'Prepared for', preparedBy: 'Prepared by', validUntil: 'Valid until',
+        item: 'Item', qty: 'Qty', unitPrice: 'Unit price', amount: 'Amount', noSku: 'No SKU',
+        recurring: billing === 'yearly' ? 'Recurring — yearly' : 'Recurring — monthly',
+        oneTime: 'One-time', totalRecurring: billing === 'yearly' ? 'Total recurring / year' : 'Total recurring / month',
+        totalOneTime: 'Total one-time',
+        footer: 'This quote is an estimate and subject to confirmation. Valid for 30 days.',
+      };
+
+      // Header band
+      doc.rect(0, 0, 612, 6).fill(C.orange);
+      doc.rect(0, 6, 612, 74).fill(C.navy);
+      try { doc.image(logoPath, L, 24, { width: 110 }); } catch (_e) { /* optional */ }
+      doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text(T.title.toUpperCase(), L, 26, { width: W, align: 'right', characterSpacing: 1.5 });
+      doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(15).text(fmtDate(now), L, 42, { width: W, align: 'right' });
+      const my = 96;
+      const meta = [[T.preparedFor, clientName || '—'], [T.preparedBy, repName || '—'], [T.validUntil, fmtDate(validUntil)]];
+      const cw = W / 3;
+      meta.forEach((m, i) => {
+        const x = L + i * cw;
+        doc.fillColor(C.light).font('Helvetica-Bold').fontSize(7).text(m[0], x, my, { characterSpacing: 1 });
+        doc.fillColor(C.navy).font('Helvetica-Bold').fontSize(11).text(m[1], x, my + 11, { width: cw - 8, ellipsis: true });
+      });
+      doc.y = my + 40;
+      doc.moveTo(L, doc.y).lineTo(R, doc.y).strokeColor(C.line).lineWidth(1).stroke();
+      doc.y += 16;
+
+      const sectionHead = (title) => {
+        ensure(46);
+        doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text(title, L, doc.y, { characterSpacing: 1.5 });
+        doc.y += 15;
+        const hy = doc.y;
+        doc.fillColor(C.light).font('Helvetica-Bold').fontSize(7);
+        doc.text(T.item, L + 2, hy, { characterSpacing: 0.5 });
+        doc.text(T.qty, L + 330, hy, { width: 40, align: 'center', characterSpacing: 0.5 });
+        doc.text(T.unitPrice, L + 375, hy, { width: 75, align: 'right', characterSpacing: 0.5 });
+        doc.text(T.amount, AMT_X, hy, { width: 92, align: 'right', characterSpacing: 0.5 });
+        doc.y = hy + 11;
+        doc.moveTo(L, doc.y).lineTo(R, doc.y).strokeColor(C.navy).lineWidth(1).stroke();
+        doc.y += 5;
+      };
+      const row = (name, sku, qty, unitAmt, i) => {
+        ensure(22);
+        const y = doc.y;
+        if (i % 2) doc.rect(L, y - 3, W, 21).fill(C.zebra);
+        doc.fillColor(C.navy).font('Helvetica-Bold').fontSize(9).text(String(name || ''), L + 2, y, { width: 300, ellipsis: true });
+        doc.fillColor(C.light).font('Helvetica').fontSize(7).text(sku || T.noSku, L + 2, y + 11, { width: 300, ellipsis: true });
+        doc.fillColor(C.gray).font('Helvetica').fontSize(9).text(String(qty), L + 330, y + 2, { width: 40, align: 'center' });
+        doc.fillColor(C.gray).text(money(unitAmt), L + 375, y + 2, { width: 75, align: 'right' });
+        doc.fillColor(C.navy).font('Helvetica-Bold').fontSize(9).text(money(unitAmt * qty), AMT_X, y + 2, { width: 92, align: 'right' });
+        doc.y = y + 24;
+      };
+
+      const recItems = items.filter((it) => it.recurring);
+      const oneTimeItems = items.filter((it) => !it.recurring);
+      if (recItems.length) {
+        sectionHead(T.recurring);
+        recItems.forEach((it, i) => row(it.name, it.sku, it.qty, it.unitAmt, i));
+        doc.y += 6;
+      }
+      if (oneTimeItems.length) {
+        sectionHead(T.oneTime);
+        oneTimeItems.forEach((it, i) => row(it.name, it.sku, it.qty, it.unitAmt, i));
+        doc.y += 6;
+      }
+
+      const recTotal = recItems.reduce((s, it) => s + it.qty * it.unitAmt, 0);
+      const oneTimeTotal = oneTimeItems.reduce((s, it) => s + it.qty * it.unitAmt, 0);
+      const bothTotals = recTotal > 0 && oneTimeTotal > 0;
+      ensure(bothTotals ? 78 : 56);
+      doc.y += 8;
+      const by = doc.y, bx = R - 268, boxH = bothTotals ? 62 : 40;
+      doc.roundedRect(bx, by, 268, boxH, 9).fillAndStroke('#fff4ec', '#f7c8ab');
+      let ty = by + 15;
+      if (recTotal > 0) {
+        doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text(T.totalRecurring, bx + 16, ty, { characterSpacing: 1 });
+        doc.fillColor(C.navy).font('Helvetica-Bold').fontSize(16).text(money(recTotal), bx + 16, ty - 4, { width: 236, align: 'right' });
+        ty += 24;
+      }
+      if (oneTimeTotal > 0) {
+        doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text(T.totalOneTime, bx + 16, ty, { characterSpacing: 1 });
+        doc.fillColor(C.navy).font('Helvetica-Bold').fontSize(16).text(money(oneTimeTotal), bx + 16, ty - 4, { width: 236, align: 'right' });
+      }
+      doc.y = by + boxH + 16;
+
+      doc.fillColor(C.light).font('Helvetica-Oblique').fontSize(7.5).text(T.footer, L, doc.y, { continued: true })
+        .font('Helvetica').text('     clusterpos.com', { align: 'left' });
+
+      doc.end();
+    } catch (e) { reject(e); }
+  });
+}
+
+// POST /api/pricing/quote/pdf — builds a formal Cluster-branded quote PDF for a merchant from
+// items the rep staged in the Pricing Guide's quote tray. Prices are re-fetched from the DB by id
+// (never trusted from the client) so a rep can't hand a merchant a PDF with edited numbers.
+app.post('/api/pricing/quote/pdf', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'pricing:view'))) return;
+  const { items, clientName, billing, lang } = req.body || {};
+  if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items required' });
+  try {
+    const ids = items.map((it) => String(it.id));
+    const rows = (await pool.query(
+      `SELECT id, name_en, name_fr, sku, price_monthly, price_yearly, price_flat
+         FROM pricing_packages WHERE id = ANY($1) AND visible = true`,
+      [ids]
+    )).rows;
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const isFr = lang === 'fr';
+    const built = items.map((it) => {
+      const p = byId.get(String(it.id));
+      if (!p) return null;
+      const qty = Math.max(1, parseInt(it.qty, 10) || 1);
+      let unitAmt = 0, recurring = false;
+      if (billing === 'yearly' && p.price_yearly != null) { unitAmt = Number(p.price_yearly); recurring = true; }
+      else if (p.price_monthly != null) { unitAmt = Number(p.price_monthly); recurring = true; }
+      else if (p.price_flat != null) { unitAmt = Number(p.price_flat); recurring = false; }
+      return { name: (isFr && p.name_fr) ? p.name_fr : p.name_en, sku: p.sku, qty, unitAmt, recurring };
+    }).filter(Boolean);
+    if (!built.length) return res.status(400).json({ error: 'no valid items' });
+    const repName = req.user.name || req.user.email || '';
+    const pdf = await buildQuotePdf({
+      items: built, clientName: (clientName || '').trim(), repName, repEmail: req.user.email || '',
+      lang: isFr ? 'fr' : 'en', billing: billing === 'yearly' ? 'yearly' : 'monthly',
+    });
+    const safeClient = (clientName || 'quote').toString().replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '').slice(0, 60) || 'quote';
+    res.json({ pdfBase64: Buffer.from(pdf).toString('base64'), fileName: `Cluster_Quote_${safeClient}.pdf` });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/resellers/unassigned-emails — reseller emails seen in activations but not mapped to any reseller
 app.get('/api/resellers/unassigned-emails', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'reseller:view'))) return;
