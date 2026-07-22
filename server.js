@@ -1720,6 +1720,28 @@ async function initializeDatabase() {
     // otherwise look identical as last_price_change_at = NULL).
     await pool.query(`ALTER TABLE saas_subscription_insights ADD COLUMN IF NOT EXISTS price_points_checked INTEGER`);
 
+    // Historical churn dataset for the SaaS Increase risk-score calibration — one row per
+    // CANCELLED subscription (a completed event), separate from saas_subscription_insights
+    // above (a live-subscription "current state" snapshot with no cancellation concept).
+    // Populated by runSaasChurnHistoryBackfill; used to replace the risk heuristic's hand-picked
+    // weights with observed churn rates once there's enough real data per bucket.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS saas_churn_events (
+        subscription_number       VARCHAR(255) PRIMARY KEY,
+        org_id                     VARCHAR(20),
+        activated_at               DATE,
+        cancelled_at               DATE,
+        had_price_increase         BOOLEAN NOT NULL DEFAULT false,
+        last_increase_at           DATE,
+        last_increase_before       NUMERIC(12,2),
+        last_increase_after        NUMERIC(12,2),
+        tenure_months_at_increase  NUMERIC(6,1),
+        months_increase_to_cancel  NUMERIC(6,1),
+        checked_at                 TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        check_error                TEXT
+      );
+    `);
+
     // Dedup log for probation-ending manager notifications (one row per rep/end-date/milestone).
     await pool.query(`
       CREATE TABLE IF NOT EXISTS probation_notifications (
@@ -6090,6 +6112,15 @@ function startAutoSync() {
       runSaasSubscriptionInsightsScan().catch(e => console.warn('[saas-insights] scheduled run failed:', e.message));
     }, 24 * 60 * 60 * 1000);
   }, 20 * 60 * 1000);
+
+  // SaaS Increase churn-history backfill (cancelled subscriptions) — weekly, not nightly;
+  // this history barely changes day to day. First run ~30 min after boot, then every 7 days.
+  setTimeout(() => {
+    runSaasChurnHistoryBackfill().catch(e => console.warn('[saas-churn] scheduled run failed:', e.message));
+    setInterval(() => {
+      runSaasChurnHistoryBackfill().catch(e => console.warn('[saas-churn] scheduled run failed:', e.message));
+    }, 7 * 24 * 60 * 60 * 1000);
+  }, 30 * 60 * 1000);
 }
 
 function stopAutoSync() {
@@ -7726,6 +7757,98 @@ app.post('/api/admin/saas-increase/insights/refresh', authenticateToken, async (
   res.json({ started: true });
 });
 
+// POST /api/admin/saas-increase/churn-history/refresh — fire-and-forget: kicks off the weekly
+// cancelled-subscription backfill on demand instead of waiting for the next scheduled run.
+app.post('/api/admin/saas-increase/churn-history/refresh', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  runSaasChurnHistoryBackfill().catch(e => console.error('[saas-churn] manual run failed:', e.message));
+  res.json({ started: true });
+});
+
+// GET /api/admin/saas-increase/churn-history/calibration — observed churn rates by
+// (increase-size × tenure-at-increase) bucket, computed on demand from saas_churn_events
+// (cancelled subscriptions) + saas_subscription_insights (live subscriptions that already have
+// a recorded increase — no extra Zoho calls needed for that side). Cheap enough (a few thousand
+// rows at most) to compute fresh on every request rather than caching. Buckets below
+// SAAS_CALIBRATION_MIN_SAMPLE are flagged insufficientData — the frontend falls back to its
+// hand-picked default weight for those rather than trusting a rate from a handful of examples.
+const SAAS_CALIBRATION_MIN_SAMPLE = 15;
+const SAAS_CALIBRATION_CHURN_WINDOW_MONTHS = 12; // only attribute a cancellation to an increase within this window
+function saasCalibrationSizeBucket(pct) {
+  if (pct == null || !Number.isFinite(pct)) return null;
+  if (pct <= 5) return '0-5';
+  if (pct <= 15) return '5-15';
+  return '15+';
+}
+function saasCalibrationTenureBucket(months) {
+  if (months == null || !Number.isFinite(months)) return null;
+  if (months < 6) return '<6';
+  if (months < 12) return '6-12';
+  return '12+';
+}
+app.get('/api/admin/saas-increase/churn-history/calibration', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  try {
+    const churnRows = (await pool.query(`SELECT * FROM saas_churn_events WHERE check_error IS NULL`)).rows;
+    const liveRows = (await pool.query(`SELECT * FROM saas_subscription_insights WHERE check_error IS NULL`)).rows;
+
+    const buckets = new Map(); // "size|tenure" -> { churned, stillLive }
+    const bucketFor = (key) => {
+      if (!buckets.has(key)) buckets.set(key, { churned: 0, stillLive: 0 });
+      return buckets.get(key);
+    };
+
+    let baselineChurned = 0, baselineStillLive = 0;
+    for (const row of churnRows) {
+      if (!row.had_price_increase) { baselineChurned++; continue; }
+      const before = Number(row.last_increase_before), after = Number(row.last_increase_after);
+      const pct = before > 0 ? ((after - before) / before) * 100 : null;
+      const sizeB = saasCalibrationSizeBucket(pct);
+      const tenureB = saasCalibrationTenureBucket(row.tenure_months_at_increase != null ? Number(row.tenure_months_at_increase) : null);
+      const withinWindow = row.months_increase_to_cancel != null && Number(row.months_increase_to_cancel) <= SAAS_CALIBRATION_CHURN_WINDOW_MONTHS;
+      if (sizeB && tenureB && withinWindow) bucketFor(`${sizeB}|${tenureB}`).churned++;
+    }
+    for (const row of liveRows) {
+      if (!row.last_price_change_at) {
+        // Only count as a confident "no increase" baseline example once enough invoice
+        // history was actually compared — otherwise "never checked" looks identical to
+        // "confirmed no increase" (same caveat as the main table's own notEnoughHistory badge).
+        if (row.price_points_checked != null && Number(row.price_points_checked) >= 2) baselineStillLive++;
+        continue;
+      }
+      const before = Number(row.last_price_before), after = Number(row.last_price_after);
+      const pct = before > 0 ? ((after - before) / before) * 100 : null;
+      const tenureMonths = row.activated_at
+        ? (new Date(row.last_price_change_at).getTime() - new Date(row.activated_at).getTime()) / (30 * 24 * 3600 * 1000)
+        : null;
+      const sizeB = saasCalibrationSizeBucket(pct);
+      const tenureB = saasCalibrationTenureBucket(tenureMonths);
+      if (sizeB && tenureB) bucketFor(`${sizeB}|${tenureB}`).stillLive++;
+    }
+
+    const bucketResults = Array.from(buckets.entries()).map(([key, v]) => {
+      const [sizeBucket, tenureBucket] = key.split('|');
+      const n = v.churned + v.stillLive;
+      return {
+        sizeBucket, tenureBucket, n, churned: v.churned, stillLive: v.stillLive,
+        observedRate: n > 0 ? r2Money((v.churned / n) * 100) / 100 : null,
+        insufficientData: n < SAAS_CALIBRATION_MIN_SAMPLE,
+      };
+    });
+    const baselineN = baselineChurned + baselineStillLive;
+    res.json({
+      buckets: bucketResults,
+      baseline: {
+        n: baselineN, churned: baselineChurned, stillLive: baselineStillLive,
+        observedRate: baselineN > 0 ? r2Money((baselineChurned / baselineN) * 100) / 100 : null,
+        insufficientData: baselineN < SAAS_CALIBRATION_MIN_SAMPLE,
+      },
+      minSample: SAAS_CALIBRATION_MIN_SAMPLE,
+      computedAt: new Date().toISOString(),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 function r2Money(n) { return Math.round((Number(n) || 0) * 100) / 100; }
 function saasIncreaseNewMonthly(current, type, value) {
   const c = Number(current) || 0;
@@ -8155,19 +8278,27 @@ const SAAS_INSIGHTS_DELAY_MS = 250; // per-subscription throttle, rate-limit fri
 // API quota on every single invocation. 20h (not 24h) keeps a manual refresh the day after a
 // scheduled run from being a no-op while still preventing back-to-back full rescans.
 const SAAS_INSIGHTS_RESCAN_AFTER_HOURS = 20;
+// Cancelled-subscription history barely changes week to week (only newly-cancelled subs need
+// picking up) — a much longer skip-if-fresh window than the live-subscription scan above.
+const SAAS_CHURN_RESCAN_AFTER_DAYS = 7;
 
 async function fetchSaasSubscriptionTenure(apiDomain, accessToken, orgId, subscriptionId) {
-  if (!subscriptionId) return null;
+  if (!subscriptionId) return { activatedAt: null, cancelledAt: null };
   const r = await axios.get(`${apiDomain}/billing/v1/subscriptions/${subscriptionId}`, {
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, 'X-com-zoho-subscriptions-organizationid': orgId },
     validateStatus: () => true,
   });
-  if (r.status !== 200) return null;
+  if (r.status !== 200) return { activatedAt: null, cancelledAt: null };
   const sub = r.data?.subscription;
-  const raw = sub?.activated_at || sub?.current_term_starts_at || sub?.start_date;
-  if (!raw) return null;
-  const d = (typeof raw === 'number' || /^\d+$/.test(String(raw))) ? new Date(parseInt(raw) * 1000) : new Date(raw);
-  return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+  const toDate = (raw) => {
+    if (!raw) return null;
+    const d = (typeof raw === 'number' || /^\d+$/.test(String(raw))) ? new Date(parseInt(raw) * 1000) : new Date(raw);
+    return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+  };
+  return {
+    activatedAt: toDate(sub?.activated_at || sub?.current_term_starts_at || sub?.start_date),
+    cancelledAt: toDate(sub?.cancelled_at),
+  };
 }
 
 // Walks a customer's Books invoices (newest-first, capped at SAAS_INSIGHTS_INVOICE_LOOKBACK)
@@ -8212,13 +8343,24 @@ async function fetchSaasPriceChange(apiDomain, accessToken, orgId, subscriptionI
       full = detRes.data?.invoice;
       if (!full) continue;
     }
-    const saasAmount = (full.line_items || [])
-      .filter(li => classifyLineType(li.name, li.sku || li.item_code, planCodes, planNames) === 'saas')
-      .reduce((s, li) => { const it = parseFloat(li.item_total); return s + (Number.isFinite(it) ? it : ((parseFloat(li.rate) * parseInt(li.quantity)) || 0)); }, 0);
-    points.push({ date: full.date, amount: Math.round(saasAmount * 100) / 100 });
+    const saasLines = (full.line_items || [])
+      .filter(li => classifyLineType(li.name, li.sku || li.item_code, planCodes, planNames) === 'saas');
+    const lineAmount = (li) => { const it = parseFloat(li.item_total); return Number.isFinite(it) ? it : ((parseFloat(li.rate) * parseInt(li.quantity)) || 0); };
+    const saasAmount = saasLines.reduce((s, li) => s + lineAmount(li), 0);
+    // Representative plan_code for this invoice — the largest single SaaS line — so a plan
+    // upgrade/downgrade (different sku, still classified 'saas') is distinguishable from a
+    // same-plan price change instead of being silently counted as one.
+    const repPlanCode = saasLines.reduce((best, li) => {
+      const amt = lineAmount(li);
+      return (!best || amt > best.amt) ? { amt, sku: (li.sku || li.item_code || '').toLowerCase().trim() || null } : best;
+    }, null)?.sku || null;
+    points.push({ date: full.date, amount: Math.round(saasAmount * 100) / 100, planCode: repPlanCode });
     await new Promise(r => setTimeout(r, 150));
   }
   for (let i = 0; i < points.length - 1; i++) {
+    // Both plan_codes known and different → a plan swap, not a same-plan price change; keep
+    // scanning further back for the next comparable same-plan pair instead of stopping here.
+    if (points[i].planCode && points[i + 1].planCode && points[i].planCode !== points[i + 1].planCode) continue;
     if (points[i].amount !== points[i + 1].amount) {
       return { points: points.length, change: { date: points[i].date, before: points[i + 1].amount, after: points[i].amount } };
     }
@@ -8249,7 +8391,7 @@ async function runSaasSubscriptionInsightsScan() {
     let ok = 0, failed = 0;
     for (const s of subs) {
       try {
-        const activatedAt = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
+        const { activatedAt } = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
         const { points, change } = await fetchSaasPriceChange(apiDomain, accessToken, booksOrgId, s.subscriptionId, s.customerId, planCodes, planNames);
         await pool.query(`
           INSERT INTO saas_subscription_insights (subscription_number, activated_at, last_price_change_at, last_price_before, last_price_after, price_points_checked, checked_at, check_error)
@@ -8275,6 +8417,85 @@ async function runSaasSubscriptionInsightsScan() {
     console.error('[saas-insights] scan failed:', e.message);
   } finally {
     saasInsightsScanRunning = false;
+  }
+}
+
+// ── SaaS Increase: historical churn dataset (cancelled subscriptions) ──────────────────────
+// Reuses the exact same price-change reconstruction as the live-subscription scan above
+// (fetchSaasPriceChange, now plan-code-aware) against every subscription Zoho Billing has ever
+// marked CANCELLED, so the risk heuristic's weights can eventually be calibrated against real
+// observed churn rates instead of hand-picked thresholds (see the "churn-risk calibration"
+// endpoint). Runs weekly, not nightly — cancelled-subscription history barely changes.
+let saasChurnBackfillRunning = false;
+async function runSaasChurnHistoryBackfill() {
+  if (saasChurnBackfillRunning) { console.log('[saas-churn] backfill already running, skipping'); return; }
+  saasChurnBackfillRunning = true;
+  try {
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    const booksOrgId = process.env.ZOHO_ORG_ID;
+    const plansRes = await pool.query('SELECT plan_code, name FROM zoho_plans');
+    const planCodes = new Set(plansRes.rows.map(r => (r.plan_code || '').toLowerCase().trim()));
+    const normalizeName = (s) => (s || '').toLowerCase().replace(/^\*+/, '').replace(/\s+/g, ' ').trim();
+    const planNames = new Map();
+    for (const p of plansRes.rows) { const k = normalizeName(p.name); if (k) planNames.set(k, p.plan_code); }
+
+    const freshRes = await pool.query(
+      `SELECT subscription_number FROM saas_churn_events WHERE checked_at > NOW() - INTERVAL '${SAAS_CHURN_RESCAN_AFTER_DAYS} days'`
+    );
+    const freshNumbers = new Set(freshRes.rows.map(r => r.subscription_number));
+
+    let ok = 0, failed = 0, skipped = 0;
+    for (const orgId of ZOHO_BILLING_ORG_IDS) {
+      const cancelledSubs = await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.CANCELLED');
+      for (const raw of cancelledSubs) {
+        const num = String(raw.subscription_number || '').trim();
+        if (!num) continue;
+        if (freshNumbers.has(num)) { skipped++; continue; }
+        try {
+          const { activatedAt, cancelledAt } = await fetchSaasSubscriptionTenure(apiDomain, accessToken, orgId, raw.subscription_id);
+          const { change } = await fetchSaasPriceChange(apiDomain, accessToken, booksOrgId, raw.subscription_id, raw.customer_id, planCodes, planNames);
+
+          let tenureMonthsAtIncrease = null, monthsIncreaseToCancel = null;
+          if (change?.date && activatedAt) {
+            tenureMonthsAtIncrease = (new Date(change.date) - new Date(activatedAt)) / (30 * 24 * 3600 * 1000);
+          }
+          if (change?.date && cancelledAt) {
+            monthsIncreaseToCancel = (new Date(cancelledAt) - new Date(change.date)) / (30 * 24 * 3600 * 1000);
+          }
+
+          await pool.query(`
+            INSERT INTO saas_churn_events
+              (subscription_number, org_id, activated_at, cancelled_at, had_price_increase,
+               last_increase_at, last_increase_before, last_increase_after,
+               tenure_months_at_increase, months_increase_to_cancel, checked_at, check_error)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NULL)
+            ON CONFLICT (subscription_number) DO UPDATE SET
+              org_id = $2, activated_at = $3, cancelled_at = $4, had_price_increase = $5,
+              last_increase_at = $6, last_increase_before = $7, last_increase_after = $8,
+              tenure_months_at_increase = $9, months_increase_to_cancel = $10, checked_at = NOW(), check_error = NULL`,
+            [num, orgId, activatedAt, cancelledAt, !!change, change?.date || null,
+             change?.before ?? null, change?.after ?? null,
+             tenureMonthsAtIncrease != null ? Math.round(tenureMonthsAtIncrease * 10) / 10 : null,
+             monthsIncreaseToCancel != null ? Math.round(monthsIncreaseToCancel * 10) / 10 : null]
+          );
+          ok++;
+        } catch (e) {
+          failed++;
+          await pool.query(`
+            INSERT INTO saas_churn_events (subscription_number, org_id, checked_at, check_error)
+            VALUES ($1, $2, NOW(), $3)
+            ON CONFLICT (subscription_number) DO UPDATE SET checked_at = NOW(), check_error = $3`,
+            [num, orgId, e.message]
+          ).catch(() => {});
+        }
+        await new Promise(r => setTimeout(r, SAAS_INSIGHTS_DELAY_MS));
+      }
+    }
+    console.log(`[saas-churn] backfill complete: ${ok} ok, ${failed} failed, ${skipped} skipped (already fresh)`);
+  } catch (e) {
+    console.error('[saas-churn] backfill failed:', e.message);
+  } finally {
+    saasChurnBackfillRunning = false;
   }
 }
 
@@ -11309,24 +11530,40 @@ function buildQuotePdf({ items, clientName, repName, repEmail, lang, billing }) 
   });
 }
 
+// Extracts a numeric unit price from hardware's free-text price string (e.g. "$1,150" -> 1150).
+// Returns null for non-numeric values ("TBD", "Monthly rental", "—") — those items simply can't
+// be quoted with a firm price and are dropped rather than shown with a misleading $0.
+function parseHardwarePrice(price) {
+  if (!price) return null;
+  const m = String(price).replace(/[, ]/g, '').match(/\$([0-9]+(?:\.[0-9]+)?)/);
+  return m ? parseFloat(m[1]) : null;
+}
+
 // POST /api/pricing/quote/pdf — builds a formal Cluster-branded quote PDF for a merchant from
-// items the rep staged in the Pricing Guide's quote tray. Prices are re-fetched from the DB by id
-// (never trusted from the client) so a rep can't hand a merchant a PDF with edited numbers.
+// items the rep staged in the Hardware & Service Guide's quote tray. Prices are re-fetched from
+// the DB by id (never trusted from the client) so a rep can't hand a merchant a PDF with edited
+// numbers. Items carry a `type` ('package' | 'hardware') so both catalogs can populate one quote.
 app.post('/api/pricing/quote/pdf', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'pricing:view'))) return;
+  if (!(await requirePermAny(req, res, ['pricing:view', 'hardware:view']))) return;
   const { items, clientName, billing, lang } = req.body || {};
   if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items required' });
   try {
-    const ids = items.map((it) => String(it.id));
-    const rows = (await pool.query(
+    const perms = req.user.isAdmin === true ? null : await getUserPermissions(req.user.email);
+    const canPricing = req.user.isAdmin === true || userHasPermission(perms, 'pricing:view');
+    const canHardware = req.user.isAdmin === true || userHasPermission(perms, 'hardware:view');
+    const isFr = lang === 'fr';
+
+    const pkgItems = items.filter((it) => it.type !== 'hardware' && canPricing);
+    const hwItems = items.filter((it) => it.type === 'hardware' && canHardware);
+
+    const pkgRows = pkgItems.length ? (await pool.query(
       `SELECT id, name_en, name_fr, sku, price_monthly, price_yearly, price_flat
          FROM pricing_packages WHERE id = ANY($1) AND visible = true`,
-      [ids]
-    )).rows;
-    const byId = new Map(rows.map((r) => [r.id, r]));
-    const isFr = lang === 'fr';
-    const built = items.map((it) => {
-      const p = byId.get(String(it.id));
+      [pkgItems.map((it) => String(it.id))]
+    )).rows : [];
+    const pkgById = new Map(pkgRows.map((r) => [r.id, r]));
+    const builtPkg = pkgItems.map((it) => {
+      const p = pkgById.get(String(it.id));
       if (!p) return null;
       const qty = Math.max(1, parseInt(it.qty, 10) || 1);
       let unitAmt = 0, recurring = false;
@@ -11335,6 +11572,23 @@ app.post('/api/pricing/quote/pdf', authenticateToken, async (req, res) => {
       else if (p.price_flat != null) { unitAmt = Number(p.price_flat); recurring = false; }
       return { name: (isFr && p.name_fr) ? p.name_fr : p.name_en, sku: p.sku, qty, unitAmt, recurring };
     }).filter(Boolean);
+
+    const hwRows = hwItems.length ? (await pool.query(
+      `SELECT id, name_en, name_fr, sku, price
+         FROM hardware_products WHERE id = ANY($1) AND visible = true`,
+      [hwItems.map((it) => String(it.id))]
+    )).rows : [];
+    const hwById = new Map(hwRows.map((r) => [r.id, r]));
+    const builtHw = hwItems.map((it) => {
+      const p = hwById.get(String(it.id));
+      if (!p) return null;
+      const unitAmt = parseHardwarePrice(p.price);
+      if (unitAmt == null) return null; // no firm price to quote — drop rather than show $0
+      const qty = Math.max(1, parseInt(it.qty, 10) || 1);
+      return { name: (isFr && p.name_fr) ? p.name_fr : p.name_en, sku: p.sku, qty, unitAmt, recurring: false };
+    }).filter(Boolean);
+
+    const built = builtPkg.concat(builtHw);
     if (!built.length) return res.status(400).json({ error: 'no valid items' });
     const repName = req.user.name || req.user.email || '';
     const pdf = await buildQuotePdf({
