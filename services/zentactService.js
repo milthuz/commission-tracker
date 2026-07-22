@@ -7,6 +7,12 @@ const STMT_MONTHS = { january: 1, february: 2, march: 3, april: 4, may: 5, june:
 // Base URL is configurable via env var — swap to production by setting ZENTACT_API_URL
 const ZENTACT_BASE_URL = process.env.ZENTACT_API_URL || 'https://api.zentact.com/api/v1';
 
+// Zentact "Reseller" values that are actually OUR OWN divisions, not third-party
+// resellers. Merchants tagged with one of these are internal-vendor activations:
+// the tag is dropped at capture so the rep keeps the signup bonus/points and the
+// deal never routes to Reseller → Payments. Compared lowercased/trimmed.
+const INTERNAL_RESELLER_TAGS = ['xperio'];
+
 // Merchant account statuses
 const MERCHANT_STATUS = {
   INITIATED: 'INITIATED',
@@ -155,9 +161,14 @@ class ZentactService {
     // Custom attribute "Reseller" — set in Zentact on merchants boarded by a
     // third-party reseller (e.g. "Lirette"). getAttribute is case-insensitive,
     // so 'Reseller' also matches 'reseller'. Try a couple of likely key names.
-    const resellerAttr  = ZentactService.getAttribute(attrs, 'Reseller')
+    let resellerAttr    = ZentactService.getAttribute(attrs, 'Reseller')
                        || ZentactService.getAttribute(attrs, 'reseller_name')
                        || null;
+    // Internal divisions tagged as "Reseller" in Zentact are not real resellers —
+    // drop the tag so the merchant counts as an internal activation.
+    if (resellerAttr && INTERNAL_RESELLER_TAGS.includes(resellerAttr.trim().toLowerCase())) {
+      resellerAttr = null;
+    }
 
     return {
       merchant_account_id: merchant.merchantAccountId,
