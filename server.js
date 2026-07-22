@@ -1658,6 +1658,37 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notified_by VARCHAR(255)`);
     await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notified_at TIMESTAMP`);
 
+    // Admin-editable library of merchant-notification email templates (name + EN/FR subject/body,
+    // with {{customerName}}/{{planName}}/{{currentMonthly}}/{{newMonthly}} placeholders) — lets
+    // different wording be applied per plan/org group instead of one hardcoded copy for everyone.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS saas_increase_email_templates (
+        id           SERIAL PRIMARY KEY,
+        name         VARCHAR(255) NOT NULL,
+        subject_en   VARCHAR(500) NOT NULL,
+        body_en      TEXT NOT NULL,
+        subject_fr   VARCHAR(500) NOT NULL,
+        body_fr      TEXT NOT NULL,
+        is_default   BOOLEAN NOT NULL DEFAULT false,
+        created_by   VARCHAR(255),
+        created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    // Seed one default template (today's hardcoded copy, see saasIncreaseDraftCopy) so the
+    // library is never empty — gives an existing row to duplicate/edit rather than starting blank,
+    // and keeps drafting behavior unchanged for anyone who never opens the template manager.
+    await pool.query(`
+      INSERT INTO saas_increase_email_templates (name, subject_en, body_en, subject_fr, body_fr, is_default)
+      SELECT 'Standard notice',
+        'An update to your {{planName}} pricing',
+        'Hello {{customerName}},\n\nWe''re writing to let you know that the monthly price of your {{planName}} will change from {{currentMonthly}} to {{newMonthly}} per month, effective at your next renewal.\n\nIf you have any questions about this change, just reply to this email — we''re happy to help.\n\nThank you for being a Cluster Systems customer.\n\nBest regards,',
+        'Une mise à jour du prix de votre {{planName}}',
+        'Bonjour {{customerName}},\n\nNous vous écrivons pour vous informer que le prix mensuel de votre {{planName}} passera de {{currentMonthly}} à {{newMonthly}} par mois, à compter de votre prochain renouvellement.\n\nPour toute question à ce sujet, répondez simplement à ce courriel — il nous fera plaisir de vous aider.\n\nMerci d''être client de Cluster Systems.\n\nCordialement,',
+        true
+      WHERE NOT EXISTS (SELECT 1 FROM saas_increase_email_templates);
+    `);
+
     // Per-subscription insights for the SaaS Increase tool — subscription tenure + when the
     // SaaS line's price last changed, both requiring a live Zoho call so they're precomputed by
     // a nightly background job (runSaasSubscriptionInsightsScan) rather than fetched per page load.
@@ -2377,7 +2408,7 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // Render each transactional email with sample data so an admin can see the look
 // & feel in the panel and send a test copy. Mirrors the real builders so the
 // preview reflects exactly what recipients get.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'probation', 'new_user'];
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'probation', 'new_user', 'saas_increase'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -2433,6 +2464,15 @@ function sampleEmail(type, lang) {
           `<strong>Amy Spicer</strong> — fin de probation le <strong>2026-07-18</strong> (dans 15 jours). Après cette date, le quota mensuel s'applique.<br><br>Amy Spicer's new-hire probation ends on 2026-07-18 (in 15 days). The monthly quota gate applies after that.`, null, null) };
     case 'new_user':
       return newUserEmail('Marie Dubois', 'marie@example.com', 'Zoho');
+    case 'saas_increase': {
+      // Cluster-branded (NOT mailShell/Sales Hub) — this goes to an external merchant, same rule
+      // as everywhere else this email is built (see buildProposalEmailHtml's comment). Mirrors
+      // the real saasIncreaseDraftCopy builder so the preview matches what actually goes out.
+      const { subject, body } = saasIncreaseDraftCopy({
+        customerName: 'Café du Coin', planName: 'Premium - Monthly', currentMonthly: 199, newMonthly: 219, lang: lang === 'en' ? 'en' : 'fr',
+      });
+      return { subject, html: buildProposalEmailHtml({ bodyText: body, acceptBtn: '', signatureHtml: '', pixel: '', frontendBase: base }) };
+    }
     case 'invitation':
     default:
       return { subject: 'Invitation — Sales Hub / You are invited to Sales Hub',
@@ -7821,15 +7861,87 @@ function saasIncreaseDraftCopy({ customerName, planName, currentMonthly, newMont
   return { subject, body };
 }
 
-// POST /api/admin/saas-increase/scenarios/:id/notifications/draft — body { itemIds: [...], lang }.
-// Resolves each item's merchant contact email (best-effort, always editable) and generates a
-// subject/body draft, persisting both so a multi-session review survives a page refresh. Never sends.
+// Plain {{token}} substitution for admin-authored templates — no template engine, no eval, just
+// a regex replace. Safe because templates are only ever written by admins (saas_increase:manage),
+// never derived from external/user input.
+function renderSaasTemplate(str, vars) {
+  return String(str || '').replace(/\{\{(\w+)\}\}/g, (m, key) => (key in vars ? String(vars[key]) : m));
+}
+function saasTemplatePlaceholders({ customerName, planName, currentMonthly, newMonthly }) {
+  const money = (n) => `$${Number(n || 0).toFixed(2)}`;
+  return { customerName: customerName || '', planName: planName || '', currentMonthly: money(currentMonthly), newMonthly: money(newMonthly) };
+}
+
+// GET /api/admin/saas-increase/email-templates — list the template library.
+app.get('/api/admin/saas-increase/email-templates', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  try {
+    const rows = (await pool.query(`SELECT * FROM saas_increase_email_templates ORDER BY is_default DESC, name`)).rows;
+    res.json({ templates: rows.map(r => ({
+      id: r.id, name: r.name, subjectEn: r.subject_en, bodyEn: r.body_en, subjectFr: r.subject_fr, bodyFr: r.body_fr, isDefault: r.is_default,
+    })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/admin/saas-increase/email-templates — create a template.
+app.post('/api/admin/saas-increase/email-templates', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  const { name, subjectEn, bodyEn, subjectFr, bodyFr } = req.body || {};
+  if (!name || !subjectEn || !bodyEn || !subjectFr || !bodyFr) return res.status(400).json({ error: 'name, subjectEn, bodyEn, subjectFr, bodyFr are all required' });
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  try {
+    const row = (await pool.query(
+      `INSERT INTO saas_increase_email_templates (name, subject_en, body_en, subject_fr, body_fr, created_by) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [name, subjectEn, bodyEn, subjectFr, bodyFr, actor]
+    )).rows[0];
+    res.json({ template: { id: row.id, name: row.name, subjectEn: row.subject_en, bodyEn: row.body_en, subjectFr: row.subject_fr, bodyFr: row.body_fr, isDefault: row.is_default } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/admin/saas-increase/email-templates/:id — update a template.
+app.put('/api/admin/saas-increase/email-templates/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  const { name, subjectEn, bodyEn, subjectFr, bodyFr } = req.body || {};
+  try {
+    const row = (await pool.query(
+      `UPDATE saas_increase_email_templates SET
+         name = COALESCE($1, name), subject_en = COALESCE($2, subject_en), body_en = COALESCE($3, body_en),
+         subject_fr = COALESCE($4, subject_fr), body_fr = COALESCE($5, body_fr), updated_at = NOW()
+       WHERE id = $6 RETURNING *`,
+      [name || null, subjectEn || null, bodyEn || null, subjectFr || null, bodyFr || null, req.params.id]
+    )).rows[0];
+    if (!row) return res.status(404).json({ error: 'template not found' });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/admin/saas-increase/email-templates/:id — remove a template. Blocks deleting the
+// last remaining one so drafting always has a fallback to use.
+app.delete('/api/admin/saas-increase/email-templates/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  try {
+    const countRow = (await pool.query(`SELECT COUNT(*) AS cnt FROM saas_increase_email_templates`)).rows[0];
+    if (parseInt(countRow.cnt) <= 1) return res.status(400).json({ error: 'cannot delete the last remaining template' });
+    await pool.query(`DELETE FROM saas_increase_email_templates WHERE id = $1`, [req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/admin/saas-increase/scenarios/:id/notifications/draft — body { itemIds: [...], lang,
+// templateId? }. Resolves each item's merchant contact email (best-effort, always editable) and
+// generates a subject/body draft, persisting both so a multi-session review survives a page
+// refresh. Never sends. When templateId is given, renders that library template's placeholders
+// instead of the hardcoded saasIncreaseDraftCopy — letting different wording be applied per group.
 app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
   const itemIds = Array.isArray(req.body?.itemIds) ? req.body.itemIds.map(Number).filter(Number.isFinite) : [];
   const lang = String(req.body?.lang || 'fr').toLowerCase() === 'en' ? 'en' : 'fr';
+  const templateId = req.body?.templateId != null ? Number(req.body.templateId) : null;
   if (!itemIds.length) return res.status(400).json({ error: 'itemIds required' });
   try {
+    const template = templateId
+      ? (await pool.query(`SELECT * FROM saas_increase_email_templates WHERE id = $1`, [templateId])).rows[0]
+      : null;
     const items = (await pool.query(
       `SELECT * FROM saas_increase_items WHERE scenario_id = $1 AND id = ANY($2::int[])`,
       [req.params.id, itemIds]
@@ -7837,10 +7949,17 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authentic
     const results = [];
     for (const it of items) {
       const to = await resolveMerchantContactEmail(it.customer_id, it.customer_name);
-      const { subject, body } = saasIncreaseDraftCopy({
-        customerName: it.customer_name, planName: it.plan_name,
-        currentMonthly: it.current_monthly, newMonthly: it.new_monthly, lang,
-      });
+      let subject, body;
+      if (template) {
+        const vars = saasTemplatePlaceholders({ customerName: it.customer_name, planName: it.plan_name, currentMonthly: it.current_monthly, newMonthly: it.new_monthly });
+        subject = renderSaasTemplate(lang === 'en' ? template.subject_en : template.subject_fr, vars);
+        body = renderSaasTemplate(lang === 'en' ? template.body_en : template.body_fr, vars);
+      } else {
+        ({ subject, body } = saasIncreaseDraftCopy({
+          customerName: it.customer_name, planName: it.plan_name,
+          currentMonthly: it.current_monthly, newMonthly: it.new_monthly, lang,
+        }));
+      }
       const row = (await pool.query(
         `UPDATE saas_increase_items SET notify_to = $1, notify_subject = $2, notify_body = $3, notify_status = 'drafted', notify_error = NULL
          WHERE id = $4 RETURNING *`,
