@@ -86,6 +86,27 @@ class ZohoBillingService {
     }
   }
 
+  // Schedule a price change on an existing subscription, effective at the next renewal (no
+  // immediate proration) — used by the SaaS Increase tool's "Push to Zoho" action. Zoho Billing
+  // has no separate price-only endpoint; this reuses "Update a Subscription" with the plan's
+  // price overridden and end_of_term so the change applies only once the current term ends.
+  async scheduleSubscriptionPriceChange(subscriptionId, planCode, newPrice) {
+    const base = billingBaseUrl(this.apiDomain);
+    try {
+      const res = await axios.put(
+        `${base}/subscriptions/${subscriptionId}`,
+        { plan: { plan_code: planCode, price: newPrice }, end_of_term: true },
+        { headers: this.headers, validateStatus: () => true }
+      );
+      if (res.status !== 200) {
+        return { ok: false, status: res.status, error: res.data };
+      }
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  }
+
   // Static helper — find a plan_code in a list of plans (case-insensitive)
   static matchPlan(plans, sku) {
     if (!sku) return null;

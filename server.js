@@ -1658,6 +1658,18 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notified_by VARCHAR(255)`);
     await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notified_at TIMESTAMP`);
 
+    // Confirmation PIN required before pushing a scenario's price increases into live Zoho
+    // subscriptions (saas_increase:execute) — a Sales-Hub-native PIN rather than re-authenticating
+    // with Zoho, since Zoho's OAuth has no documented guarantee of forcing credential re-entry
+    // for an already-signed-in browser session.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS saas_push_pins (
+        email       VARCHAR(255) PRIMARY KEY,
+        pin_hash    VARCHAR(255) NOT NULL,
+        updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
     // Admin-editable library of merchant-notification email templates (name + EN/FR subject/body,
     // with {{customerName}}/{{planName}}/{{currentMonthly}}/{{newMonthly}} placeholders) — lets
     // different wording be applied per plan/org group instead of one hardcoded copy for everyone.
@@ -1972,7 +1984,7 @@ app.get('/api/auth/zoho', (req, res) => {
   const forceConsent = req.query.reconsent === '1' || req.query.prompt === 'consent';
 
   const authUrl = `${ZOHO_CONFIG.accounts_url}/oauth/v2/auth?` +
-    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE,ZohoBooks.estimates.READ,ZohoBooks.contacts.READ,ZohoSubscriptions.plans.READ,ZohoSubscriptions.products.READ,ZohoSubscriptions.subscriptions.READ,AaaServer.profile.READ` +
+    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE,ZohoBooks.estimates.READ,ZohoBooks.contacts.READ,ZohoSubscriptions.plans.READ,ZohoSubscriptions.products.READ,ZohoSubscriptions.subscriptions.READ,ZohoSubscriptions.subscriptions.UPDATE,AaaServer.profile.READ` +
     `&client_id=${ZOHO_CONFIG.client_id}` +
     `&response_type=code` +
     `&redirect_uri=${ZOHO_CONFIG.redirect_uri}` +
@@ -7012,6 +7024,42 @@ app.put('/api/user/signature', authenticateToken, async (req, res) => {
   }
 });
 
+// SaaS Increase — push confirmation PIN. Required before pushing price increases into live
+// Zoho subscriptions (saas_increase:execute); see PUT /api/admin/saas-increase/scenarios/:id/push.
+app.get('/api/user/push-pin/status', authenticateToken, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT 1 FROM saas_push_pins WHERE email = $1', [req.user.email]);
+    res.json({ hasPin: r.rowCount > 0 });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to check PIN status', details: error.message });
+  }
+});
+
+app.put('/api/user/push-pin', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:execute'))) return;
+  const { currentPin, newPin } = req.body;
+  if (!newPin || !/^\d{4,}$/.test(String(newPin))) {
+    return res.status(400).json({ error: 'PIN must be at least 4 digits' });
+  }
+  try {
+    const existing = (await pool.query('SELECT pin_hash FROM saas_push_pins WHERE email = $1', [req.user.email])).rows[0];
+    if (existing) {
+      if (!currentPin || !(await bcrypt.compare(String(currentPin), existing.pin_hash))) {
+        return res.status(401).json({ error: 'Current PIN is incorrect' });
+      }
+    }
+    const hash = await bcrypt.hash(String(newPin), 10);
+    await pool.query(
+      `INSERT INTO saas_push_pins (email, pin_hash, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP)
+       ON CONFLICT (email) DO UPDATE SET pin_hash = $2, updated_at = CURRENT_TIMESTAMP`,
+      [req.user.email, hash]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to save PIN', details: error.message });
+  }
+});
+
 // ============================================================================
 // DASHBOARD
 // ============================================================================
@@ -8032,6 +8080,63 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
         );
       }
       results.push({ itemId, sent: r.sent, reason: r.reason });
+    }
+    res.json({ results });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/admin/saas-increase/scenarios/:id/push — schedule the selected items' price
+// increases into live Zoho Billing subscriptions, effective at each one's next renewal (see
+// ZohoBillingService.scheduleSubscriptionPriceChange). Gated by both the saas_increase:execute
+// permission AND a Sales-Hub-native confirmation PIN (see saas_push_pins) — this is the one
+// action in the tool that changes real customer billing, so it continues past individual
+// item failures rather than aborting the whole batch (same convention as notifications/send).
+app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:execute'))) return;
+  const itemIds = Array.isArray(req.body?.itemIds) ? req.body.itemIds.map(Number).filter(Boolean) : [];
+  const pin = String(req.body?.pin || '');
+  if (!itemIds.length) return res.status(400).json({ error: 'itemIds required' });
+
+  const pinRow = (await pool.query('SELECT pin_hash FROM saas_push_pins WHERE email = $1', [req.user.email])).rows[0];
+  if (!pinRow) return res.status(400).json({ error: 'no_pin_set' });
+  if (!pin || !(await bcrypt.compare(pin, pinRow.pin_hash))) return res.status(401).json({ error: 'invalid_pin' });
+
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  try {
+    const items = (await pool.query(
+      `SELECT * FROM saas_increase_items WHERE scenario_id = $1 AND id = ANY($2::int[])`,
+      [req.params.id, itemIds]
+    )).rows;
+    // Live lookup for Zoho's real internal subscription_id — not persisted on the item (which
+    // only stores the human-readable subscription_number), so this also naturally catches
+    // subscriptions that no longer exist/changed since the scenario was built.
+    const liveSubs = await getSaasIncreaseSubscriptions();
+    const liveBySub = new Map(liveSubs.map(s => [s.subscriptionNumber, s]));
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+
+    const results = [];
+    for (const item of items) {
+      const live = liveBySub.get(item.subscription_number);
+      if (!live || !live.subscriptionId) {
+        const msg = 'Subscription no longer found in Zoho Billing';
+        await pool.query(`UPDATE saas_increase_items SET status = 'push_failed', push_error = $1 WHERE id = $2`, [msg, item.id]);
+        results.push({ itemId: item.id, ok: false, error: msg });
+        continue;
+      }
+      const billing = new ZohoBillingService(accessToken, apiDomain, item.org_id);
+      const r = await billing.scheduleSubscriptionPriceChange(live.subscriptionId, item.plan_code, Number(item.new_monthly));
+      if (r.ok) {
+        await pool.query(
+          `UPDATE saas_increase_items SET status = 'pushed', push_error = NULL, pushed_by = $1, pushed_at = NOW() WHERE id = $2`,
+          [actor, item.id]
+        );
+        results.push({ itemId: item.id, ok: true });
+      } else {
+        const msg = typeof r.error === 'string' ? r.error : JSON.stringify(r.error || {}).slice(0, 500);
+        await pool.query(`UPDATE saas_increase_items SET status = 'push_failed', push_error = $1 WHERE id = $2`, [msg, item.id]);
+        results.push({ itemId: item.id, ok: false, error: msg });
+      }
+      await new Promise(r2 => setTimeout(r2, 250));
     }
     res.json({ results });
   } catch (e) { res.status(500).json({ error: e.message }); }
