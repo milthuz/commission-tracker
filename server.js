@@ -6384,7 +6384,12 @@ async function syncZentactMerchants() {
         sales_rep_email   = COALESCE(EXCLUDED.sales_rep_email, zentact_merchants.sales_rep_email),
         sales_rep_name    = COALESCE($7, zentact_merchants.sales_rep_name),
         opportunity_id    = COALESCE(EXCLUDED.opportunity_id,  zentact_merchants.opportunity_id),
-        reseller_attribute = COALESCE(EXCLUDED.reseller_attribute, zentact_merchants.reseller_attribute),
+        -- Direct assignment (not COALESCE): this is a live Zentact custom field, so the
+        -- latest sync is authoritative — including clearing it back to NULL when
+        -- transformMerchant drops an internal-division tag (INTERNAL_RESELLER_TAGS).
+        -- A COALESCE here would let a once-seen value survive forever, even after the
+        -- code stops reporting it.
+        reseller_attribute = EXCLUDED.reseller_attribute,
         activated_at    = CASE
           -- Keep any existing date (never overwrite a real stamp)
           WHEN zentact_merchants.activated_at IS NOT NULL
