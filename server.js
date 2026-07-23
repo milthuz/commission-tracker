@@ -57,6 +57,7 @@ const PERMISSION_CATALOG = [
   { key: 'tracker:view_all_totals',    label: 'View all reps totals (no details)',           category: 'Commission Tracker' },
   { key: 'tracker:view_all_details',   label: 'View all reps deals + merchants details',     category: 'Commission Tracker' },
   { key: 'tracker:assign_merchants',   label: 'Assign unassigned Zentact merchants to reps', category: 'Commission Tracker' },
+  { key: 'tracker:manual_activation',  label: 'Add manual payment activations (when Zentact is unavailable)', category: 'Commission Tracker' },
 
   // Commission Report
   { key: 'report:view_own',            label: 'View own commission report',                  category: 'Commission Report' },
@@ -1641,6 +1642,10 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE zentact_merchants ADD COLUMN IF NOT EXISTS reseller_attribute VARCHAR(255)`);
     // Stores (locations) nested under a merchant account — added after the table shipped.
     await pool.query(`ALTER TABLE zentact_merchants ADD COLUMN IF NOT EXISTS stores JSONB`);
+    // Hand-entered activations (Admin → Commissions → Bonus), for when Zentact itself is
+    // down/limited. merchant_account_id is a synthetic "MANUAL-..." id, never touched by
+    // the real Zentact sync (which only upserts merchants it actually pulled from the API).
+    await pool.query(`ALTER TABLE zentact_merchants ADD COLUMN IF NOT EXISTS is_manual BOOLEAN DEFAULT FALSE`);
 
     // Per-merchant monthly revenue from Zentact's transaction-profitability report.
     // All monetary fields are in MINOR UNITS (cents). transaction_profit_cents = the
@@ -17642,6 +17647,68 @@ app.delete('/api/commissions/manual-bonus/:id', authenticateToken, async (req, r
   try {
     const row = (await pool.query(`DELETE FROM manual_bonuses WHERE id = $1 RETURNING rep_name, amount::float AS amount, to_char(period,'YYYY-MM') AS ym`, [parseInt(req.params.id)])).rows[0];
     if (row) logActivity('rep_pay', row.rep_name, 'manual_bonus_removed', `Manual bonus of $${row.amount.toFixed(2)} for ${row.ym} removed by ${actor}`, actor, { amount: -row.amount });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Manual payment activations — stop-gap for when Zentact itself is limited/down. Inserts
+// a real zentact_merchants row (synthetic "MANUAL-..." id) so it flows through the exact
+// same Payment Activations / points / signup-bonus logic as a real Zentact merchant. ──────
+
+app.get('/api/zentact/merchants/manual', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'tracker:manual_activation'))) return;
+  try {
+    const rows = (await pool.query(
+      `SELECT merchant_account_id, business_name, sales_rep_name, activated_at,
+              points, bonus_amount::float AS bonus_amount, created_at
+       FROM zentact_merchants WHERE is_manual = true ORDER BY created_at DESC`
+    )).rows;
+    res.json({ activations: rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/zentact/merchants/manual', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'tracker:manual_activation'))) return;
+  const { businessName, repName, activatedAt, points, bonusAmount } = req.body || {};
+  if (!businessName || !repName || !activatedAt) {
+    return res.status(400).json({ error: 'businessName, repName and activatedAt required' });
+  }
+  const spCheck = await pool.query(`SELECT 1 FROM salespeople WHERE name = $1 AND is_active = true`, [repName]);
+  if (spCheck.rowCount === 0) return res.status(400).json({ error: 'Unknown or inactive rep' });
+
+  const merchantId = `MANUAL-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  const pts = parseInt(points) || 1;
+  const bonus = (bonusAmount !== undefined && bonusAmount !== null && bonusAmount !== '') ? parseFloat(bonusAmount) : 100;
+  if (isNaN(bonus)) return res.status(400).json({ error: 'Invalid bonusAmount' });
+
+  try {
+    await pool.query(
+      `INSERT INTO zentact_merchants
+        (merchant_account_id, business_name, sales_rep_name, status, activated_at,
+         points, bonus_amount, is_manual, raw_attributes)
+       VALUES ($1, $2, $3, 'ACTIVE', $4::date, $5, $6, true, $7::jsonb)`,
+      [merchantId, businessName.toString().slice(0, 500), repName, activatedAt, pts, bonus,
+       JSON.stringify([{ name: 'manual_entry', value: `Added by ${actor}` }])]
+    );
+    logActivity('zentact_merchant', merchantId, 'manual_activation_added',
+      `Manual payment activation "${businessName}" added for ${repName} (${activatedAt}) by ${actor}`, actor, { amount: bonus });
+    res.json({ success: true, merchantAccountId: merchantId });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/zentact/merchants/manual/:merchantId', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'tracker:manual_activation'))) return;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  try {
+    const row = (await pool.query(
+      `DELETE FROM zentact_merchants WHERE merchant_account_id = $1 AND is_manual = true
+       RETURNING business_name, sales_rep_name, bonus_amount::float AS bonus_amount`,
+      [req.params.merchantId]
+    )).rows[0];
+    if (!row) return res.status(404).json({ error: 'Not found (or not a manual entry)' });
+    logActivity('zentact_merchant', req.params.merchantId, 'manual_activation_removed',
+      `Manual payment activation "${row.business_name}" for ${row.sales_rep_name} removed by ${actor}`, actor, { amount: -row.bonus_amount });
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
