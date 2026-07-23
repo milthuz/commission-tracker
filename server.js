@@ -2467,11 +2467,11 @@ const authenticatePartnerToken = async (req, res, next) => {
     // reasoning as isAdmin/isDemo re-resolution in authenticateToken) so a disabled partner user
     // or a role change takes effect immediately, not just on next login.
     const pu = (await pool.query(
-      `SELECT id, partner_id, email, display_name, role, status FROM partner_users WHERE id = $1`,
+      `SELECT id, partner_id, email, display_name, role, status, totp_enabled FROM partner_users WHERE id = $1`,
       [claims.partnerUserId]
     )).rows[0];
     if (!pu || pu.status !== 'active') return res.status(401).json({ error: 'Invalid token' });
-    req.partnerUser = { id: pu.id, partnerId: pu.partner_id, email: pu.email, name: pu.display_name || pu.email, role: pu.role };
+    req.partnerUser = { id: pu.id, partnerId: pu.partner_id, email: pu.email, name: pu.display_name || pu.email, role: pu.role, totpEnabled: pu.totp_enabled };
     next();
   } catch {
     res.status(401).json({ error: 'Invalid token' });
@@ -3119,6 +3119,46 @@ app.post('/api/partner-portal/change-password', authenticatePartnerToken, async 
   }
 });
 
+// POST /api/partner-portal/2fa/reset — start replacing this partner user's authenticator device.
+// Mirrors the invite/accept 2FA setup flow: the new secret travels ONLY inside a short-lived
+// signed token, never touching partner_users until /2fa/confirm verifies a live code — so a
+// user who abandons the flow midway keeps using their existing device untouched.
+app.post('/api/partner-portal/2fa/reset', authenticatePartnerToken, async (req, res) => {
+  if (rateLimited(`p2fareset:${req.partnerUser.email}`)) return res.status(429).json({ error: 'Too many attempts — try again later' });
+  try {
+    const secret = authenticator.generateSecret();
+    const otpauth = authenticator.keyuri(req.partnerUser.email, 'Sales Hub', secret);
+    const qrDataUrl = await QRCode.toDataURL(otpauth, { margin: 1, width: 220 });
+    const setupToken = jwt.sign(
+      { email: req.partnerUser.email, purpose: 'partner-2fa-reset', secret }, JWT_SECRET, { expiresIn: '15m' }
+    );
+    res.json({ qrDataUrl, secret, setupToken });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/partner-portal/2fa/confirm { setupToken, code } — verify a code from the new device
+// before it replaces the old one.
+app.post('/api/partner-portal/2fa/confirm', authenticatePartnerToken, async (req, res) => {
+  const p = verifyMfaJwt(String(req.body.setupToken || ''), 'partner-2fa-reset');
+  if (!p || p.email !== req.partnerUser.email) return res.status(401).json({ error: 'Setup session expired — start over' });
+  if (rateLimited(`p2faresetverify:${req.partnerUser.email}`)) return res.status(429).json({ error: 'Too many attempts — try again later' });
+  if (!authenticator.check(String(req.body.code || ''), p.secret)) {
+    return res.status(401).json({ error: 'Invalid code' });
+  }
+  try {
+    await pool.query(
+      `UPDATE partner_users SET totp_secret = $2, totp_enabled = true, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [req.partnerUser.id, p.secret]
+    );
+    logActivity('partner_user', req.partnerUser.email, 'reset_2fa', `${req.partnerUser.email} replaced their authenticator device`, req.partnerUser.email);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/partner-portal/team — Admin-only: list this partner's own users.
 app.get('/api/partner-portal/team', authenticatePartnerToken, async (req, res) => {
   if (req.partnerUser.role !== 'admin') return res.status(403).json({ error: 'Partner Admin only' });
@@ -3173,6 +3213,128 @@ app.post('/api/partner-portal/team/invite', authenticatePartnerToken, async (req
     res.json({ success: true, inviteUrl, emailSent: mail.sent, emailError: mail.sent ? null : mail.reason });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// Partner org logos are small images — 2 MB cap, kept in memory then written to bytea. Mirrors
+// uploadResellerLogo below (same size limit, same storage shape).
+const uploadPartnerLogo = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
+
+// POST /api/partner-portal/organization/logo — Admin-only: upload/replace this partner's own
+// co-branding logo (multipart field "file"), SH-32.
+app.post('/api/partner-portal/organization/logo', authenticatePartnerToken, uploadPartnerLogo.single('file'), async (req, res) => {
+  if (req.partnerUser.role !== 'admin') return res.status(403).json({ error: 'Partner Admin only' });
+  const file = req.file;
+  if (!file) return res.status(400).json({ error: 'file required (multipart field "file")' });
+  if (!/^image\//.test(file.mimetype)) return res.status(400).json({ error: 'logo must be an image' });
+  try {
+    await pool.query(
+      `UPDATE partners SET logo_data = $2, logo_mime_type = $3, logo_file_name = $4, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [req.partnerUser.partnerId, file.buffer, file.mimetype, file.originalname]
+    );
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/partner-portal/organization/logo — Admin-only: clear the logo.
+app.delete('/api/partner-portal/organization/logo', authenticatePartnerToken, async (req, res) => {
+  if (req.partnerUser.role !== 'admin') return res.status(403).json({ error: 'Partner Admin only' });
+  try {
+    await pool.query(
+      `UPDATE partners SET logo_data = NULL, logo_mime_type = NULL, logo_file_name = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [req.partnerUser.partnerId]
+    );
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/partner-portal/organization/logo/:partnerId — serve the logo. Intentionally
+// UNAUTHENTICATED (same reasoning as GET /api/resellers/:id/logo): a co-brand logo is a public
+// brand asset and needs to render in a plain <img src>, which can't carry an Authorization header.
+app.get('/api/partner-portal/organization/logo/:partnerId', async (req, res) => {
+  try {
+    const r = (await pool.query(
+      `SELECT logo_data, logo_mime_type FROM partners WHERE id = $1`, [parseInt(req.params.partnerId)]
+    )).rows[0];
+    if (!r || !r.logo_data) return res.status(404).end();
+    res.setHeader('Content-Type', r.logo_mime_type || 'image/png');
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    res.send(r.logo_data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================================
+// PARTNER PORTAL — in-app help chatbot (Claude API). Separate system prompt from
+// ASSISTANT_SYSTEM above — Sofia's Partner Portal persona only knows about the portal itself
+// (opportunities, team, organization branding, account settings), never the internal Sales Hub
+// sales/commission content, since a partner account should never be walked through internal-only
+// features (mirrors the isAdmin/non-admin split above, but keyed on the partner's own role).
+// ============================================================================
+
+const PARTNER_ASSISTANT_SYSTEM = `You are the in-app assistant for the "Sales Hub Partner Portal", where Cluster Systems' referral partners submit and track business opportunities. Your job: help partner users understand and navigate the portal, in a friendly, concise way.
+
+LANGUAGE: Always reply in the user's language (French or English).
+
+THE PORTAL'S SECTIONS (left menu):
+- Opportunities: submit a new business opportunity (merchant + contact info, and who the partner's rep is on the deal) and see the status of everything already submitted (Pending, Approved, Rejected).
+- Team (Partner Admins only): invite more people from their own organization into the portal, as a Standard user or another Admin.
+- Organization (Partner Admins only): upload the organization's logo, shown alongside the Sales Hub brand in the portal.
+- My Settings: update display name, change password, and reset the two-factor authentication (2FA) device.
+
+RULES:
+- Be concise. Use short paragraphs or bullets. No headers unless really useful.
+- Only discuss the Partner Portal and how to use it. For anything else (general questions, other software, personal advice, or the internal Sales Hub app), politely decline and steer back to the portal.
+- You CANNOT see the user's data (their opportunities, statuses). Never invent information. For data questions, tell them where in the portal to look.
+- If you don't know or the question needs a human, direct them to saleshub@clustersystems.com.`;
+
+const PARTNER_ASSISTANT_SYSTEM_ADMIN = `
+PARTNER ADMIN CONTEXT — this user IS a Partner Admin for their organization, so you may also explain Team invites and the Organization logo upload.`;
+
+const PARTNER_ASSISTANT_SYSTEM_STANDARD = `
+IMPORTANT — this user is a Standard partner user, not a Partner Admin. Do not describe or walk them through Team invites or the Organization logo upload — those are Partner Admin only. If asked, tell them to contact their organization's Partner Admin.`;
+
+app.post('/api/partner-portal/assistant/chat', authenticatePartnerToken, async (req, res) => {
+  const client = getAnthropic();
+  if (!client) return res.status(503).json({ error: 'assistant_not_configured' });
+  if (rateLimited(`passistant:${req.partnerUser.email}`, 30)) {
+    return res.status(429).json({ error: 'Too many messages — try again in a few minutes' });
+  }
+  const uiLang = String(req.body.lang || '').toLowerCase().startsWith('fr') ? 'French' : 'English';
+  const raw = Array.isArray(req.body.messages) ? req.body.messages : [];
+  const history = raw.slice(-12)
+    .map(m => ({
+      role: m && m.role === 'assistant' ? 'assistant' : 'user',
+      content: String((m && m.content) || '').slice(0, 4000),
+    }))
+    .filter(m => m.content.trim());
+  while (history.length && history[0].role !== 'user') history.shift();
+  if (!history.length || history[history.length - 1].role !== 'user') {
+    return res.status(400).json({ error: 'messages must end with a user message' });
+  }
+  try {
+    const isAdmin = req.partnerUser.role === 'admin';
+    const response = await client.messages.create({
+      model: 'claude-opus-4-8',
+      max_tokens: 1024,
+      thinking: { type: 'adaptive' },
+      output_config: { effort: 'low' },
+      system: [
+        { type: 'text', text: PARTNER_ASSISTANT_SYSTEM + (isAdmin ? PARTNER_ASSISTANT_SYSTEM_ADMIN : PARTNER_ASSISTANT_SYSTEM_STANDARD) },
+        { type: 'text', text: `Current user: ${req.partnerUser.name || req.partnerUser.email}${isAdmin ? ' (Partner Admin)' : ' (Standard user, not a Partner Admin)'}. Reply in ${uiLang}.` },
+      ],
+      messages: history,
+    });
+    const reply = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
+    res.json({ reply });
+  } catch (e) {
+    console.warn('[PARTNER ASSISTANT] error:', e.message);
+    res.status(502).json({ error: 'assistant_error' });
   }
 });
 
