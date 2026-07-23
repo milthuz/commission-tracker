@@ -134,6 +134,10 @@ const PERMISSION_CATALOG = [
   { key: 'saas_increase:manage',       label: 'Build & simulate SaaS price-increase scenarios',                 category: 'SaaS Increase' },
   { key: 'saas_increase:notify',       label: 'Send merchant notification emails about a SaaS price increase', category: 'SaaS Increase' },
   { key: 'saas_increase:execute',      label: 'Push SaaS price increases into live Zoho subscriptions',        category: 'SaaS Increase' },
+
+  // Partner Portal (internal staff side — manage partner companies + review submissions;
+  // partner accounts themselves never touch this permission system, see partner_users)
+  { key: 'partners:manage',            label: 'Manage partner companies and review submitted opportunities',   category: 'Partners' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -1362,6 +1366,72 @@ async function initializeDatabase() {
     // Demo mode for external users too (same semantics as user_tokens.demo_mode)
     await pool.query(`ALTER TABLE local_users ADD COLUMN IF NOT EXISTS demo_mode BOOLEAN DEFAULT false`);
 
+    // Partner Portal (Phase 1 — SH-25/26/27/31/33). Deliberately a SEPARATE table/auth surface
+    // from local_users, not a shared one: SH-25 requires a partner account to reach ONLY the
+    // Partner Portal, regardless of role, and keeping the identity + login machinery fully
+    // isolated (own table, own JWT userType, own middleware) makes that guarantee structural
+    // rather than something every future permission check has to remember to enforce. The
+    // partner-facing UI still looks like Sales Hub (same brand) — this separation is invisible
+    // to anyone using the app; it only matters for how access is enforced under the hood.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS partners (
+        id              SERIAL PRIMARY KEY,
+        name            TEXT UNIQUE NOT NULL,
+        active          BOOLEAN DEFAULT true,
+        logo_data       BYTEA,
+        logo_mime_type  VARCHAR(150),
+        logo_file_name  VARCHAR(400),
+        created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS partner_users (
+        id                 SERIAL PRIMARY KEY,
+        partner_id         INT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+        email              VARCHAR(255) UNIQUE NOT NULL,
+        display_name       VARCHAR(255),
+        role               VARCHAR(20) NOT NULL DEFAULT 'standard',
+        password_hash      VARCHAR(255),
+        totp_secret        VARCHAR(64),
+        totp_enabled       BOOLEAN DEFAULT false,
+        status             VARCHAR(20) DEFAULT 'invited',
+        invite_token_hash  VARCHAR(64),
+        invite_expires_at  TIMESTAMP,
+        reset_token_hash   VARCHAR(64),
+        reset_expires_at   TIMESTAMP,
+        invited_by         VARCHAR(255),
+        last_login_at      TIMESTAMP,
+        created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS partner_opportunities (
+        id                  SERIAL PRIMARY KEY,
+        partner_id          INT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+        submitted_by        INT REFERENCES partner_users(id),
+        business_name       VARCHAR(255) NOT NULL,
+        contact_first_name  VARCHAR(255),
+        contact_last_name   VARCHAR(255),
+        contact_phone       VARCHAR(50),
+        contact_email       VARCHAR(255),
+        rep_first_name      VARCHAR(255),
+        rep_last_name       VARCHAR(255),
+        rep_phone           VARCHAR(50),
+        rep_email           VARCHAR(255),
+        notes               TEXT,
+        status              VARCHAR(20) NOT NULL DEFAULT 'pending',
+        reviewed_by         VARCHAR(255),
+        reviewed_at         TIMESTAMP,
+        rejection_reason    TEXT,
+        created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_partner_users_partner ON partner_users(partner_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_partner_opps_partner ON partner_opportunities(partner_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_partner_opps_status ON partner_opportunities(status)`);
+
     // Resellers — third-party companies that resell licenses. POS activations come from a
     // Zoho Form; residual payments come from Zentact. Linked by reseller name for now.
     await pool.query(`
@@ -1803,6 +1873,10 @@ const authenticateToken = async (req, res, next) => {
 
   try {
     const user = jwt.verify(token, JWT_SECRET);
+    // SECURITY (Partner Portal isolation, SH-25): a partner token must never authenticate against
+    // internal routes, no matter what permissions/roles later logic might otherwise resolve for
+    // that email. Reject it here, before any other logic runs.
+    if (user.userType === 'partner') return res.status(401).json({ error: 'Invalid token' });
     req.user = user;
 
     // SECURITY: the Zoho-login JWT is signed isAdmin:true for everyone (legacy). NEVER trust
@@ -2376,6 +2450,34 @@ function verifyMfaJwt(token, purpose) {
   } catch { return null; }
 }
 
+// Partner Portal auth (SH-25) — fully separate from signLocalJwt/authenticateToken by design,
+// see the partner_users table comment. The token carries userType:'partner' so authenticateToken
+// (the internal middleware) rejects it outright, and this middleware rejects anything that isn't.
+const signPartnerJwt = (pu) => jwt.sign(
+  { email: pu.email, name: pu.display_name || pu.email, partnerId: pu.partner_id, partnerUserId: pu.id, role: pu.role, userType: 'partner' },
+  JWT_SECRET, { expiresIn: '7d' }
+);
+const authenticatePartnerToken = async (req, res, next) => {
+  const token = req.headers['authorization']?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+  try {
+    const claims = jwt.verify(token, JWT_SECRET);
+    if (claims.userType !== 'partner') return res.status(401).json({ error: 'Invalid token' });
+    // Never trust the JWT's role/partnerId alone — re-resolve the live row every request (same
+    // reasoning as isAdmin/isDemo re-resolution in authenticateToken) so a disabled partner user
+    // or a role change takes effect immediately, not just on next login.
+    const pu = (await pool.query(
+      `SELECT id, partner_id, email, display_name, role, status FROM partner_users WHERE id = $1`,
+      [claims.partnerUserId]
+    )).rows[0];
+    if (!pu || pu.status !== 'active') return res.status(401).json({ error: 'Invalid token' });
+    req.partnerUser = { id: pu.id, partnerId: pu.partner_id, email: pu.email, name: pu.display_name || pu.email, role: pu.role };
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+};
+
 // --- Admin: invitations & external-user management (gate: admin:users) ---
 
 // POST /api/admin/local-users/invite { email, name } → creates/refreshes the invite + emails it
@@ -2740,6 +2842,453 @@ app.post('/api/auth/reset-password', async (req, res) => {
               updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
       [u.id, await bcrypt.hash(password, 10)]
     );
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================================
+// PARTNER PORTAL — auth (SH-25/26/27/31/33). Mirrors the local_users flow above 1:1 (same
+// bcrypt/TOTP/invite-token machinery) but scoped to partner_users — see the table comment and
+// authenticatePartnerToken for why this is a fully separate surface.
+// ============================================================================
+
+app.get('/api/partner-auth/invite-info', async (req, res) => {
+  const raw = String(req.query.token || '');
+  if (!raw) return res.status(400).json({ error: 'Missing token' });
+  try {
+    const pu = (await pool.query(
+      `SELECT pu.email, pu.display_name, pu.invite_expires_at, pu.status, p.name AS partner_name
+         FROM partner_users pu JOIN partners p ON p.id = pu.partner_id
+        WHERE pu.invite_token_hash = $1`,
+      [sha256hex(raw)]
+    )).rows[0];
+    if (!pu || pu.status !== 'invited') return res.status(404).json({ error: 'Invalid invitation' });
+    if (new Date(pu.invite_expires_at) < new Date()) return res.status(410).json({ error: 'Invitation expired' });
+    res.json({ valid: true, email: pu.email, name: pu.display_name, partnerName: pu.partner_name });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/partner-auth/invite/accept', async (req, res) => {
+  const raw = String(req.body.token || '');
+  const password = String(req.body.password || '');
+  if (rateLimited(`paccept:${req.ip}`)) return res.status(429).json({ error: 'Too many attempts — try again later' });
+  if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  try {
+    const pu = (await pool.query(
+      `SELECT id, email, display_name, invite_expires_at, status FROM partner_users WHERE invite_token_hash = $1`,
+      [sha256hex(raw)]
+    )).rows[0];
+    if (!pu || pu.status !== 'invited') return res.status(404).json({ error: 'Invalid invitation' });
+    if (new Date(pu.invite_expires_at) < new Date()) return res.status(410).json({ error: 'Invitation expired' });
+
+    const secret = authenticator.generateSecret();
+    await pool.query(
+      `UPDATE partner_users SET password_hash = $2, totp_secret = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [pu.id, await bcrypt.hash(password, 10), secret]
+    );
+    const otpauth = authenticator.keyuri(pu.email, 'Sales Hub', secret);
+    const qrDataUrl = await QRCode.toDataURL(otpauth, { margin: 1, width: 220 });
+    res.json({ success: true, qrDataUrl, secret, setupToken: signMfaJwt(pu.email, 'partner-2fa-setup') });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/partner-auth/invite/verify-2fa', async (req, res) => {
+  const p = verifyMfaJwt(String(req.body.setupToken || ''), 'partner-2fa-setup');
+  if (!p) return res.status(401).json({ error: 'Setup session expired — restart from the invite link' });
+  if (rateLimited(`psetup2fa:${p.email}`)) return res.status(429).json({ error: 'Too many attempts — try again later' });
+  try {
+    const pu = (await pool.query(`SELECT * FROM partner_users WHERE email = $1`, [p.email])).rows[0];
+    if (!pu || !pu.totp_secret) return res.status(404).json({ error: 'Invalid state' });
+    if (!authenticator.check(String(req.body.code || ''), pu.totp_secret)) {
+      return res.status(401).json({ error: 'Invalid code' });
+    }
+    await pool.query(
+      `UPDATE partner_users SET totp_enabled = true, status = 'active', invite_token_hash = NULL,
+              invite_expires_at = NULL, last_login_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1`, [pu.id]
+    );
+    logActivity('partner_user', pu.email, 'activated', `${pu.display_name || pu.email} activated their Partner Portal account`, pu.email);
+    res.json({ success: true, token: signPartnerJwt(pu) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/partner-auth/login', async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+  if (rateLimited(`plogin:${email}`) || rateLimited(`ploginip:${req.ip}`, 20)) {
+    return res.status(429).json({ error: 'Too many attempts — try again later' });
+  }
+  try {
+    const pu = (await pool.query(`SELECT * FROM partner_users WHERE email = $1`, [email])).rows[0];
+    const fail = () => res.status(401).json({ error: 'Invalid email or password' });
+    if (!pu || !pu.password_hash || pu.status === 'disabled') return fail();
+    if (!(await bcrypt.compare(password, pu.password_hash))) return fail();
+    if (pu.status !== 'active' || !pu.totp_enabled) {
+      return res.status(403).json({ error: 'Account setup incomplete — use your invitation link' });
+    }
+    res.json({ mfaRequired: true, mfaToken: signMfaJwt(pu.email, 'partner-2fa-login') });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/partner-auth/login/verify-2fa', async (req, res) => {
+  const p = verifyMfaJwt(String(req.body.mfaToken || ''), 'partner-2fa-login');
+  if (!p) return res.status(401).json({ error: 'Session expired — log in again' });
+  if (rateLimited(`p2fa:${p.email}`)) return res.status(429).json({ error: 'Too many attempts — try again later' });
+  try {
+    const pu = (await pool.query(`SELECT * FROM partner_users WHERE email = $1 AND status = 'active'`, [p.email])).rows[0];
+    if (!pu) return res.status(401).json({ error: 'Invalid state' });
+    if (!authenticator.check(String(req.body.code || ''), pu.totp_secret)) {
+      return res.status(401).json({ error: 'Invalid code' });
+    }
+    await pool.query(`UPDATE partner_users SET last_login_at = CURRENT_TIMESTAMP WHERE id = $1`, [pu.id]);
+    logActivity('partner_user', pu.email, 'login', `${pu.display_name || pu.email} logged in to the Partner Portal`, pu.email);
+    res.json({ success: true, token: signPartnerJwt(pu) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/partner-auth/forgot-password', async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  if (rateLimited(`pforgot:${req.ip}`)) return res.status(429).json({ error: 'Too many attempts — try again later' });
+  try {
+    const pu = (await pool.query(
+      `SELECT id, display_name FROM partner_users WHERE email = $1 AND status = 'active'`, [email]
+    )).rows[0];
+    if (pu) {
+      const raw = newRawToken();
+      await pool.query(
+        `UPDATE partner_users SET reset_token_hash = $2, reset_expires_at = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [pu.id, sha256hex(raw), new Date(Date.now() + 3600 * 1000)]
+      );
+      const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+      await sendMail(
+        email,
+        'Réinitialisation du mot de passe — Sales Hub / Password reset',
+        mailShell(
+          'Réinitialiser votre mot de passe · Reset your password',
+          `Une réinitialisation du mot de passe a été demandée pour votre compte du Portail partenaire Sales Hub. Le lien expire dans 1 heure. Si vous n'êtes pas à l'origine de cette demande, ignorez ce courriel.<br><br>A password reset was requested for your Sales Hub Partner Portal account. The link expires in 1 hour. If you didn't request this, you can ignore this email.`,
+          'Réinitialiser / Reset password',
+          `${base}/partner-portal/reset-password?token=${raw}`
+        )
+      );
+    }
+    res.json({ success: true }); // always OK — no user enumeration
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/partner-auth/reset-password', async (req, res) => {
+  const raw = String(req.body.token || '');
+  const password = String(req.body.password || '');
+  if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  try {
+    const pu = (await pool.query(
+      `SELECT id, reset_expires_at FROM partner_users WHERE reset_token_hash = $1`, [sha256hex(raw)]
+    )).rows[0];
+    if (!pu) return res.status(404).json({ error: 'Invalid link' });
+    if (new Date(pu.reset_expires_at) < new Date()) return res.status(410).json({ error: 'Link expired' });
+    await pool.query(
+      `UPDATE partner_users SET password_hash = $2, reset_token_hash = NULL, reset_expires_at = NULL,
+              updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [pu.id, await bcrypt.hash(password, 10)]
+    );
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/partner-auth/verify — the partner-side equivalent of /api/auth/verify.
+app.get('/api/partner-auth/verify', authenticatePartnerToken, async (req, res) => {
+  try {
+    const p = (await pool.query(`SELECT name FROM partners WHERE id = $1`, [req.partnerUser.partnerId])).rows[0];
+    res.json({ user: { ...req.partnerUser, partnerName: p?.name || null } });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================================
+// PARTNER PORTAL — opportunities + team (SH-27, SH-26, SH-31). All gated by
+// authenticatePartnerToken; Admin-only actions additionally check req.partnerUser.role — this is
+// a partner-scoped role, unrelated to the internal PERMISSION_CATALOG/roles system.
+// ============================================================================
+
+// Shared camelCase mapper for both opportunity-listing endpoints below.
+function mapOpportunityRow(r) {
+  return {
+    id: r.id, businessName: r.business_name,
+    contactFirstName: r.contact_first_name, contactLastName: r.contact_last_name,
+    contactPhone: r.contact_phone, contactEmail: r.contact_email,
+    repFirstName: r.rep_first_name, repLastName: r.rep_last_name,
+    repPhone: r.rep_phone, repEmail: r.rep_email,
+    notes: r.notes, status: r.status, reviewedBy: r.reviewed_by, reviewedAt: r.reviewed_at,
+    rejectionReason: r.rejection_reason, createdAt: r.created_at,
+    partnerName: r.partner_name, submittedByEmail: r.submitted_by_email,
+  };
+}
+
+// GET /api/partner-portal/opportunities — Standard: only their own submissions. Admin: every
+// submission for their partner company.
+app.get('/api/partner-portal/opportunities', authenticatePartnerToken, async (req, res) => {
+  try {
+    const isAdmin = req.partnerUser.role === 'admin';
+    const rows = (await pool.query(
+      `SELECT id, business_name, contact_first_name, contact_last_name, contact_phone, contact_email,
+              rep_first_name, rep_last_name, rep_phone, rep_email, notes, status, reviewed_at,
+              rejection_reason, created_at
+         FROM partner_opportunities
+        WHERE partner_id = $1 ${isAdmin ? '' : 'AND submitted_by = $2'}
+        ORDER BY created_at DESC`,
+      isAdmin ? [req.partnerUser.partnerId] : [req.partnerUser.partnerId, req.partnerUser.id]
+    )).rows;
+    res.json({ opportunities: rows.map(mapOpportunityRow) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/partner-portal/opportunities — SH-27 submission form.
+app.post('/api/partner-portal/opportunities', authenticatePartnerToken, async (req, res) => {
+  const b = req.body || {};
+  const businessName = String(b.businessName || '').trim();
+  if (!businessName) return res.status(400).json({ error: 'Business name is required' });
+  try {
+    const r = await pool.query(
+      `INSERT INTO partner_opportunities
+         (partner_id, submitted_by, business_name, contact_first_name, contact_last_name, contact_phone,
+          contact_email, rep_first_name, rep_last_name, rep_phone, rep_email, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+      [req.partnerUser.partnerId, req.partnerUser.id, businessName,
+       String(b.contactFirstName || '').trim() || null, String(b.contactLastName || '').trim() || null,
+       String(b.contactPhone || '').trim() || null, String(b.contactEmail || '').trim() || null,
+       String(b.repFirstName || '').trim() || null, String(b.repLastName || '').trim() || null,
+       String(b.repPhone || '').trim() || null, String(b.repEmail || '').trim() || null,
+       String(b.notes || '').trim() || null]
+    );
+    logActivity('partner_opportunity', String(r.rows[0].id), 'submitted', `${businessName} submitted by ${req.partnerUser.email}`, req.partnerUser.email);
+    res.json({ success: true, id: r.rows[0].id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/partner-portal/team — Admin-only: list this partner's own users.
+app.get('/api/partner-portal/team', authenticatePartnerToken, async (req, res) => {
+  if (req.partnerUser.role !== 'admin') return res.status(403).json({ error: 'Partner Admin only' });
+  try {
+    const rows = (await pool.query(
+      `SELECT id, email, display_name, role, status, totp_enabled, last_login_at, created_at
+         FROM partner_users WHERE partner_id = $1 ORDER BY created_at DESC`,
+      [req.partnerUser.partnerId]
+    )).rows;
+    res.json({ users: rows.map((r) => ({
+      id: r.id, email: r.email, displayName: r.display_name, role: r.role, status: r.status,
+      totpEnabled: r.totp_enabled, lastLoginAt: r.last_login_at, createdAt: r.created_at,
+    })) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/partner-portal/team/invite { email, name, role } — Admin-only, SH-31.
+app.post('/api/partner-portal/team/invite', authenticatePartnerToken, async (req, res) => {
+  if (req.partnerUser.role !== 'admin') return res.status(403).json({ error: 'Partner Admin only' });
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const name = String(req.body.name || '').trim();
+  const role = req.body.role === 'admin' ? 'admin' : 'standard';
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'Invalid email' });
+  try {
+    const existing = (await pool.query(`SELECT id, status FROM partner_users WHERE email = $1`, [email])).rows[0];
+    if (existing && existing.status === 'active') return res.status(409).json({ error: 'User already active' });
+    const raw = newRawToken();
+    const expires = new Date(Date.now() + 7 * 24 * 3600 * 1000);
+    await pool.query(
+      `INSERT INTO partner_users (partner_id, email, display_name, role, status, invite_token_hash, invite_expires_at, invited_by)
+       VALUES ($1,$2,$3,$4,'invited',$5,$6,$7)
+       ON CONFLICT (email) DO UPDATE SET
+         display_name = $3, role = $4, status = 'invited', invite_token_hash = $5,
+         invite_expires_at = $6, invited_by = $7, updated_at = CURRENT_TIMESTAMP`,
+      [req.partnerUser.partnerId, email, name || null, role, sha256hex(raw), expires, req.partnerUser.email]
+    );
+    const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+    const inviteUrl = `${base}/partner-portal/accept-invite?token=${raw}`;
+    const mail = await sendMail(
+      email,
+      'Invitation — Sales Hub Partner Portal',
+      mailShell(
+        'Vous êtes invité au Portail partenaire Sales Hub · You are invited to the Sales Hub Partner Portal',
+        `${name ? name + ', ' : ''}un compte vous a été préparé sur le Portail partenaire Sales Hub. Cliquez ci-dessous pour choisir votre mot de passe et activer la vérification en deux étapes. Le lien expire dans 7 jours.<br><br>An account has been prepared for you on the Sales Hub Partner Portal. Click below to set your password and enable two-step verification. The link expires in 7 days.`,
+        'Activer mon compte / Activate my account',
+        inviteUrl
+      )
+    );
+    logActivity('partner_user', email, 'invited', `${email}${name ? ` (${name})` : ''} invited by ${req.partnerUser.email}`, req.partnerUser.email);
+    res.json({ success: true, inviteUrl, emailSent: mail.sent, emailError: mail.sent ? null : mail.reason });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================================
+// PARTNER PORTAL — internal admin side (partners:manage). Manage partner companies + review
+// submitted opportunities. Phase 1: approve/reject is a status flip only — no Zoho CRM
+// duplicate-check or Lead creation yet (SH-28/29/30/37/38 are a later phase).
+// ============================================================================
+
+app.get('/api/admin/partners', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const rows = (await pool.query(
+      `SELECT p.id, p.name, p.active, p.created_at, (p.logo_data IS NOT NULL) AS has_logo,
+              COUNT(pu.id) AS user_count
+         FROM partners p LEFT JOIN partner_users pu ON pu.partner_id = p.id
+        GROUP BY p.id ORDER BY p.name`
+    )).rows;
+    res.json({ partners: rows.map((r) => ({
+      id: r.id, name: r.name, active: r.active, createdAt: r.created_at,
+      hasLogo: r.has_logo, userCount: parseInt(r.user_count, 10),
+    })) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/partners', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  const name = String(req.body.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'Partner name required' });
+  try {
+    const r = await pool.query(`INSERT INTO partners (name) VALUES ($1) RETURNING id`, [name]);
+    res.json({ success: true, id: r.rows[0].id });
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ error: 'A partner with that name already exists' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/admin/partners/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  const name = String(req.body.name || '').trim();
+  const active = req.body.active !== false;
+  if (!name) return res.status(400).json({ error: 'Partner name required' });
+  try {
+    const r = await pool.query(
+      `UPDATE partners SET name = $2, active = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING id`,
+      [parseInt(req.params.id, 10), name, active]
+    );
+    if (!r.rowCount) return res.status(404).json({ error: 'Partner not found' });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/admin/partners/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const r = await pool.query(`DELETE FROM partners WHERE id = $1 RETURNING id`, [parseInt(req.params.id, 10)]);
+    if (!r.rowCount) return res.status(404).json({ error: 'Partner not found' });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/partners/:id/invite-admin { email, name } — bootstraps the FIRST Partner
+// Admin for a newly created partner company. Reuses the same invite mechanism as
+// /api/partner-portal/team/invite (partner admin inviting more of their own users).
+app.post('/api/admin/partners/:id/invite-admin', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  const partnerId = parseInt(req.params.id, 10);
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const name = String(req.body.name || '').trim();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'Invalid email' });
+  try {
+    const partner = (await pool.query(`SELECT name FROM partners WHERE id = $1`, [partnerId])).rows[0];
+    if (!partner) return res.status(404).json({ error: 'Partner not found' });
+    const existing = (await pool.query(`SELECT id, status FROM partner_users WHERE email = $1`, [email])).rows[0];
+    if (existing && existing.status === 'active') return res.status(409).json({ error: 'User already active' });
+    const raw = newRawToken();
+    const expires = new Date(Date.now() + 7 * 24 * 3600 * 1000);
+    const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+    await pool.query(
+      `INSERT INTO partner_users (partner_id, email, display_name, role, status, invite_token_hash, invite_expires_at, invited_by)
+       VALUES ($1,$2,$3,'admin','invited',$4,$5,$6)
+       ON CONFLICT (email) DO UPDATE SET
+         partner_id = $1, display_name = $3, role = 'admin', status = 'invited', invite_token_hash = $4,
+         invite_expires_at = $5, invited_by = $6, updated_at = CURRENT_TIMESTAMP`,
+      [partnerId, email, name || null, sha256hex(raw), expires, actor]
+    );
+    const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+    const inviteUrl = `${base}/partner-portal/accept-invite?token=${raw}`;
+    const mail = await sendMail(
+      email,
+      'Invitation — Sales Hub Partner Portal',
+      mailShell(
+        'Vous êtes invité au Portail partenaire Sales Hub · You are invited to the Sales Hub Partner Portal',
+        `${name ? name + ', ' : ''}un compte administrateur pour ${partner.name} vous a été préparé sur le Portail partenaire Sales Hub. Cliquez ci-dessous pour choisir votre mot de passe et activer la vérification en deux étapes. Le lien expire dans 7 jours.<br><br>An admin account for ${partner.name} has been prepared for you on the Sales Hub Partner Portal. Click below to set your password and enable two-step verification. The link expires in 7 days.`,
+        'Activer mon compte / Activate my account',
+        inviteUrl
+      )
+    );
+    logActivity('partner_user', email, 'invited', `${email}${name ? ` (${name})` : ''} invited as Partner Admin for ${partner.name} by ${actor}`, actor);
+    res.json({ success: true, inviteUrl, emailSent: mail.sent, emailError: mail.sent ? null : mail.reason });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/partner-opportunities?status= — the full review queue (all partners).
+app.get('/api/admin/partner-opportunities', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const statusFilter = ['pending', 'approved', 'rejected'].includes(req.query.status) ? req.query.status : null;
+    const rows = (await pool.query(
+      `SELECT o.id, o.business_name, o.contact_first_name, o.contact_last_name, o.contact_phone, o.contact_email,
+              o.rep_first_name, o.rep_last_name, o.rep_phone, o.rep_email, o.notes, o.status,
+              o.reviewed_by, o.reviewed_at, o.rejection_reason, o.created_at,
+              p.name AS partner_name, pu.email AS submitted_by_email
+         FROM partner_opportunities o
+         JOIN partners p ON p.id = o.partner_id
+         LEFT JOIN partner_users pu ON pu.id = o.submitted_by
+        ${statusFilter ? 'WHERE o.status = $1' : ''}
+        ORDER BY o.created_at DESC`,
+      statusFilter ? [statusFilter] : []
+    )).rows;
+    res.json({ opportunities: rows.map(mapOpportunityRow) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/admin/partner-opportunities/:id { status: 'approved'|'rejected', rejectionReason? }
+app.put('/api/admin/partner-opportunities/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  const status = req.body.status === 'approved' ? 'approved' : req.body.status === 'rejected' ? 'rejected' : null;
+  if (!status) return res.status(400).json({ error: 'status must be approved or rejected' });
+  try {
+    const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+    const r = await pool.query(
+      `UPDATE partner_opportunities SET status = $2, reviewed_by = $3, reviewed_at = CURRENT_TIMESTAMP,
+              rejection_reason = $4
+       WHERE id = $1 RETURNING business_name`,
+      [parseInt(req.params.id, 10), status, actor, status === 'rejected' ? (String(req.body.rejectionReason || '').trim() || null) : null]
+    );
+    if (!r.rowCount) return res.status(404).json({ error: 'Opportunity not found' });
+    logActivity('partner_opportunity', req.params.id, status, `${r.rows[0].business_name} ${status} by ${actor}`, actor);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
