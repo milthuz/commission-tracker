@@ -1367,6 +1367,26 @@ async function initializeDatabase() {
     // Demo mode for external users too (same semantics as user_tokens.demo_mode)
     await pool.query(`ALTER TABLE local_users ADD COLUMN IF NOT EXISTS demo_mode BOOLEAN DEFAULT false`);
 
+    // "Remember this device for 30 days" (user request 2026-07-2x) — shared by both TOTP login
+    // surfaces (local_users AND partner_users) since the mechanism is identical for each: a
+    // random token, sha256 hashed like every other token in this file, tied to email + which
+    // surface it belongs to. user_type is a discriminator, not a security boundary that needs
+    // its own table — a lookup only ever matches within the surface that's checking it (the
+    // local login path queries user_type='local', the partner path queries 'partner'), so there's
+    // no way a trusted-device row from one surface could be presented as trust for the other.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS trusted_devices (
+        id           SERIAL PRIMARY KEY,
+        email        VARCHAR(255) NOT NULL,
+        user_type    VARCHAR(10) NOT NULL CHECK (user_type IN ('local','partner')),
+        token_hash   VARCHAR(64) NOT NULL UNIQUE,
+        expires_at   TIMESTAMP NOT NULL,
+        created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_used_at TIMESTAMP
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_trusted_devices_lookup ON trusted_devices(token_hash, email, user_type)`);
+
     // Partner Portal (Phase 1 — SH-25/26/27/31/33). Deliberately a SEPARATE table/auth surface
     // from local_users, not a shared one: SH-25 requires a partner account to reach ONLY the
     // Partner Portal, regardless of role, and keeping the identity + login machinery fully
@@ -2335,6 +2355,7 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
         isAdmin,
         isSalesperson,
         isDemo: req.user.isDemo || false,
+        isLocal: req.user.userType === 'local',
         permissions,
         impersonating:   req.user.impersonating || false,
         realAdminEmail:  req.user.realAdminEmail || null,
@@ -2350,6 +2371,7 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
         photo:   req.user.photo || null,
         zoho_id: req.user.zoho_id || req.user.email,
         isAdmin: req.user.isAdmin || false,
+        isLocal: req.user.userType === 'local',
       }
     });
   }
@@ -2365,6 +2387,28 @@ app.get('/api/auth/verify', authenticateToken, async (req, res) => {
 
 const sha256hex = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const newRawToken = () => crypto.randomBytes(32).toString('hex');
+
+// "Remember this device" (30 days) — see the trusted_devices table comment. userType is
+// 'local' or 'partner'; checkTrustedDevice is a no-op (returns false) when no token is sent,
+// so existing clients that don't yet send one just keep hitting the normal MFA step.
+async function checkTrustedDevice(email, userType, rawToken) {
+  if (!rawToken) return false;
+  const row = (await pool.query(
+    `SELECT id FROM trusted_devices WHERE token_hash = $1 AND email = $2 AND user_type = $3 AND expires_at > NOW()`,
+    [sha256hex(String(rawToken)), email, userType]
+  )).rows[0];
+  if (!row) return false;
+  await pool.query(`UPDATE trusted_devices SET last_used_at = CURRENT_TIMESTAMP WHERE id = $1`, [row.id]);
+  return true;
+}
+async function trustDevice(email, userType) {
+  const raw = newRawToken();
+  await pool.query(
+    `INSERT INTO trusted_devices (email, user_type, token_hash, expires_at) VALUES ($1,$2,$3,$4)`,
+    [email, userType, sha256hex(raw), new Date(Date.now() + 30 * 24 * 3600 * 1000)]
+  );
+  return raw;
+}
 authenticator.options = { window: 1 }; // tolerate ±30s clock drift
 
 // SMTP mailer — Heroku config vars: SMTP_HOST, SMTP_PORT (465=TLS), SMTP_USER,
@@ -2792,6 +2836,11 @@ app.post('/api/auth/login', async (req, res) => {
     if (u.status !== 'active' || !u.totp_enabled) {
       return res.status(403).json({ error: 'Account setup incomplete — use your invitation link' });
     }
+    if (await checkTrustedDevice(u.email, 'local', req.body.deviceToken)) {
+      await pool.query(`UPDATE local_users SET last_login_at = CURRENT_TIMESTAMP WHERE id = $1`, [u.id]);
+      logActivity('auth', u.email, 'login', `${u.display_name || u.email} logged in (trusted device)`, u.email, { metadata: { via: 'local' } });
+      return res.json({ success: true, token: signLocalJwt(u) });
+    }
     res.json({ mfaRequired: true, mfaToken: signMfaJwt(u.email, '2fa-login') });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -2810,7 +2859,8 @@ app.post('/api/auth/login/verify-2fa', async (req, res) => {
     }
     await pool.query(`UPDATE local_users SET last_login_at = CURRENT_TIMESTAMP WHERE id = $1`, [u.id]);
     logActivity('auth', u.email, 'login', `${u.display_name || u.email} logged in`, u.email, { metadata: { via: 'local' } });
-    res.json({ success: true, token: signLocalJwt(u) });
+    const deviceToken = req.body.rememberDevice ? await trustDevice(u.email, 'local') : undefined;
+    res.json({ success: true, token: signLocalJwt(u), deviceToken });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -2957,6 +3007,11 @@ app.post('/api/partner-auth/login', async (req, res) => {
     if (pu.status !== 'active' || !pu.totp_enabled) {
       return res.status(403).json({ error: 'Account setup incomplete — use your invitation link' });
     }
+    if (await checkTrustedDevice(pu.email, 'partner', req.body.deviceToken)) {
+      await pool.query(`UPDATE partner_users SET last_login_at = CURRENT_TIMESTAMP WHERE id = $1`, [pu.id]);
+      logActivity('partner_user', pu.email, 'login', `${pu.display_name || pu.email} logged in to the Partner Portal (trusted device)`, pu.email);
+      return res.json({ success: true, token: signPartnerJwt(pu) });
+    }
     res.json({ mfaRequired: true, mfaToken: signMfaJwt(pu.email, 'partner-2fa-login') });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -2975,7 +3030,8 @@ app.post('/api/partner-auth/login/verify-2fa', async (req, res) => {
     }
     await pool.query(`UPDATE partner_users SET last_login_at = CURRENT_TIMESTAMP WHERE id = $1`, [pu.id]);
     logActivity('partner_user', pu.email, 'login', `${pu.display_name || pu.email} logged in to the Partner Portal`, pu.email);
-    res.json({ success: true, token: signPartnerJwt(pu) });
+    const deviceToken = req.body.rememberDevice ? await trustDevice(pu.email, 'partner') : undefined;
+    res.json({ success: true, token: signPartnerJwt(pu), deviceToken });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -7877,6 +7933,47 @@ app.put('/api/user/push-pin', authenticateToken, async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to save PIN', details: error.message });
+  }
+});
+
+// POST /api/user/2fa/reset — start replacing this LOCAL user's authenticator device. Zoho SSO
+// users don't have TOTP at all (they authenticate via Zoho), so this is 403'd for anyone whose
+// JWT isn't userType:'local' — mirrors /api/partner-portal/2fa/reset's design exactly (the new
+// secret lives only in the signed setup token until /2fa/confirm verifies a live code).
+app.post('/api/user/2fa/reset', authenticateToken, async (req, res) => {
+  if (req.user.userType !== 'local') return res.status(403).json({ error: 'Not available for Zoho-authenticated accounts' });
+  if (rateLimited(`u2fareset:${req.user.email}`)) return res.status(429).json({ error: 'Too many attempts — try again later' });
+  try {
+    const secret = authenticator.generateSecret();
+    const otpauth = authenticator.keyuri(req.user.email, 'Sales Hub', secret);
+    const qrDataUrl = await QRCode.toDataURL(otpauth, { margin: 1, width: 220 });
+    const setupToken = jwt.sign(
+      { email: req.user.email, purpose: 'local-2fa-reset', secret }, JWT_SECRET, { expiresIn: '15m' }
+    );
+    res.json({ qrDataUrl, secret, setupToken });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/user/2fa/confirm { setupToken, code }
+app.post('/api/user/2fa/confirm', authenticateToken, async (req, res) => {
+  if (req.user.userType !== 'local') return res.status(403).json({ error: 'Not available for Zoho-authenticated accounts' });
+  const p = verifyMfaJwt(String(req.body.setupToken || ''), 'local-2fa-reset');
+  if (!p || p.email !== req.user.email) return res.status(401).json({ error: 'Setup session expired — start over' });
+  if (rateLimited(`u2faresetverify:${req.user.email}`)) return res.status(429).json({ error: 'Too many attempts — try again later' });
+  if (!authenticator.check(String(req.body.code || ''), p.secret)) {
+    return res.status(401).json({ error: 'Invalid code' });
+  }
+  try {
+    await pool.query(
+      `UPDATE local_users SET totp_secret = $2, totp_enabled = true, updated_at = CURRENT_TIMESTAMP WHERE email = $1`,
+      [req.user.email, p.secret]
+    );
+    logActivity('auth', req.user.email, 'reset_2fa', `${req.user.email} replaced their authenticator device`, req.user.email);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
