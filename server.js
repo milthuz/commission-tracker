@@ -1433,6 +1433,24 @@ async function initializeDatabase() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_partner_opps_partner ON partner_opportunities(partner_id)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_partner_opps_status ON partner_opportunities(status)`);
 
+    // Broadcast notifications for the Partner Portal's bell icon (user request 2026-07-2x:
+    // "notification area like Sales Hub, we'll push notifications eventually"). Org-wide, not
+    // per-user, mirroring the opportunity queue's own scoping — nothing writes to this table yet;
+    // it exists so a future feature (e.g. an opportunity status change, an announcement) can
+    // insert a row and have it show up with zero additional plumbing. "Seen" is tracked
+    // client-side (localStorage timestamp), same lightweight pattern as the release-seen dot.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS partner_notifications (
+        id          SERIAL PRIMARY KEY,
+        partner_id  INT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+        title       VARCHAR(255) NOT NULL,
+        body        TEXT,
+        link        VARCHAR(500),
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_partner_notifications_partner ON partner_notifications(partner_id, created_at DESC)`);
+
     // Resellers — third-party companies that resell licenses. POS activations come from a
     // Zoho Form; residual payments come from Zentact. Linked by reseller name for now.
     await pool.query(`
@@ -3159,6 +3177,22 @@ app.post('/api/partner-portal/2fa/confirm', authenticatePartnerToken, async (req
     );
     logActivity('partner_user', req.partnerUser.email, 'reset_2fa', `${req.partnerUser.email} replaced their authenticator device`, req.partnerUser.email);
     res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/partner-portal/notifications — latest broadcast notifications for this partner org.
+app.get('/api/partner-portal/notifications', authenticatePartnerToken, async (req, res) => {
+  try {
+    const rows = (await pool.query(
+      `SELECT id, title, body, link, created_at FROM partner_notifications
+        WHERE partner_id = $1 ORDER BY created_at DESC LIMIT 20`,
+      [req.partnerUser.partnerId]
+    )).rows;
+    res.json({ notifications: rows.map((r) => ({
+      id: r.id, title: r.title, body: r.body, link: r.link, createdAt: r.created_at,
+    })) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
