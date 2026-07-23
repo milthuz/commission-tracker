@@ -11414,121 +11414,183 @@ app.put('/api/pricing', authenticateToken, async (req, res) => {
   } finally { client.release(); }
 });
 
-// Cluster-branded (not Sales Hub) quote PDF — same navy/orange palette and layout idiom as
-// buildPayrollPdf, but wearing the CUSTOMER-facing Cluster brand (cluster_logo.png, #fe6523)
-// since this document goes to a merchant, matching the Proposal Builder's cover convention.
+// Cluster-branded quote PDF — matches the "Cluster Quote" design handoff (light Kaizen design
+// system: white page, thin orange rail, Satoshi type, soft-orange totals card). The design spec
+// is authored at 816x1056px/96dpi; pdfkit draws at 72dpi, and 816*0.75=612 / 1056*0.75=792 is an
+// EXACT match for US Letter — so every measurement below is the design's px value times PX(0.75).
 function buildQuotePdf({ items, clientName, repName, repEmail, lang, billing }) {
   const isFr = lang === 'fr';
   return new Promise((resolve, reject) => {
     try {
-      const doc = new PDFDocument({ size: 'LETTER', margin: 40 });
+      const doc = new PDFDocument({ size: 'LETTER', margin: 0 });
       const chunks = [];
       doc.on('data', (c) => chunks.push(c));
       doc.on('end', () => resolve(Buffer.concat(chunks)));
-      const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      const L = 40, R = 572, W = R - L, AMT_X = R - 96;
-      const C = { navy: '#1c2434', orange: '#fe6523', gray: '#475569', light: '#94a3b8', zebra: '#fafbfd', line: '#e8edf3' };
-      const ensure = (h) => { if (doc.y + h > 730) doc.addPage(); };
-      const logoPath = require('path').join(PROPOSAL_ASSETS, 'cluster_logo.png');
+
+      const path = require('path');
+      const quoteAssets = path.join(__dirname, 'assets', 'quote');
+      const fontDir = path.join(quoteAssets, 'fonts');
+      doc.registerFont('Satoshi-Bold', path.join(fontDir, 'Satoshi-Bold.otf'));
+      doc.registerFont('Satoshi-Medium', path.join(fontDir, 'Satoshi-Medium.otf'));
+      doc.registerFont('Satoshi-Italic', path.join(fontDir, 'Satoshi-Italic.otf'));
+      const logoPath = path.join(quoteAssets, 'cluster-logo-ink.png');
+
+      const PX = 0.75; // design px -> pdfkit pt
+      const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const L = 48, R = 612 - 48, W = R - L; // 64px content margins
+      const C = {
+        orange: '#F58345', pressed: '#D16630', ink: '#1C2434', secondary: '#47556E',
+        muted: '#8A94A6', skuMuted: '#98A2B3', metaFill: '#F7F9FB', hairline: '#E8EDF3',
+        rowLine: '#EEF1F5', totalsFill: '#FFF4EC', totalsBorder: '#F7C8AB',
+      };
       const locale = isFr ? 'fr-CA' : 'en-CA';
       const now = new Date();
       const validUntil = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
       const fmtDate = (d) => d.toLocaleDateString(locale, { year: 'numeric', month: 'long', day: 'numeric' });
 
       const T = isFr ? {
-        title: 'Soumission', preparedFor: 'Préparé pour', preparedBy: 'Préparé par', validUntil: 'Valide jusqu’au',
+        eyebrow: 'SOUMISSION', preparedFor: 'Préparé pour', preparedBy: 'Préparé par', validUntil: 'Valide jusqu’au',
         item: 'Article', qty: 'Qté', unitPrice: 'Prix unitaire', amount: 'Montant', noSku: 'Aucun NP',
-        recurring: billing === 'yearly' ? 'Récurrent — annuel' : 'Récurrent — mensuel',
+        recurring: billing === 'yearly' ? 'Récurrent · annuel' : 'Récurrent · mensuel',
         oneTime: 'Frais uniques', totalRecurring: billing === 'yearly' ? 'Total récurrent / an' : 'Total récurrent / mois',
         totalOneTime: 'Total frais uniques',
         footer: 'Cette soumission est une estimation et sujette à confirmation. Valide 30 jours.',
       } : {
-        title: 'Quote', preparedFor: 'Prepared for', preparedBy: 'Prepared by', validUntil: 'Valid until',
+        eyebrow: 'QUOTE', preparedFor: 'Prepared for', preparedBy: 'Prepared by', validUntil: 'Valid until',
         item: 'Item', qty: 'Qty', unitPrice: 'Unit price', amount: 'Amount', noSku: 'No SKU',
-        recurring: billing === 'yearly' ? 'Recurring — yearly' : 'Recurring — monthly',
+        recurring: billing === 'yearly' ? 'Recurring · yearly' : 'Recurring · monthly',
         oneTime: 'One-time', totalRecurring: billing === 'yearly' ? 'Total recurring / year' : 'Total recurring / month',
         totalOneTime: 'Total one-time',
         footer: 'This quote is an estimate and subject to confirmation. Valid for 30 days.',
       };
 
-      // Header band
-      doc.rect(0, 0, 612, 6).fill(C.orange);
-      doc.rect(0, 6, 612, 74).fill(C.navy);
-      try { doc.image(logoPath, L, 24, { width: 110 }); } catch (_e) { /* optional */ }
-      doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text(T.title.toUpperCase(), L, 26, { width: W, align: 'right', characterSpacing: 1.5 });
-      doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(15).text(fmtDate(now), L, 42, { width: W, align: 'right' });
-      const my = 96;
-      const meta = [[T.preparedFor, clientName || '—'], [T.preparedBy, repName || '—'], [T.validUntil, fmtDate(validUntil)]];
-      const cw = W / 3;
-      meta.forEach((m, i) => {
-        const x = L + i * cw;
-        doc.fillColor(C.light).font('Helvetica-Bold').fontSize(7).text(m[0], x, my, { characterSpacing: 1 });
-        doc.fillColor(C.navy).font('Helvetica-Bold').fontSize(11).text(m[1], x, my + 11, { width: cw - 8, ellipsis: true });
-      });
-      doc.y = my + 40;
-      doc.moveTo(L, doc.y).lineTo(R, doc.y).strokeColor(C.line).lineWidth(1).stroke();
-      doc.y += 16;
+      // 1. Brand rail
+      doc.rect(0, 0, 612, 5 * PX).fill(C.orange);
 
-      const sectionHead = (title) => {
-        ensure(46);
-        doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text(title, L, doc.y, { characterSpacing: 1.5 });
-        doc.y += 15;
-        const hy = doc.y;
-        doc.fillColor(C.light).font('Helvetica-Bold').fontSize(7);
-        doc.text(T.item, L + 2, hy, { characterSpacing: 0.5 });
-        doc.text(T.qty, L + 330, hy, { width: 40, align: 'center', characterSpacing: 0.5 });
-        doc.text(T.unitPrice, L + 375, hy, { width: 75, align: 'right', characterSpacing: 0.5 });
-        doc.text(T.amount, AMT_X, hy, { width: 92, align: 'right', characterSpacing: 0.5 });
-        doc.y = hy + 11;
-        doc.moveTo(L, doc.y).lineTo(R, doc.y).strokeColor(C.navy).lineWidth(1).stroke();
-        doc.y += 5;
+      // 2. Masthead — logo left, eyebrow+date right-aligned, both flush at the same top y.
+      let y = 5 * PX + 52 * PX;
+      const logoW = 164 * PX, logoH = logoW * (164 / 688);
+      try { doc.image(logoPath, L, y, { width: logoW }); } catch (_e) { /* optional */ }
+      const eyebrowLH = 11 * PX * 1.2, dateLH = 24 * PX * 1.2;
+      doc.fillColor(C.orange).font('Satoshi-Bold').fontSize(11 * PX)
+        .text(T.eyebrow, L, y, { width: W, align: 'right', characterSpacing: 11 * PX * 0.24 });
+      doc.fillColor(C.ink).font('Satoshi-Bold').fontSize(24 * PX)
+        .text(fmtDate(now), L, y + eyebrowLH + 6 * PX, { width: W, align: 'right', characterSpacing: 24 * PX * -0.01 });
+      y += Math.max(logoH, eyebrowLH + 6 * PX + dateLH);
+
+      // 3. Meta strip — rounded card, 3 columns with hairline dividers.
+      y += 40 * PX;
+      const metaTop = y;
+      const metaPadX = 26 * PX, metaPadY = 22 * PX, metaGap = 24 * PX, metaColW = (W - metaGap * 2) / 3;
+      const metaLabelH = 10.5 * PX * 1.2, metaGapV = 7 * PX, metaValueH = 16 * PX * 1.2;
+      const metaH = metaPadY * 2 + metaLabelH + metaGapV + metaValueH;
+      doc.roundedRect(L, metaTop, W, metaH, 16 * PX).fillAndStroke(C.metaFill, C.hairline);
+      const metaCells = [[T.preparedFor, clientName || '—'], [T.preparedBy, repName || '—'], [T.validUntil, fmtDate(validUntil)]];
+      metaCells.forEach((cell, i) => {
+        const cx = L + i * (metaColW + metaGap);
+        const tx = cx + (i === 0 ? metaPadX : metaPadX + 24 * PX);
+        if (i > 0) {
+          doc.moveTo(cx + metaGap / 2, metaTop + metaPadY).lineTo(cx + metaGap / 2, metaTop + metaH - metaPadY)
+            .strokeColor(C.hairline).lineWidth(0.75).stroke();
+        }
+        doc.fillColor(C.muted).font('Satoshi-Bold').fontSize(10.5 * PX)
+          .text(cell[0], tx, metaTop + metaPadY, { width: metaColW - metaPadX, characterSpacing: 10.5 * PX * 0.1 });
+        doc.fillColor(C.ink).font('Satoshi-Medium').fontSize(16 * PX)
+          .text(cell[1], tx, metaTop + metaPadY + metaLabelH + metaGapV, { width: metaColW - metaPadX, ellipsis: true });
+      });
+      y = metaTop + metaH;
+
+      // 4. Line-item sections — dot + label header, column-header row, item rows.
+      y += 38 * PX;
+      const gap = 12 * PX, rowPadX = 18 * PX;
+      const gridL = L + rowPadX, gridR = R - rowPadX;
+      const colQtyW = 64 * PX, colPriceW = 128 * PX, colAmtW = 128 * PX;
+      const colItemW = (gridR - gridL) - colQtyW - colPriceW - colAmtW - gap * 3;
+      const colItemX = gridL, colQtyX = colItemX + colItemW + gap;
+      const colPriceX = colQtyX + colQtyW + gap, colAmtX = colPriceX + colPriceW + gap;
+      const ensure = (h) => { if (y + h > 792 - 40 * PX) { doc.addPage(); y = 40 * PX; } };
+
+      const sectionHead = (label) => {
+        ensure(70 * PX);
+        const dotR = 8 * PX / 2;
+        const labelLH = 13 * PX * 1.2;
+        doc.circle(L + dotR, y + labelLH / 2, dotR).fill(C.orange);
+        doc.fillColor(C.ink).font('Satoshi-Bold').fontSize(13 * PX)
+          .text(label, L + 8 * PX + 10 * PX, y, { characterSpacing: 13 * PX * 0.08 });
+        y += labelLH + 14 * PX;
+        const hy = y;
+        doc.fillColor(C.muted).font('Satoshi-Bold').fontSize(10.5 * PX);
+        doc.text(T.item, colItemX, hy, { width: colItemW, characterSpacing: 10.5 * PX * 0.08 });
+        doc.text(T.qty, colQtyX, hy, { width: colQtyW, align: 'center', characterSpacing: 10.5 * PX * 0.08 });
+        doc.text(T.unitPrice, colPriceX, hy, { width: colPriceW, align: 'right', characterSpacing: 10.5 * PX * 0.08 });
+        doc.text(T.amount, colAmtX, hy, { width: colAmtW, align: 'right', characterSpacing: 10.5 * PX * 0.08 });
+        y = hy + 10.5 * PX * 1.2 + 10 * PX;
+        doc.moveTo(L, y).lineTo(R, y).strokeColor(C.ink).lineWidth(2 * PX).stroke();
       };
-      const row = (name, sku, qty, unitAmt, i) => {
-        ensure(22);
-        const y = doc.y;
-        if (i % 2) doc.rect(L, y - 3, W, 21).fill(C.zebra);
-        doc.fillColor(C.navy).font('Helvetica-Bold').fontSize(9).text(String(name || ''), L + 2, y, { width: 300, ellipsis: true });
-        doc.fillColor(C.light).font('Helvetica').fontSize(7).text(sku || T.noSku, L + 2, y + 11, { width: 300, ellipsis: true });
-        doc.fillColor(C.gray).font('Helvetica').fontSize(9).text(String(qty), L + 330, y + 2, { width: 40, align: 'center' });
-        doc.fillColor(C.gray).text(money(unitAmt), L + 375, y + 2, { width: 75, align: 'right' });
-        doc.fillColor(C.navy).font('Helvetica-Bold').fontSize(9).text(money(unitAmt * qty), AMT_X, y + 2, { width: 92, align: 'right' });
-        doc.y = y + 24;
+      const row = (name, sku, qty, unitAmt) => {
+        ensure(50 * PX);
+        const rowPadY = 16 * PX;
+        const rowTop = y;
+        const nameLH = 15 * PX * 1.2, skuGap = 3 * PX, skuLH = sku ? 11 * PX * 1.2 : 0;
+        const contentH = nameLH + (sku ? skuGap + skuLH : 0);
+        const rowH = Math.max(contentH, 14 * PX * 1.2) + rowPadY * 2;
+        const textY = rowTop + rowPadY;
+        doc.fillColor(C.ink).font('Satoshi-Medium').fontSize(15 * PX)
+          .text(name || '', colItemX, textY, { width: colItemW, ellipsis: true });
+        if (sku) {
+          doc.fillColor(C.skuMuted).font('Satoshi-Medium').fontSize(11 * PX)
+            .text(sku, colItemX, textY + nameLH + skuGap, { width: colItemW, characterSpacing: 11 * PX * 0.04, ellipsis: true });
+        }
+        const midY = textY + Math.max(0, (contentH - 14 * PX * 1.2) / 2);
+        doc.fillColor(C.secondary).font('Satoshi-Medium').fontSize(14 * PX).text(String(qty), colQtyX, midY, { width: colQtyW, align: 'center' });
+        doc.text(money(unitAmt), colPriceX, midY, { width: colPriceW, align: 'right' });
+        doc.fillColor(C.ink).font('Satoshi-Bold').fontSize(15 * PX).text(money(unitAmt * qty), colAmtX, midY, { width: colAmtW, align: 'right' });
+        y = rowTop + rowH;
+        doc.moveTo(L, y).lineTo(R, y).strokeColor(C.rowLine).lineWidth(0.75).stroke();
       };
 
       const recItems = items.filter((it) => it.recurring);
       const oneTimeItems = items.filter((it) => !it.recurring);
       if (recItems.length) {
         sectionHead(T.recurring);
-        recItems.forEach((it, i) => row(it.name, it.sku, it.qty, it.unitAmt, i));
-        doc.y += 6;
+        recItems.forEach((it) => row(it.name, it.sku, it.qty, it.unitAmt));
+        y += 34 * PX;
       }
       if (oneTimeItems.length) {
         sectionHead(T.oneTime);
-        oneTimeItems.forEach((it, i) => row(it.name, it.sku, it.qty, it.unitAmt, i));
-        doc.y += 6;
+        oneTimeItems.forEach((it) => row(it.name, it.sku, it.qty, it.unitAmt));
       }
 
+      // 5. Totals card — right-aligned, soft-orange fill.
       const recTotal = recItems.reduce((s, it) => s + it.qty * it.unitAmt, 0);
       const oneTimeTotal = oneTimeItems.reduce((s, it) => s + it.qty * it.unitAmt, 0);
-      const bothTotals = recTotal > 0 && oneTimeTotal > 0;
-      ensure(bothTotals ? 78 : 56);
-      doc.y += 8;
-      const by = doc.y, bx = R - 268, boxH = bothTotals ? 62 : 40;
-      doc.roundedRect(bx, by, 268, boxH, 9).fillAndStroke('#fff4ec', '#f7c8ab');
-      let ty = by + 15;
-      if (recTotal > 0) {
-        doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text(T.totalRecurring, bx + 16, ty, { characterSpacing: 1 });
-        doc.fillColor(C.navy).font('Helvetica-Bold').fontSize(16).text(money(recTotal), bx + 16, ty - 4, { width: 236, align: 'right' });
-        ty += 24;
-      }
-      if (oneTimeTotal > 0) {
-        doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text(T.totalOneTime, bx + 16, ty, { characterSpacing: 1 });
-        doc.fillColor(C.navy).font('Helvetica-Bold').fontSize(16).text(money(oneTimeTotal), bx + 16, ty - 4, { width: 236, align: 'right' });
-      }
-      doc.y = by + boxH + 16;
+      const totalRows = [];
+      if (recTotal > 0) totalRows.push([T.totalRecurring, money(recTotal)]);
+      if (oneTimeTotal > 0) totalRows.push([T.totalOneTime, money(oneTimeTotal)]);
+      y += 34 * PX;
+      const totalsW = 340 * PX, totalsPadX = 26 * PX, totalsPadY = 22 * PX, totalsGap = 16 * PX;
+      const totalRowH = 24 * PX * 1.2;
+      const totalsH = totalsPadY * 2 + totalRowH * totalRows.length + totalsGap * Math.max(0, totalRows.length - 1);
+      ensure(totalsH + 40 * PX);
+      const totalsX = R - totalsW;
+      doc.roundedRect(totalsX, y, totalsW, totalsH, 18 * PX).fillAndStroke(C.totalsFill, C.totalsBorder);
+      let ty = y + totalsPadY;
+      totalRows.forEach(([label, val]) => {
+        doc.fillColor(C.pressed).font('Satoshi-Bold').fontSize(12.5 * PX)
+          .text(label, totalsX + totalsPadX, ty + (totalRowH - 12.5 * PX * 1.2) / 2, { width: 180 * PX, lineBreak: false });
+        doc.fillColor(C.ink).font('Satoshi-Bold').fontSize(24 * PX)
+          .text(val, totalsX + totalsPadX, ty, { width: totalsW - totalsPadX * 2, align: 'right', characterSpacing: 24 * PX * -0.01 });
+        ty += totalRowH + totalsGap;
+      });
+      y += totalsH;
 
-      doc.fillColor(C.light).font('Helvetica-Oblique').fontSize(7.5).text(T.footer, L, doc.y, { continued: true })
-        .font('Helvetica').text('     clusterpos.com', { align: 'left' });
+      // 6. Footer — disclaimer left, clusterpos.com link right, hairline divider above.
+      y += 34 * PX;
+      doc.moveTo(L, y).lineTo(R, y).strokeColor(C.hairline).lineWidth(0.75).stroke();
+      y += 10 * PX;
+      doc.fillColor(C.muted).font('Satoshi-Italic').fontSize(11.5 * PX)
+        .text(T.footer, L, y, { width: 440 * PX, lineGap: 2 });
+      doc.fillColor(C.ink).font('Satoshi-Bold').fontSize(12.5 * PX).text('clusterpos.com', L, y, { width: W, align: 'right' });
 
       doc.end();
     } catch (e) { reject(e); }
