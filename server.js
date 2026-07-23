@@ -3085,6 +3085,40 @@ app.post('/api/partner-portal/opportunities', authenticatePartnerToken, async (r
   }
 });
 
+// PUT /api/partner-portal/profile { displayName } — a partner user editing their own name.
+app.put('/api/partner-portal/profile', authenticatePartnerToken, async (req, res) => {
+  const displayName = String(req.body.displayName || '').trim();
+  try {
+    await pool.query(
+      `UPDATE partner_users SET display_name = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [req.partnerUser.id, displayName || null]
+    );
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/partner-portal/change-password { currentPassword, newPassword }
+app.post('/api/partner-portal/change-password', authenticatePartnerToken, async (req, res) => {
+  const currentPassword = String(req.body.currentPassword || '');
+  const newPassword = String(req.body.newPassword || '');
+  if (newPassword.length < 8) return res.status(400).json({ error: 'New password must be at least 8 characters' });
+  try {
+    const pu = (await pool.query(`SELECT password_hash FROM partner_users WHERE id = $1`, [req.partnerUser.id])).rows[0];
+    if (!pu || !(await bcrypt.compare(currentPassword, pu.password_hash))) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+    await pool.query(
+      `UPDATE partner_users SET password_hash = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [req.partnerUser.id, await bcrypt.hash(newPassword, 10)]
+    );
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/partner-portal/team — Admin-only: list this partner's own users.
 app.get('/api/partner-portal/team', authenticatePartnerToken, async (req, res) => {
   if (req.partnerUser.role !== 'admin') return res.status(403).json({ error: 'Partner Admin only' });
