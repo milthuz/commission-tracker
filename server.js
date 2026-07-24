@@ -4158,7 +4158,11 @@ app.get('/api/auth/zoho-crm', authenticateToken, (req, res) => {
   const state = Math.random().toString(36).substring(7);
 
   const authUrl = `${ZOHO_CONFIG.accounts_url}/oauth/v2/auth?` +
-    `scope=ZohoCRM.modules.ALL,ZohoCRM.settings.ALL,ZohoCRM.coql.READ,ZohoCRM.users.READ` +
+    // ZohoCRM.org.READ is needed for getCrmOrgId() (server.js) to build direct "View in Zoho
+    // CRM" links on partner-opportunity duplicate matches — without it that lookup 401s and the
+    // link is silently omitted. Reconnecting (disconnect + Connect again) is required for an
+    // existing admin's refresh token to pick up this scope; Zoho won't grant it retroactively.
+    `scope=ZohoCRM.modules.ALL,ZohoCRM.settings.ALL,ZohoCRM.coql.READ,ZohoCRM.users.READ,ZohoCRM.org.READ` +
     `&client_id=${ZOHO_CONFIG.client_id}` +
     `&response_type=code` +
     `&redirect_uri=${process.env.ZOHO_CRM_REDIRECT_URI || ZOHO_CONFIG.redirect_uri.replace('/callback', '/crm-callback')}` +
