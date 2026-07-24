@@ -3695,6 +3695,45 @@ app.put('/api/admin/partner-opportunities/:id', authenticateToken, async (req, r
   }
 });
 
+// DELETE /api/admin/partner-opportunities/:id — removes the opportunity record entirely. If a
+// Zoho CRM Lead was already created for it (crm_lead_id, from SH-30), also deletes that Lead —
+// best-effort: a CRM failure never blocks deleting the local record, but the error comes back so
+// the admin can clean up the Lead manually if needed.
+app.delete('/api/admin/partner-opportunities/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  const id = parseInt(req.params.id, 10);
+  try {
+    const o = (await pool.query(`SELECT business_name, crm_lead_id FROM partner_opportunities WHERE id = $1`, [id])).rows[0];
+    if (!o) return res.status(404).json({ error: 'Opportunity not found' });
+
+    let crmDeleteError = null;
+    if (o.crm_lead_id) {
+      try {
+        const crmToken = await ensureValidCrmToken();
+        const r = await axios.delete(`https://www.zohoapis.com/crm/v2/Leads/${o.crm_lead_id}`, {
+          headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true,
+        });
+        const result = r.data?.data?.[0];
+        if (!(r.status >= 200 && r.status < 300 && result?.status === 'success')) {
+          crmDeleteError = String(result?.message || r.data?.message || `HTTP ${r.status}`).slice(0, 300);
+        }
+      } catch (e) {
+        crmDeleteError = e.message.slice(0, 300);
+      }
+    }
+
+    await pool.query(`DELETE FROM partner_opportunities WHERE id = $1`, [id]);
+    const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+    logActivity('partner_opportunity', req.params.id, 'deleted',
+      `${o.business_name} deleted by ${actor}` +
+      (o.crm_lead_id ? (crmDeleteError ? ` (Zoho Lead ${o.crm_lead_id} delete failed: ${crmDeleteError})` : ` (Zoho Lead ${o.crm_lead_id} also deleted)`) : ''),
+      actor);
+    res.json({ success: true, crmDeleteError });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ============================================================================
 // AI ASSISTANT — in-app help chatbot (Claude API)
 // ============================================================================
