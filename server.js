@@ -1462,6 +1462,17 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_lead_id VARCHAR(50)`);
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_lead_error TEXT`);
 
+    // Partner-manager-configurable Zoho Lead Source (per partner — Zoho's Lead Source picklist
+    // identifies which partner referred the lead) + billing/business contact info, editable from
+    // the internal admin UI alongside the existing logo upload.
+    await pool.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS lead_source VARCHAR(200)`);
+    await pool.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS billing_contact_name VARCHAR(255)`);
+    await pool.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS billing_contact_email VARCHAR(255)`);
+    await pool.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS billing_contact_phone VARCHAR(50)`);
+    await pool.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS business_contact_name VARCHAR(255)`);
+    await pool.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS business_contact_email VARCHAR(255)`);
+    await pool.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS business_contact_phone VARCHAR(50)`);
+
     // Broadcast notifications for the Partner Portal's bell icon (user request 2026-07-2x:
     // "notification area like Sales Hub, we'll push notifications eventually"). Org-wide, not
     // per-user, mirroring the opportunity queue's own scoping — nothing writes to this table yet;
@@ -3462,6 +3473,8 @@ app.get('/api/admin/partners', authenticateToken, async (req, res) => {
   try {
     const rows = (await pool.query(
       `SELECT p.id, p.name, p.active, p.created_at, (p.logo_data IS NOT NULL) AS has_logo,
+              p.lead_source, p.billing_contact_name, p.billing_contact_email, p.billing_contact_phone,
+              p.business_contact_name, p.business_contact_email, p.business_contact_phone,
               COUNT(pu.id) AS user_count
          FROM partners p LEFT JOIN partner_users pu ON pu.partner_id = p.id
         GROUP BY p.id ORDER BY p.name`
@@ -3469,6 +3482,9 @@ app.get('/api/admin/partners', authenticateToken, async (req, res) => {
     res.json({ partners: rows.map((r) => ({
       id: r.id, name: r.name, active: r.active, createdAt: r.created_at,
       hasLogo: r.has_logo, userCount: parseInt(r.user_count, 10),
+      leadSource: r.lead_source,
+      billingContactName: r.billing_contact_name, billingContactEmail: r.billing_contact_email, billingContactPhone: r.billing_contact_phone,
+      businessContactName: r.business_contact_name, businessContactEmail: r.business_contact_email, businessContactPhone: r.business_contact_phone,
     })) });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -3488,19 +3504,39 @@ app.post('/api/admin/partners', authenticateToken, async (req, res) => {
   }
 });
 
+// PUT /api/admin/partners/:id — partial update. Only fields present in the body are changed
+// (undefined = leave as-is), so the simple Active-toggle button (which only sends {name, active})
+// and the fuller Edit-Partner modal (which sends name/active plus Lead Source + billing/business
+// contact info) can share this same endpoint.
 app.put('/api/admin/partners/:id', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'partners:manage'))) return;
-  const name = String(req.body.name || '').trim();
-  const active = req.body.active !== false;
-  if (!name) return res.status(400).json({ error: 'Partner name required' });
+  const id = parseInt(req.params.id, 10);
   try {
-    const r = await pool.query(
-      `UPDATE partners SET name = $2, active = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING id`,
-      [parseInt(req.params.id, 10), name, active]
+    const current = (await pool.query(`SELECT * FROM partners WHERE id = $1`, [id])).rows[0];
+    if (!current) return res.status(404).json({ error: 'Partner not found' });
+    const pick = (key, col) => req.body[key] !== undefined ? (String(req.body[key] || '').trim() || null) : current[col];
+    const name = req.body.name !== undefined ? String(req.body.name || '').trim() : current.name;
+    if (!name) return res.status(400).json({ error: 'Partner name required' });
+    const active = req.body.active !== undefined ? req.body.active !== false : current.active;
+    const leadSource = pick('leadSource', 'lead_source');
+    const billingContactName = pick('billingContactName', 'billing_contact_name');
+    const billingContactEmail = pick('billingContactEmail', 'billing_contact_email');
+    const billingContactPhone = pick('billingContactPhone', 'billing_contact_phone');
+    const businessContactName = pick('businessContactName', 'business_contact_name');
+    const businessContactEmail = pick('businessContactEmail', 'business_contact_email');
+    const businessContactPhone = pick('businessContactPhone', 'business_contact_phone');
+    await pool.query(
+      `UPDATE partners SET name = $2, active = $3, lead_source = $4,
+              billing_contact_name = $5, billing_contact_email = $6, billing_contact_phone = $7,
+              business_contact_name = $8, business_contact_email = $9, business_contact_phone = $10,
+              updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [id, name, active, leadSource, billingContactName, billingContactEmail, billingContactPhone,
+       businessContactName, businessContactEmail, businessContactPhone]
     );
-    if (!r.rowCount) return res.status(404).json({ error: 'Partner not found' });
     res.json({ success: true });
   } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ error: 'A partner with that name already exists' });
     res.status(500).json({ error: e.message });
   }
 });
@@ -3639,7 +3675,7 @@ app.put('/api/admin/partner-opportunities/:id', authenticateToken, async (req, r
       const full = (await pool.query(
         `SELECT o.business_name, o.contact_first_name, o.contact_last_name, o.contact_phone, o.contact_email,
                 o.rep_first_name, o.rep_last_name, o.rep_phone, o.rep_email, o.notes,
-                p.name AS partner_name, pu.email AS submitted_by_email
+                p.name AS partner_name, p.lead_source AS lead_source, pu.email AS submitted_by_email
            FROM partner_opportunities o
            JOIN partners p ON p.id = o.partner_id
            LEFT JOIN partner_users pu ON pu.id = o.submitted_by
@@ -10151,13 +10187,32 @@ async function findCrmEmailByName(name) {
   return null;
 }
 
+// Zoho CRM org ID, used to build direct links to a record (https://crm.zoho.com/crm/org<id>/tab/
+// <Module>/<recordId>). Cached in memory for the process lifetime — an org's ID never changes.
+let _crmOrgIdCache = null;
+async function getCrmOrgId() {
+  if (_crmOrgIdCache) return _crmOrgIdCache;
+  try {
+    const crmToken = await ensureValidCrmToken();
+    const r = await axios.get('https://www.zohoapis.com/crm/v2/org', {
+      headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true,
+    });
+    if (r.status === 200) {
+      const orgId = r.data?.org?.[0]?.id || null;
+      if (orgId) _crmOrgIdCache = orgId;
+    }
+  } catch (e) { console.warn('[partner-crm] org lookup failed:', e.message); }
+  return _crmOrgIdCache;
+}
+
 // SH-28 — pre-approval duplicate check for a Partner Portal opportunity: searches Zoho CRM
 // Leads/Contacts/Accounts by business name, contact email, and contact phone. Best-effort — a
 // CRM outage should never block a partner's submission or an admin's approval, so every failure
 // resolves to { status: 'check_failed' } rather than throwing. Each match carries enough detail
-// (name/phone/email/city) for a human to tell "same lead" from "different location, same
-// business name" — deliberately never auto-blocks on a match, since a multi-location merchant
-// showing up under one name is a normal, non-duplicate case (see the Zentact-stores precedent).
+// (name/company/phone/email/city + a direct crmUrl into the real record) for a human to tell
+// "same lead" from "different location, same business name" — deliberately never auto-blocks on
+// a match, since a multi-location merchant showing up under one name is a normal, non-duplicate
+// case (see the Zentact-stores precedent).
 async function checkCrmDuplicate({ businessName, contactEmail, contactPhone }) {
   const matches = [];
   try {
@@ -10187,10 +10242,17 @@ async function checkCrmDuplicate({ businessName, contactEmail, contactPhone }) {
       const r = await axios.get(s.url, { headers, validateStatus: () => true });
       if (r.status !== 200) continue; // 204 = no match
       for (const rec of (r.data?.data || [])) {
+        // Company name if available: Leads carry it directly; Accounts' own name IS the company
+        // name; Contacts' Account_Name is a lookup field ({id, name}), regardless of which search
+        // (name/email/phone) matched.
+        const company = s.module === 'Leads' ? (rec.Company || null)
+          : s.module === 'Accounts' ? (rec.Account_Name || null)
+          : (rec.Account_Name?.name || null);
         matches.push({
           module: s.module,
           id: rec.id,
           name: rec[s.nameField] || rec.Account_Name || rec.Company || rec.Full_Name || '(unnamed)',
+          company,
           phone: rec.Phone || rec.Mobile || null,
           email: rec.Email || rec.Secondary_Email || null,
           city: rec.Billing_City || rec.Mailing_City || null,
@@ -10208,19 +10270,29 @@ async function checkCrmDuplicate({ businessName, contactEmail, contactPhone }) {
     seen.add(k);
     return true;
   });
-  const summary = deduped.length ? deduped.map((m) => `${m.module}: ${m.name}`).join('; ') : null;
-  return { status: deduped.length ? 'match_found' : 'no_match', matches: deduped, summary };
+  const orgId = deduped.length ? await getCrmOrgId() : null;
+  const enriched = deduped.map((m) => ({
+    ...m,
+    crmUrl: orgId ? `https://crm.zoho.com/crm/org${orgId}/tab/${m.module}/${m.id}` : null,
+  }));
+  const summary = enriched.length ? enriched.map((m) => `${m.module}: ${m.name}`).join('; ') : null;
+  return { status: enriched.length ? 'match_found' : 'no_match', matches: enriched, summary };
 }
 
-// SH-30 — create a real Lead in Zoho CRM once a Partner Portal opportunity is approved. Never
-// sets Lead_Source (a picklist whose valid values vary per Zoho org — an invalid value would
-// hard-fail the whole create with INVALID_DATA), so partner/rep context goes into Description
-// instead. `o` is the joined opportunity+partner+submitter row (see the PUT handler below).
+// SH-30 — create a real Lead in Zoho CRM once a Partner Portal opportunity is approved.
+// Lead_Source comes from the referring partner's configured value (Admin → Partners → Edit,
+// request 2026-07-2x) — left unset if the partner manager hasn't configured one, rather than
+// guessing a picklist value that could hard-fail the whole create with INVALID_DATA. Country and
+// Lead_Status are fixed per the partner manager's instructions (this org's Zoho picklists).
+// `o` is the joined opportunity+partner+submitter row (see the PUT handler below).
 async function createCrmLead(o) {
   const fields = {
     Company: o.business_name,
     Last_Name: o.contact_last_name || o.business_name,
+    Country: 'Canada',
+    Lead_Status: 'NEW',
   };
+  if (o.lead_source) fields.Lead_Source = o.lead_source;
   if (o.contact_first_name) fields.First_Name = o.contact_first_name;
   if (o.contact_email) fields.Email = o.contact_email;
   if (o.contact_phone) fields.Phone = o.contact_phone;
