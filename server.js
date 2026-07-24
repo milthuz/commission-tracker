@@ -3170,7 +3170,7 @@ app.post('/api/partner-portal/opportunities', authenticatePartnerToken, async (r
     // SH-28 — fire-and-forget so the partner's submission never waits on a Zoho round-trip;
     // the result lands in the admin queue by the time anyone reviews it.
     const opportunityId = r.rows[0].id;
-    checkCrmDuplicate({ businessName, contactEmail: String(b.contactEmail || '').trim() })
+    checkCrmDuplicate({ businessName, contactEmail: String(b.contactEmail || '').trim(), contactPhone: String(b.contactPhone || '').trim() })
       .then((result) => pool.query(
         `UPDATE partner_opportunities SET crm_match_status = $2, crm_match_summary = $3, crm_match_records = $4 WHERE id = $1`,
         [opportunityId, result.status, result.summary, JSON.stringify(result.matches)]
@@ -3569,7 +3569,7 @@ app.get('/api/admin/partner-opportunities', authenticateToken, async (req, res) 
       `SELECT o.id, o.business_name, o.contact_first_name, o.contact_last_name, o.contact_phone, o.contact_email,
               o.rep_first_name, o.rep_last_name, o.rep_phone, o.rep_email, o.notes, o.status,
               o.reviewed_by, o.reviewed_at, o.rejection_reason, o.created_at,
-              o.crm_match_status, o.crm_match_summary, o.crm_lead_id, o.crm_lead_error,
+              o.crm_match_status, o.crm_match_summary, o.crm_match_records, o.crm_lead_id, o.crm_lead_error,
               p.name AS partner_name, pu.email AS submitted_by_email
          FROM partner_opportunities o
          JOIN partners p ON p.id = o.partner_id
@@ -3584,6 +3584,7 @@ app.get('/api/admin/partner-opportunities', authenticateToken, async (req, res) 
       ...mapOpportunityRow(r),
       crmMatchStatus: r.crm_match_status,
       crmMatchSummary: r.crm_match_summary,
+      crmMatchRecords: r.crm_match_records || [],
       crmLeadId: r.crm_lead_id,
       crmLeadError: r.crm_lead_error,
     })) });
@@ -3600,10 +3601,10 @@ app.post('/api/admin/partner-opportunities/:id/crm-check', authenticateToken, as
   try {
     const id = parseInt(req.params.id, 10);
     const o = (await pool.query(
-      `SELECT business_name, contact_email FROM partner_opportunities WHERE id = $1`, [id]
+      `SELECT business_name, contact_email, contact_phone FROM partner_opportunities WHERE id = $1`, [id]
     )).rows[0];
     if (!o) return res.status(404).json({ error: 'Opportunity not found' });
-    const result = await checkCrmDuplicate({ businessName: o.business_name, contactEmail: o.contact_email });
+    const result = await checkCrmDuplicate({ businessName: o.business_name, contactEmail: o.contact_email, contactPhone: o.contact_phone });
     await pool.query(
       `UPDATE partner_opportunities SET crm_match_status = $2, crm_match_summary = $3, crm_match_records = $4 WHERE id = $1`,
       [id, result.status, result.summary, JSON.stringify(result.matches)]
@@ -10151,16 +10152,20 @@ async function findCrmEmailByName(name) {
 }
 
 // SH-28 — pre-approval duplicate check for a Partner Portal opportunity: searches Zoho CRM
-// Leads/Contacts/Accounts by business name and contact email. Best-effort — a CRM outage should
-// never block a partner's submission or an admin's approval, so every failure resolves to
-// { status: 'check_failed' } rather than throwing.
-async function checkCrmDuplicate({ businessName, contactEmail }) {
+// Leads/Contacts/Accounts by business name, contact email, and contact phone. Best-effort — a
+// CRM outage should never block a partner's submission or an admin's approval, so every failure
+// resolves to { status: 'check_failed' } rather than throwing. Each match carries enough detail
+// (name/phone/email/city) for a human to tell "same lead" from "different location, same
+// business name" — deliberately never auto-blocks on a match, since a multi-location merchant
+// showing up under one name is a normal, non-duplicate case (see the Zentact-stores precedent).
+async function checkCrmDuplicate({ businessName, contactEmail, contactPhone }) {
   const matches = [];
   try {
     const crmToken = await ensureValidCrmToken();
     const headers = { Authorization: `Zoho-oauthtoken ${crmToken}` };
     const name = String(businessName || '').trim();
     const email = String(contactEmail || '').trim();
+    const phone = String(contactPhone || '').trim();
     const searches = [];
     if (name) {
       const enc = encodeURIComponent(name);
@@ -10172,11 +10177,24 @@ async function checkCrmDuplicate({ businessName, contactEmail }) {
       searches.push({ module: 'Contacts', url: `https://www.zohoapis.com/crm/v2/Contacts/search?email=${encE}`, nameField: 'Full_Name' });
       searches.push({ module: 'Leads', url: `https://www.zohoapis.com/crm/v2/Leads/search?email=${encE}`, nameField: 'Full_Name' });
     }
+    if (phone) {
+      const encP = encodeURIComponent(phone);
+      searches.push({ module: 'Contacts', url: `https://www.zohoapis.com/crm/v2/Contacts/search?phone=${encP}`, nameField: 'Full_Name' });
+      searches.push({ module: 'Leads', url: `https://www.zohoapis.com/crm/v2/Leads/search?phone=${encP}`, nameField: 'Full_Name' });
+      searches.push({ module: 'Accounts', url: `https://www.zohoapis.com/crm/v2/Accounts/search?criteria=(Phone:equals:${encP})`, nameField: 'Account_Name' });
+    }
     for (const s of searches) {
       const r = await axios.get(s.url, { headers, validateStatus: () => true });
       if (r.status !== 200) continue; // 204 = no match
       for (const rec of (r.data?.data || [])) {
-        matches.push({ module: s.module, id: rec.id, name: rec[s.nameField] || rec.Account_Name || rec.Company || rec.Full_Name || '(unnamed)' });
+        matches.push({
+          module: s.module,
+          id: rec.id,
+          name: rec[s.nameField] || rec.Account_Name || rec.Company || rec.Full_Name || '(unnamed)',
+          phone: rec.Phone || rec.Mobile || null,
+          email: rec.Email || rec.Secondary_Email || null,
+          city: rec.Billing_City || rec.Mailing_City || null,
+        });
       }
     }
   } catch (e) {
