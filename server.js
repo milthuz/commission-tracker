@@ -3645,7 +3645,13 @@ app.post('/api/admin/partner-opportunities/:id/crm-check', authenticateToken, as
       `UPDATE partner_opportunities SET crm_match_status = $2, crm_match_summary = $3, crm_match_records = $4 WHERE id = $1`,
       [id, result.status, result.summary, JSON.stringify(result.matches)]
     );
-    res.json({ crmMatchStatus: result.status, crmMatchSummary: result.summary, crmMatchRecords: result.matches });
+    res.json({
+      crmMatchStatus: result.status, crmMatchSummary: result.summary, crmMatchRecords: result.matches,
+      // Diagnostic-only, never persisted: why crmUrl came back null on every match (e.g. the CRM
+      // connection is missing the org.READ scope) — surfaced so an admin can tell without needing
+      // server log access.
+      orgLookupError: result.orgLookupError || null,
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -10233,6 +10239,9 @@ async function findCrmEmailByName(name) {
 // Zoho CRM org ID, used to build direct links to a record (https://crm.zoho.com/crm/org<id>/tab/
 // <Module>/<recordId>). Cached in memory for the process lifetime — an org's ID never changes.
 let _crmOrgIdCache = null;
+// Reason the last getCrmOrgId() call failed to produce an ID, so a manual Recheck can surface
+// it to the admin directly (no Railway log access needed to diagnose a bad OAuth scope, etc.).
+let _crmOrgIdLastError = null;
 async function getCrmOrgId() {
   if (_crmOrgIdCache) return _crmOrgIdCache;
   try {
@@ -10242,9 +10251,15 @@ async function getCrmOrgId() {
     });
     if (r.status === 200) {
       const orgId = r.data?.org?.[0]?.id || null;
-      if (orgId) _crmOrgIdCache = orgId;
+      if (orgId) { _crmOrgIdCache = orgId; _crmOrgIdLastError = null; return orgId; }
+      _crmOrgIdLastError = 'Org lookup returned no id';
+    } else {
+      _crmOrgIdLastError = `HTTP ${r.status}: ${JSON.stringify(r.data).slice(0, 200)}`;
     }
-  } catch (e) { console.warn('[partner-crm] org lookup failed:', e.message); }
+  } catch (e) {
+    _crmOrgIdLastError = e.message;
+  }
+  console.warn('[partner-crm] org lookup failed:', _crmOrgIdLastError);
   return _crmOrgIdCache;
 }
 
@@ -10319,7 +10334,10 @@ async function checkCrmDuplicate({ businessName, contactEmail, contactPhone }) {
     crmUrl: orgId ? `https://crm.zoho.com/crm/org${orgId}/tab/${m.module}/${m.id}` : null,
   }));
   const summary = enriched.length ? enriched.map((m) => `${m.module}: ${m.name}`).join('; ') : null;
-  return { status: enriched.length ? 'match_found' : 'no_match', matches: enriched, summary };
+  return {
+    status: enriched.length ? 'match_found' : 'no_match', matches: enriched, summary,
+    orgLookupError: (enriched.length && !orgId) ? _crmOrgIdLastError : null,
+  };
 }
 
 // SH-30 — create a real Lead in Zoho CRM once a Partner Portal opportunity is approved.
