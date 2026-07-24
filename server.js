@@ -1453,6 +1453,15 @@ async function initializeDatabase() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_partner_opps_partner ON partner_opportunities(partner_id)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_partner_opps_status ON partner_opportunities(status)`);
 
+    // SH-28 (duplicate check) + SH-30 (auto-create CRM Lead on approval). crm_match_* is set
+    // automatically right after a partner submits (best-effort — a CRM outage never blocks the
+    // submission itself); crm_lead_* is set when an admin approves.
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_match_status VARCHAR(20)`);
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_match_summary TEXT`);
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_match_records JSONB`);
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_lead_id VARCHAR(50)`);
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_lead_error TEXT`);
+
     // Broadcast notifications for the Partner Portal's bell icon (user request 2026-07-2x:
     // "notification area like Sales Hub, we'll push notifications eventually"). Org-wide, not
     // per-user, mirroring the opportunity queue's own scoping — nothing writes to this table yet;
@@ -3158,7 +3167,16 @@ app.post('/api/partner-portal/opportunities', authenticatePartnerToken, async (r
        String(b.notes || '').trim() || null]
     );
     logActivity('partner_opportunity', String(r.rows[0].id), 'submitted', `${businessName} submitted by ${req.partnerUser.email}`, req.partnerUser.email);
-    res.json({ success: true, id: r.rows[0].id });
+    // SH-28 — fire-and-forget so the partner's submission never waits on a Zoho round-trip;
+    // the result lands in the admin queue by the time anyone reviews it.
+    const opportunityId = r.rows[0].id;
+    checkCrmDuplicate({ businessName, contactEmail: String(b.contactEmail || '').trim() })
+      .then((result) => pool.query(
+        `UPDATE partner_opportunities SET crm_match_status = $2, crm_match_summary = $3, crm_match_records = $4 WHERE id = $1`,
+        [opportunityId, result.status, result.summary, JSON.stringify(result.matches)]
+      ))
+      .catch((e) => console.warn('[partner-crm] failed to persist duplicate check:', e.message));
+    res.json({ success: true, id: opportunityId });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -3551,6 +3569,7 @@ app.get('/api/admin/partner-opportunities', authenticateToken, async (req, res) 
       `SELECT o.id, o.business_name, o.contact_first_name, o.contact_last_name, o.contact_phone, o.contact_email,
               o.rep_first_name, o.rep_last_name, o.rep_phone, o.rep_email, o.notes, o.status,
               o.reviewed_by, o.reviewed_at, o.rejection_reason, o.created_at,
+              o.crm_match_status, o.crm_match_summary, o.crm_lead_id, o.crm_lead_error,
               p.name AS partner_name, pu.email AS submitted_by_email
          FROM partner_opportunities o
          JOIN partners p ON p.id = o.partner_id
@@ -3559,7 +3578,37 @@ app.get('/api/admin/partner-opportunities', authenticateToken, async (req, res) 
         ORDER BY o.created_at DESC`,
       statusFilter ? [statusFilter] : []
     )).rows;
-    res.json({ opportunities: rows.map(mapOpportunityRow) });
+    // crm_match_*/crm_lead_* are internal-review-only — mapOpportunityRow (shared with the
+    // partner-facing GET) never sees them, so a partner can never see this via a shared code path.
+    res.json({ opportunities: rows.map((r) => ({
+      ...mapOpportunityRow(r),
+      crmMatchStatus: r.crm_match_status,
+      crmMatchSummary: r.crm_match_summary,
+      crmLeadId: r.crm_lead_id,
+      crmLeadError: r.crm_lead_error,
+    })) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/partner-opportunities/:id/crm-check — manually (re)run the SH-28 duplicate
+// check, e.g. if the automatic one at submission time failed (CRM was down) or the admin wants
+// a fresh look right before approving.
+app.post('/api/admin/partner-opportunities/:id/crm-check', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const id = parseInt(req.params.id, 10);
+    const o = (await pool.query(
+      `SELECT business_name, contact_email FROM partner_opportunities WHERE id = $1`, [id]
+    )).rows[0];
+    if (!o) return res.status(404).json({ error: 'Opportunity not found' });
+    const result = await checkCrmDuplicate({ businessName: o.business_name, contactEmail: o.contact_email });
+    await pool.query(
+      `UPDATE partner_opportunities SET crm_match_status = $2, crm_match_summary = $3, crm_match_records = $4 WHERE id = $1`,
+      [id, result.status, result.summary, JSON.stringify(result.matches)]
+    );
+    res.json({ crmMatchStatus: result.status, crmMatchSummary: result.summary, crmMatchRecords: result.matches });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -3580,7 +3629,30 @@ app.put('/api/admin/partner-opportunities/:id', authenticateToken, async (req, r
     );
     if (!r.rowCount) return res.status(404).json({ error: 'Opportunity not found' });
     logActivity('partner_opportunity', req.params.id, status, `${r.rows[0].business_name} ${status} by ${actor}`, actor);
-    res.json({ success: true });
+
+    let crmLead = null;
+    if (status === 'approved') {
+      // SH-30 — create the Lead now, synchronously, so the admin sees success/failure in the
+      // same response rather than having to refresh and wonder whether it worked.
+      const id = parseInt(req.params.id, 10);
+      const full = (await pool.query(
+        `SELECT o.business_name, o.contact_first_name, o.contact_last_name, o.contact_phone, o.contact_email,
+                o.rep_first_name, o.rep_last_name, o.rep_phone, o.rep_email, o.notes,
+                p.name AS partner_name, pu.email AS submitted_by_email
+           FROM partner_opportunities o
+           JOIN partners p ON p.id = o.partner_id
+           LEFT JOIN partner_users pu ON pu.id = o.submitted_by
+          WHERE o.id = $1`,
+        [id]
+      )).rows[0];
+      const result = await createCrmLead(full);
+      await pool.query(
+        `UPDATE partner_opportunities SET crm_lead_id = $2, crm_lead_error = $3 WHERE id = $1`,
+        [id, result.success ? result.leadId : null, result.success ? null : result.error]
+      );
+      crmLead = result.success ? { leadId: result.leadId } : { error: result.error };
+    }
+    res.json({ success: true, crmLead });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -10076,6 +10148,90 @@ async function findCrmEmailByName(name) {
     }
   } catch (e) { console.warn('[proposal] CRM email lookup:', e.message); }
   return null;
+}
+
+// SH-28 — pre-approval duplicate check for a Partner Portal opportunity: searches Zoho CRM
+// Leads/Contacts/Accounts by business name and contact email. Best-effort — a CRM outage should
+// never block a partner's submission or an admin's approval, so every failure resolves to
+// { status: 'check_failed' } rather than throwing.
+async function checkCrmDuplicate({ businessName, contactEmail }) {
+  const matches = [];
+  try {
+    const crmToken = await ensureValidCrmToken();
+    const headers = { Authorization: `Zoho-oauthtoken ${crmToken}` };
+    const name = String(businessName || '').trim();
+    const email = String(contactEmail || '').trim();
+    const searches = [];
+    if (name) {
+      const enc = encodeURIComponent(name);
+      searches.push({ module: 'Accounts', url: `https://www.zohoapis.com/crm/v2/Accounts/search?criteria=(Account_Name:equals:${enc})`, nameField: 'Account_Name' });
+      searches.push({ module: 'Leads', url: `https://www.zohoapis.com/crm/v2/Leads/search?criteria=(Company:equals:${enc})`, nameField: 'Company' });
+    }
+    if (email) {
+      const encE = encodeURIComponent(email);
+      searches.push({ module: 'Contacts', url: `https://www.zohoapis.com/crm/v2/Contacts/search?email=${encE}`, nameField: 'Full_Name' });
+      searches.push({ module: 'Leads', url: `https://www.zohoapis.com/crm/v2/Leads/search?email=${encE}`, nameField: 'Full_Name' });
+    }
+    for (const s of searches) {
+      const r = await axios.get(s.url, { headers, validateStatus: () => true });
+      if (r.status !== 200) continue; // 204 = no match
+      for (const rec of (r.data?.data || [])) {
+        matches.push({ module: s.module, id: rec.id, name: rec[s.nameField] || rec.Account_Name || rec.Company || rec.Full_Name || '(unnamed)' });
+      }
+    }
+  } catch (e) {
+    console.warn('[partner-crm] duplicate check failed:', e.message);
+    return { status: 'check_failed', matches: [], summary: null };
+  }
+  const seen = new Set();
+  const deduped = matches.filter((m) => {
+    const k = `${m.module}:${m.id}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  const summary = deduped.length ? deduped.map((m) => `${m.module}: ${m.name}`).join('; ') : null;
+  return { status: deduped.length ? 'match_found' : 'no_match', matches: deduped, summary };
+}
+
+// SH-30 — create a real Lead in Zoho CRM once a Partner Portal opportunity is approved. Never
+// sets Lead_Source (a picklist whose valid values vary per Zoho org — an invalid value would
+// hard-fail the whole create with INVALID_DATA), so partner/rep context goes into Description
+// instead. `o` is the joined opportunity+partner+submitter row (see the PUT handler below).
+async function createCrmLead(o) {
+  const fields = {
+    Company: o.business_name,
+    Last_Name: o.contact_last_name || o.business_name,
+  };
+  if (o.contact_first_name) fields.First_Name = o.contact_first_name;
+  if (o.contact_email) fields.Email = o.contact_email;
+  if (o.contact_phone) fields.Phone = o.contact_phone;
+  const repName = [o.rep_first_name, o.rep_last_name].filter(Boolean).join(' ');
+  fields.Description = [
+    `Referred by partner: ${o.partner_name}`,
+    o.submitted_by_email ? `Submitted by: ${o.submitted_by_email}` : null,
+    repName ? `Partner's rep on this deal: ${repName}${o.rep_phone ? ` — ${o.rep_phone}` : ''}${o.rep_email ? ` — ${o.rep_email}` : ''}` : null,
+    o.notes ? `Notes: ${o.notes}` : null,
+  ].filter(Boolean).join('\n');
+
+  try {
+    const crmToken = await ensureValidCrmToken();
+    const r = await axios.post(
+      'https://www.zohoapis.com/crm/v2/Leads',
+      { data: [fields] },
+      { headers: { Authorization: `Zoho-oauthtoken ${crmToken}`, 'Content-Type': 'application/json' }, validateStatus: () => true }
+    );
+    const result = r.data?.data?.[0];
+    if (r.status >= 200 && r.status < 300 && result?.status === 'success') {
+      return { success: true, leadId: result.details?.id || null };
+    }
+    const msg = result?.message || r.data?.message || `HTTP ${r.status}`;
+    console.warn('[partner-crm] Lead creation failed:', msg);
+    return { success: false, error: String(msg).slice(0, 300) };
+  } catch (e) {
+    console.warn('[partner-crm] Lead creation error:', e.message);
+    return { success: false, error: e.message.slice(0, 300) };
+  }
 }
 
 // Best-effort merchant contact email for a SaaS Increase notification — same fallback chain as
