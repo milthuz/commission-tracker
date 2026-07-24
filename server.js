@@ -3645,13 +3645,7 @@ app.post('/api/admin/partner-opportunities/:id/crm-check', authenticateToken, as
       `UPDATE partner_opportunities SET crm_match_status = $2, crm_match_summary = $3, crm_match_records = $4 WHERE id = $1`,
       [id, result.status, result.summary, JSON.stringify(result.matches)]
     );
-    res.json({
-      crmMatchStatus: result.status, crmMatchSummary: result.summary, crmMatchRecords: result.matches,
-      // Diagnostic-only, never persisted: why crmUrl came back null on every match (e.g. the CRM
-      // connection is missing the org.READ scope) — surfaced so an admin can tell without needing
-      // server log access.
-      orgLookupError: result.orgLookupError || null,
-    });
+    res.json({ crmMatchStatus: result.status, crmMatchSummary: result.summary, crmMatchRecords: result.matches });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -4164,10 +4158,6 @@ app.get('/api/auth/zoho-crm', authenticateToken, (req, res) => {
   const state = Math.random().toString(36).substring(7);
 
   const authUrl = `${ZOHO_CONFIG.accounts_url}/oauth/v2/auth?` +
-    // ZohoCRM.org.READ is needed for getCrmOrgId() (server.js) to build direct "View in Zoho
-    // CRM" links on partner-opportunity duplicate matches — without it that lookup 401s and the
-    // link is silently omitted. Reconnecting (disconnect + Connect again) is required for an
-    // existing admin's refresh token to pick up this scope; Zoho won't grant it retroactively.
     `scope=ZohoCRM.modules.ALL,ZohoCRM.settings.ALL,ZohoCRM.coql.READ,ZohoCRM.users.READ,ZohoCRM.org.READ` +
     `&client_id=${ZOHO_CONFIG.client_id}` +
     `&response_type=code` +
@@ -10236,33 +10226,6 @@ async function findCrmEmailByName(name) {
   return null;
 }
 
-// Zoho CRM org ID, used to build direct links to a record (https://crm.zoho.com/crm/org<id>/tab/
-// <Module>/<recordId>). Cached in memory for the process lifetime — an org's ID never changes.
-let _crmOrgIdCache = null;
-// Reason the last getCrmOrgId() call failed to produce an ID, so a manual Recheck can surface
-// it to the admin directly (no Railway log access needed to diagnose a bad OAuth scope, etc.).
-let _crmOrgIdLastError = null;
-async function getCrmOrgId() {
-  if (_crmOrgIdCache) return _crmOrgIdCache;
-  try {
-    const crmToken = await ensureValidCrmToken();
-    const r = await axios.get('https://www.zohoapis.com/crm/v2/org', {
-      headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true,
-    });
-    if (r.status === 200) {
-      const orgId = r.data?.org?.[0]?.id || null;
-      if (orgId) { _crmOrgIdCache = orgId; _crmOrgIdLastError = null; return orgId; }
-      _crmOrgIdLastError = 'Org lookup returned no id';
-    } else {
-      _crmOrgIdLastError = `HTTP ${r.status}: ${JSON.stringify(r.data).slice(0, 200)}`;
-    }
-  } catch (e) {
-    _crmOrgIdLastError = e.message;
-  }
-  console.warn('[partner-crm] org lookup failed:', _crmOrgIdLastError);
-  return _crmOrgIdCache;
-}
-
 // SH-28 — pre-approval duplicate check for a Partner Portal opportunity: searches Zoho CRM
 // Leads/Contacts/Accounts by business name, contact email, and contact phone. Best-effort — a
 // CRM outage should never block a partner's submission or an admin's approval, so every failure
@@ -10328,16 +10291,16 @@ async function checkCrmDuplicate({ businessName, contactEmail, contactPhone }) {
     seen.add(k);
     return true;
   });
-  const orgId = deduped.length ? await getCrmOrgId() : null;
+  // Org-less deep link: https://crm.zoho.com/crm/org<id>/tab/... required a numeric org ID that
+  // turned out not to be resolvable from GET /crm/v2/org's "id" field (confirmed dead end live —
+  // even the bare org+module URL, with no record id, errored). Omitting the org segment lets Zoho
+  // resolve it from the browser's own logged-in session instead.
   const enriched = deduped.map((m) => ({
     ...m,
-    crmUrl: orgId ? `https://crm.zoho.com/crm/org${orgId}/tab/${m.module}/${m.id}` : null,
+    crmUrl: `https://crm.zoho.com/crm/tab/${m.module}/${m.id}`,
   }));
   const summary = enriched.length ? enriched.map((m) => `${m.module}: ${m.name}`).join('; ') : null;
-  return {
-    status: enriched.length ? 'match_found' : 'no_match', matches: enriched, summary,
-    orgLookupError: (enriched.length && !orgId) ? _crmOrgIdLastError : null,
-  };
+  return { status: enriched.length ? 'match_found' : 'no_match', matches: enriched, summary };
 }
 
 // SH-30 — create a real Lead in Zoho CRM once a Partner Portal opportunity is approved.
