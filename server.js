@@ -3682,6 +3682,9 @@ app.put('/api/admin/partner-opportunities/:id', authenticateToken, async (req, r
           WHERE o.id = $1`,
         [id]
       )).rows[0];
+      // crmOwnerId — the Zoho CRM user the partner manager picked to own this Lead (SH-30
+      // follow-up); optional, comes straight from the request body, not persisted separately.
+      full.crm_owner_id = String(req.body.crmOwnerId || '').trim() || null;
       const result = await createCrmLead(full);
       await pool.query(
         `UPDATE partner_opportunities SET crm_lead_id = $2, crm_lead_error = $3 WHERE id = $1`,
@@ -3690,6 +3693,51 @@ app.put('/api/admin/partner-opportunities/:id', authenticateToken, async (req, r
       crmLead = result.success ? { leadId: result.leadId } : { error: result.error };
     }
     res.json({ success: true, crmLead });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/partner-opportunities/crm-reps — Zoho CRM's active users, so the partner manager
+// can pick who a Lead gets assigned to at approval time (SH-30 follow-up).
+app.get('/api/admin/partner-opportunities/crm-reps', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const crmToken = await ensureValidCrmToken();
+    const r = await axios.get('https://www.zohoapis.com/crm/v2/users?type=ActiveUsers', {
+      headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true,
+    });
+    if (r.status !== 200) return res.json({ reps: [] }); // 204 = none
+    const reps = (r.data?.users || []).map((u) => ({ id: u.id, name: u.full_name, email: u.email }));
+    res.json({ reps });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// TEMP DIAGNOSTIC — GET /api/admin/partner-opportunities/crm-lead-sample. The partner manager
+// doesn't currently have Zoho Setup access to look up the API name for the "Lead Contact Method"
+// field, so this pulls a few recent Leads and flags any field whose value looks like a contact
+// method (matches "website form"/"partner portal"/"contact method") — the field key on that match
+// IS the API name we need for createCrmLead(). Remove once the field is wired up for real.
+app.get('/api/admin/partner-opportunities/crm-lead-sample', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const crmToken = await ensureValidCrmToken();
+    const r = await axios.get('https://www.zohoapis.com/crm/v2/Leads?per_page=5&sort_by=Created_Time&sort_order=desc', {
+      headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true,
+    });
+    if (r.status !== 200) return res.status(502).json({ error: `Zoho returned HTTP ${r.status}`, details: r.data });
+    const leads = r.data?.data || [];
+    const candidates = [];
+    for (const lead of leads) {
+      for (const [key, value] of Object.entries(lead)) {
+        if (typeof value === 'string' && /website\s*form|partner\s*portal|contact\s*method/i.test(value)) {
+          candidates.push({ leadId: lead.id, company: lead.Company, field: key, value });
+        }
+      }
+    }
+    res.json({ candidates, sampleCount: leads.length, rawFirstLead: leads[0] || null });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -10320,6 +10368,8 @@ async function createCrmLead(o) {
   if (o.contact_first_name) fields.First_Name = o.contact_first_name;
   if (o.contact_email) fields.Email = o.contact_email;
   if (o.contact_phone) fields.Phone = o.contact_phone;
+  // SH-30 follow-up — the partner manager's chosen rep to own this Lead in Zoho CRM.
+  if (o.crm_owner_id) fields.Owner = { id: o.crm_owner_id };
   const repName = [o.rep_first_name, o.rep_last_name].filter(Boolean).join(' ');
   fields.Description = [
     `Referred by partner: ${o.partner_name}`,
