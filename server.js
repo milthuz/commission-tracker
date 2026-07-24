@@ -2636,7 +2636,7 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // Render each transactional email with sample data so an admin can see the look
 // & feel in the panel and send a test copy. Mirrors the real builders so the
 // preview reflects exactly what recipients get.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'probation', 'new_user', 'saas_increase'];
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -2692,6 +2692,8 @@ function sampleEmail(type, lang) {
           `<strong>Amy Spicer</strong> — fin de probation le <strong>2026-07-18</strong> (dans 15 jours). Après cette date, le quota mensuel s'applique.<br><br>Amy Spicer's new-hire probation ends on 2026-07-18 (in 15 days). The monthly quota gate applies after that.`, null, null) };
     case 'new_user':
       return newUserEmail('Marie Dubois', 'marie@example.com', 'Zoho');
+    case 'new_partner_opportunity':
+      return newPartnerOpportunityEmail('Resto Untel', 'Moneris', 'tony.soprano@example.com');
     case 'saas_increase': {
       // Cluster-branded (NOT mailShell/Sales Hub) — this goes to an external merchant, same rule
       // as everywhere else this email is built (see buildProposalEmailHtml's comment). Mirrors
@@ -3235,6 +3237,9 @@ app.post('/api/partner-portal/opportunities', authenticatePartnerToken, async (r
         [opportunityId, result.status, result.summary, JSON.stringify(result.matches)]
       ))
       .catch((e) => console.warn('[partner-crm] failed to persist duplicate check:', e.message));
+    // Same fire-and-forget idiom — email the configured partner managers so they don't have to
+    // poll the queue. notifyNewPartnerOpportunity() never throws.
+    notifyNewPartnerOpportunity(req.partnerUser.partnerId, businessName, req.partnerUser.email);
     res.json({ success: true, id: opportunityId });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -3645,6 +3650,18 @@ app.post('/api/admin/partners/:id/invite-admin', authenticateToken, async (req, 
 });
 
 // GET /api/admin/partner-opportunities?status= — the full review queue (all partners).
+// GET /api/admin/partner-opportunities/pending-count — lightweight count for the Sidebar's
+// "needs attention" badge on the Partners nav item (mirrors the data-health badge idiom).
+app.get('/api/admin/partner-opportunities/pending-count', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const r = await pool.query(`SELECT COUNT(*) FROM partner_opportunities WHERE status = 'pending'`);
+    res.json({ count: parseInt(r.rows[0].count, 10) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/admin/partner-opportunities', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'partners:manage'))) return;
   try {
@@ -13540,6 +13557,60 @@ async function notifyNewUserWithoutRole(email, displayName, source) {
     await sendMail(recipients.join(','), subject, html);
     console.log(`📣 [NEWUSER] notified ${recipients.length} recipient(s) about ${email} (no role)`);
   } catch (e) { console.warn('[NEWUSER] notify failed:', e.message); }
+}
+
+// app_settings key 'partner_opportunity_recipients' — who gets notified when a partner submits
+// a new opportunity through the Partner Portal. Empty = nobody. Gated on partners:manage (not
+// the broader admin:notifications) since this is specifically the partner manager's concern.
+async function getPartnerOpportunityRecipients() {
+  try {
+    const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'partner_opportunity_recipients'`);
+    const v = r.rows[0]?.value;
+    return Array.isArray(v) ? v.filter(e => typeof e === 'string') : [];
+  } catch { return []; }
+}
+app.get('/api/admin/partner-opportunity-recipients', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try { res.json({ recipients: await getPartnerOpportunityRecipients() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/admin/partner-opportunity-recipients', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  const emails = Array.isArray(req.body?.emails) ? req.body.emails.map(e => String(e).trim().toLowerCase()).filter(Boolean) : null;
+  if (!emails) return res.status(400).json({ error: 'emails array required' });
+  if (emails.some(e => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e))) return res.status(400).json({ error: 'invalid email' });
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('partner_opportunity_recipients', $1::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [JSON.stringify(emails)]
+    );
+    res.json({ recipients: emails });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// The new-partner-opportunity email. Shared with the email-preview sample ('new_partner_opportunity').
+function newPartnerOpportunityEmail(businessName, partnerName, submittedByEmail) {
+  const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+  return {
+    subject: `Nouvelle occasion d'affaires — ${businessName}`,
+    html: mailShell('Nouvelle occasion d\'affaires / New partner opportunity',
+      `<strong>${esc(partnerName)}</strong> a soumis une nouvelle occasion d'affaires pour <strong>${esc(businessName)}</strong> via le Portail partenaire.<br>Soumis par / Submitted by : ${esc(submittedByEmail)}<br><br>${esc(partnerName)} submitted a new opportunity for <strong>${esc(businessName)}</strong> through the Partner Portal.`,
+      'Voir la file d\'attente / View the queue', `${base}/admin/partners`),
+  };
+}
+
+// Fired right after a partner submits an opportunity. Never throws (fire-and-forget from the
+// submission endpoint) — a mail failure must never affect the partner's own submission flow.
+async function notifyNewPartnerOpportunity(partnerId, businessName, submittedByEmail) {
+  try {
+    const recipients = await getPartnerOpportunityRecipients();
+    if (!recipients.length) return;
+    const partner = (await pool.query(`SELECT name FROM partners WHERE id = $1`, [partnerId])).rows[0];
+    const { subject, html } = newPartnerOpportunityEmail(businessName, partner?.name || 'Partner', submittedByEmail);
+    await sendMail(recipients.join(','), subject, html);
+  } catch (e) { console.warn('[partner-opp] notify failed:', e.message); }
 }
 
 // Daily job: email the configured recipients when an active rep's probation ends in 45/30/15
