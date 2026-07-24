@@ -3699,45 +3699,28 @@ app.put('/api/admin/partner-opportunities/:id', authenticateToken, async (req, r
 });
 
 // GET /api/admin/partner-opportunities/crm-reps — Zoho CRM's active users, so the partner manager
-// can pick who a Lead gets assigned to at approval time (SH-30 follow-up).
+// can pick who a Lead gets assigned to at approval time (SH-30 follow-up). Filtered down to
+// Sales Hub's own active salespeople (matched by name, or email when set) — the CRM org's full
+// ActiveUsers list includes plenty of accounts with no connection to the sales team; every real
+// Sales Hub rep already has a Zoho account (they log in via Zoho SSO), so this cross-reference
+// also confirms they genuinely have a CRM account rather than just an app login.
 app.get('/api/admin/partner-opportunities/crm-reps', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'partners:manage'))) return;
   try {
+    const spRows = (await pool.query(`SELECT name, email FROM salespeople WHERE is_active = true`)).rows;
+    const namesLower = new Set(spRows.map((r) => r.name.trim().toLowerCase()));
+    const emailsLower = new Set(spRows.filter((r) => r.email).map((r) => r.email.trim().toLowerCase()));
+
     const crmToken = await ensureValidCrmToken();
     const r = await axios.get('https://www.zohoapis.com/crm/v2/users?type=ActiveUsers', {
       headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true,
     });
     if (r.status !== 200) return res.json({ reps: [] }); // 204 = none
-    const reps = (r.data?.users || []).map((u) => ({ id: u.id, name: u.full_name, email: u.email }));
+    const reps = (r.data?.users || [])
+      .filter((u) => namesLower.has(String(u.full_name || '').trim().toLowerCase())
+        || (u.email && emailsLower.has(String(u.email).trim().toLowerCase())))
+      .map((u) => ({ id: u.id, name: u.full_name, email: u.email }));
     res.json({ reps });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// TEMP DIAGNOSTIC — GET /api/admin/partner-opportunities/crm-lead-sample. The partner manager
-// doesn't currently have Zoho Setup access to look up the API name for the "Lead Contact Method"
-// field, so this pulls a few recent Leads and flags any field whose value looks like a contact
-// method (matches "website form"/"partner portal"/"contact method") — the field key on that match
-// IS the API name we need for createCrmLead(). Remove once the field is wired up for real.
-app.get('/api/admin/partner-opportunities/crm-lead-sample', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'partners:manage'))) return;
-  try {
-    const crmToken = await ensureValidCrmToken();
-    const r = await axios.get('https://www.zohoapis.com/crm/v2/Leads?per_page=5&sort_by=Created_Time&sort_order=desc', {
-      headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true,
-    });
-    if (r.status !== 200) return res.status(502).json({ error: `Zoho returned HTTP ${r.status}`, details: r.data });
-    const leads = r.data?.data || [];
-    const candidates = [];
-    for (const lead of leads) {
-      for (const [key, value] of Object.entries(lead)) {
-        if (typeof value === 'string' && /website\s*form|partner\s*portal|contact\s*method/i.test(value)) {
-          candidates.push({ leadId: lead.id, company: lead.Company, field: key, value });
-        }
-      }
-    }
-    res.json({ candidates, sampleCount: leads.length, rawFirstLead: leads[0] || null });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -10354,8 +10337,9 @@ async function checkCrmDuplicate({ businessName, contactEmail, contactPhone }) {
 // SH-30 — create a real Lead in Zoho CRM once a Partner Portal opportunity is approved.
 // Lead_Source comes from the referring partner's configured value (Admin → Partners → Edit,
 // request 2026-07-2x) — left unset if the partner manager hasn't configured one, rather than
-// guessing a picklist value that could hard-fail the whole create with INVALID_DATA. Country and
-// Lead_Status are fixed per the partner manager's instructions (this org's Zoho picklists).
+// guessing a picklist value that could hard-fail the whole create with INVALID_DATA. Country,
+// Lead_Status, and Lead_Contact_Method (API name confirmed via the temp diagnostic endpoint,
+// value = "Website Form" style) are fixed per the partner manager's instructions.
 // `o` is the joined opportunity+partner+submitter row (see the PUT handler below).
 async function createCrmLead(o) {
   const fields = {
@@ -10363,6 +10347,7 @@ async function createCrmLead(o) {
     Last_Name: o.contact_last_name || o.business_name,
     Country: 'Canada',
     Lead_Status: 'NEW',
+    Lead_Contact_Method: 'Partner Portal',
   };
   if (o.lead_source) fields.Lead_Source = o.lead_source;
   if (o.contact_first_name) fields.First_Name = o.contact_first_name;
