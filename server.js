@@ -1473,6 +1473,11 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS business_contact_email VARCHAR(255)`);
     await pool.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS business_contact_phone VARCHAR(50)`);
 
+    // Denormalized display name of the Zoho CRM rep a Lead was assigned to at approval time
+    // (SH-30 follow-up) — lets the partner see who owns their deal without exposing any other
+    // internal review data (crm_match_*, crm_lead_error stay admin-only).
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_owner_name VARCHAR(255)`);
+
     // Broadcast notifications for the Partner Portal's bell icon (user request 2026-07-2x:
     // "notification area like Sales Hub, we'll push notifications eventually"). Org-wide, not
     // per-user, mirroring the opportunity queue's own scoping — nothing writes to this table yet;
@@ -3139,6 +3144,24 @@ function mapOpportunityRow(r) {
   };
 }
 
+// Best-effort live Zoho CRM Lead status for the partner-facing opportunity list — never throws;
+// returns null on any failure so one bad lookup can't break the whole list. $converted is Zoho's
+// read-only system field marking a Lead that's been converted into a Contact/Account/Deal.
+async function getCrmLeadStage(leadId) {
+  try {
+    const crmToken = await ensureValidCrmToken();
+    const r = await axios.get(`https://www.zohoapis.com/crm/v2/Leads/${leadId}`, {
+      headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true,
+    });
+    if (r.status !== 200) return null;
+    const lead = r.data?.data?.[0];
+    if (!lead) return null;
+    return { leadStage: lead.Lead_Status || null, leadConverted: !!lead.$converted };
+  } catch {
+    return null;
+  }
+}
+
 // GET /api/partner-portal/opportunities — Standard: only their own submissions. Admin: every
 // submission for their partner company.
 app.get('/api/partner-portal/opportunities', authenticatePartnerToken, async (req, res) => {
@@ -3147,24 +3170,50 @@ app.get('/api/partner-portal/opportunities', authenticatePartnerToken, async (re
     const rows = (await pool.query(
       `SELECT id, business_name, contact_first_name, contact_last_name, contact_phone, contact_email,
               rep_first_name, rep_last_name, rep_phone, rep_email, notes, status, reviewed_at,
-              rejection_reason, created_at
+              rejection_reason, created_at, crm_owner_name, crm_lead_id
          FROM partner_opportunities
         WHERE partner_id = $1 ${isAdmin ? '' : 'AND submitted_by = $2'}
         ORDER BY created_at DESC`,
       isAdmin ? [req.partnerUser.partnerId] : [req.partnerUser.partnerId, req.partnerUser.id]
     )).rows;
-    res.json({ opportunities: rows.map(mapOpportunityRow) });
+    // Assigned rep + live Lead stage are partner-safe (unlike crm_match_*/crm_lead_error, which
+    // stay admin-only — see mapOpportunityRow's comment) — only fetched for approved rows that
+    // actually have a Lead, so a partner with no approved deals costs zero Zoho calls.
+    const stages = await Promise.all(rows.map((r) => (r.status === 'approved' && r.crm_lead_id) ? getCrmLeadStage(r.crm_lead_id) : Promise.resolve(null)));
+    res.json({ opportunities: rows.map((r, i) => ({
+      ...mapOpportunityRow(r),
+      assignedRepName: r.crm_owner_name,
+      leadStage: stages[i]?.leadStage || null,
+      leadConverted: stages[i]?.leadConverted || false,
+    })) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// POST /api/partner-portal/opportunities — SH-27 submission form.
+// POST /api/partner-portal/opportunities — SH-27 submission form. A Standard user submitting
+// their own deal IS the rep on it, so their rep_* fields are always derived from their own
+// account rather than trusted from the body (also saves them from re-typing their own info).
+// A partner Admin can submit on behalf of any of their team's reps, so their rep_* fields come
+// through as sent (the frontend fills them from a team-member picker, not free text anymore).
 app.post('/api/partner-portal/opportunities', authenticatePartnerToken, async (req, res) => {
   const b = req.body || {};
   const businessName = String(b.businessName || '').trim();
   if (!businessName) return res.status(400).json({ error: 'Business name is required' });
   try {
+    let repFirstName, repLastName, repPhone, repEmail;
+    if (req.partnerUser.role === 'standard') {
+      const nameParts = String(req.partnerUser.name || '').trim().split(/\s+/);
+      repFirstName = nameParts[0] || null;
+      repLastName = nameParts.slice(1).join(' ') || null;
+      repPhone = null;
+      repEmail = req.partnerUser.email;
+    } else {
+      repFirstName = String(b.repFirstName || '').trim() || null;
+      repLastName = String(b.repLastName || '').trim() || null;
+      repPhone = String(b.repPhone || '').trim() || null;
+      repEmail = String(b.repEmail || '').trim() || null;
+    }
     const r = await pool.query(
       `INSERT INTO partner_opportunities
          (partner_id, submitted_by, business_name, contact_first_name, contact_last_name, contact_phone,
@@ -3173,8 +3222,7 @@ app.post('/api/partner-portal/opportunities', authenticatePartnerToken, async (r
       [req.partnerUser.partnerId, req.partnerUser.id, businessName,
        String(b.contactFirstName || '').trim() || null, String(b.contactLastName || '').trim() || null,
        String(b.contactPhone || '').trim() || null, String(b.contactEmail || '').trim() || null,
-       String(b.repFirstName || '').trim() || null, String(b.repLastName || '').trim() || null,
-       String(b.repPhone || '').trim() || null, String(b.repEmail || '').trim() || null,
+       repFirstName, repLastName, repPhone, repEmail,
        String(b.notes || '').trim() || null]
     );
     logActivity('partner_opportunity', String(r.rows[0].id), 'submitted', `${businessName} submitted by ${req.partnerUser.email}`, req.partnerUser.email);
@@ -3683,12 +3731,15 @@ app.put('/api/admin/partner-opportunities/:id', authenticateToken, async (req, r
         [id]
       )).rows[0];
       // crmOwnerId — the Zoho CRM user the partner manager picked to own this Lead (SH-30
-      // follow-up); optional, comes straight from the request body, not persisted separately.
+      // follow-up); optional, comes straight from the request body. crmOwnerName (the same
+      // rep's display name, already known client-side from the crm-reps list) IS persisted, so
+      // the partner can see who owns their deal without a second Zoho lookup.
       full.crm_owner_id = String(req.body.crmOwnerId || '').trim() || null;
+      const ownerName = String(req.body.crmOwnerName || '').trim() || null;
       const result = await createCrmLead(full);
       await pool.query(
-        `UPDATE partner_opportunities SET crm_lead_id = $2, crm_lead_error = $3 WHERE id = $1`,
-        [id, result.success ? result.leadId : null, result.success ? null : result.error]
+        `UPDATE partner_opportunities SET crm_lead_id = $2, crm_lead_error = $3, crm_owner_name = $4 WHERE id = $1`,
+        [id, result.success ? result.leadId : null, result.success ? null : result.error, full.crm_owner_id ? ownerName : null]
       );
       crmLead = result.success ? { leadId: result.leadId } : { error: result.error };
     }
