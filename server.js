@@ -3155,6 +3155,7 @@ function mapOpportunityRow(r) {
     notes: r.notes, status: r.status, reviewedBy: r.reviewed_by, reviewedAt: r.reviewed_at,
     rejectionReason: r.rejection_reason, createdAt: r.created_at,
     partnerName: r.partner_name, submittedByEmail: r.submitted_by_email,
+    submittedByName: r.submitted_by_name,
   };
 }
 
@@ -3182,12 +3183,14 @@ app.get('/api/partner-portal/opportunities', authenticatePartnerToken, async (re
   try {
     const isAdmin = req.partnerUser.role === 'admin';
     const rows = (await pool.query(
-      `SELECT id, business_name, contact_first_name, contact_last_name, contact_phone, contact_email,
-              rep_first_name, rep_last_name, rep_phone, rep_email, notes, status, reviewed_at,
-              rejection_reason, created_at, crm_owner_name, crm_lead_id
-         FROM partner_opportunities
-        WHERE partner_id = $1 ${isAdmin ? '' : 'AND submitted_by = $2'}
-        ORDER BY created_at DESC`,
+      `SELECT o.id, o.business_name, o.contact_first_name, o.contact_last_name, o.contact_phone, o.contact_email,
+              o.rep_first_name, o.rep_last_name, o.rep_phone, o.rep_email, o.notes, o.status, o.reviewed_at,
+              o.rejection_reason, o.created_at, o.crm_owner_name, o.crm_lead_id,
+              pu.display_name AS submitted_by_name, pu.email AS submitted_by_email
+         FROM partner_opportunities o
+         LEFT JOIN partner_users pu ON pu.id = o.submitted_by
+        WHERE o.partner_id = $1 ${isAdmin ? '' : 'AND o.submitted_by = $2'}
+        ORDER BY o.created_at DESC`,
       isAdmin ? [req.partnerUser.partnerId] : [req.partnerUser.partnerId, req.partnerUser.id]
     )).rows;
     // Assigned rep + live Lead stage are partner-safe (unlike crm_match_*/crm_lead_error, which
