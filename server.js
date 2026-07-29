@@ -1832,11 +1832,21 @@ async function initializeDatabase() {
       INSERT INTO saas_increase_email_templates (name, subject_en, body_en, subject_fr, body_fr, is_default)
       SELECT 'Standard notice',
         'An update to your {{planName}} pricing',
-        'Hello {{customerName}},\n\nWe''re writing to let you know that the monthly price of your {{planName}} will change from {{currentMonthly}} to {{newMonthly}} per month, effective at your next renewal.\n\nIf you have any questions about this change, just reply to this email — we''re happy to help.\n\nThank you for being a Cluster Systems customer.\n\nBest regards,',
+        'Hello {{customerName}},\n\nWe''re writing to let you know that the monthly price of your {{planName}} will change from {{currentMonthly}} to {{newMonthly}} per month, effective {{effectiveDate}}.\n\nIf you have any questions about this change, just reply to this email — we''re happy to help.\n\nThank you for being a Cluster Systems customer.\n\nBest regards,',
         'Une mise à jour du prix de votre {{planName}}',
-        'Bonjour {{customerName}},\n\nNous vous écrivons pour vous informer que le prix mensuel de votre {{planName}} passera de {{currentMonthly}} à {{newMonthly}} par mois, à compter de votre prochain renouvellement.\n\nPour toute question à ce sujet, répondez simplement à ce courriel — il nous fera plaisir de vous aider.\n\nMerci d''être client de Cluster Systems.\n\nCordialement,',
+        'Bonjour {{customerName}},\n\nNous vous écrivons pour vous informer que le prix mensuel de votre {{planName}} passera de {{currentMonthly}} à {{newMonthly}} par mois, à compter du {{effectiveDate}}.\n\nPour toute question à ce sujet, répondez simplement à ce courriel — il nous fera plaisir de vous aider.\n\nMerci d''être client de Cluster Systems.\n\nCordialement,',
         true
       WHERE NOT EXISTS (SELECT 1 FROM saas_increase_email_templates);
+    `);
+    // Backfill the {{effectiveDate}} placeholder into the default template if it's still the
+    // pristine seeded text — never touches a row an admin has since customized.
+    await pool.query(`
+      UPDATE saas_increase_email_templates SET
+        body_en = 'Hello {{customerName}},\n\nWe''re writing to let you know that the monthly price of your {{planName}} will change from {{currentMonthly}} to {{newMonthly}} per month, effective {{effectiveDate}}.\n\nIf you have any questions about this change, just reply to this email — we''re happy to help.\n\nThank you for being a Cluster Systems customer.\n\nBest regards,',
+        body_fr = 'Bonjour {{customerName}},\n\nNous vous écrivons pour vous informer que le prix mensuel de votre {{planName}} passera de {{currentMonthly}} à {{newMonthly}} par mois, à compter du {{effectiveDate}}.\n\nPour toute question à ce sujet, répondez simplement à ce courriel — il nous fera plaisir de vous aider.\n\nMerci d''être client de Cluster Systems.\n\nCordialement,',
+        updated_at = NOW()
+      WHERE is_default = true
+        AND body_en = 'Hello {{customerName}},\n\nWe''re writing to let you know that the monthly price of your {{planName}} will change from {{currentMonthly}} to {{newMonthly}} per month, effective at your next renewal.\n\nIf you have any questions about this change, just reply to this email — we''re happy to help.\n\nThank you for being a Cluster Systems customer.\n\nBest regards,';
     `);
 
     // Per-subscription insights for the SaaS Increase tool — subscription tenure + when the
@@ -2698,8 +2708,10 @@ function sampleEmail(type, lang) {
       // Cluster-branded (NOT mailShell/Sales Hub) — this goes to an external merchant, same rule
       // as everywhere else this email is built (see buildProposalEmailHtml's comment). Mirrors
       // the real saasIncreaseDraftCopy builder so the preview matches what actually goes out.
+      const sampleEffectiveDate = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString().slice(0, 10);
       const { subject, body } = saasIncreaseDraftCopy({
-        customerName: 'Café du Coin', planName: 'Premium - Monthly', currentMonthly: 199, newMonthly: 219, lang: lang === 'en' ? 'en' : 'fr',
+        customerName: 'Café du Coin', planName: 'Premium - Monthly', currentMonthly: 199, newMonthly: 219,
+        effectiveDate: sampleEffectiveDate, lang: lang === 'en' ? 'en' : 'fr',
       });
       return { subject, html: buildProposalEmailHtml({ bodyText: body, acceptBtn: '', signatureHtml: '', pixel: '', frontendBase: base }) };
     }
@@ -8825,6 +8837,14 @@ async function computeSaasIncreaseSubscriptions() {
     `SELECT subscription_number, merchant_account_id FROM merchant_saas_links WHERE subscription_number IS NOT NULL`
   );
   const merchantBySub = new Map(linksRes.rows.map(r => [String(r.subscription_number), r.merchant_account_id]));
+  // Same raw→date parsing already used for the tenure/insights scan (Zoho sends either an epoch
+  // number or an ISO string depending on the field/org) — already present on the list response
+  // Zoho Billing returns, so this costs no extra API call.
+  const toDate = (raw) => {
+    if (!raw) return null;
+    const d = (typeof raw === 'number' || /^\d+$/.test(String(raw))) ? new Date(parseInt(raw) * 1000) : new Date(raw);
+    return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+  };
   const subscriptions = [];
   for (const { orgId, subs } of perOrgAll) {
     for (const s of subs) {
@@ -8843,6 +8863,9 @@ async function computeSaasIncreaseSubscriptions() {
         planName: s.plan_name || '',
         status: String(s.status || '').toLowerCase(),
         currentMonthly: Math.round(subMonthlyAmount(s.sub_total != null ? s.sub_total : s.amount, s.interval, s.interval_unit) * 100) / 100,
+        // When this subscription's next term/price change actually takes effect — used for the
+        // merchant notification's {{effectiveDate}} placeholder, not just the price itself.
+        nextBillingAt: toDate(s.next_billing_at || s.current_term_ends_at),
       });
     }
   }
@@ -9154,14 +9177,25 @@ app.get('/api/admin/saas-increase/scenarios/:id/export', authenticateToken, asyn
 // Cluster-branded chrome (buildProposalEmailHtml) rather than mailChrome/Sales Hub, since this
 // goes to an external merchant, not an internal Sales Hub user (same rule Proposal Builder
 // follows for quotes — see buildProposalEmailHtml's comment).
-function saasIncreaseDraftCopy({ customerName, planName, currentMonthly, newMonthly, lang }) {
+// Formats the {{effectiveDate}} placeholder in the merchant's language — falls back to the
+// generic "at your next renewal" phrasing (both languages) when the date isn't known yet
+// (e.g. Zoho hasn't returned next_billing_at for this subscription).
+function formatSaasEffectiveDate(dateStr, lang) {
+  if (!dateStr) return lang === 'en' ? 'your next renewal' : 'votre prochain renouvellement';
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return lang === 'en' ? 'your next renewal' : 'votre prochain renouvellement';
+  return new Intl.DateTimeFormat(lang === 'en' ? 'en-US' : 'fr-CA', { year: 'numeric', month: 'long', day: 'numeric' }).format(d);
+}
+function saasIncreaseDraftCopy({ customerName, planName, currentMonthly, newMonthly, effectiveDate, lang }) {
   const money = (n) => `$${Number(n || 0).toFixed(2)}`;
   const greeting = customerName ? ` ${customerName}` : '';
   const plan = planName || (lang === 'en' ? 'subscription' : 'abonnement');
+  const whenEn = effectiveDate ? `on ${formatSaasEffectiveDate(effectiveDate, 'en')}` : 'at your next renewal';
+  const whenFr = effectiveDate ? `le ${formatSaasEffectiveDate(effectiveDate, 'fr')}` : 'à votre prochain renouvellement';
   const subject = lang === 'en' ? `An update to your ${plan} pricing` : `Une mise à jour du prix de votre ${plan}`;
   const body = lang === 'en'
-    ? `Hello${greeting},\n\nWe're writing to let you know that the monthly price of your ${plan} will change from ${money(currentMonthly)} to ${money(newMonthly)} per month, effective at your next renewal.\n\nIf you have any questions about this change, just reply to this email — we're happy to help.\n\nThank you for being a Cluster Systems customer.\n\nBest regards,`
-    : `Bonjour${greeting},\n\nNous vous écrivons pour vous informer que le prix mensuel de votre ${plan} passera de ${money(currentMonthly)} à ${money(newMonthly)} par mois, à compter de votre prochain renouvellement.\n\nPour toute question à ce sujet, répondez simplement à ce courriel — il nous fera plaisir de vous aider.\n\nMerci d'être client de Cluster Systems.\n\nCordialement,`;
+    ? `Hello${greeting},\n\nWe're writing to let you know that the monthly price of your ${plan} will change from ${money(currentMonthly)} to ${money(newMonthly)} per month, effective ${whenEn}.\n\nIf you have any questions about this change, just reply to this email — we're happy to help.\n\nThank you for being a Cluster Systems customer.\n\nBest regards,`
+    : `Bonjour${greeting},\n\nNous vous écrivons pour vous informer que le prix mensuel de votre ${plan} passera de ${money(currentMonthly)} à ${money(newMonthly)} par mois, ${whenFr}.\n\nPour toute question à ce sujet, répondez simplement à ce courriel — il nous fera plaisir de vous aider.\n\nMerci d'être client de Cluster Systems.\n\nCordialement,`;
   return { subject, body };
 }
 
@@ -9171,9 +9205,12 @@ function saasIncreaseDraftCopy({ customerName, planName, currentMonthly, newMont
 function renderSaasTemplate(str, vars) {
   return String(str || '').replace(/\{\{(\w+)\}\}/g, (m, key) => (key in vars ? String(vars[key]) : m));
 }
-function saasTemplatePlaceholders({ customerName, planName, currentMonthly, newMonthly }) {
+function saasTemplatePlaceholders({ customerName, planName, currentMonthly, newMonthly, effectiveDate, lang }) {
   const money = (n) => `$${Number(n || 0).toFixed(2)}`;
-  return { customerName: customerName || '', planName: planName || '', currentMonthly: money(currentMonthly), newMonthly: money(newMonthly) };
+  return {
+    customerName: customerName || '', planName: planName || '', currentMonthly: money(currentMonthly), newMonthly: money(newMonthly),
+    effectiveDate: formatSaasEffectiveDate(effectiveDate, lang),
+  };
 }
 
 // GET /api/admin/saas-increase/email-templates — list the template library.
@@ -9250,18 +9287,23 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authentic
       `SELECT * FROM saas_increase_items WHERE scenario_id = $1 AND id = ANY($2::int[])`,
       [req.params.id, itemIds]
     )).rows;
+    // Effective date isn't stored on the item (it's Zoho's own next-renewal date, which can
+    // shift) — looked up fresh from the same cached subscriptions list the main table uses.
+    const liveSubs = await getSaasIncreaseSubscriptions();
+    const nextBillingBySub = new Map(liveSubs.map(s => [s.subscriptionNumber, s.nextBillingAt]));
     const results = [];
     for (const it of items) {
       const to = await resolveMerchantContactEmail(it.customer_id, it.customer_name);
+      const effectiveDate = nextBillingBySub.get(it.subscription_number) || null;
       let subject, body;
       if (template) {
-        const vars = saasTemplatePlaceholders({ customerName: it.customer_name, planName: it.plan_name, currentMonthly: it.current_monthly, newMonthly: it.new_monthly });
+        const vars = saasTemplatePlaceholders({ customerName: it.customer_name, planName: it.plan_name, currentMonthly: it.current_monthly, newMonthly: it.new_monthly, effectiveDate, lang });
         subject = renderSaasTemplate(lang === 'en' ? template.subject_en : template.subject_fr, vars);
         body = renderSaasTemplate(lang === 'en' ? template.body_en : template.body_fr, vars);
       } else {
         ({ subject, body } = saasIncreaseDraftCopy({
           customerName: it.customer_name, planName: it.plan_name,
-          currentMonthly: it.current_monthly, newMonthly: it.new_monthly, lang,
+          currentMonthly: it.current_monthly, newMonthly: it.new_monthly, effectiveDate, lang,
         }));
       }
       const row = (await pool.query(
@@ -9287,6 +9329,33 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/preview', authent
     const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
     const html = buildProposalEmailHtml({ bodyText, acceptBtn: '', signatureHtml, pixel: '', frontendBase });
     res.json({ html });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/admin/saas-increase/scenarios/:id/notifications/test-send — body { subject, body }.
+// Sends whatever's CURRENTLY in the editor to the acting admin's own inbox, subject prefixed
+// "[TEST]", never touching notify_status/notify_to. Works with fully fake/typed placeholder
+// text too — no real scenario item or Zoho subscription required — so this is the safe way to
+// try a new template or the {{effectiveDate}} placeholder end-to-end before it ever reaches a
+// real merchant.
+app.post('/api/admin/saas-increase/scenarios/:id/notifications/test-send', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  const subject = String(req.body?.subject || '').trim();
+  const bodyText = String(req.body?.body || '');
+  const testTo = (req.user.email || '').trim();
+  if (!subject || !bodyText) return res.status(400).json({ error: 'subject and body required' });
+  if (!testTo) return res.status(400).json({ error: 'no email on your account' });
+  try {
+    const repName = req.user.name || req.user.email || '';
+    let signatureHtml = '';
+    try { signatureHtml = await resolveSignatureHtml(req.user, repName); } catch { /* fall back to no signature */ }
+    const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+    const html = buildProposalEmailHtml({ bodyText, acceptBtn: '', signatureHtml, pixel: '', frontendBase });
+    const verifiedDomains = (process.env.VERIFIED_SENDER_DOMAINS || '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
+    const repDomain = testTo.includes('@') ? testTo.split('@')[1].toLowerCase() : '';
+    const fromAddr = verifiedDomains.includes(repDomain) ? testTo : (process.env.SMTP_FROM || process.env.SMTP_USER);
+    const r = await sendMail(testTo, `[TEST] ${subject}`, html, { from: { name: repName || 'Cluster Systems', address: fromAddr }, replyTo: testTo });
+    res.json({ sent: r.sent, reason: r.reason, to: testTo });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
