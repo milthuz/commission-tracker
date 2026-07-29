@@ -1478,6 +1478,49 @@ async function initializeDatabase() {
     // internal review data (crm_match_*, crm_lead_error stay admin-only).
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_owner_name VARCHAR(255)`);
 
+    // SH-40/41 — partner payouts. Mirrors the rep commission gate exactly: a flat $ amount per
+    // partner (payout_rate), paid ONCE per opportunity (not recurring like SaaS renewals) once the
+    // referred merchant has an actual PAID invoice in Sales Hub. There's no automatic link from a
+    // Zoho CRM Lead to a Sales Hub invoice, so linked_customer_name is set manually by the partner
+    // manager (same fuzzy-matching-by-hand pattern as the existing unassigned-invoices tooling)
+    // once the deal has clearly become a real, invoiced customer.
+    await pool.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS payout_rate DECIMAL(10,2)`);
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS linked_customer_name VARCHAR(255)`);
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS payout_status VARCHAR(20) NOT NULL DEFAULT 'not_eligible'`);
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS payout_run_id INTEGER`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS partner_payout_runs (
+        id             SERIAL PRIMARY KEY,
+        partner_id     INT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+        period_label   VARCHAR(50) NOT NULL,
+        status         VARCHAR(20) NOT NULL DEFAULT 'draft',
+        total_amount   DECIMAL(10,2) NOT NULL DEFAULT 0,
+        created_by     VARCHAR(255),
+        created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        finalized_by   VARCHAR(255),
+        finalized_at   TIMESTAMP
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_partner_opps_payout_status ON partner_opportunities(payout_status)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_partner_payout_runs_partner ON partner_payout_runs(partner_id)`);
+
+    // SH-42 — Partner Admin invoice upload, forwarded to accounting. Stored in-DB (bytea), same
+    // convention as the Resources library and reseller/partner logos — no object storage exists.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS partner_invoices (
+        id             SERIAL PRIMARY KEY,
+        partner_id     INT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+        payout_run_id  INT REFERENCES partner_payout_runs(id) ON DELETE SET NULL,
+        uploaded_by    INT REFERENCES partner_users(id),
+        file_name      VARCHAR(400) NOT NULL,
+        mime_type      VARCHAR(150),
+        file_data      BYTEA NOT NULL,
+        uploaded_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        forwarded_at   TIMESTAMP
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_partner_invoices_partner ON partner_invoices(partner_id)`);
+
     // Broadcast notifications for the Partner Portal's bell icon (user request 2026-07-2x:
     // "notification area like Sales Hub, we'll push notifications eventually"). Org-wide, not
     // per-user, mirroring the opportunity queue's own scoping — nothing writes to this table yet;
@@ -2646,7 +2689,7 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // Render each transactional email with sample data so an admin can see the look
 // & feel in the panel and send a test copy. Mirrors the real builders so the
 // preview reflects exactly what recipients get.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity'];
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -2704,6 +2747,8 @@ function sampleEmail(type, lang) {
       return newUserEmail('Marie Dubois', 'marie@example.com', 'Zoho');
     case 'new_partner_opportunity':
       return newPartnerOpportunityEmail('Resto Untel', 'Moneris', 'tony.soprano@example.com');
+    case 'partner_invoice_uploaded':
+      return partnerInvoiceUploadedEmail('Moneris', '2026-Q3', 1250, 'facture-moneris-q3.pdf');
     case 'saas_increase': {
       // Cluster-branded (NOT mailShell/Sales Hub) — this goes to an external merchant, same rule
       // as everywhere else this email is built (see buildProposalEmailHtml's comment). Mirrors
@@ -3185,7 +3230,8 @@ app.get('/api/partner-portal/opportunities', authenticatePartnerToken, async (re
     const rows = (await pool.query(
       `SELECT o.id, o.business_name, o.contact_first_name, o.contact_last_name, o.contact_phone, o.contact_email,
               o.rep_first_name, o.rep_last_name, o.rep_phone, o.rep_email, o.notes, o.status, o.reviewed_at,
-              o.rejection_reason, o.created_at, o.crm_owner_name, o.crm_lead_id,
+              o.rejection_reason, o.created_at, o.crm_owner_name, o.crm_lead_id, o.payout_run_id,
+              o.payout_status, o.linked_customer_name,
               pu.display_name AS submitted_by_name, pu.email AS submitted_by_email
          FROM partner_opportunities o
          LEFT JOIN partner_users pu ON pu.id = o.submitted_by
@@ -3202,6 +3248,10 @@ app.get('/api/partner-portal/opportunities', authenticatePartnerToken, async (re
       assignedRepName: r.crm_owner_name,
       leadStage: stages[i]?.leadStage || null,
       leadConverted: stages[i]?.leadConverted || false,
+      // SH-39 — payout status is partner-safe (it's their own money); linked_customer_name is the
+      // admin's internal matching detail and stays out of this response.
+      payoutStatus: r.payout_status,
+      payoutRunId: r.payout_run_id,
     })) });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -3530,6 +3580,74 @@ app.post('/api/partner-portal/assistant/chat', authenticatePartnerToken, async (
   }
 });
 
+const uploadPartnerInvoice = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+
+// GET /api/partner-portal/payout-runs — SH-39/42: "which invoice do we need to issue" report for
+// the Partner Admin. Only finalized runs are shown (a draft is still under internal review) —
+// each includes whether an invoice has already been uploaded against it, so the UI can prompt for
+// the ones still missing one. Standard users don't see this (payout is an Admin concern, SH-39).
+app.get('/api/partner-portal/payout-runs', authenticatePartnerToken, async (req, res) => {
+  if (req.partnerUser.role !== 'admin') return res.status(403).json({ error: 'Partner Admin only' });
+  try {
+    const rows = (await pool.query(
+      `SELECT r.id, r.period_label, r.total_amount, r.finalized_at, COUNT(o.id)::int AS opportunity_count,
+              (SELECT COUNT(*) FROM partner_invoices pi WHERE pi.payout_run_id = r.id)::int AS invoice_count
+         FROM partner_payout_runs r
+         LEFT JOIN partner_opportunities o ON o.payout_run_id = r.id
+        WHERE r.partner_id = $1 AND r.status = 'finalized'
+        GROUP BY r.id
+        ORDER BY r.finalized_at DESC`,
+      [req.partnerUser.partnerId]
+    )).rows;
+    res.json({ runs: rows.map((r) => ({
+      id: r.id, periodLabel: r.period_label, totalAmount: parseFloat(r.total_amount),
+      opportunityCount: r.opportunity_count, finalizedAt: r.finalized_at, hasInvoice: r.invoice_count > 0,
+    })) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/partner-portal/invoices — SH-42: Partner Admin uploads their invoice for a finalized
+// payout run. Stored in-DB (bytea, mirrors the Resources library — no object storage exists) and
+// forwarded to accounting by email; never blocks on the email failing.
+app.post('/api/partner-portal/invoices', authenticatePartnerToken, uploadPartnerInvoice.single('file'), async (req, res) => {
+  if (req.partnerUser.role !== 'admin') return res.status(403).json({ error: 'Partner Admin only' });
+  if (!req.file) return res.status(400).json({ error: 'file is required' });
+  const payoutRunId = req.body.payoutRunId ? parseInt(req.body.payoutRunId, 10) : null;
+  try {
+    if (payoutRunId) {
+      const run = (await pool.query(`SELECT partner_id, status FROM partner_payout_runs WHERE id = $1`, [payoutRunId])).rows[0];
+      if (!run || run.partner_id !== req.partnerUser.partnerId || run.status !== 'finalized') {
+        return res.status(400).json({ error: 'Invalid payout run' });
+      }
+    }
+    const r = await pool.query(
+      `INSERT INTO partner_invoices (partner_id, payout_run_id, uploaded_by, file_name, mime_type, file_data)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+      [req.partnerUser.partnerId, payoutRunId, req.partnerUser.id, req.file.originalname, req.file.mimetype, req.file.buffer]
+    );
+    notifyPartnerInvoiceUploaded(r.rows[0].id).catch(() => {});
+    res.json({ success: true, id: r.rows[0].id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/partner-portal/invoices — the Partner Admin's own upload history.
+app.get('/api/partner-portal/invoices', authenticatePartnerToken, async (req, res) => {
+  if (req.partnerUser.role !== 'admin') return res.status(403).json({ error: 'Partner Admin only' });
+  try {
+    const rows = (await pool.query(
+      `SELECT id, payout_run_id, file_name, uploaded_at FROM partner_invoices WHERE partner_id = $1 ORDER BY uploaded_at DESC`,
+      [req.partnerUser.partnerId]
+    )).rows;
+    res.json({ invoices: rows.map((r) => ({ id: r.id, payoutRunId: r.payout_run_id, fileName: r.file_name, uploadedAt: r.uploaded_at })) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ============================================================================
 // PARTNER PORTAL — internal admin side (partners:manage). Manage partner companies + review
 // submitted opportunities. Phase 1: approve/reject is a status flip only — no Zoho CRM
@@ -3542,7 +3660,7 @@ app.get('/api/admin/partners', authenticateToken, async (req, res) => {
     const rows = (await pool.query(
       `SELECT p.id, p.name, p.active, p.created_at, (p.logo_data IS NOT NULL) AS has_logo,
               p.lead_source, p.billing_contact_name, p.billing_contact_email, p.billing_contact_phone,
-              p.business_contact_name, p.business_contact_email, p.business_contact_phone,
+              p.business_contact_name, p.business_contact_email, p.business_contact_phone, p.payout_rate,
               COUNT(pu.id) AS user_count
          FROM partners p LEFT JOIN partner_users pu ON pu.partner_id = p.id
         GROUP BY p.id ORDER BY p.name`
@@ -3553,6 +3671,7 @@ app.get('/api/admin/partners', authenticateToken, async (req, res) => {
       leadSource: r.lead_source,
       billingContactName: r.billing_contact_name, billingContactEmail: r.billing_contact_email, billingContactPhone: r.billing_contact_phone,
       businessContactName: r.business_contact_name, businessContactEmail: r.business_contact_email, businessContactPhone: r.business_contact_phone,
+      payoutRate: r.payout_rate !== null ? parseFloat(r.payout_rate) : null,
     })) });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -3593,14 +3712,20 @@ app.put('/api/admin/partners/:id', authenticateToken, async (req, res) => {
     const businessContactName = pick('businessContactName', 'business_contact_name');
     const businessContactEmail = pick('businessContactEmail', 'business_contact_email');
     const businessContactPhone = pick('businessContactPhone', 'business_contact_phone');
+    const payoutRate = req.body.payoutRate !== undefined
+      ? (req.body.payoutRate === '' || req.body.payoutRate === null ? null : parseFloat(req.body.payoutRate))
+      : current.payout_rate;
+    if (payoutRate !== null && (isNaN(payoutRate) || payoutRate < 0)) {
+      return res.status(400).json({ error: 'Payout rate must be a positive number' });
+    }
     await pool.query(
       `UPDATE partners SET name = $2, active = $3, lead_source = $4,
               billing_contact_name = $5, billing_contact_email = $6, billing_contact_phone = $7,
               business_contact_name = $8, business_contact_email = $9, business_contact_phone = $10,
-              updated_at = CURRENT_TIMESTAMP
+              payout_rate = $11, updated_at = CURRENT_TIMESTAMP
        WHERE id = $1`,
       [id, name, active, leadSource, billingContactName, billingContactEmail, billingContactPhone,
-       businessContactName, businessContactEmail, businessContactPhone]
+       businessContactName, businessContactEmail, businessContactPhone, payoutRate]
     );
     res.json({ success: true });
   } catch (e) {
@@ -3686,6 +3811,7 @@ app.get('/api/admin/partner-opportunities', authenticateToken, async (req, res) 
               o.rep_first_name, o.rep_last_name, o.rep_phone, o.rep_email, o.notes, o.status,
               o.reviewed_by, o.reviewed_at, o.rejection_reason, o.created_at,
               o.crm_match_status, o.crm_match_summary, o.crm_match_records, o.crm_lead_id, o.crm_lead_error,
+              o.linked_customer_name, o.payout_status,
               p.name AS partner_name, pu.email AS submitted_by_email
          FROM partner_opportunities o
          JOIN partners p ON p.id = o.partner_id
@@ -3703,6 +3829,8 @@ app.get('/api/admin/partner-opportunities', authenticateToken, async (req, res) 
       crmMatchRecords: r.crm_match_records || [],
       crmLeadId: r.crm_lead_id,
       crmLeadError: r.crm_lead_error,
+      linkedCustomerName: r.linked_customer_name,
+      payoutStatus: r.payout_status,
     })) });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -3809,6 +3937,69 @@ app.get('/api/admin/partner-opportunities/crm-reps', authenticateToken, async (r
   }
 });
 
+// Recomputes payout eligibility for one opportunity from its linked_customer_name — mirrors
+// runRecalcV2's own commission gate exactly (SH-40/41): eligible only once a real, PAID invoice
+// exists for that customer, never merely because a Zoho Lead converted. Never downgrades a row
+// that's already 'in_run' or 'paid' — those are frozen once a payout run has claimed them,
+// same PAID=FROZEN principle as the rep commission engine.
+async function recomputePartnerPayoutStatus(opportunityId) {
+  const o = (await pool.query(
+    `SELECT linked_customer_name, payout_status FROM partner_opportunities WHERE id = $1`, [opportunityId]
+  )).rows[0];
+  if (!o || !o.linked_customer_name || ['in_run', 'paid'].includes(o.payout_status)) return;
+  const paid = (await pool.query(
+    `SELECT 1 FROM invoices WHERE customer_name = $1 AND status = 'paid' AND paid_date IS NOT NULL LIMIT 1`,
+    [o.linked_customer_name]
+  )).rows.length > 0;
+  const nextStatus = paid ? 'eligible' : 'not_eligible';
+  if (nextStatus !== o.payout_status) {
+    await pool.query(`UPDATE partner_opportunities SET payout_status = $2 WHERE id = $1`, [opportunityId, nextStatus]);
+  }
+}
+
+// GET /api/admin/partner-opportunities/customer-search?q= — autocomplete against Sales Hub's own
+// invoiced customers, used by the partner manager to manually link a converted opportunity to the
+// real merchant once it's clear which one it became (there's no automatic Zoho Lead → Sales Hub
+// customer link).
+app.get('/api/admin/partner-opportunities/customer-search', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  const q = String(req.query.q || '').trim();
+  if (q.length < 2) return res.json({ customers: [] });
+  try {
+    const rows = (await pool.query(
+      `SELECT DISTINCT customer_name FROM invoices WHERE customer_name ILIKE $1 ORDER BY customer_name LIMIT 20`,
+      [`%${q}%`]
+    )).rows;
+    res.json({ customers: rows.map((r) => r.customer_name) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/admin/partner-opportunities/:id/link-customer — body { customerName } (or null to
+// unlink). Immediately recomputes payout eligibility against that customer's invoices.
+app.put('/api/admin/partner-opportunities/:id/link-customer', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  const id = parseInt(req.params.id, 10);
+  const customerName = req.body.customerName ? String(req.body.customerName).trim() : null;
+  try {
+    const current = (await pool.query(`SELECT payout_status FROM partner_opportunities WHERE id = $1`, [id])).rows[0];
+    if (!current) return res.status(404).json({ error: 'Opportunity not found' });
+    if (['in_run', 'paid'].includes(current.payout_status)) {
+      return res.status(409).json({ error: 'This opportunity is already part of a payout run and can no longer be relinked.' });
+    }
+    await pool.query(
+      `UPDATE partner_opportunities SET linked_customer_name = $2, payout_status = 'not_eligible' WHERE id = $1`,
+      [id, customerName]
+    );
+    if (customerName) await recomputePartnerPayoutStatus(id);
+    const updated = (await pool.query(`SELECT linked_customer_name, payout_status FROM partner_opportunities WHERE id = $1`, [id])).rows[0];
+    res.json({ success: true, linkedCustomerName: updated.linked_customer_name, payoutStatus: updated.payout_status });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // DELETE /api/admin/partner-opportunities/:id — removes the opportunity record entirely. If a
 // Zoho CRM Lead was already created for it (crm_lead_id, from SH-30), also deletes that Lead —
 // best-effort: a CRM failure never blocks deleting the local record, but the error comes back so
@@ -3846,6 +4037,243 @@ app.delete('/api/admin/partner-opportunities/:id', authenticateToken, async (req
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ============================================================================
+// PARTNER PAYOUTS (SH-40/41) — quarterly runs against opportunities the partner
+// manager has linked to a real, paid Sales Hub customer (see recomputePartnerPayoutStatus).
+// ============================================================================
+
+// GET /api/admin/partner-payouts/pending — every partner with ≥1 'eligible' opportunity not yet
+// claimed by a run, with a suggested total (payout_rate × count) the manager can adjust before
+// creating the run.
+app.get('/api/admin/partner-payouts/pending', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const rows = (await pool.query(
+      `SELECT o.id, o.business_name, o.linked_customer_name, o.created_at,
+              p.id AS partner_id, p.name AS partner_name, p.payout_rate
+         FROM partner_opportunities o
+         JOIN partners p ON p.id = o.partner_id
+        WHERE o.payout_status = 'eligible'
+        ORDER BY p.name, o.created_at`
+    )).rows;
+    const byPartner = new Map();
+    for (const r of rows) {
+      if (!byPartner.has(r.partner_id)) {
+        byPartner.set(r.partner_id, {
+          partnerId: r.partner_id, partnerName: r.partner_name,
+          payoutRate: r.payout_rate !== null ? parseFloat(r.payout_rate) : null,
+          opportunities: [],
+        });
+      }
+      byPartner.get(r.partner_id).opportunities.push({
+        id: r.id, businessName: r.business_name, linkedCustomerName: r.linked_customer_name, createdAt: r.created_at,
+      });
+    }
+    const partners = [...byPartner.values()].map((p) => ({
+      ...p, suggestedAmount: p.payoutRate !== null ? Math.round(p.payoutRate * p.opportunities.length * 100) / 100 : null,
+    }));
+    res.json({ partners });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/partner-payouts/runs — history of all runs (draft + finalized), newest first.
+app.get('/api/admin/partner-payouts/runs', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const rows = (await pool.query(
+      `SELECT r.id, r.period_label, r.status, r.total_amount, r.created_by, r.created_at, r.finalized_by, r.finalized_at,
+              p.name AS partner_name, COUNT(o.id)::int AS opportunity_count
+         FROM partner_payout_runs r
+         JOIN partners p ON p.id = r.partner_id
+         LEFT JOIN partner_opportunities o ON o.payout_run_id = r.id
+        GROUP BY r.id, p.name
+        ORDER BY r.created_at DESC`
+    )).rows;
+    res.json({ runs: rows.map((r) => ({
+      id: r.id, partnerName: r.partner_name, periodLabel: r.period_label, status: r.status,
+      totalAmount: parseFloat(r.total_amount), opportunityCount: r.opportunity_count,
+      createdBy: r.created_by, createdAt: r.created_at, finalizedBy: r.finalized_by, finalizedAt: r.finalized_at,
+    })) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/partner-payouts/runs/:id — one run's detail, including its opportunities (used
+// by both the draft-edit view and the read-only history view).
+app.get('/api/admin/partner-payouts/runs/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  const id = parseInt(req.params.id, 10);
+  try {
+    const run = (await pool.query(
+      `SELECT r.*, p.name AS partner_name FROM partner_payout_runs r JOIN partners p ON p.id = r.partner_id WHERE r.id = $1`, [id]
+    )).rows[0];
+    if (!run) return res.status(404).json({ error: 'Run not found' });
+    const items = (await pool.query(
+      `SELECT id, business_name, linked_customer_name FROM partner_opportunities WHERE payout_run_id = $1 ORDER BY business_name`, [id]
+    )).rows;
+    res.json({
+      run: {
+        id: run.id, partnerId: run.partner_id, partnerName: run.partner_name, periodLabel: run.period_label,
+        status: run.status, totalAmount: parseFloat(run.total_amount),
+        createdBy: run.created_by, createdAt: run.created_at, finalizedBy: run.finalized_by, finalizedAt: run.finalized_at,
+        opportunities: items.map((o) => ({ id: o.id, businessName: o.business_name, linkedCustomerName: o.linked_customer_name })),
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/partner-payouts/runs — create a draft run claiming a set of currently-eligible
+// opportunities for one partner. totalAmount defaults to the rate-based suggestion but can be
+// overridden right away (manager adjustment, per SH-41).
+app.post('/api/admin/partner-payouts/runs', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  const partnerId = parseInt(req.body.partnerId, 10);
+  const periodLabel = String(req.body.periodLabel || '').trim();
+  const opportunityIds = Array.isArray(req.body.opportunityIds) ? req.body.opportunityIds.map((x) => parseInt(x, 10)) : [];
+  if (!partnerId || !periodLabel || !opportunityIds.length) {
+    return res.status(400).json({ error: 'partnerId, periodLabel, and at least one opportunity are required' });
+  }
+  try {
+    const eligible = (await pool.query(
+      `SELECT id FROM partner_opportunities WHERE partner_id = $1 AND payout_status = 'eligible' AND id = ANY($2::int[])`,
+      [partnerId, opportunityIds]
+    )).rows.map((r) => r.id);
+    if (eligible.length !== opportunityIds.length) {
+      return res.status(409).json({ error: 'One or more opportunities are no longer eligible — refresh and try again.' });
+    }
+    const totalAmount = req.body.totalAmount !== undefined ? parseFloat(req.body.totalAmount) : 0;
+    if (isNaN(totalAmount) || totalAmount < 0) return res.status(400).json({ error: 'Total amount must be a positive number' });
+    const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+    const run = await pool.query(
+      `INSERT INTO partner_payout_runs (partner_id, period_label, total_amount, created_by) VALUES ($1, $2, $3, $4) RETURNING id`,
+      [partnerId, periodLabel, totalAmount, actor]
+    );
+    const runId = run.rows[0].id;
+    await pool.query(
+      `UPDATE partner_opportunities SET payout_run_id = $1, payout_status = 'in_run' WHERE id = ANY($2::int[])`,
+      [runId, eligible]
+    );
+    logActivity('partner_payout_run', runId, 'created', `Draft payout run for ${periodLabel} created by ${actor} (${eligible.length} opportunities)`, actor);
+    res.json({ success: true, id: runId });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/admin/partner-payouts/runs/:id — draft-only edits: adjust the total, period label, or
+// the set of included opportunities before finalizing.
+app.put('/api/admin/partner-payouts/runs/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  const id = parseInt(req.params.id, 10);
+  try {
+    const run = (await pool.query(`SELECT * FROM partner_payout_runs WHERE id = $1`, [id])).rows[0];
+    if (!run) return res.status(404).json({ error: 'Run not found' });
+    if (run.status !== 'draft') return res.status(409).json({ error: 'Only draft runs can be edited' });
+
+    const periodLabel = req.body.periodLabel !== undefined ? String(req.body.periodLabel).trim() : run.period_label;
+    const totalAmount = req.body.totalAmount !== undefined ? parseFloat(req.body.totalAmount) : parseFloat(run.total_amount);
+    if (isNaN(totalAmount) || totalAmount < 0) return res.status(400).json({ error: 'Total amount must be a positive number' });
+
+    if (Array.isArray(req.body.opportunityIds)) {
+      const nextIds = req.body.opportunityIds.map((x) => parseInt(x, 10));
+      const current = (await pool.query(`SELECT id FROM partner_opportunities WHERE payout_run_id = $1`, [id])).rows.map((r) => r.id);
+      const toRemove = current.filter((x) => !nextIds.includes(x));
+      const toAdd = nextIds.filter((x) => !current.includes(x));
+      if (toRemove.length) {
+        await pool.query(`UPDATE partner_opportunities SET payout_run_id = NULL, payout_status = 'eligible' WHERE id = ANY($1::int[])`, [toRemove]);
+      }
+      if (toAdd.length) {
+        const addEligible = (await pool.query(
+          `SELECT id FROM partner_opportunities WHERE partner_id = $1 AND payout_status = 'eligible' AND id = ANY($2::int[])`,
+          [run.partner_id, toAdd]
+        )).rows.map((r) => r.id);
+        if (addEligible.length !== toAdd.length) return res.status(409).json({ error: 'One or more added opportunities are not eligible' });
+        await pool.query(`UPDATE partner_opportunities SET payout_run_id = $1, payout_status = 'in_run' WHERE id = ANY($2::int[])`, [id, addEligible]);
+      }
+    }
+
+    await pool.query(`UPDATE partner_payout_runs SET period_label = $2, total_amount = $3 WHERE id = $1`, [id, periodLabel, totalAmount]);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/admin/partner-payouts/runs/:id — cancel a draft run: releases its opportunities
+// back to 'eligible' (recomputed, in case their invoice status changed meanwhile) and drops the run.
+app.delete('/api/admin/partner-payouts/runs/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  const id = parseInt(req.params.id, 10);
+  try {
+    const run = (await pool.query(`SELECT status FROM partner_payout_runs WHERE id = $1`, [id])).rows[0];
+    if (!run) return res.status(404).json({ error: 'Run not found' });
+    if (run.status !== 'draft') return res.status(409).json({ error: 'Only draft runs can be cancelled' });
+    const items = (await pool.query(`SELECT id FROM partner_opportunities WHERE payout_run_id = $1`, [id])).rows.map((r) => r.id);
+    await pool.query(`UPDATE partner_opportunities SET payout_run_id = NULL, payout_status = 'not_eligible' WHERE id = ANY($1::int[])`, [items]);
+    await Promise.all(items.map((oid) => recomputePartnerPayoutStatus(oid)));
+    await pool.query(`DELETE FROM partner_payout_runs WHERE id = $1`, [id]);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/partner-payouts/runs/:id/finalize — locks the run: its opportunities become
+// 'paid' (frozen — recomputePartnerPayoutStatus never touches 'in_run'/'paid' rows again).
+app.post('/api/admin/partner-payouts/runs/:id/finalize', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  const id = parseInt(req.params.id, 10);
+  try {
+    const run = (await pool.query(`SELECT * FROM partner_payout_runs WHERE id = $1`, [id])).rows[0];
+    if (!run) return res.status(404).json({ error: 'Run not found' });
+    if (run.status !== 'draft') return res.status(409).json({ error: 'This run was already finalized' });
+    const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+    await pool.query(`UPDATE partner_payout_runs SET status = 'finalized', finalized_by = $2, finalized_at = CURRENT_TIMESTAMP WHERE id = $1`, [id, actor]);
+    await pool.query(`UPDATE partner_opportunities SET payout_status = 'paid' WHERE payout_run_id = $1`, [id]);
+    logActivity('partner_payout_run', id, 'finalized', `Payout run for ${run.period_label} finalized by ${actor} ($${run.total_amount})`, actor);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/partner-invoices — every partner-uploaded invoice (SH-42), newest first.
+app.get('/api/admin/partner-invoices', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const rows = (await pool.query(
+      `SELECT pi.id, pi.file_name, pi.uploaded_at, pi.forwarded_at, p.name AS partner_name, r.period_label, r.total_amount
+         FROM partner_invoices pi
+         JOIN partners p ON p.id = pi.partner_id
+         LEFT JOIN partner_payout_runs r ON r.id = pi.payout_run_id
+        ORDER BY pi.uploaded_at DESC`
+    )).rows;
+    res.json({ invoices: rows.map((r) => ({
+      id: r.id, fileName: r.file_name, uploadedAt: r.uploaded_at, forwarded: !!r.forwarded_at,
+      partnerName: r.partner_name, periodLabel: r.period_label, totalAmount: r.total_amount !== null ? parseFloat(r.total_amount) : null,
+    })) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/partner-invoices/:id/download
+app.get('/api/admin/partner-invoices/:id/download', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const r = (await pool.query(`SELECT file_name, mime_type, file_data FROM partner_invoices WHERE id = $1`, [req.params.id])).rows[0];
+    if (!r) return res.status(404).json({ error: 'not found' });
+    res.setHeader('Content-Type', r.mime_type || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(r.file_name)}"`);
+    res.send(r.file_data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ============================================================================
@@ -13683,6 +14111,75 @@ async function notifyNewPartnerOpportunity(partnerId, businessName, submittedByE
     const { subject, html } = newPartnerOpportunityEmail(businessName, partner?.name || 'Partner', submittedByEmail);
     await sendMail(recipients.join(','), subject, html);
   } catch (e) { console.warn('[partner-opp] notify failed:', e.message); }
+}
+
+// app_settings key 'partner_invoice_recipients' — accounting's inbox for partner invoices
+// uploaded through SH-42. Separate audience from partner_opportunity_recipients (partner
+// managers) — accounting only cares once there's money to actually pay out.
+async function getPartnerInvoiceRecipients() {
+  try {
+    const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'partner_invoice_recipients'`);
+    const v = r.rows[0]?.value;
+    return Array.isArray(v) ? v.filter(e => typeof e === 'string') : [];
+  } catch { return []; }
+}
+app.get('/api/admin/partner-invoice-recipients', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try { res.json({ recipients: await getPartnerInvoiceRecipients() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/admin/partner-invoice-recipients', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  const emails = Array.isArray(req.body?.emails) ? req.body.emails.map(e => String(e).trim().toLowerCase()).filter(Boolean) : null;
+  if (!emails) return res.status(400).json({ error: 'emails array required' });
+  if (emails.some(e => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e))) return res.status(400).json({ error: 'invalid email' });
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('partner_invoice_recipients', $1::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [JSON.stringify(emails)]
+    );
+    res.json({ recipients: emails });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// The partner-invoice-uploaded email. Shared with the email-preview sample ('partner_invoice_uploaded').
+function partnerInvoiceUploadedEmail(partnerName, periodLabel, totalAmount, fileName) {
+  const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+  return {
+    subject: `Facture partenaire reçue — ${partnerName} (${periodLabel})`,
+    html: mailShell('Facture partenaire reçue / Partner invoice received',
+      `<strong>${esc(partnerName)}</strong> a téléversé sa facture pour la période <strong>${esc(periodLabel)}</strong> (${totalAmount.toFixed(2)} $), fichier : ${esc(fileName)}.<br><br>` +
+      `${esc(partnerName)} uploaded their invoice for period <strong>${esc(periodLabel)}</strong> ($${totalAmount.toFixed(2)}), file: ${esc(fileName)} — attached to this email.`,
+      'Voir les partenaires / View partners', `${base}/admin/partners`),
+  };
+}
+
+// Fired right after a Partner Admin uploads an invoice (SH-42). Attaches the file itself so
+// accounting can act without logging into the admin panel. Never throws — fire-and-forget.
+async function notifyPartnerInvoiceUploaded(invoiceId) {
+  try {
+    const recipients = await getPartnerInvoiceRecipients();
+    if (!recipients.length) return;
+    const row = (await pool.query(
+      `SELECT pi.file_name, pi.mime_type, pi.file_data, p.name AS partner_name,
+              r.period_label, r.total_amount
+         FROM partner_invoices pi
+         JOIN partners p ON p.id = pi.partner_id
+         LEFT JOIN partner_payout_runs r ON r.id = pi.payout_run_id
+        WHERE pi.id = $1`,
+      [invoiceId]
+    )).rows[0];
+    if (!row) return;
+    const { subject, html } = partnerInvoiceUploadedEmail(
+      row.partner_name, row.period_label || 'N/A', row.total_amount ? parseFloat(row.total_amount) : 0, row.file_name
+    );
+    await sendMail(recipients.join(','), subject, html, {
+      attachments: [{ filename: row.file_name, content: row.file_data, contentType: row.mime_type }],
+    });
+    await pool.query(`UPDATE partner_invoices SET forwarded_at = CURRENT_TIMESTAMP WHERE id = $1`, [invoiceId]);
+  } catch (e) { console.warn('[partner-invoice] notify failed:', e.message); }
 }
 
 // Daily job: email the configured recipients when an active rep's probation ends in 45/30/15
