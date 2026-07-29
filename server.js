@@ -2031,20 +2031,45 @@ const authenticateToken = async (req, res, next) => {
     // user_tokens → resolves false, which is correct (they're never admins).
     let realIsAdmin = false;
     let isDemo = false;
+    let localStatus = null;
+    let resolved = false;
     if (user.email) {
       try {
-        // One round-trip: admin flag (Zoho accounts only) + demo flag (either account type)
+        // One round-trip: admin flag (Zoho accounts only) + demo flag + local account status.
+        // local_status rides along in the same query, so the revocation check below costs nothing.
         const r = await pool.query(
           `SELECT COALESCE((SELECT is_admin  FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1), false) AS is_admin,
                   COALESCE((SELECT demo_mode FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1),
                            (SELECT demo_mode FROM local_users WHERE LOWER(email) = LOWER($1) LIMIT 1),
-                           false) AS demo_mode`,
+                           false) AS demo_mode,
+                  (SELECT status FROM local_users WHERE LOWER(email) = LOWER($1) LIMIT 1) AS local_status`,
           [user.email]
         );
         realIsAdmin = r.rows[0]?.is_admin === true;
         isDemo = r.rows[0]?.demo_mode === true;
-      } catch { /* default false */ }
+        localStatus = r.rows[0]?.local_status ?? null;
+        resolved = true;
+      } catch { /* default false; `resolved` stays false so the status check below can tell */ }
     }
+
+    // SECURITY: honour account revocation for email+password (local) accounts. Previously this
+    // middleware never consulted local_users.status, and JWTs live 7 days with no jti or token
+    // version — so disabling a user, or DELETING them outright, left their session fully working
+    // for up to a week, and a post-compromise password reset did not evict the attacker. The
+    // partner middleware already re-checks status per request; this is the internal equivalent.
+    //
+    // Scoped to userType 'local' on purpose: Zoho SSO accounts live in user_tokens and have no
+    // local_users row at all, so a blanket check would lock out all staff. Because a local token
+    // requires a live 'active' row, this also covers deletion (no row → no access).
+    if (user.userType === 'local') {
+      if (!resolved) {
+        // Couldn't verify. Fail closed, but with 503 rather than 401 so a transient DB blip is
+        // retried instead of being treated as "signed out" by the frontend.
+        return res.status(503).json({ error: 'Could not verify account status — please retry' });
+      }
+      if (localStatus !== 'active') return res.status(401).json({ error: 'Account is no longer active' });
+    }
+
     req.user.isAdmin = realIsAdmin;
     req.user.isDemo = isDemo;
 
@@ -2508,6 +2533,18 @@ async function trustDevice(email, userType) {
   );
   return raw;
 }
+// Drop every remembered device for an account. MUST be called whenever the credentials or the
+// second factor change, or the account is disabled/deleted — a trusted device SKIPS 2FA for 30
+// days, so without this an attacker who once ticked "remember this device" kept that bypass even
+// after the victim reset their password and re-enrolled their authenticator. Rows are keyed by
+// email and were never deleted anywhere, which also meant deleting a user and re-inviting the same
+// address handed the new account the old device's trust. Never throws — revocation is best-effort
+// and must not fail the operation that triggered it.
+async function revokeTrustedDevices(email, userType) {
+  try {
+    await pool.query(`DELETE FROM trusted_devices WHERE LOWER(email) = LOWER($1) AND user_type = $2`, [email, userType]);
+  } catch (e) { console.warn('[trusted-devices] revoke failed:', e.message); }
+}
 authenticator.options = { window: 1 }; // tolerate ±30s clock drift
 
 // SMTP mailer — Heroku config vars: SMTP_HOST, SMTP_PORT (465=TLS), SMTP_USER,
@@ -2884,6 +2921,10 @@ app.put('/api/admin/local-users/:id/status', authenticateToken, async (req, res)
       [parseInt(req.params.id), status]
     );
     if (!r.rowCount) return res.status(404).json({ error: 'User not found (or invite not yet accepted)' });
+    // Disabling must also kill the 2FA-skip trust, otherwise the account stays reachable from a
+    // remembered device. (authenticateToken now rejects a non-active local account per request, so
+    // the session itself is already dead — this closes the re-enable-free path too.)
+    if (status === 'disabled') await revokeTrustedDevices(r.rows[0].email, 'local');
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -2896,6 +2937,9 @@ app.delete('/api/admin/local-users/:id', authenticateToken, async (req, res) => 
   try {
     const r = await pool.query(`DELETE FROM local_users WHERE id = $1 RETURNING email`, [parseInt(req.params.id)]);
     if (!r.rowCount) return res.status(404).json({ error: 'User not found' });
+    // trusted_devices rows are keyed by email, not by user id, so they outlive the account. Without
+    // this, re-inviting the same address later would inherit the deleted user's 2FA-skip trust.
+    await revokeTrustedDevices(r.rows[0].email, 'local');
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -3061,7 +3105,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
   if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
   try {
     const u = (await pool.query(
-      `SELECT id, reset_expires_at FROM local_users WHERE reset_token_hash = $1`, [sha256hex(raw)]
+      `SELECT id, email, reset_expires_at FROM local_users WHERE reset_token_hash = $1`, [sha256hex(raw)]
     )).rows[0];
     if (!u) return res.status(404).json({ error: 'Invalid link' });
     if (new Date(u.reset_expires_at) < new Date()) return res.status(410).json({ error: 'Link expired' });
@@ -3070,6 +3114,9 @@ app.post('/api/auth/reset-password', async (req, res) => {
               updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
       [u.id, await bcrypt.hash(password, 10)]
     );
+    // A password reset is the standard response to a suspected compromise, so it must also drop
+    // remembered devices — otherwise the attacker's 30-day 2FA bypass survives the reset.
+    await revokeTrustedDevices(u.email, 'local');
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -3229,7 +3276,7 @@ app.post('/api/partner-auth/reset-password', async (req, res) => {
   if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
   try {
     const pu = (await pool.query(
-      `SELECT id, reset_expires_at FROM partner_users WHERE reset_token_hash = $1`, [sha256hex(raw)]
+      `SELECT id, email, reset_expires_at FROM partner_users WHERE reset_token_hash = $1`, [sha256hex(raw)]
     )).rows[0];
     if (!pu) return res.status(404).json({ error: 'Invalid link' });
     if (new Date(pu.reset_expires_at) < new Date()) return res.status(410).json({ error: 'Link expired' });
@@ -3238,6 +3285,7 @@ app.post('/api/partner-auth/reset-password', async (req, res) => {
               updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
       [pu.id, await bcrypt.hash(password, 10)]
     );
+    await revokeTrustedDevices(pu.email, 'partner');  // same reasoning as the internal reset above
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -3422,6 +3470,17 @@ app.post('/api/partner-portal/change-password', authenticatePartnerToken, async 
 // user who abandons the flow midway keeps using their existing device untouched.
 app.post('/api/partner-portal/2fa/reset', authenticatePartnerToken, async (req, res) => {
   if (rateLimited(`p2fareset:${req.partnerUser.email}`)) return res.status(429).json({ error: 'Too many attempts — try again later' });
+  // SECURITY: re-binding the second factor now requires the current password. A session token
+  // alone used to be enough, so anyone with a stolen token could move the account's 2FA onto their
+  // own authenticator (and lock the real user out of their own app). /change-password already
+  // demanded currentPassword — this brings 2FA re-enrollment up to the same bar.
+  const currentPassword = String(req.body.currentPassword || '');
+  try {
+    const me = (await pool.query(`SELECT password_hash FROM partner_users WHERE id = $1`, [req.partnerUser.id])).rows[0];
+    if (!me?.password_hash || !(await bcrypt.compare(currentPassword, me.password_hash))) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+  } catch (e) { return res.status(500).json({ error: e.message }); }
   try {
     const secret = authenticator.generateSecret();
     const otpauth = authenticator.keyuri(req.partnerUser.email, 'Sales Hub', secret);
@@ -3449,6 +3508,8 @@ app.post('/api/partner-portal/2fa/confirm', authenticatePartnerToken, async (req
       `UPDATE partner_users SET totp_secret = $2, totp_enabled = true, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
       [req.partnerUser.id, p.secret]
     );
+    // Changing the second factor invalidates any device that was allowed to SKIP it.
+    await revokeTrustedDevices(req.partnerUser.email, 'partner');
     logActivity('partner_user', req.partnerUser.email, 'reset_2fa', `${req.partnerUser.email} replaced their authenticator device`, req.partnerUser.email);
     res.json({ success: true });
   } catch (e) {
@@ -8733,6 +8794,15 @@ app.put('/api/user/push-pin', authenticateToken, async (req, res) => {
 app.post('/api/user/2fa/reset', authenticateToken, async (req, res) => {
   if (req.user.userType !== 'local') return res.status(403).json({ error: 'Not available for Zoho-authenticated accounts' });
   if (rateLimited(`u2fareset:${req.user.email}`)) return res.status(429).json({ error: 'Too many attempts — try again later' });
+  // Requires the current password — see the partner twin's comment. A session token alone must not
+  // be enough to move the account's second factor to a new device.
+  const currentPassword = String(req.body.currentPassword || '');
+  try {
+    const me = (await pool.query(`SELECT password_hash FROM local_users WHERE LOWER(email) = LOWER($1)`, [req.user.email])).rows[0];
+    if (!me?.password_hash || !(await bcrypt.compare(currentPassword, me.password_hash))) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+  } catch (e) { return res.status(500).json({ error: e.message }); }
   try {
     const secret = authenticator.generateSecret();
     const otpauth = authenticator.keyuri(req.user.email, 'Sales Hub', secret);
@@ -8760,6 +8830,7 @@ app.post('/api/user/2fa/confirm', authenticateToken, async (req, res) => {
       `UPDATE local_users SET totp_secret = $2, totp_enabled = true, updated_at = CURRENT_TIMESTAMP WHERE email = $1`,
       [req.user.email, p.secret]
     );
+    await revokeTrustedDevices(req.user.email, 'local');  // a new second factor voids 2FA-skip trust
     logActivity('auth', req.user.email, 'reset_2fa', `${req.user.email} replaced their authenticator device`, req.user.email);
     res.json({ success: true });
   } catch (e) {
