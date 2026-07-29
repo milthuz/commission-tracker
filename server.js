@@ -1981,7 +1981,8 @@ app.use(cors({
       'http://localhost:3001',
       'https://sparkly-kulfi-c7641a.netlify.app', // Netlify (default)
       'https://saleshub.clusterpos.com', // custom domain
-      'https://commission-tracker-frontend-git-main-david-s-projects-dbd14131.vercel.app', // Vercel (old)
+      // (Removed a stale Vercel preview origin — that deployment is dead, and leaving a domain we
+      //  no longer control in the allowlist is a needless risk.)
     ].filter(Boolean);
     
     if (!origin || allowedOrigins.includes(origin)) {
@@ -2140,10 +2141,17 @@ function demoFakeBizName(real) {
 
 // Keys whose STRING value is a client/merchant/deal identity → faked.
 // (Internal demo: salespeople/user names stay real — do NOT add generic 'name' here.)
+// NOTE: keys are matched LOWERCASED, so a camelCase response field like `merchantName` must be
+// listed as 'merchantname' — listing only the snake_case 'merchant_name' does NOT cover it. That
+// gap leaked real merchant names on the processing-bonus statement and real Zoho Books customer
+// names on the partner payout views, next to correctly-scrambled amounts. Any new endpoint that
+// returns a client identity must add its exact lowercased key here.
 const DEMO_NAME_KEYS = new Set([
   'customer_name', 'customername', 'client_name', 'business_name', 'businessname',
   'deal_name', 'account_name', 'merchant_name', 'company_name',
   'billing_customer_name', 'merchant', 'client', 'customer',
+  'merchantname', 'accountname', 'dealname', 'companyname', 'clientname',
+  'linked_customer_name', 'linkedcustomername',
 ]);
 // Numeric keys that are MONEY → scaled. Counts/ids/rates are excluded below.
 const DEMO_MONEY_RE = /(commission|revenue|amount|total|salary|profit|balance|price|mrr|arr|ltv|arpu|sub_total|subtotal|bonus|savings|margin|fee|paid|earned|value|cost)/i;
@@ -2398,26 +2406,12 @@ app.get('/api/auth/callback', async (req, res) => {
   }
 });
 
-// 3. Get access token
-app.get('/api/auth/token', authenticateToken, async (req, res) => {
-  const { email } = req.user;
-
-  try {
-    const result = await pool.query(
-      'SELECT access_token FROM user_tokens WHERE email = $1',
-      [email]
-    );
-
-    if (!result.rows.length) {
-      return res.status(401).json({ error: 'No token found' });
-    }
-
-    res.json({ accessToken: result.rows[0].access_token });
-  } catch (error) {
-    console.error('Token retrieval error:', error);
-    res.status(500).json({ error: 'Failed to retrieve token' });
-  }
-});
+// REMOVED: GET /api/auth/token, which returned the caller's raw Zoho OAuth access_token to the
+// browser. Nothing in the frontend ever called it. For an admin that token carries
+// ZohoBooks.invoices.CREATE/UPDATE, contacts.READ and ZohoSubscriptions.subscriptions.UPDATE over
+// the whole org, so any XSS or malicious browser extension would have escalated from "a Sales Hub
+// session" to org-wide write access on Zoho Books and Billing. The server holds these tokens and
+// calls Zoho itself (ensureValidToken / ensureValidCrmToken) — the browser never needs one.
 
 // 4. Verify JWT token
 app.get('/api/auth/verify', authenticateToken, async (req, res) => {
@@ -2631,6 +2625,35 @@ async function resolveOwnRepName(email, fallbackName) {
     return r.rows[0]?.display_name || fallbackName || null;
   } catch { return fallbackName || null; }
 }
+
+// Shared guard for the invoice/estimate document routes (download + iframe preview). Returns
+// { ok, reason } — 'demo' or 'permission'.
+//
+// FAILS CLOSED. The preview routes previously wrapped this logic in `catch { /* fail open */ }`,
+// so a transient DB error skipped the 403 entirely and served the raw Zoho PDF. Given the
+// cross-cloud Postgres latency that's a reachable state, not a theoretical one — an authorization
+// check must deny when it cannot decide. Callers must treat a throw as a denial.
+async function canViewInvoiceDocs(email) {
+  if (!email) return { ok: false, reason: 'permission' };
+  const d = await pool.query(
+    `SELECT COALESCE((SELECT is_admin  FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1), false) AS is_admin,
+            COALESCE((SELECT demo_mode FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1),
+                     (SELECT demo_mode FROM local_users WHERE LOWER(email) = LOWER($1) LIMIT 1),
+                     false) AS demo_mode`, [email]);
+  if (d.rows[0]?.demo_mode === true) return { ok: false, reason: 'demo' };
+  if (d.rows[0]?.is_admin === true) return { ok: true };
+  const perms = await getUserPermissions(email);
+  const viewPerms = ['invoices:view_own', 'invoices:view_all', 'report:view_own', 'report:view_others', 'report:view_paystub'];
+  if (!viewPerms.some(p => userHasPermission(perms, p))) return { ok: false, reason: 'permission' };
+  return { ok: true };
+}
+const DOC_DENY_HTML = (msg) =>
+  `<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>${msg}</h3></body></html>`;
+// These document routes are the only places in the file that emit HTML, and they interpolate
+// req.params plus raw upstream Zoho response bodies. Escape both.
+const escHtml = (s) => String(s == null ? '' : s)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
 // For the two PDF-preview routes that take the JWT as a query param (an iframe can't send an
 // Authorization header) and so can't use authenticateToken. Applies the same token-shape rules that
@@ -4847,7 +4870,13 @@ app.get('/api/auth/crm-status', authenticateToken, async (req, res) => {
 // ============================================================================
 
 // GET /api/crm/deals — fetch all deals from Zoho CRM
+// These five raw CRM passthroughs return company-wide pipeline data (deal name, account, amount,
+// owning rep) using the ADMIN's CRM OAuth token, and had authenticateToken only — so any rep could
+// read every colleague's pipeline and every client's deal value. Nothing in the frontend calls
+// them (the only UI CRM call is /api/crm/deals/:dealId/source), so admin-gating breaks nothing.
+// Contrast /api/crm/points, which correctly scopes by canViewAll.
 app.get('/api/crm/deals', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin only' });
   try {
     const crmToken = await ensureValidCrmToken();
     const crm = new ZohoCRMService(crmToken);
@@ -4862,6 +4891,7 @@ app.get('/api/crm/deals', authenticateToken, async (req, res) => {
 
 // GET /api/crm/deals/sold — fetch only SOLD deals (Deposit Information Received)
 app.get('/api/crm/deals/sold', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin only' });
   try {
     const crmToken = await ensureValidCrmToken();
     const crm = new ZohoCRMService(crmToken);
@@ -4876,6 +4906,7 @@ app.get('/api/crm/deals/sold', authenticateToken, async (req, res) => {
 
 // GET /api/crm/fields — inspect all Deal field names (useful for setup)
 app.get('/api/crm/fields', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin only' });
   try {
     const crmToken = await ensureValidCrmToken();
     const crm = new ZohoCRMService(crmToken);
@@ -7125,6 +7156,7 @@ app.get('/api/crm/debug', authenticateToken, async (req, res) => {
 
 // GET /api/crm/views — list all custom views for the Deals module
 app.get('/api/crm/views', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin only' });
   try {
     const crmToken = await ensureValidCrmToken();
     const response = await axios.get('https://www.zohoapis.com/crm/v2/Deals/views', {
@@ -7145,6 +7177,7 @@ app.get('/api/crm/views', authenticateToken, async (req, res) => {
 
 // GET /api/crm/reports — list all reports in Zoho CRM
 app.get('/api/crm/reports', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin only' });
   try {
     const crmToken = await ensureValidCrmToken();
     const response = await axios.get('https://www.zohoapis.com/crm/v2/reports', {
@@ -9010,6 +9043,10 @@ app.post('/api/invoices/sync', authenticateToken, async (req, res) => {
 
 // POST /api/invoices/incremental-sync
 app.post('/api/invoices/incremental-sync', authenticateToken, async (req, res) => {
+  // Admin-gated to match its siblings /invoices/sync and /invoices/bulk-import. Ungated, any user
+  // could trigger a full paginated Zoho Books sync on demand — Zoho API quota exhaustion plus
+  // write load on the invoices table.
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin only' });
   try {
     await autoSyncInvoices();
     const countResult = await pool.query(
@@ -10479,28 +10516,29 @@ app.get('/api/proposals/estimate/:estimateId/preview', async (req, res) => {
   } catch {
     return res.status(401).send('Invalid token');
   }
-  if (tokenEmail) {
+  // FAILS CLOSED, same as the invoice-preview route — this used to swallow DB errors and serve
+  // the estimate PDF anyway.
+  {
+    let allowed = false, isDemo = false;
     try {
       const d = await pool.query(
         `SELECT COALESCE((SELECT is_admin  FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1), false) AS is_admin,
                 COALESCE((SELECT demo_mode FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1),
                          (SELECT demo_mode FROM local_users WHERE LOWER(email) = LOWER($1) LIMIT 1),
                          false) AS demo_mode`, [tokenEmail]);
-      if (d.rows[0]?.demo_mode === true) {
-        return res.status(403).send('<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>Aperçu désactivé en mode démo / Preview disabled in demo mode</h3></body></html>');
-      }
-      if (d.rows[0]?.is_admin !== true) {
-        const perms = await getUserPermissions(tokenEmail);
-        if (!userHasPermission(perms, 'proposals:send')) {
-          return res.status(403).send('<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>Permission requise / Permission required</h3></body></html>');
-        }
-      }
-    } catch { /* fail open on DB hiccup — same as the invoice-preview route */ }
+      isDemo = d.rows[0]?.demo_mode === true;
+      allowed = d.rows[0]?.is_admin === true
+        || userHasPermission(await getUserPermissions(tokenEmail), 'proposals:send');
+    } catch {
+      return res.status(503).send(DOC_DENY_HTML('Vérification impossible — réessayez / Could not verify permissions — please retry'));
+    }
+    if (isDemo) return res.status(403).send(DOC_DENY_HTML('Aperçu désactivé en mode démo / Preview disabled in demo mode'));
+    if (!allowed) return res.status(403).send(DOC_DENY_HTML('Permission requise / Permission required'));
   }
   try {
     const result = await fetchEstimatePdfBytes(req.params.estimateId);
     if (result.error) {
-      return res.status(result.status || 500).send(`<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>Could not fetch this estimate from Zoho Books</h3><pre style="font-size:11px;color:#888;white-space:pre-wrap">${result.body || ''}</pre></body></html>`);
+      return res.status(result.status || 500).send(`<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>Could not fetch this estimate from Zoho Books</h3><pre style="font-size:11px;color:#888;white-space:pre-wrap">${escHtml(result.body)}</pre></body></html>`);
     }
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `inline; filename="${req.params.estimateId}.pdf"`);
@@ -11421,10 +11459,21 @@ app.delete('/api/proposals/sent/:id', authenticateToken, async (req, res) => {
 // GET /api/invoices/:invoiceNumber/pdf — download
 app.get('/api/invoices/:invoiceNumber/pdf', authenticateToken, async (req, res) => {
   try {
+    // SECURITY: this route had NO permission check at all, while its /preview sibling was
+    // explicitly hardened against exactly this ("a valid JWT alone used to be enough to fetch ANY
+    // invoice by number") — the download path was simply never given the same guard, so any
+    // logged-in user could enumerate invoice numbers and pull every customer's PDF.
+    let gate;
+    try {
+      gate = await canViewInvoiceDocs(req.user.email);
+    } catch { return res.status(503).json({ error: 'Could not verify permissions — try again' }); }
+    if (!gate.ok) {
+      return res.status(403).json({ error: gate.reason === 'demo' ? 'Disabled in demo mode' : 'Permission required' });
+    }
     const result = await fetchInvoicePdfBytes(req.params.invoiceNumber);
     if (result.error) return res.status(result.status).json({ error: result.error, details: result.body });
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${req.params.invoiceNumber}.pdf"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(req.params.invoiceNumber)}.pdf"`);
     return res.send(result.buffer);
   } catch (e) {
     console.error('Invoice PDF error:', e.message);
@@ -11443,36 +11492,30 @@ app.get('/api/invoices/:invoiceNumber/preview', async (req, res) => {
   } catch {
     return res.status(401).send('Invalid token');
   }
-  // This route bypasses authenticateToken (JWT via query for the iframe), so it needs its
-  // own guards: (a) demo accounts are blocked — the raw Zoho PDF would leak real client
-  // names/amounts; (b) the user must hold at least one invoice/report view permission
-  // (admins pass) — a valid JWT alone used to be enough to fetch ANY invoice by number.
-  if (tokenEmail) {
+  // This route bypasses authenticateToken (JWT via query for the iframe), so it needs its own
+  // guards: demo accounts are blocked (the raw Zoho PDF would leak real client names/amounts) and
+  // the caller must hold an invoice/report view permission. Now FAILS CLOSED — this block used to
+  // swallow DB errors and serve the PDF anyway.
+  {
+    let gate;
     try {
-      const d = await pool.query(
-        `SELECT COALESCE((SELECT is_admin  FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1), false) AS is_admin,
-                COALESCE((SELECT demo_mode FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1),
-                         (SELECT demo_mode FROM local_users WHERE LOWER(email) = LOWER($1) LIMIT 1),
-                         false) AS demo_mode`, [tokenEmail]);
-      if (d.rows[0]?.demo_mode === true) {
-        return res.status(403).send('<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>Aperçu désactivé en mode démo / Preview disabled in demo mode</h3></body></html>');
-      }
-      if (d.rows[0]?.is_admin !== true) {
-        const perms = await getUserPermissions(tokenEmail);
-        const viewPerms = ['invoices:view_own', 'invoices:view_all', 'report:view_own', 'report:view_others', 'report:view_paystub'];
-        if (!viewPerms.some(p => userHasPermission(perms, p))) {
-          return res.status(403).send('<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>Permission requise / Permission required</h3></body></html>');
-        }
-      }
-    } catch { /* fail open on DB hiccup — same as before this guard */ }
+      gate = await canViewInvoiceDocs(tokenEmail);
+    } catch {
+      return res.status(503).send(DOC_DENY_HTML('Vérification impossible — réessayez / Could not verify permissions — please retry'));
+    }
+    if (!gate.ok) {
+      return res.status(403).send(DOC_DENY_HTML(gate.reason === 'demo'
+        ? 'Aperçu désactivé en mode démo / Preview disabled in demo mode'
+        : 'Permission requise / Permission required'));
+    }
   }
   try {
     const result = await fetchInvoicePdfBytes(req.params.invoiceNumber);
     if (result.error === 'not_found') {
-      return res.status(404).send(`<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>Invoice ${req.params.invoiceNumber} not found in Zoho Books</h3><p>This invoice exists in our local database but Zoho Books couldn't find it when we searched by its number. Possible causes:</p><ul><li>The invoice was deleted from Zoho Books after we synced it</li><li>The invoice number has changed in Zoho</li><li>The Zoho admin account no longer has access to this organization</li></ul></body></html>`);
+      return res.status(404).send(`<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>Invoice ${escHtml(req.params.invoiceNumber)} not found in Zoho Books</h3><p>This invoice exists in our local database but Zoho Books couldn't find it when we searched by its number. Possible causes:</p><ul><li>The invoice was deleted from Zoho Books after we synced it</li><li>The invoice number has changed in Zoho</li><li>The Zoho admin account no longer has access to this organization</li></ul></body></html>`);
     }
     if (result.error) {
-      return res.status(result.status).send(`<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>Could not fetch this invoice from Zoho Books</h3><pre style="font-size:11px;color:#888;white-space:pre-wrap">${result.body || ''}</pre></body></html>`);
+      return res.status(result.status).send(`<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>Could not fetch this invoice from Zoho Books</h3><pre style="font-size:11px;color:#888;white-space:pre-wrap">${escHtml(result.body)}</pre></body></html>`);
     }
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `inline; filename="${req.params.invoiceNumber}.pdf"`);
@@ -12371,6 +12414,36 @@ function parseImportFilename(filename) {
   return { month, year, repFirstName, periodDate: `${year}-${String(month).padStart(2, '0')}-01` };
 }
 
+// Guard for the two pay-stub email endpoints. Admins may mail any rep's stub anywhere (a real
+// admin function). Everyone else is pinned to their own name and their own address, so the
+// endpoints can't be used to send fabricated statements under someone else's identity.
+// Returns { recipient } or { error }.
+async function pinPayStubRecipient(req, requestedRepName, requestedTo) {
+  if (req.user.isAdmin) return { recipient: String(requestedTo || '').trim() };
+  const myName = await resolveOwnRepName(req.user.email, req.user.name);
+  const wanted = String(requestedRepName || '').trim().toLowerCase();
+  if (myName && wanted && wanted !== String(myName).trim().toLowerCase()) {
+    return { error: "You can only email your own statement." };
+  }
+  const requested = String(requestedTo || '').trim().toLowerCase();
+  const own = String(req.user.email || '').trim().toLowerCase();
+  if (requested && own && requested !== own) {
+    return { error: 'You can only send your own statement to your own email address.' };
+  }
+  return { recipient: req.user.email };
+}
+
+// Clamp a numeric admin input to [0, max], falling back to `fallback` only when the value is
+// genuinely absent or unparseable. Note the `=== ''`/null checks: a plain `parseFloat(x) || d`
+// treats a legitimate 0 as missing and substitutes the default, which is how a 0% commission rate
+// used to become 10%.
+function safeRate(v, fallback, max) {
+  if (v === undefined || v === null || v === '') return fallback;
+  const n = parseFloat(v);
+  if (isNaN(n)) return fallback;
+  return Math.max(0, Math.min(max, n));
+}
+
 // Parse a money cell tolerant of "$7,298.30" (US) and "638,90" (EU comma-decimal).
 function parseMoneyCell(v) {
   if (v == null) return 0;
@@ -12445,7 +12518,11 @@ function parseStandardReport(rows, headerIdx) {
     const r = rows[i];
     const inv = r[idxInvoiceNumber];
     if (inv && typeof inv === 'string' && inv.startsWith('INV-')) {
-      const commission = parseFloat(r[idxCommission]) || 0;
+      // parseMoneyCell, not parseFloat: a commission stored as TEXT ("$1,234.56" or "1,234.56")
+      // made parseFloat stop at the comma (→ 1) or return NaN (→ 0). The row was still committed
+      // and flipped to approval_status='paid', and PAID = FROZEN in recalc, so the pay-stub line
+      // was permanently recorded at the wrong amount with no error surfaced anywhere.
+      const commission = parseMoneyCell(r[idxCommission]);
       invoices.push({
         invoice_number: inv.trim(),
         rep: r[idxRep] ? String(r[idxRep]).trim() : null,
@@ -12469,7 +12546,9 @@ function parseStandardReport(rows, headerIdx) {
   for (i = headerIdx + 1; i < rows.length; i++) {
     const r = rows[i];
     const tag = r[idxLeadSource] ? String(r[idxLeadSource]).trim() : '';
-    const amount = parseFloat(r[idxCommission]) || 0;
+    // Same fix — with parseFloat, a text-formatted bonus like "1,500.00" became 1, and "$1,500"
+    // became 0, which then failed the `amount > 0` test below and dropped the bonus row entirely.
+    const amount = parseMoneyCell(r[idxCommission]);
     if (/^Signup commission$/i.test(tag) && amount > 0) {
       signupBonuses.push({
         merchant: r[idxCustomer] ? String(r[idxCustomer]).trim() : null,
@@ -15813,9 +15892,12 @@ app.put('/api/salespeople/:name/commission-rate', authenticateToken, async (req,
   const { commissionRate } = req.body;
   try {
     await pool.query(
+      // Bounds-checked. `parseFloat(x) || 10` silently rewrote a legitimate 0% rate to 10% (0 is
+      // falsy) and accepted negatives and absurd values. Matches how signup-bonus and
+      // quota-waiver already validate.
       `INSERT INTO salespeople (name, commission_rate) VALUES ($1, $2)
        ON CONFLICT (name) DO UPDATE SET commission_rate = $2, updated_at = CURRENT_TIMESTAMP`,
-      [req.params.name, parseFloat(commissionRate) || 10]
+      [req.params.name, safeRate(commissionRate, 10, 100)]
     );
     res.json({ success: true });
   } catch (error) {
@@ -15829,9 +15911,11 @@ app.put('/api/salespeople/:name/base-salary', authenticateToken, async (req, res
   const { baseSalary } = req.body;
   try {
     await pool.query(
+      // Bounds-checked — a negative base salary used to be accepted and fed the Total
+      // Compensation accrual math.
       `INSERT INTO salespeople (name, base_salary) VALUES ($1, $2)
        ON CONFLICT (name) DO UPDATE SET base_salary = $2, updated_at = CURRENT_TIMESTAMP`,
-      [req.params.name, parseFloat(baseSalary) || 0]
+      [req.params.name, safeRate(baseSalary, 0, 10000000)]
     );
     res.json({ success: true });
   } catch (error) {
@@ -18590,7 +18674,14 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
 app.post('/api/commissions/pay-stub/email', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'report:view_paystub'))) return;
   const { repName, period, to, lines = [], bonuses = [], total = 0, source } = req.body || {};
-  const recipient = String(to || '').trim();
+  // SECURITY: report:view_paystub is granted to every Sales Rep, and `to`/`repName`/`lines`/`total`
+  // all came from the body unchecked — so any rep could render fabricated figures under another
+  // rep's name into the official Sales Hub template and send it anywhere on the internet
+  // (an authenticated open relay + pay-stub forgery). Non-admins may now only send their OWN stub
+  // to their OWN address; admins keep the ability to mail a rep their stub.
+  const pinned = await pinPayStubRecipient(req, repName, to);
+  if (pinned.error) return res.status(403).json({ error: pinned.error });
+  const recipient = pinned.recipient;
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(recipient)) return res.status(400).json({ error: 'valid recipient email required' });
   const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -18639,7 +18730,10 @@ app.post('/api/commissions/pay-stub/email', authenticateToken, async (req, res) 
 app.post('/api/commissions/processing-bonus-statement/email', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'report:view_paystub'))) return;
   const { repName, period, to, accounts = [], total = 0 } = req.body || {};
-  const recipient = String(to || '').trim();
+  // Same pinning as /pay-stub/email above — this endpoint had the identical open-relay shape.
+  const pinned = await pinPayStubRecipient(req, repName, to);
+  if (pinned.error) return res.status(403).json({ error: pinned.error });
+  const recipient = pinned.recipient;
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(recipient)) return res.status(400).json({ error: 'valid recipient email required' });
   const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -21533,13 +21627,18 @@ app.post('/api/commissions/recalculate', authenticateToken, async (req, res) => 
 });
 
 // POST /api/commissions/recalculate/stop
+// Admin-gated to match /recalculate/start and both v2 twins. Without it any rep could abort a
+// running admin recalculation mid-iteration, leaving invoices.commission partially recalculated
+// across the table — and could repeat it to make recalculation impossible.
 app.post('/api/commissions/recalculate/stop', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin only' });
   if (recalcJob.status === 'running') recalcJob.status = 'stopping';
   res.json({ success: true });
 });
 
 // GET /api/commissions/recalculate/status
 app.get('/api/commissions/recalculate/status', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin only' });
   res.json(recalcJob);
 });
 
