@@ -1958,6 +1958,21 @@ initializeDatabase().then(() => { dbReady = true; });
 // MIDDLEWARE
 // ============================================================================
 
+// Don't advertise the stack (Express sets X-Powered-By by default).
+app.disable('x-powered-by');
+
+// Baseline security headers. Deliberately hand-rolled rather than pulling in helmet: these four
+// are the ones that matter for a JSON API + PDF/logo byte responses, and none of them need tuning.
+// A real Content-Security-Policy is NOT set here — it has to be tailored to the Vite bundle and the
+// AppStream/PDF iframes first, so it's tracked as a follow-up rather than guessed at.
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');      // stops MIME-sniffing an uploaded logo/doc into HTML
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');          // API responses should never be framed cross-origin
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
+
 app.use(cors({
   origin: function(origin, callback) {
     const allowedOrigins = [
@@ -1993,7 +2008,15 @@ const authenticateToken = async (req, res, next) => {
   if (!token) return res.status(401).json({ error: 'No token provided' });
 
   try {
-    const user = jwt.verify(token, JWT_SECRET);
+    const user = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
+    // SECURITY: intermediate tokens are NOT sessions. signMfaJwt() signs { email, purpose } with
+    // this same JWT_SECRET for the 2FA handshake (login/setup/reset) — and carries no userType, so
+    // the partner check below does not catch it. Without this guard, the mfaToken handed out after
+    // a PASSWORD-ONLY login (see /api/auth/login) authenticates here with the victim's full
+    // permissions, reducing mandatory 2FA to password-only. Real session tokens never set
+    // `purpose`: signLocalJwt / signPartnerJwt / the Zoho SSO JWT all omit it. Checked by claim
+    // rather than a userType allowlist on purpose — the Zoho JWT has no userType either.
+    if (user.purpose) return res.status(401).json({ error: 'Invalid token' });
     // SECURITY (Partner Portal isolation, SH-25): a partner token must never authenticate against
     // internal routes, no matter what permissions/roles later logic might otherwise resolve for
     // that email. Reject it here, before any other logic runs.
@@ -2269,8 +2292,9 @@ app.get('/api/auth/callback', async (req, res) => {
     );
 
     const userInfo = userInfoResponse.data;
-    // Log the FULL Zoho user info so we can see every available field
-    console.log('✅ Full Zoho user info:', JSON.stringify(userInfo, null, 2));
+    // Was dumping the entire Zoho profile (a debugging aid that shipped) — that put every user's
+    // full PII into retained Railway logs on every login. Email is enough to trace a login.
+    console.log('✅ Zoho user info received for', userInfo.Email);
 
     const userEmail = userInfo.Email;
     const userName = `${userInfo.First_Name || ''} ${userInfo.Last_Name || ''}`.trim() || userEmail;
@@ -2354,9 +2378,12 @@ app.get('/api/auth/callback', async (req, res) => {
     console.log('✅ JWT token created');
 
     // Redirect to frontend with token
-    const redirectUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/auth/zoho/callback?token=${jwtToken}`;
-    console.log('🔄 Redirecting to:', redirectUrl);
-    res.redirect(redirectUrl);
+    const base = process.env.FRONTEND_URL || 'http://localhost:3000';
+    // SECURITY: never log this URL — it carries the full 7-day session JWT as a query param, and
+    // Railway retains stdout, so logging it put a replayable credential for every user (admins
+    // included) into the deploy logs. Log the destination only.
+    console.log('🔄 Redirecting to frontend callback');
+    res.redirect(`${base}/auth/zoho/callback?token=${jwtToken}`);
   } catch (error) {
     console.error('OAuth callback error:', error.message);
     console.error('Zoho API response status:', error.response?.status);
@@ -2593,6 +2620,27 @@ function verifyMfaJwt(token, purpose) {
     const p = jwt.verify(token, JWT_SECRET);
     return p.purpose === purpose ? p : null;
   } catch { return null; }
+}
+// Resolves the caller's OWN salesperson name for rep-scoped queries. Always derive the scope from
+// the authenticated email via this helper — never from a client-supplied name/id — otherwise the
+// "non-admins only see their own data" guard becomes caller-controlled (see /api/commissions).
+async function resolveOwnRepName(email, fallbackName) {
+  if (!email) return fallbackName || null;
+  try {
+    const r = await pool.query(`SELECT display_name FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1`, [email]);
+    return r.rows[0]?.display_name || fallbackName || null;
+  } catch { return fallbackName || null; }
+}
+
+// For the two PDF-preview routes that take the JWT as a query param (an iframe can't send an
+// Authorization header) and so can't use authenticateToken. Applies the same token-shape rules that
+// middleware does — throws on anything that isn't a real internal session token, so a `purpose`
+// (2FA-handshake) token or a partner token can't be used as a credential here either.
+function sessionEmailFromToken(token) {
+  const p = jwt.verify(String(token), JWT_SECRET, { algorithms: ['HS256'] });
+  if (p.purpose) throw new Error('not a session token');
+  if (p.userType === 'partner') throw new Error('partner token rejected on internal route');
+  return p.email || null;
 }
 
 // Partner Portal auth (SH-25) — fully separate from signLocalJwt/authenticateToken by design,
@@ -3427,15 +3475,28 @@ app.post('/api/partner-portal/team/invite', authenticatePartnerToken, async (req
   const role = req.body.role === 'admin' ? 'admin' : 'standard';
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'Invalid email' });
   try {
-    const existing = (await pool.query(`SELECT id, status FROM partner_users WHERE email = $1`, [email])).rows[0];
+    // SECURITY: partner_users.email is globally UNIQUE across every partner company, so this
+    // lookup MUST be tenant-scoped. Without the partner_id check a Partner Admin at company A
+    // could target a pending user of company B: the upsert below would hand A a fresh invite
+    // token for a row that still belongs to B, and redeeming it yields an active session scoped
+    // to B. Reject any email that already belongs to another company outright.
+    const existing = (await pool.query(
+      `SELECT id, status, partner_id FROM partner_users WHERE email = $1`, [email]
+    )).rows[0];
+    if (existing && existing.partner_id !== req.partnerUser.partnerId) {
+      return res.status(409).json({ error: 'That email is already registered on the Partner Portal' });
+    }
     if (existing && existing.status === 'active') return res.status(409).json({ error: 'User already active' });
     const raw = newRawToken();
     const expires = new Date(Date.now() + 7 * 24 * 3600 * 1000);
     await pool.query(
+      // partner_id = $1 in the DO UPDATE is deliberate and load-bearing: it re-asserts ownership
+      // on the conflict path so a re-invite can never leave a row pointing at another company
+      // (mirrors the internal admin twin, /api/admin/partners/:id/invite-admin).
       `INSERT INTO partner_users (partner_id, email, display_name, role, status, invite_token_hash, invite_expires_at, invited_by)
        VALUES ($1,$2,$3,$4,'invited',$5,$6,$7)
        ON CONFLICT (email) DO UPDATE SET
-         display_name = $3, role = $4, status = 'invited', invite_token_hash = $5,
+         partner_id = $1, display_name = $3, role = $4, status = 'invited', invite_token_hash = $5,
          invite_expires_at = $6, invited_by = $7, updated_at = CURRENT_TIMESTAMP`,
       [req.partnerUser.partnerId, email, name || null, role, sha256hex(raw), expires, req.partnerUser.email]
     );
@@ -8266,10 +8327,13 @@ app.get('/api/commissions', authenticateToken, async (req, res) => {
     const params = [process.env.ZOHO_ORG_ID, startDate, endDate];
     let paramIndex = 4;
 
-    // If not admin, only show their data
+    // SECURITY: scope non-admins to THEIR OWN name, resolved server-side. This used to push
+    // `repName || email` — i.e. the caller-supplied ?repName= query param — so the "only show
+    // their data" guard actually filtered to whichever rep the caller named, letting any rep read
+    // any colleague's commissions. Never derive the scope from client input.
     if (!isAdmin) {
       query += ` AND salesperson_name = $${paramIndex}`;
-      params.push(repName || email);
+      params.push(await resolveOwnRepName(email, req.user.name));
       paramIndex++;
     }
 
@@ -8297,9 +8361,10 @@ app.get('/api/commissions', authenticateToken, async (req, res) => {
     const invParams = [process.env.ZOHO_ORG_ID, new Date(start), new Date(end)];
     let invParamIndex = 4;
     
+    // Same fix as the aggregate query above — own name only, resolved server-side.
     if (!isAdmin) {
       invQuery += ` AND salesperson_name = $${invParamIndex}`;
-      invParams.push(repName || email);
+      invParams.push(await resolveOwnRepName(email, req.user.name));
     }
     
     invQuery += ` ORDER BY date DESC`;
@@ -8415,8 +8480,19 @@ app.get('/api/invoices', authenticateToken, async (req, res) => {
     const params = [process.env.ZOHO_ORG_ID, startDate, endDate];
     let paramIndex = 4;
 
-    // Handle comma-separated salesperson filter
-    if (salesperson) {
+    // SECURITY: the non-admin scope is applied FIRST and unconditionally. It used to sit in an
+    // `else if` behind the ?salesperson= filter, so passing that param skipped rep scoping
+    // entirely and any rep could dump the whole company's invoice + commission book via
+    // ?salesperson=A,B,C. A non-admin is now always pinned to their own name and the
+    // caller-supplied filter is ignored for them.
+    if (!isAdmin) {
+      const myName = await resolveOwnRepName(email, req.user.name);
+      // No resolvable rep identity → no invoices, rather than falling through to everything.
+      query += ` AND salesperson_name = $${paramIndex}`;
+      params.push(myName || ' __no_such_rep__');
+      paramIndex++;
+    } else if (salesperson) {
+      // Admins only: honour the comma-separated filter.
       const names = salesperson.split(',').map(s => s.trim()).filter(Boolean);
       if (names.length === 1) {
         query += ` AND salesperson_name = $${paramIndex}`;
@@ -8427,15 +8503,6 @@ app.get('/api/invoices', authenticateToken, async (req, res) => {
         query += ` AND salesperson_name IN (${placeholders})`;
         params.push(...names);
         paramIndex += names.length;
-      }
-    } else if (!isAdmin) {
-      // Non-admins only see their own invoices
-      const tokenResult = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
-      const myName = tokenResult.rows[0]?.display_name || req.user.name;
-      if (myName) {
-        query += ` AND salesperson_name = $${paramIndex}`;
-        params.push(myName);
-        paramIndex++;
       }
     }
 
@@ -8542,14 +8609,14 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
 // PUT /api/user/preferences
 app.put('/api/user/preferences', authenticateToken, async (req, res) => {
   const { email } = req.user;
-  const { displayName, language, currency, dateFormat, timezone } = req.body;
+  const { language, currency, dateFormat, timezone } = req.body;
   try {
-    if (displayName !== undefined) {
-      await pool.query(
-        `UPDATE user_tokens SET display_name = $1, updated_at = CURRENT_TIMESTAMP WHERE email = $2`,
-        [displayName, email]
-      );
-    }
+    // SECURITY: displayName is deliberately NOT writable here. user_tokens.display_name is the
+    // rep-identity key that every rep-scoped query resolves against (pay stubs, commission
+    // reports, /api/commissions, /api/invoices, resolveTargetRep). Letting a user set it freely
+    // meant a rep could rename themselves to a colleague and be served that colleague's pay stub,
+    // commission report and salary. Renaming a rep is an admin action — it belongs in
+    // Admin → Salespeople, not in self-service preferences.
     await pool.query(
       `INSERT INTO user_preferences (email, language, currency, date_format, timezone)
        VALUES ($1, $2, $3, $4, $5)
@@ -8886,7 +8953,15 @@ app.get('/api/invoices/stats', authenticateToken, async (req, res) => {
     const params = [process.env.ZOHO_ORG_ID, startDate, endDate];
     let idx = 4;
 
-    if (salesperson) {
+    // SECURITY: this endpoint had no rep scoping at all, so any authenticated user could read
+    // company-wide paid/commission totals — or any named colleague's — via ?salesperson=.
+    // Non-admins are now pinned to their own name; the filter is admin-only. Same shape as
+    // GET /api/invoices above.
+    if (!req.user.isAdmin) {
+      const myName = await resolveOwnRepName(req.user.email, req.user.name);
+      where += ` AND salesperson_name = $${idx}`;
+      params.push(myName || ' __no_such_rep__'); idx++;
+    } else if (salesperson) {
       const names = salesperson.split(',').map(s => s.trim()).filter(Boolean);
       if (names.length === 1) {
         where += ` AND salesperson_name = $${idx}`;
@@ -10400,7 +10475,7 @@ app.get('/api/proposals/estimate/:estimateId/preview', async (req, res) => {
   if (!token) return res.status(401).send('Missing token');
   let tokenEmail = null;
   try {
-    tokenEmail = jwt.verify(String(token), JWT_SECRET)?.email || null;
+    tokenEmail = sessionEmailFromToken(token);
   } catch {
     return res.status(401).send('Invalid token');
   }
@@ -11364,7 +11439,7 @@ app.get('/api/invoices/:invoiceNumber/preview', async (req, res) => {
   if (!token) return res.status(401).send('Missing token');
   let tokenEmail = null;
   try {
-    tokenEmail = jwt.verify(String(token), JWT_SECRET)?.email || null;
+    tokenEmail = sessionEmailFromToken(token);
   } catch {
     return res.status(401).send('Invalid token');
   }
