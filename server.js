@@ -333,6 +333,11 @@ const pool = new Pool({
   idleTimeoutMillis: 30000,
   keepAlive: true,                // le proxy TCP Railway coupe les connexions idle — keepAlive évite les resets
   query_timeout: 25000,           // borne client-side une requête lente sous le timeout routeur Heroku (30s)
+  // query_timeout only stops the CLIENT waiting — Postgres keeps executing the statement and holds
+  // its backend resources. statement_timeout makes the server itself give up, so a slow scan can't
+  // outlive the request that asked for it. Set slightly below query_timeout so the server aborts
+  // first and we get a clean Postgres error rather than an ambiguous client-side timeout.
+  options: '-c statement_timeout=20000',
 });
 
 // Split an array into fixed-size chunks (used to batch multi-row INSERT/UPDATE statements
@@ -422,6 +427,30 @@ async function initializeDatabase() {
           approved_at    = COALESCE(approved_at, updated_at, CURRENT_TIMESTAMP)
       WHERE commission_paid = true AND approval_status = 'pending'
     `);
+
+    // PERFORMANCE: `invoices` is the busiest table in the app (~105 queries reference it) and had
+    // NO indexes at all beyond the implicit PK and UNIQUE(invoice_number) — so every commission
+    // page, report, pay stub and reconciliation was a full sequential scan over thousands of rows,
+    // each carrying an inline JSONB line_items column. Postgres is reached over a public proxy
+    // here, so those scans dominate user-visible latency.
+    //
+    // (migrations/003_create_invoices.sql does declare four indexes, but on an obsolete schema —
+    //  sales_rep_id / invoice_date / zoho_invoice_id — none of which exist on the live table.)
+    //
+    // Columns chosen from the actual predicates: organization_id + date (every list/range query),
+    // salesperson_name (rep scoping, 34 queries), status (33 queries filter status='paid'),
+    // customer_name (the O(N²) lateral in adjustments/suggestions and the partner payout
+    // eligibility check), and commission_payable_date (pay-stub period selection).
+    // CONCURRENTLY is deliberately NOT used: these run inside the startup migration block where a
+    // brief lock on first deploy is fine, and CONCURRENTLY cannot run in a transaction.
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_invoices_org_date ON invoices(organization_id, date DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_invoices_salesperson ON invoices(salesperson_name)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_invoices_customer ON invoices(customer_name)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_invoices_org_status ON invoices(organization_id, status)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_invoices_payable ON invoices(commission_payable_date) WHERE commission > 0`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_invoices_rep_payable ON invoices(salesperson_name, commission_payable_date)`);
+    // (Indexes for crm_sold_deals / zentact_merchants / user_roles live next to those tables'
+    //  CREATE statements further down — they don't exist yet at this point in the migration.)
 
     // User preferences table
     await pool.query(`
@@ -563,6 +592,10 @@ async function initializeDatabase() {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_log_entity ON activity_log(entity_type, entity_id, created_at DESC)`);
+    // The Audit → Logs page paginates with a bare ORDER BY created_at DESC, which the composite
+    // index above cannot serve — so every page was a full scan plus a full sort of a table that
+    // only ever grows (logActivity writes on every mutation).
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_log_created ON activity_log(created_at DESC)`);
     // Coarse connection-time tracking for the Admin → Audit dashboard ("who's online, how many
     // hours"). One row per continuous session: started at first request after an idle gap,
     // extended (last_seen_at bumped) on subsequent requests, never explicitly closed (JWTs are
@@ -1121,6 +1154,11 @@ async function initializeDatabase() {
         PRIMARY KEY (user_email, role_id)
       );
     `);
+    // PERFORMANCE: getUserPermissions() filters on LOWER(ur.user_email), which cannot use this
+    // table's PRIMARY KEY (user_email, role_id) — so every permission check on a non-admin request
+    // was a sequential scan, and requirePerm appears ~178 times.
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_roles_email_lower ON user_roles(LOWER(user_email))`);
+
     // Per-role storage quota for the resources library. A user's effective cap is their
     // explicit per-user limit if set, else the most generous limit among their roles.
     await pool.query(`
@@ -1720,6 +1758,11 @@ async function initializeDatabase() {
       );
     `);
 
+    // PERFORMANCE: only a PK on deal_id existed, yet every points/dashboard query range-scans
+    // sold_date or groups by owner — and those fire on every dashboard load.
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_sold_deals_sold_date ON crm_sold_deals(sold_date)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_sold_deals_owner_date ON crm_sold_deals(owner_name, sold_date)`);
+
     // Zentact merchants — stores all merchant accounts pulled from Zentact API.
     // activated_at is stamped the first time we see status = ACTIVE (never overwritten).
     await pool.query(`
@@ -1752,6 +1795,9 @@ async function initializeDatabase() {
     // down/limited. merchant_account_id is a synthetic "MANUAL-..." id, never touched by
     // the real Zentact sync (which only upserts merchants it actually pulled from the API).
     await pool.query(`ALTER TABLE zentact_merchants ADD COLUMN IF NOT EXISTS is_manual BOOLEAN DEFAULT FALSE`);
+    // PERFORMANCE: only a UNIQUE on merchant_account_id existed, yet this table is always filtered
+    // on status='ACTIVE' AND activated_at BETWEEN ... (points, bonuses, dashboards).
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_zentact_merchants_status_activated ON zentact_merchants(status, activated_at)`);
 
     // Per-merchant monthly revenue from Zentact's transaction-profitability report.
     // All monetary fields are in MINOR UNITS (cents). transaction_profit_cents = the
@@ -8354,45 +8400,14 @@ app.get('/api/commissions', authenticateToken, async (req, res) => {
   const { start, end, repName } = req.query;
 
   try {
-    // Get token from database
-    const tokenResult = await pool.query(
-      'SELECT access_token, refresh_token, api_domain, expires_at FROM user_tokens WHERE email = $1',
-      [email]
-    );
-
-    if (!tokenResult.rows.length) {
+    // PERFORMANCE: this route reads only from our own `invoices` table — it never calls Zoho. It
+    // used to fetch the Zoho token and, when expired, do a full OAuth refresh HTTP round-trip plus
+    // an UPDATE… and then never use the resulting token (verified: `accessToken` was assigned and
+    // never read). Removed. The existence check below is kept deliberately: a caller with no
+    // user_tokens row still gets the same 401 as before, so behaviour is unchanged.
+    const hasZohoAccount = await pool.query(`SELECT 1 FROM user_tokens WHERE email = $1 LIMIT 1`, [email]);
+    if (!hasZohoAccount.rows.length) {
       return res.status(401).json({ error: 'No Zoho token found' });
-    }
-
-    let tokenData = tokenResult.rows[0];
-    let accessToken = tokenData.access_token;
-
-    // Check if token needs refresh
-    if (Date.now() >= tokenData.expires_at) {
-      console.log('Refreshing expired token...');
-      const refreshResponse = await axios.post(
-        `${ZOHO_CONFIG.accounts_url}/oauth/v2/token`,
-        new URLSearchParams({
-          grant_type: 'refresh_token',
-          client_id: ZOHO_CONFIG.client_id,
-          client_secret: ZOHO_CONFIG.client_secret,
-          refresh_token: tokenData.refresh_token,
-        }),
-        {
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-        }
-      );
-
-      accessToken = refreshResponse.data.access_token;
-      
-      // Update token in database
-      await pool.query(
-        `UPDATE user_tokens SET access_token = $1, expires_at = $2, updated_at = CURRENT_TIMESTAMP 
-         WHERE email = $3`,
-        [accessToken, Date.now() + refreshResponse.data.expires_in * 1000, email]
-      );
     }
 
     console.log('📊 Fetching commissions from database...');
@@ -8446,8 +8461,13 @@ app.get('/api/commissions', authenticateToken, async (req, res) => {
     console.log(`✅ Found ${commissions.length} reps with paid invoices`);
 
     // Get all invoices (for invoices tab)
+    // Explicit column list instead of SELECT * — the latter dragged the whole line_items JSONB
+    // blob of every row across the wire to be discarded. Same 8 scalar columns the sibling
+    // /api/invoices endpoint returns for the same UI.
     let invQuery = `
-      SELECT * FROM invoices 
+      SELECT invoice_number, salesperson_name, customer_name, date,
+             total, commission, commission_paid, status
+      FROM invoices
       WHERE organization_id = $1
       AND date BETWEEN $2 AND $3
     `;
@@ -21039,7 +21059,34 @@ app.post('/api/admin/processing-bonus/relink', (req, res, next) => {
   }
 });
 
+// PERFORMANCE: this is a pure read (4 SELECTs, result depends only on fromDate) that several
+// handlers call MORE THAN ONCE with the identical argument in a single request — the pay stub calls
+// it twice (once inside the bonus calculation, once for the quota gate), i.e. 4 wasted round-trips
+// over the cross-cloud link per stub. A short TTL memo fixes every such call site at once without
+// restructuring any handler. 30s is far shorter than the CRM sync interval that changes the
+// underlying deals, so no handler can observe staler data than it already could.
+// Same idiom as getDisabledReportYears / refreshBonusTiers elsewhere in this file.
+const _monthlyPointsCache = new Map();  // isoDate -> { at, promise }
+const MONTHLY_POINTS_TTL_MS = 30000;
 async function getMonthlyPointsByRep(fromDate) {
+  const key = new Date(fromDate).toISOString().slice(0, 10);
+  const hit = _monthlyPointsCache.get(key);
+  if (hit && Date.now() - hit.at < MONTHLY_POINTS_TTL_MS) return hit.promise;
+  // Cache the PROMISE, not the result, so concurrent callers in the same tick share one round-trip
+  // instead of all missing and issuing their own.
+  const promise = _computeMonthlyPointsByRep(fromDate).catch((e) => {
+    _monthlyPointsCache.delete(key);   // never cache a failure
+    throw e;
+  });
+  _monthlyPointsCache.set(key, { at: Date.now(), promise });
+  if (_monthlyPointsCache.size > 64) {  // bound it — keys are dates, so this can only grow slowly
+    for (const [k, v] of _monthlyPointsCache) {
+      if (Date.now() - v.at >= MONTHLY_POINTS_TTL_MS) _monthlyPointsCache.delete(k);
+    }
+  }
+  return promise;
+}
+async function _computeMonthlyPointsByRep(fromDate) {
   const dealSourcePoints = new Map(
     (await pool.query(`SELECT source_group, points FROM deal_source_points`)).rows
       .map(r => [String(r.source_group).toLowerCase(), parseInt(r.points)])
