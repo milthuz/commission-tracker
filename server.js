@@ -2973,7 +2973,7 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // Render each transactional email with sample data so an admin can see the look
 // & feel in the panel and send a test copy. Mirrors the real builders so the
 // preview reflects exactly what recipients get.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded'];
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -3023,6 +3023,11 @@ function sampleEmail(type, lang) {
       return { subject: 'Commission manquante — Amy Spicer',
         html: mailShell('Signalement de commission manquante / Missing commission report',
           `<strong>Amy Spicer</strong> (amy@example.com) signale une commission possiblement manquante / reports a possibly missing commission.<br><br><strong>Facture · Invoice :</strong> INV-001<br><strong>Période · Period :</strong> 2026-05<br><strong>Message :</strong><br>Cette facture devrait m'être attribuée.`, null, null) };
+    case 'report_resolved':
+      return reportResolvedEmail(
+        { report_type: 'missing_points', reference: 'Café du Coin', period: '2026-05',
+          message: "Le marchand n'apparaît pas dans mes points." },
+        'Le marchand était rattaché au mauvais vendeur dans Zentact. Corrigé, les points apparaissent maintenant.');
     case 'probation':
       return { subject: 'Probation — Amy Spicer (J-15)',
         html: mailShell('Fin de probation dans 15 jours / Probation ends in 15 days',
@@ -14420,18 +14425,76 @@ async function checkProbationNotifications() {
   } catch (e) { console.error('❌ [PROBATION] notification check error:', e.message); }
 }
 
+// Courriel envoyé au VENDEUR quand son signalement est résolu (demande utilisateur
+// 2026-07-30). Jusqu'ici la boucle était à sens unique : il signalait, l'admin
+// corrigeait, et personne ne le lui disait — donc il resignalait, ou pire, il
+// pensait avoir été ignoré.
+function reportResolvedEmail(r, note) {
+  const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const isPoints = r.report_type === 'missing_points';
+  const what = isPoints ? 'points manquants / missing points' : 'commission manquante / missing commission';
+  const refLabel = isPoints ? 'Marchand / dossier · Merchant' : 'Facture · Invoice';
+  const intro =
+      `Bonne nouvelle — votre signalement de ${what} a été traité.<br>`
+    + `Good news — your ${isPoints ? 'missing points' : 'missing commission'} report has been resolved.<br><br>`
+    + (r.reference ? `<strong>${refLabel} :</strong> ${esc(r.reference)}<br>` : '')
+    + (r.period ? `<strong>Période · Period :</strong> ${esc(r.period)}<br>` : '')
+    + `<strong>Votre signalement · Your report :</strong><br>${esc(r.message).replace(/\n/g, '<br>')}<br><br>`
+    // La note de l'admin est le vrai contenu utile : « corrigé » sans expliquer
+    // quoi oblige le vendeur à aller vérifier lui-même.
+    + (note
+        ? `<strong>Réponse · Response :</strong><br>${esc(note).replace(/\n/g, '<br>')}<br><br>`
+        : '')
+    + `Les montants sont recalculés automatiquement — vérifiez votre rapport de commissions.<br>`
+    + `Amounts are recalculated automatically — check your commission report.`;
+  return {
+    subject: isPoints ? 'Points manquants — résolu / resolved' : 'Commission manquante — résolue / resolved',
+    html: mailShell('Signalement résolu / Report resolved', intro,
+      'Voir mon rapport · View my report', `${process.env.FRONTEND_URL || ''}/commission-report`),
+  };
+}
+
 // POST /api/admin/user-reports/:id/resolve — mark a user report (missing commission/points) resolved.
+// Body (optionnel) : { note } — ce que l'admin veut dire au vendeur.
 app.post('/api/admin/user-reports/:id/resolve', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'admin:data_health'))) return;
   try {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ error: 'invalid id' });
-    await pool.query(
-      `UPDATE user_reports SET status = 'resolved', resolved_at = NOW(), resolved_by = $2 WHERE id = $1`,
+    const note = (req.body?.note || '').toString().trim().slice(0, 1000);
+    // RETURNING plutôt qu'un SELECT séparé : une seule aller-retour, et on obtient
+    // l'état d'AVANT-résolution sans course avec un autre admin.
+    const row = (await pool.query(
+      `UPDATE user_reports SET status = 'resolved', resolved_at = NOW(), resolved_by = $2
+        WHERE id = $1 AND status <> 'resolved'
+        RETURNING id, report_type, reporter_email, reporter_name, reference, period, message`,
       [id, req.user.email || req.user.name || 'admin']
-    );
+    )).rows[0];
     _dataHealthCache = { at: 0, data: null };
-    res.json({ resolved: true });
+
+    // Déjà résolu (double-clic, ou deux admins en même temps) : on ne renvoie pas
+    // un second courriel au vendeur.
+    if (!row) return res.json({ resolved: true, notified: false, reason: 'already_resolved' });
+
+    let notified = false, reason = null;
+    if (row.reporter_email) {
+      try {
+        const { subject, html } = reportResolvedEmail(row, note);
+        const sent = await sendMail(row.reporter_email, subject, html);
+        notified = !!sent.sent; reason = sent.reason || null;
+      } catch (e) {
+        // L'envoi qui échoue ne doit pas annuler la résolution : elle est faite,
+        // et la reprocher à l'admin l'obligerait à recliquer sans effet.
+        reason = e.message; console.warn('[user-report] notify failed:', e.message);
+      }
+    } else {
+      reason = 'no_reporter_email';
+    }
+    await logActivity('user_report', id, 'resolved',
+      `Signalement résolu${note ? ' avec réponse' : ''} — ${row.reporter_name || row.reporter_email || '?'}`,
+      req.user.email || 'admin', { metadata: { reportType: row.report_type, notified, reason } });
+
+    res.json({ resolved: true, notified, reason });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
