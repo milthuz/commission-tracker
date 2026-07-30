@@ -1578,6 +1578,62 @@ async function initializeDatabase() {
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_partner_notifications_partner ON partner_notifications(partner_id, created_at DESC)`);
 
+    // The Pass / La Passe (SH-22) — membres du programme de recommandation marchand.
+    // Troisième surface d'identité du produit, séparée de local_users ET de partner_users
+    // pour la même raison que celles-ci le sont entre elles : un membre de La Passe ne doit
+    // atteindre QUE son espace membre, et le garantir par la structure vaut mieux que le
+    // confier à la mémoire de chaque futur contrôle de permission.
+    //
+    // Aucune colonne de mot de passe ni de TOTP, contrairement aux deux autres surfaces :
+    // la connexion se fait par lien magique (décision 2026-07-30). Le courriel EST déjà la
+    // règle d'éligibilité — il doit correspondre à un client actif de Zoho Books — donc
+    // prouver qu'on relève ses courriels prouve exactement ce que le programme exige. Un
+    // restaurateur qui vient recommander un ami n'a ni mot de passe à perdre ni application
+    // d'authentification à installer.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS pass_members (
+        id                      SERIAL PRIMARY KEY,
+        email                   VARCHAR(255) UNIQUE NOT NULL,
+        full_name               VARCHAR(255),
+        business                VARCHAR(255),
+        zoho_contact_id         VARCHAR(64),
+        province                VARCHAR(4),
+        locale                  VARCHAR(5) NOT NULL DEFAULT 'fr-CA',
+        status                  VARCHAR(20) NOT NULL DEFAULT 'active',
+        lifetime_live_referrals INT NOT NULL DEFAULT 0,
+        tier_level              INT NOT NULL DEFAULT 1,
+        consent_at              TIMESTAMP,
+        consent_locale          VARCHAR(5),
+        consent_terms_version   VARCHAR(20),
+        last_login_at           TIMESTAMP,
+        created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    // `locale` porte la langue de correspondance du membre : c'est elle qui décide la langue
+    // des quatre courriels du programme, pas la langue de l'interface au moment du clic. Le
+    // brief la signale comme le mécanisme de conformité linguistique côté Québec.
+    //
+    // `lifetime_live_referrals` et `tier_level` sont dérivables de pass_referrals, mais restent
+    // persistés : ce sont les valeurs qui justifient un montant déjà versé, et un calcul refait
+    // six mois plus tard sur des règles modifiées ne prouve plus rien.
+
+    // Jetons de connexion à usage unique. Table séparée plutôt qu'une colonne sur le membre :
+    // un lien est demandé AVANT que le membre existe (première connexion = inscription), donc
+    // le jeton est porté par un courriel, pas par une ligne de membre.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS pass_login_tokens (
+        id          SERIAL PRIMARY KEY,
+        email       VARCHAR(255) NOT NULL,
+        token_hash  VARCHAR(64) NOT NULL UNIQUE,
+        expires_at  TIMESTAMP NOT NULL,
+        used_at     TIMESTAMP,
+        context     JSONB,
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_pass_login_tokens_hash ON pass_login_tokens(token_hash)`);
+
     // Resellers — third-party companies that resell licenses. POS activations come from a
     // Zoho Form; residual payments come from Zentact. Linked by reseller name for now.
     await pool.query(`
@@ -2085,7 +2141,12 @@ const authenticateToken = async (req, res, next) => {
     // SECURITY (Partner Portal isolation, SH-25): a partner token must never authenticate against
     // internal routes, no matter what permissions/roles later logic might otherwise resolve for
     // that email. Reject it here, before any other logic runs.
-    if (user.userType === 'partner') return res.status(401).json({ error: 'Invalid token' });
+    // Written as an ALLOWLIST rather than `userType === 'partner'`: every external identity
+    // surface added since (The Pass members, SH-22) would otherwise have to remember to add
+    // itself to a deny-list here, and forgetting is silent — the token simply authenticates.
+    // Only the two internal surfaces are admissible: Zoho SSO (no userType at all) and
+    // local/external users ('local').
+    if (user.userType && user.userType !== 'local') return res.status(401).json({ error: 'Invalid token' });
     req.user = user;
 
     // SECURITY: the Zoho-login JWT is signed isAdmin:true for everyone (legacy). NEVER trust
@@ -14303,6 +14364,331 @@ app.put('/api/admin/pass/config', authenticateToken, async (req, res) => {
       `Configuration de La Passe modifiée${before.enabled !== next.enabled ? (next.enabled ? ' — programme ACTIVÉ' : ' — programme DÉSACTIVÉ') : ''}`,
       req.user.email || 'admin', { metadata: { before, after: next } });
     res.json({ config: next });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================================
+// LA PASSE — identité des membres (inscription + connexion par lien magique)
+// ============================================================================
+// Version des conditions acceptées à l'adhésion. Elle est persistée sur le membre :
+// savoir QUE quelqu'un a consenti ne vaut rien si on ne sait plus à QUOI.
+const PASS_TERMS_VERSION = '2026-07';
+
+// Deux expéditeurs, un par langue — le programme porte deux noms. ⚠️ Les deux
+// adresses doivent être vérifiées comme expéditeurs dans SendGrid avant le premier
+// envoi, sinon l'envoi échoue en silence (sendMail avale l'erreur par conception).
+const PASS_SENDERS = {
+  'fr-CA': { name: 'La Passe chez Cluster', address: 'lapasse@clusterpos.ca' },
+  'en-CA': { name: 'The Pass at Cluster',   address: 'thepass@clusterpos.ca' },
+};
+
+// La langue est celle du MEMBRE, pas celle de l'interface au moment du clic : c'est
+// la préférence de correspondance que le brief signale comme le mécanisme de
+// conformité linguistique côté Québec. Défaut français, jamais anglais.
+const passLocale = (x) => (String(x || '').toLowerCase().startsWith('en') ? 'en-CA' : 'fr-CA');
+
+// Le formatage monétaire diffère par locale et n'est PAS interchangeable :
+// EN « $1,000 » vs FR « 1 000 $ » (espace insécable, symbole après). Le brief
+// interdit explicitement de le faire à la main — on passe par l'ICU de la plateforme.
+const passMoney = (amount, locale) => new Intl.NumberFormat(passLocale(locale), {
+  style: 'currency', currency: 'CAD', minimumFractionDigits: 0, maximumFractionDigits: 0,
+}).format(Number(amount) || 0);
+
+// Les 13 provinces et territoires : liste FERMÉE, côté serveur. « Canada seulement »
+// est une règle d'éligibilité, pas une ligne de copie (brief, règle 5).
+const CA_PROVINCES = ['AB', 'BC', 'MB', 'NB', 'NL', 'NS', 'NT', 'NU', 'ON', 'PE', 'QC', 'SK', 'YT'];
+// Zoho stocke la province en texte libre et dans l'une ou l'autre langue : on ramène
+// au code à deux lettres, seule forme sur laquelle on peut décider quoi que ce soit.
+const CA_PROVINCE_ALIASES = {
+  'alberta': 'AB', 'british columbia': 'BC', 'colombie-britannique': 'BC',
+  'manitoba': 'MB', 'new brunswick': 'NB', 'nouveau-brunswick': 'NB',
+  'newfoundland and labrador': 'NL', 'terre-neuve-et-labrador': 'NL',
+  'nova scotia': 'NS', 'nouvelle-ecosse': 'NS', 'northwest territories': 'NT',
+  'territoires du nord-ouest': 'NT', 'nunavut': 'NU', 'ontario': 'ON',
+  'prince edward island': 'PE', 'ile-du-prince-edouard': 'PE',
+  'quebec': 'QC', 'québec': 'QC', 'saskatchewan': 'SK', 'yukon': 'YT',
+};
+function normalizeProvince(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  if (/^[A-Za-z]{2}$/.test(s) && CA_PROVINCES.includes(s.toUpperCase())) return s.toUpperCase();
+  const key = s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+  return CA_PROVINCE_ALIASES[key] || CA_PROVINCE_ALIASES[s.toLowerCase()] || null;
+}
+
+// Éligibilité : seul un client ACTIF de Zoho Books peut adhérer. C'est ce qui rend la
+// note de crédit applicable à un vrai compte — sans cette contrainte, le programme
+// promet de l'argent à des comptes qui n'existent pas. Le scope ZohoBooks.contacts.READ
+// est déjà accordé, donc aucune reconnexion Zoho n'est nécessaire ici.
+async function findPassEligibleCustomer(email) {
+  const { accessToken, apiDomain } = await getAdminBooksAuth();
+  const headers = { Authorization: `Zoho-oauthtoken ${accessToken}` };
+  const orgId = process.env.ZOHO_ORG_ID;
+
+  const list = await axios.get(`${apiDomain}/books/v3/contacts`, {
+    params: { organization_id: orgId, email, contact_type: 'customer', per_page: 20 },
+    headers, validateStatus: () => true,
+  });
+  if (list.status !== 200) {
+    const body = typeof list.data === 'string' ? list.data.slice(0, 200) : JSON.stringify(list.data || {}).slice(0, 200);
+    throw new Error(`Zoho Books contacts → HTTP ${list.status} ${body}`);
+  }
+  const wanted = String(email).trim().toLowerCase();
+  // Le filtre `email` de Zoho est permissif ; on reconfirme l'égalité exacte nous-mêmes.
+  const hit = (list.data?.contacts || []).find(c => String(c.email || '').trim().toLowerCase() === wanted);
+  if (!hit) return { eligible: false, reason: 'not_a_customer' };
+  if (String(hit.status || '').toLowerCase() === 'inactive') return { eligible: false, reason: 'inactive_customer' };
+
+  // La liste ne porte pas l'adresse — il faut le détail pour connaître le pays.
+  const det = await axios.get(`${apiDomain}/books/v3/contacts/${hit.contact_id}`, {
+    params: { organization_id: orgId }, headers, validateStatus: () => true,
+  });
+  const contact = det.status === 200 ? (det.data?.contact || {}) : {};
+  const addr = contact.billing_address || contact.shipping_address || {};
+  const country = String(addr.country || '').trim().toLowerCase();
+  // On ne rejette que sur un pays RENSEIGNÉ et non canadien. Un champ vide chez un
+  // client réel est courant ; refuser sur une absence exclurait de vrais marchands,
+  // alors que la province du restaurant recommandé, elle, est validée durement au
+  // formulaire — c'est là que « Canada seulement » se joue vraiment.
+  if (country && !['canada', 'ca', 'can'].includes(country)) {
+    return { eligible: false, reason: 'not_canadian' };
+  }
+  return {
+    eligible: true,
+    contact: {
+      zohoContactId: String(hit.contact_id),
+      business: contact.company_name || hit.company_name || hit.contact_name || null,
+      fullName: contact.contact_name || hit.contact_name || null,
+      province: normalizeProvince(addr.state),
+      countryKnown: !!country,
+    },
+  };
+}
+
+// Session d'un membre. Aucun rôle, aucune permission : un jeton de La Passe n'ouvre que
+// l'espace membre. authenticateToken rejette tout userType autre que 'local' — donc
+// l'isolement tient par construction, pas par vigilance (voir son commentaire).
+const signPassJwt = (m) => jwt.sign(
+  { email: m.email, name: m.full_name || m.email, passMemberId: m.id, userType: 'pass' },
+  JWT_SECRET, { expiresIn: '30d' }
+);
+const authenticatePassToken = async (req, res, next) => {
+  const token = req.headers['authorization']?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+  try {
+    const claims = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
+    if (claims.userType !== 'pass' || claims.purpose) return res.status(401).json({ error: 'Invalid token' });
+    // On relit la ligne vivante à chaque requête, comme les deux autres surfaces : un
+    // membre suspendu doit l'être immédiatement, pas à l'expiration de son jeton — et
+    // celui-ci dure 30 jours.
+    const m = (await pool.query(`SELECT * FROM pass_members WHERE id = $1`, [claims.passMemberId])).rows[0];
+    if (!m || m.status !== 'active') return res.status(401).json({ error: 'Invalid token' });
+    req.passMember = m;
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+};
+
+// Vue publique d'un membre : ce que l'espace membre affiche. Le palier et le crédit sont
+// recalculés à la lecture à partir de la config vivante, pour qu'un changement de montant
+// se voie tout de suite ; les valeurs PERSISTÉES sur le membre servent l'audit des sommes
+// déjà versées, pas l'affichage.
+function passMemberPublic(m, config) {
+  const lifetime = Number(m.lifetime_live_referrals) || 0;
+  const tier = passTierFor(config, lifetime);
+  const tiers = [...(config.tiers || [])].sort((a, b) => a.from - b.from);
+  const next = tiers.find(t => t.from > lifetime) || null;
+  return {
+    id: m.id,
+    email: m.email,
+    fullName: m.full_name,
+    business: m.business,
+    province: m.province,
+    locale: m.locale,
+    joinedAt: m.created_at,
+    lifetimeLiveReferrals: lifetime,
+    tier: { level: tier.level, key: tier.key, credit: tier.credit },
+    nextTier: next ? { level: next.level, key: next.key, credit: next.credit, referralsAway: next.from - lifetime } : null,
+    hardwareDiscount: config.hardwareDiscount,
+    currency: config.currency,
+  };
+}
+
+// Enveloppe de courriel propre à La Passe. Les courriels du programme partent vers des
+// MARCHANDS : ils ne portent donc pas le bandeau Sales Hub (mailChrome), qui est l'outil
+// interne des vendeurs. Réutilisée telle quelle par les quatre gabarits du design.
+function passMail(locale, title, bodyHtml, cta) {
+  const lc = passLocale(locale);
+  const fr = lc === 'fr-CA';
+  const brand = fr ? 'La Passe' : 'The Pass';
+  const foot = fr
+    ? `Vous recevez ce message parce que vous êtes membre de La Passe, le programme de recommandation marchand de Cluster au Canada. Le crédit s'applique aux recommandations admissibles qui deviennent des clients actifs et est assujetti aux conditions du programme. Tous les montants sont en dollars canadiens.`
+    : `You're receiving this because you're a member of The Pass, Cluster's merchant referral program in Canada. Credit applies to qualified referrals that become active customers and is subject to program terms. All amounts are in Canadian dollars.`;
+  const button = cta?.url && cta?.label ? `
+    <table role="presentation" cellpadding="0" cellspacing="0" style="margin:26px 0 4px"><tr><td style="border-radius:9px;background:#0f1722">
+      <a href="${cta.url}" style="display:inline-block;padding:13px 30px;color:#ffffff;font-size:14px;font-weight:700;text-decoration:none;border-radius:9px">${cta.label}</a>
+    </td></tr></table>
+    <p style="margin:18px 0 0;color:#94a3b8;font-size:12px;line-height:1.6">${fr ? 'Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :' : "If the button doesn't work, copy this link into your browser:"}<br>
+    <a href="${cta.url}" style="color:#0f1722;word-break:break-all">${cta.url}</a></p>` : '';
+  return `<!doctype html><html lang="${fr ? 'fr' : 'en'}"><head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light only"><meta name="supported-color-schemes" content="light">
+  </head>
+  <body style="margin:0;padding:0;background:#f4f2ee;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f2ee;padding:32px 12px"><tr><td align="center">
+      <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(16,23,34,.08),0 10px 28px rgba(16,23,34,.07)">
+        <tr><td style="background:#0f1722;padding:22px 36px">
+          <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-.3px">${brand}</span>
+          <span style="display:block;color:#8a99af;font-size:12px;margin-top:2px;letter-spacing:.2px">Cluster</span>
+        </td></tr>
+        <tr><td style="padding:34px 36px 6px">
+          <h1 style="margin:0 0 14px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${title}</h1>
+          <div style="color:#475569;font-size:14.5px;line-height:1.65">${bodyHtml}</div>
+          ${button}
+        </td></tr>
+        <tr><td style="padding:26px 36px 0"><div style="border-top:1px solid #eef1f6;font-size:0;line-height:0">&nbsp;</div></td></tr>
+        <tr><td style="padding:16px 36px 30px">
+          <p style="margin:0;color:#94a3b8;font-size:12px;line-height:1.7">${foot}<br>Cluster — clusterpos.ca</p>
+        </td></tr>
+      </table>
+    </td></tr></table>
+  </body></html>`;
+}
+
+// POST /api/pass/auth/request-link { email, locale, consent }
+// Un seul point d'entrée pour l'inscription ET la connexion : la première fois, le lien
+// crée le membre ; ensuite, il ouvre la session. Il n'y a rien à retenir entre les deux.
+app.post('/api/pass/auth/request-link', async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const locale = passLocale(req.body?.locale);
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'invalid_email' });
+  if (rateLimited(`passlink:${email}`, 5) || rateLimited(`passlinkip:${req.ip}`, 20)) {
+    return res.status(429).json({ error: 'too_many_attempts' });
+  }
+  try {
+    const config = await getPassConfig();
+    if (!config.enabled) return res.status(403).json({ error: 'program_not_open' });
+
+    const member = (await pool.query(`SELECT * FROM pass_members WHERE LOWER(email) = $1`, [email])).rows[0];
+    if (member && member.status !== 'active') return res.status(403).json({ error: 'member_suspended' });
+
+    let context = null;
+    if (!member) {
+      // Adhésion : le consentement doit être explicite et daté, et on retient la langue
+      // dans laquelle les conditions ont été présentées — l'exigence linguistique du
+      // Québec porte sur la langue du consentement, pas seulement sur son existence.
+      if (req.body?.consent !== true) return res.status(400).json({ error: 'consent_required' });
+      const check = await findPassEligibleCustomer(email);
+      if (!check.eligible) {
+        // On répond quand même 200 : dire « cette adresse n'est pas cliente » à qui la
+        // saisit transformerait ce formulaire en outil d'énumération de la clientèle de
+        // Cluster. L'explication part par courriel, à l'adresse concernée uniquement.
+        const html = passMail(locale,
+          locale === 'fr-CA' ? 'Nous n\'avons pas trouvé de compte Cluster' : 'We couldn\'t find a Cluster account',
+          locale === 'fr-CA'
+            ? `<p style="margin:0 0 12px">Une demande d'accès à La Passe a été faite avec cette adresse, mais elle ne correspond à aucun compte client actif de Cluster.</p><p style="margin:0">La Passe est réservée aux marchands Cluster du Canada. Si vous êtes client et que votre compte utilise une autre adresse, réessayez avec celle-ci — ou écrivez-nous.</p>`
+            : `<p style="margin:0 0 12px">Someone requested access to The Pass with this address, but it doesn't match an active Cluster customer account.</p><p style="margin:0">The Pass is for Cluster merchants in Canada. If you're a customer and your account uses a different address, try that one — or write to us.</p>`);
+        await sendMail(email, locale === 'fr-CA' ? 'La Passe — accès impossible' : 'The Pass — access not available', html, { from: PASS_SENDERS[locale] });
+        return res.json({ ok: true });
+      }
+      context = { ...check.contact, consentLocale: locale, termsVersion: PASS_TERMS_VERSION };
+    }
+
+    const raw = newRawToken();
+    await pool.query(
+      `INSERT INTO pass_login_tokens (email, token_hash, expires_at, context) VALUES ($1,$2,$3,$4::jsonb)`,
+      [email, sha256hex(raw), new Date(Date.now() + 15 * 60 * 1000), context ? JSON.stringify(context) : null]
+    );
+    const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+    const url = `${base}/pass/connexion?token=${raw}&lang=${locale === 'fr-CA' ? 'fr' : 'en'}`;
+    const fr = locale === 'fr-CA';
+    const html = passMail(locale,
+      fr ? (member ? 'Votre lien de connexion' : 'Bienvenue dans La Passe') : (member ? 'Your sign-in link' : 'Welcome to The Pass'),
+      fr
+        ? `<p style="margin:0 0 12px">Voici votre lien pour ${member ? 'ouvrir votre espace membre' : 'activer votre adhésion'}. Il est valide 15 minutes et ne sert qu'une fois.</p><p style="margin:0">Si vous n'avez rien demandé, ignorez ce message : rien ne se passera.</p>`
+        : `<p style="margin:0 0 12px">Here's your link to ${member ? 'open your member hub' : 'activate your membership'}. It's valid for 15 minutes and works once.</p><p style="margin:0">If you didn't ask for this, ignore this message — nothing will happen.</p>`,
+      { label: fr ? 'Ouvrir mon espace membre' : 'Open My Member Hub', url });
+    const sent = await sendMail(email, fr ? 'La Passe — votre lien de connexion' : 'The Pass — your sign-in link', html, { from: PASS_SENDERS[locale] });
+    // Sans SMTP configuré, un 200 muet enverrait le membre attendre un courriel qui
+    // n'arrivera jamais. On le dit.
+    if (!sent.sent) return res.status(502).json({ error: 'email_not_sent', detail: sent.reason });
+    res.json({ ok: true });
+  } catch (e) {
+    // Zoho indisponible, base indisponible : dans les deux cas le membre ne peut rien y
+    // faire et ne doit pas se voir promettre un courriel. Le détail reste dans le journal.
+    console.warn('[pass] request-link failed:', e.message);
+    res.status(502).json({ error: 'link_request_failed' });
+  }
+});
+
+// POST /api/pass/auth/consume { token } → session
+app.post('/api/pass/auth/consume', async (req, res) => {
+  const raw = String(req.body?.token || '').trim();
+  if (!raw) return res.status(400).json({ error: 'token_required' });
+  if (rateLimited(`passconsume:${req.ip}`, 30)) return res.status(429).json({ error: 'too_many_attempts' });
+  try {
+    // Consommation atomique : le UPDATE ne rend une ligne que s'il l'a lui-même marquée
+    // utilisée. Deux requêtes simultanées avec le même lien — un préchargeur de courriel
+    // et le clic de l'humain, cas très réel — ne peuvent pas ouvrir deux sessions.
+    const tok = (await pool.query(
+      `UPDATE pass_login_tokens SET used_at = NOW()
+        WHERE token_hash = $1 AND used_at IS NULL AND expires_at > NOW()
+        RETURNING email, context`,
+      [sha256hex(raw)]
+    )).rows[0];
+    if (!tok) return res.status(400).json({ error: 'link_invalid_or_expired' });
+
+    const config = await getPassConfig();
+    let member = (await pool.query(`SELECT * FROM pass_members WHERE LOWER(email) = $1`, [tok.email])).rows[0];
+    if (!member) {
+      const c = tok.context || {};
+      member = (await pool.query(
+        `INSERT INTO pass_members (email, full_name, business, zoho_contact_id, province, locale,
+                                   consent_at, consent_locale, consent_terms_version, last_login_at)
+         VALUES ($1,$2,$3,$4,$5,$6,NOW(),$7,$8,NOW())
+         ON CONFLICT (email) DO UPDATE SET last_login_at = NOW()
+         RETURNING *`,
+        [tok.email, c.fullName || null, c.business || null, c.zohoContactId || null, c.province || null,
+         passLocale(c.consentLocale), passLocale(c.consentLocale), c.termsVersion || PASS_TERMS_VERSION]
+      )).rows[0];
+      await logActivity('pass_member', String(member.id), 'created',
+        `Adhésion à La Passe — ${member.business || member.email}`, member.email,
+        { metadata: { zohoContactId: c.zohoContactId || null, province: c.province || null, termsVersion: member.consent_terms_version } });
+    } else {
+      if (member.status !== 'active') return res.status(403).json({ error: 'member_suspended' });
+      await pool.query(`UPDATE pass_members SET last_login_at = NOW() WHERE id = $1`, [member.id]);
+    }
+    res.json({ token: signPassJwt(member), member: passMemberPublic(member, config) });
+  } catch (e) {
+    console.warn('[pass] consume failed:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/pass/me — l'espace membre (paliers, progression, montants)
+app.get('/api/pass/me', authenticatePassToken, async (req, res) => {
+  try {
+    const config = await getPassConfig();
+    res.json({ member: passMemberPublic(req.passMember, config), program: { enabled: config.enabled, currency: config.currency } });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /api/pass/me { locale } — la langue de correspondance, seule chose que le membre
+// modifie sur son profil. Le reste (raison sociale, province) vient de Zoho Books et doit
+// y être corrigé, sinon la note de crédit et l'adhésion divergeraient.
+app.put('/api/pass/me', authenticatePassToken, async (req, res) => {
+  try {
+    const locale = passLocale(req.body?.locale);
+    const m = (await pool.query(
+      `UPDATE pass_members SET locale = $2, updated_at = NOW() WHERE id = $1 RETURNING *`,
+      [req.passMember.id, locale]
+    )).rows[0];
+    res.json({ member: passMemberPublic(m, await getPassConfig()) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
