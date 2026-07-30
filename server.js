@@ -1105,6 +1105,38 @@ async function initializeDatabase() {
     // discount into sub_total (discount_total=0, sub_total < line sum) and sometimes reports it
     // separately — dividing the real net pre-tax by our gross line sum handles both.
     await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS gross_line_total NUMERIC(12,2)`);
+
+    // ------------------------------------------------------------------
+    // Deal co-selling: two reps worked the file together (user decision 2026-07-30)
+    // ------------------------------------------------------------------
+    // `commission` keeps meaning THE DEAL'S FULL COMMISSION. That is the whole
+    // point of this design: every aggregate (22 SUM sites), every report and the
+    // reconciliation keep showing the true total, nothing double-counts, and what
+    // the company pays out is unchanged. Only the SHARE each rep sees is new.
+    //
+    // Scope chosen by the user: MONEY ONLY. Both reps keep the deal at 100% for
+    // points and quota — crm_sold_deals is deliberately never touched, so a rep is
+    // not penalised in their quota for having worked as a team.
+    //
+    // The co-seller's share inherits the PRIMARY rep's rate and quota gate, because
+    // the commission is computed once per invoice (runRecalcV2) and then split. It
+    // is a division of one amount, not two independent commissions.
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS co_seller_name VARCHAR(255)`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS co_seller_percent NUMERIC(5,2)`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS co_seller_set_by VARCHAR(255)`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS co_seller_set_at TIMESTAMPTZ`);
+    // A rep can never be their own co-seller, and the share must be a real split.
+    await pool.query(`
+      DO $$ BEGIN
+        ALTER TABLE invoices ADD CONSTRAINT chk_co_seller_sane CHECK (
+          co_seller_name IS NULL
+          OR (co_seller_percent > 0 AND co_seller_percent < 100
+              AND co_seller_name IS DISTINCT FROM salesperson_name)
+        );
+      EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+    `);
+    // Rep-facing money queries now match on EITHER side of the split.
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_invoices_co_seller ON invoices(co_seller_name) WHERE co_seller_name IS NOT NULL`);
     // One-time correction: gross_line_total used to be summed from each line's net `amount`,
     // which is already net of item-level (per-line) discounts — silently hiding them from the
     // ≥25%-discount hardware-rate-halving rule (only invoice-level discounts were ever caught).
@@ -2297,6 +2329,62 @@ function requireWebhookSecret(primary, fallback) {
     });
     return res.status(401).json({ error: 'invalid secret' });
   };
+}
+
+// ============================================================================
+// CO-VENTE — la part de commission d'UN vendeur sur une facture
+// ============================================================================
+// Un seul endroit definit « combien ce vendeur-ci touche sur cette facture ».
+// C'est deliberement du SQL partage plutot que 10 copies : deux ecrans qui
+// calculent la meme part differemment, c'est un ecart de paie qu'on ne
+// decouvre qu'au moment ou quelqu'un se plaint.
+//
+// `invoices.commission` reste LA COMMISSION TOTALE DU DOSSIER. Les agregats,
+// les rapports et la reconciliation continuent donc de dire vrai, et la somme
+// des parts vaut exactement le total — on ne peut pas creer ni perdre d'argent
+// par arrondi de repartition.
+//
+// Sans co-vendeur, co_seller_percent est NULL : le principal touche 100 %,
+// donc le comportement est rigoureusement identique a avant.
+
+// Le co-vendeur touche sa part ARRONDIE au cent, et le principal touche LE RESTE.
+// Ce n'est pas cosmetique : un 50/50 sur 999,99 $ donne 499,995 $ chacun, qui
+// s'arrondit a 500,00 $ des deux cotes — soit 1 000,00 $ verses pour une
+// commission de 999,99 $. Un cent cree a partir de rien, a chaque dossier
+// concerne, et une reconciliation qui ne balance jamais. En donnant le reste au
+// principal, la somme des parts vaut EXACTEMENT le total, par construction.
+/** Fragment SQL : part du vendeur `$<n>` sur la colonne commission. */
+const repShareSql = (repParam, col = 'commission') => `
+  (CASE
+     WHEN co_seller_name IS NULL OR COALESCE(co_seller_percent, 0) = 0
+       THEN ${col}
+     WHEN co_seller_name = ${repParam}
+       THEN ROUND((${col} * co_seller_percent / 100.0)::numeric, 2)
+     ELSE ${col} - ROUND((${col} * co_seller_percent / 100.0)::numeric, 2)
+   END)`;
+
+/** Fragment SQL : cette facture concerne-t-elle ce vendeur, d'un cote ou de l'autre ? */
+const repMatchSql = (repParam) =>
+  `(salesperson_name = ${repParam} OR co_seller_name = ${repParam})`;
+
+/** Meme calcul, cote JS, pour les chemins qui travaillent sur des lignes deja
+ *  chargees. DOIT rester identique a repShareSql, arrondi compris — deux
+ *  formules qui divergent d'un cent, c'est une reconciliation qui ne balance pas. */
+function repShareOf(inv, repName) {
+  const total = Number(inv.commission) || 0;
+  const pct   = Number(inv.co_seller_percent) || 0;
+  if (!inv.co_seller_name || !pct) return total;
+  // Arithmetique en CENTS ENTIERS, et non en dollars flottants. Postgres calcule
+  // en NUMERIC (decimal exact) ; il faut REPRODUIRE cette semantique, pas
+  // l'approcher. Contre-exemple reel trouve en test : 19,99 $ partage 50/50.
+  // En flottant, 19.99 * 50 vaut 999.4999999999999 et non 999.5, donc l'arrondi
+  // bascule de l'autre cote et les deux formules attribuent 9,99 et 10,00 aux
+  // vendeurs INVERSES. Le total restait bon — seul le destinataire du cent
+  // changeait, ce qui est precisement le genre d'ecart qu'on ne decouvre que
+  // quand quelqu'un compare son talon a celui de son collegue.
+  const totalCents = Math.round(total * 100);
+  const coCents    = Math.round(totalCents * pct / 100);
+  return (inv.co_seller_name === repName ? coCents : totalCents - coCents) / 100;
 }
 
 
@@ -11635,6 +11723,15 @@ async function upsertInvoiceFromZoho(inv) {
        total            = $4,
        status           = $5,
        date             = $6,
+       -- CO-VENTE : si Zoho change le vendeur PRINCIPAL, un partage existant
+       -- deviendrait un partage entre un nouveau principal et l'ancien
+       -- co-vendeur — c'est-a-dire de l'argent attribue a quelqu'un que plus
+       -- personne n'a decide. On efface donc le partage, et l'admin le
+       -- redefinit en connaissance de cause. Silencieux serait pire.
+       co_seller_name    = CASE WHEN invoices.salesperson_name IS DISTINCT FROM $2
+                                THEN NULL ELSE invoices.co_seller_name END,
+       co_seller_percent = CASE WHEN invoices.salesperson_name IS DISTINCT FROM $2
+                                THEN NULL ELSE invoices.co_seller_percent END,
        updated_at       = CURRENT_TIMESTAMP`,
     [inv.invoice_number, salesperson, customerName, total, status, invDate, commission, process.env.ZOHO_ORG_ID]
   );
@@ -18472,10 +18569,19 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
     // Each line carries approval_status so callers can split paid vs unpaid.
     const genLines = async () => {
       const rows = (await pool.query(
-        `SELECT invoice_number, customer_name, commission::float AS commission, approval_status,
+        // CO-VENTE : `commission` reste le total du dossier ; ce qu'on paie a CE
+        // vendeur est sa part. Le filtre attrape les deux cotes du partage, donc
+        // un dossier co-vendu apparait sur les DEUX talons, chacun pour sa part.
+        // On expose aussi le total et le co-vendeur pour que le talon puisse
+        // dire « partage avec X » plutot qu'afficher un montant inexplicable.
+        `SELECT invoice_number, customer_name, approval_status,
+                ${repShareSql('$1')}::float AS commission,
+                commission::float           AS deal_commission,
+                co_seller_name, co_seller_percent::float AS co_seller_percent,
+                salesperson_name,
                 commission_status, quota_forfeited_amount::float AS quota_forfeited_amount
          FROM invoices
-         WHERE salesperson_name = $1 AND organization_id = $2
+         WHERE ${repMatchSql('$1')} AND organization_id = $2
            AND commission_payable_date >= $3 AND commission_payable_date < $4
            AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
          ORDER BY commission DESC`,
@@ -18484,11 +18590,22 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
       return rows.map(r => ({
         invoice_number: r.invoice_number,
         customer:       r.customer_name || null,
-        paid_amount:    r.commission || 0,
+        paid_amount:    r.commission || 0,   // deja la PART de ce vendeur (repShareSql)
         app_commission: r.commission || 0,
         approval_status: r.approval_status || 'pending',
         quota_partial: r.commission_status === 'quota_partial',
         quota_forfeited: r.quota_forfeited_amount || 0,
+        // Co-vente : de quoi expliquer le montant sur le document, sinon une
+        // ligne a 50 % du total ressemble a une erreur de calcul.
+        shared: r.co_seller_name
+          ? {
+              with:    r.co_seller_name === targetRep ? r.salesperson_name : r.co_seller_name,
+              percent: r.co_seller_name === targetRep
+                         ? (r.co_seller_percent || 0)
+                         : 100 - (r.co_seller_percent || 0),
+              dealTotal: r.deal_commission || 0,
+            }
+          : null,
       }));
     };
     // The bi-annual processing bonus is deliberately NOT part of the monthly pay stub (see
