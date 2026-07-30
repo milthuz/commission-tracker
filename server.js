@@ -2007,13 +2007,38 @@ initializeDatabase().then(() => { dbReady = true; });
 // Don't advertise the stack (Express sets X-Powered-By by default).
 app.disable('x-powered-by');
 
-// Baseline security headers. Deliberately hand-rolled rather than pulling in helmet: these four
-// are the ones that matter for a JSON API + PDF/logo byte responses, and none of them need tuning.
-// A real Content-Security-Policy is NOT set here — it has to be tailored to the Vite bundle and the
-// AppStream/PDF iframes first, so it's tracked as a follow-up rather than guessed at.
+// Origines autorisées à ENCADRER nos réponses (aperçus PDF affichés en iframe)
+// ET à faire des requêtes cross-origin. Une seule liste : deux listes qui
+// divergent, c'est une origine ajoutée d'un côté et pas de l'autre.
+const ALLOWED_ORIGINS = [
+  process.env.FRONTEND_URL,
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'https://sparkly-kulfi-c7641a.netlify.app', // Netlify (default)
+  'https://saleshub.clusterpos.com',          // custom domain
+  // (Removed a stale Vercel preview origin — that deployment is dead, and leaving a domain we
+  //  no longer control in the allowlist is a needless risk.)
+].filter(Boolean);
+
+// Baseline security headers, hand-rolled rather than pulling in helmet.
+//
+// ⚠️ PAS de X-Frame-Options. Il a été posé à SAMEORIGIN lors de l'audit de
+// sécurité (2026-07-29) et ça a CASSÉ tous les aperçus PDF : le frontend
+// (saleshub.clusterpos.com) et cette API (…railway.app) sont des origines
+// DIFFÉRENTES par conception, donc « same origin » interdit l'iframe et le
+// navigateur affiche « refused to connect ». X-Frame-Options ne sait pas
+// exprimer « une autre origine précise » — sa valeur ALLOW-FROM est obsolète et
+// ignorée par les navigateurs modernes.
+//
+// On utilise donc `frame-ancestors`, qui le remplace et sait nommer les
+// origines. Le résultat est PLUS strict que SAMEORIGIN ici : seules nos propres
+// interfaces peuvent encadrer, alors que SAMEORIGIN autorisait n'importe quelle
+// page servie depuis le domaine Railway.
+const FRAME_ANCESTORS = ["'self'", ...ALLOWED_ORIGINS.filter(o => /^https?:\/\//.test(o))].join(' ');
+
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');      // stops MIME-sniffing an uploaded logo/doc into HTML
-  res.setHeader('X-Frame-Options', 'SAMEORIGIN');          // API responses should never be framed cross-origin
+  res.setHeader('Content-Security-Policy', `frame-ancestors ${FRAME_ANCESTORS}`);
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   next();
@@ -2021,16 +2046,8 @@ app.use((req, res, next) => {
 
 app.use(cors({
   origin: function(origin, callback) {
-    const allowedOrigins = [
-      process.env.FRONTEND_URL,
-      'http://localhost:3000',
-      'http://localhost:3001',
-      'https://sparkly-kulfi-c7641a.netlify.app', // Netlify (default)
-      'https://saleshub.clusterpos.com', // custom domain
-      // (Removed a stale Vercel preview origin — that deployment is dead, and leaving a domain we
-      //  no longer control in the allowlist is a needless risk.)
-    ].filter(Boolean);
-    
+    const allowedOrigins = ALLOWED_ORIGINS;
+
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
