@@ -18158,6 +18158,13 @@ app.get('/api/commissions/invoices', authenticateToken, async (req, res) => {
         approvedAt:                 r.approved_at || null,
         payoutPaidBy:               r.payout_paid_by || null,
         payoutPaidAt:               r.payout_paid_at || null,
+        // CO-VENTE : `commission` ci-dessus est la PART de ce vendeur. Sans le
+        // contexte qui suit, une ligne a moitie du montant ressemble a une
+        // erreur de calcul — l'interface doit pouvoir ecrire « partage avec X ».
+        primaryRep:      r.salesperson_name || null,
+        dealCommission:  r.deal_commission == null ? null : parseFloat(r.deal_commission),
+        coSellerName:    r.co_seller_name || null,
+        coSellerPercent: r.co_seller_percent == null ? null : parseFloat(r.co_seller_percent),
       }))
     });
   } catch (error) {
