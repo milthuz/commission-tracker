@@ -8751,11 +8751,13 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
     const repName = td.display_name || req.user.name || email;
 
     const statsResult = await pool.query(
+      // CO-VENTE : le total gagne affiche au vendeur est la somme de SES parts.
+      // Le chiffre d'affaires reste entier (statistique, non partagee).
       `SELECT COUNT(*) AS paid_invoices,
-              COALESCE(SUM(commission), 0) AS total_commission,
+              COALESCE(SUM(${repShareSql('$1')}), 0) AS total_commission,
               COALESCE(SUM(total), 0) AS total_revenue
        FROM invoices
-       WHERE salesperson_name = $1 AND status = 'paid' AND organization_id = $2`,
+       WHERE ${repMatchSql('$1')} AND status = 'paid' AND organization_id = $2`,
       [repName, process.env.ZOHO_ORG_ID]
     );
     const stats = statsResult.rows[0] || {};
@@ -17941,9 +17943,13 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
       SELECT
         EXTRACT(MONTH FROM ${dateCol}) AS month_num,
         COUNT(*) AS invoices,
+        -- CO-VENTE : le CHIFFRE D'AFFAIRES reste entier des deux cotes — c'est une
+        -- statistique, et la portee choisie est « l'argent seulement » : les deux
+        -- vendeurs gardent le dossier a 100 % pour leurs stats. Seule la COMMISSION
+        -- est repartie, parce que c'est elle qu'on verse.
         COALESCE(SUM(total), 0) AS revenue,
-        COALESCE(SUM(commission), 0) AS commission,
-        COALESCE(SUM(CASE WHEN commission_paid THEN commission ELSE 0 END), 0) AS paid_commission,
+        COALESCE(SUM(${repShareSql('$1')}), 0) AS commission,
+        COALESCE(SUM(CASE WHEN commission_paid THEN ${repShareSql('$1')} ELSE 0 END), 0) AS paid_commission,
         COALESCE(SUM(CASE WHEN status = 'paid' THEN total ELSE 0 END), 0) AS paid_revenue,
         -- All three counts share the same base: invoices that actually EARN commission
         -- (commission > 0). Previously paid/approved counted ANY approval_status (incl. $0
@@ -17954,9 +17960,9 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
         COUNT(CASE WHEN commission > 0 AND approval_status = 'paid' THEN 1 END) AS commission_paid_count,
         COUNT(CASE WHEN commission > 0 AND approval_status = 'approved' THEN 1 END) AS commission_approved_count,
         COUNT(CASE WHEN commission > 0 THEN 1 END) AS commission_qualifying_count,
-        COALESCE(SUM(CASE WHEN approval_status = 'approved' THEN commission ELSE 0 END), 0) AS approved_commission
+        COALESCE(SUM(CASE WHEN approval_status = 'approved' THEN ${repShareSql('$1')} ELSE 0 END), 0) AS approved_commission
       FROM invoices
-      WHERE salesperson_name = $1 AND organization_id = $2
+      WHERE ${repMatchSql('$1')} AND organization_id = $2
         AND ${dateCol} >= $3 AND ${dateCol} <= $4
       GROUP BY EXTRACT(MONTH FROM ${dateCol}) ORDER BY month_num
     `, [targetRep, process.env.ZOHO_ORG_ID, startDate, endDate]);
@@ -17965,9 +17971,11 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
     const pendingResult = await pool.query(`
       SELECT
         COUNT(*) AS pending_count,
-        COALESCE(SUM(CASE WHEN hardware_amount > 0 THEN hardware_amount * ($5::numeric / 100.0) ELSE 0 END), 0) AS pending_commission
+        COALESCE(SUM(CASE WHEN hardware_amount > 0
+                          THEN ${repShareSql('$1', '(hardware_amount * ($5::numeric / 100.0))')}
+                          ELSE 0 END), 0) AS pending_commission
       FROM invoices
-      WHERE salesperson_name = $1 AND organization_id = $2
+      WHERE ${repMatchSql('$1')} AND organization_id = $2
         AND date >= $3 AND date <= $4
         AND commission_status IN ('pending_saas','pending_payment')
     `, [targetRep, process.env.ZOHO_ORG_ID, startDate, endDate, commissionRate]);
@@ -17979,6 +17987,10 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
     let quotaForfeitedByMonth = new Map();
     if (isAdmin || isOwnReport) {
       const qfRows = (await pool.query(`
+        -- CO-VENTE : volontairement reste sur salesperson_name SEUL. Le montant
+        -- perdu au quota raconte pourquoi LE PRINCIPAL n'a rien touche ce mois-la ;
+        -- c'est SA porte de quota qui a joue. L'afficher au co-vendeur lui
+        -- attribuerait un manque a gagner qui n'est pas le sien.
         SELECT EXTRACT(MONTH FROM quota_forfeited_period)::int AS month_num,
                SUM(quota_forfeited_amount)::float AS forfeited
           FROM invoices
@@ -18018,9 +18030,9 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
       SELECT COALESCE(customer_name, 'Unknown') AS customer_name,
              COUNT(*) AS invoices,
              COALESCE(SUM(total), 0) AS revenue,
-             COALESCE(SUM(commission), 0) AS commission
+             COALESCE(SUM(${repShareSql('$1')}), 0) AS commission
       FROM invoices
-      WHERE salesperson_name = $1 AND organization_id = $2
+      WHERE ${repMatchSql('$1')} AND organization_id = $2
         AND ${dateCol} >= $3 AND ${dateCol} ${custEndOp} $4
         AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
       GROUP BY customer_name ORDER BY commission DESC LIMIT 50
@@ -18107,12 +18119,19 @@ app.get('/api/commissions/invoices', authenticateToken, async (req, res) => {
     // rep can find a specific client/invoice across the whole period (used with month omitted).
     const q = (req.query.q || '').toString().trim();
     const result = await pool.query(`
-      SELECT invoice_number, customer_name, date, total, commission, status,
+      SELECT invoice_number, customer_name, date, total, status,
+             -- CO-VENTE : la colonne commission porte ici la PART de ce vendeur,
+             -- pour que la liste concorde avec le talon et le rapport. Le total du
+             -- dossier reste expose a cote, sinon un montant a moitie ressemble a
+             -- une erreur de calcul.
+             ${repShareSql('$1')} AS commission,
+             commission AS deal_commission,
+             co_seller_name, co_seller_percent, salesperson_name,
              commission_paid, commission_status, commission_payable_date,
              hardware_amount, saas_amount, subscription_activation_date, paid_date,
              approval_status, approved_by, approved_at, payout_paid_by, payout_paid_at
       FROM invoices
-      WHERE salesperson_name = $1 AND organization_id = $2 AND ${whereDate}
+      WHERE ${repMatchSql('$1')} AND organization_id = $2 AND ${whereDate}
         AND ($5::text IS NULL OR COALESCE(customer_name, 'Unknown') = $5)
         AND ($6::text IS NULL OR customer_name ILIKE '%'||$6||'%' OR invoice_number ILIKE '%'||$6||'%')
       ORDER BY COALESCE(commission_payable_date, date) DESC, date DESC
@@ -18395,10 +18414,12 @@ async function snapshotAppGeneratedStub(repName, year, month, actor) {
     [repName, periodStart, periodEnd])).rows[0];
   if (real) return null; // a real pay file is the source of truth — don't overwrite
   const invRows = (await pool.query(
-    `SELECT invoice_number, customer_name, commission::float AS commission,
+    // CO-VENTE : le talon fige doit enregistrer LA PART de ce vendeur, pas le
+    // total du dossier — c'est ce montant-la qui lui sera verse.
+    `SELECT invoice_number, customer_name, ${repShareSql('$1')}::float AS commission,
             commission_status, quota_forfeited_amount::float AS quota_forfeited_amount
        FROM invoices
-     WHERE salesperson_name = $1 AND organization_id = $2 AND commission_payable_date >= $3
+     WHERE ${repMatchSql('$1')} AND organization_id = $2 AND commission_payable_date >= $3
        AND commission_payable_date < $4 AND commission > 0
        AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial') AND approval_status = 'paid'
      ORDER BY commission DESC`,
@@ -19132,10 +19153,11 @@ app.get('/api/commissions/unpaid-commissions', authenticateToken, async (req, re
   if (!rep) return res.status(400).json({ error: 'repName required' });
   try {
     const rows = (await pool.query(
-      `SELECT invoice_number, customer_name AS customer, commission::float AS commission,
+      `SELECT invoice_number, customer_name AS customer,
+              ${repShareSql('$1')}::float AS commission,
               commission_status, commission_payable_date::date AS payable_date
        FROM invoices
-       WHERE salesperson_name = $1 AND organization_id = $2
+       WHERE ${repMatchSql('$1')} AND organization_id = $2
          AND commission > 0
          -- 'saas_renewal' is included here on purpose: a mixed hardware+SaaS invoice whose SaaS
          -- portion is a renewal (0%) still earns real hardware commission on top, but the bucket
@@ -19788,10 +19810,11 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
     await client.query('BEGIN');
 
     const invRows = (await client.query(
-      `SELECT invoice_number, customer_name, commission::float AS commission,
+      // CO-VENTE : on fige LA PART de ce vendeur — c'est ce montant qui sera verse.
+      `SELECT invoice_number, customer_name, ${repShareSql('$1')}::float AS commission,
               commission_status, quota_forfeited_amount::float AS quota_forfeited_amount
        FROM invoices
-       WHERE salesperson_name = $1 AND organization_id = $2
+       WHERE ${repMatchSql('$1')} AND organization_id = $2
          AND commission_payable_date >= $3 AND commission_payable_date < $4
          AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
          AND approval_status <> 'paid'
@@ -20033,10 +20056,11 @@ async function payrollDataForMonth(year, month) {
     } else {
       source = 'generated';
       lines = (await pool.query(
-        `SELECT invoice_number, customer_name AS customer, commission::float AS paid_amount,
+        // CO-VENTE : l'envoi de paie doit porter LA PART de ce vendeur.
+        `SELECT invoice_number, customer_name AS customer, ${repShareSql('$1')}::float AS paid_amount,
                 (commission_status = 'quota_partial') AS quota_partial, quota_forfeited_amount::float AS quota_forfeited
          FROM invoices
-         WHERE salesperson_name = $1 AND organization_id = $2
+         WHERE ${repMatchSql('$1')} AND organization_id = $2
            AND commission_payable_date >= $3 AND commission_payable_date < $4
            AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
            AND approval_status <> 'paid' ORDER BY commission DESC`,
