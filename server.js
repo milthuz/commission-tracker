@@ -70,6 +70,7 @@ const PERMISSION_CATALOG = [
   { key: 'report:adjustments',         label: 'Manage commission adjustments & reconciliation suggestions', category: 'Commission Report' },
   { key: 'report:quota_review',        label: 'Review quota-gated (forfeited) commissions',  category: 'Commission Report' },
   { key: 'pass:manage',                label: 'Configure The Pass (merchant referral program)', category: 'The Pass' },
+  { key: 'pass:referrals',             label: 'Track The Pass referrals and apply credits',     category: 'The Pass' },
 
   // Dashboard
   { key: 'dashboard:view_admin',       label: 'View the Admin dashboard (company finance + action items)', category: 'Dashboard' },
@@ -1633,6 +1634,54 @@ async function initializeDatabase() {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_pass_login_tokens_hash ON pass_login_tokens(token_hash)`);
+
+    // Les recommandations. Les quatre horodatages sont l'état : une étape est FAITE quand
+    // son horodatage existe, COURANTE quand c'est la première qui manque. Pas de machine à
+    // états parallèle à maintenir en plus de `status` — les dates sont la source, `status`
+    // en est le résumé interrogeable.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS pass_referrals (
+        id                  SERIAL PRIMARY KEY,
+        ref_code            VARCHAR(20) UNIQUE NOT NULL,
+        member_id           INT NOT NULL REFERENCES pass_members(id) ON DELETE CASCADE,
+        restaurant_name     VARCHAR(255) NOT NULL,
+        contact_name        VARCHAR(255) NOT NULL,
+        city                VARCHAR(255) NOT NULL,
+        province            VARCHAR(4) NOT NULL,
+        postal_code         VARCHAR(10) NOT NULL,
+        contact             VARCHAR(255) NOT NULL,
+        contact_locale      VARCHAR(5) NOT NULL DEFAULT 'fr-CA',
+        relationship        TEXT,
+        status              VARCHAR(20) NOT NULL DEFAULT 'new',
+        submitted_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        contacted_at        TIMESTAMP,
+        live_at             TIMESTAMP,
+        credit_applied_at   TIMESTAMP,
+        tier_at_submission  INT,
+        tier_at_live        INT,
+        credit_amount       NUMERIC(10,2),
+        currency            VARCHAR(3) DEFAULT 'CAD',
+        certificate_code    VARCHAR(40),
+        hardware_discount   NUMERIC(10,2),
+        crm_lead_id         VARCHAR(64),
+        crm_lead_error      TEXT,
+        consent_at          TIMESTAMP,
+        consent_locale      VARCHAR(5),
+        notes               TEXT,
+        created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    // Le numéro de dossier est SÉQUENTIEL, pas aléatoire : membre et spécialiste se le
+    // lisent au téléphone. Démarré à la valeur du design (CR-20418) pour qu'aucun numéro
+    // ne trahisse que le programme vient d'ouvrir.
+    await pool.query(`CREATE SEQUENCE IF NOT EXISTS pass_referral_code_seq START 20418`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_pass_referrals_member ON pass_referrals(member_id, submitted_at DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_pass_referrals_status ON pass_referrals(status, submitted_at DESC)`);
+    // Détection de doublons : deux membres qui recommandent le même restaurant. On
+    // n'impose PAS l'unicité — refuser une soumission sur une correspondance approximative
+    // ferait perdre de vraies recommandations. L'index sert à les faire remonter aux ops,
+    // à qui revient la décision.
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_pass_referrals_dupe ON pass_referrals(LOWER(restaurant_name), postal_code)`);
 
     // Resellers — third-party companies that resell licenses. POS activations come from a
     // Zoho Form; residual payments come from Zentact. Linked by reseller name for now.
@@ -11197,6 +11246,9 @@ async function createCrmLead(o) {
     Lead_Status: 'NEW',
     Lead_Contact_Method: 'Partner Portal',
   };
+  // La Passe passe par le même chemin (SH-22) mais doit rester distinguable dans le CRM :
+  // ce n'est pas un partenaire tiers qui recommande, c'est un marchand client.
+  if (o.lead_contact_method) fields.Lead_Contact_Method = o.lead_contact_method;
   if (o.lead_source) fields.Lead_Source = o.lead_source;
   if (o.contact_first_name) fields.First_Name = o.contact_first_name;
   if (o.contact_email) fields.Email = o.contact_email;
@@ -11204,7 +11256,7 @@ async function createCrmLead(o) {
   // SH-30 follow-up — the partner manager's chosen rep to own this Lead in Zoho CRM.
   if (o.crm_owner_id) fields.Owner = { id: o.crm_owner_id };
   const repName = [o.rep_first_name, o.rep_last_name].filter(Boolean).join(' ');
-  fields.Description = [
+  fields.Description = o.description || [
     `Referred by partner: ${o.partner_name}`,
     o.submitted_by_email ? `Submitted by: ${o.submitted_by_email}` : null,
     repName ? `Partner's rep on this deal: ${repName}${o.rep_phone ? ` — ${o.rep_phone}` : ''}${o.rep_email ? ` — ${o.rep_email}` : ''}` : null,
@@ -14689,6 +14741,393 @@ app.put('/api/pass/me', authenticatePassToken, async (req, res) => {
       [req.passMember.id, locale]
     )).rows[0];
     res.json({ member: passMemberPublic(m, await getPassConfig()) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================================
+// LA PASSE — recommandations
+// ============================================================================
+const PASS_STATUSES = ['new', 'contacted', 'live', 'credit_applied', 'not_qualified'];
+
+// Courriel OU téléphone canadien : le design laisse le membre donner ce qu'il a. Un
+// restaurateur connaît souvent le numéro de son voisin sans connaître son courriel.
+const isEmailLike = (s) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(s);
+const isCaPhone = (s) => {
+  const d = String(s).replace(/\D/g, '');
+  return d.length === 10 || (d.length === 11 && d.startsWith('1'));
+};
+// Format canadien A1A 1A1. On accepte l'espace absent ou multiple à la saisie et on
+// normalise : le code postal sert de clé de rapprochement des doublons, donc deux
+// écritures du même code doivent produire la même chaîne.
+function normalizePostalCode(raw) {
+  const s = String(raw || '').toUpperCase().replace(/[\s-]/g, '');
+  if (!/^[ABCEGHJ-NPRSTVXY]\d[A-Z]\d[A-Z]\d$/.test(s)) return null;
+  return `${s.slice(0, 3)} ${s.slice(3)}`;
+}
+
+function passReferralPublic(r) {
+  return {
+    id: r.id,
+    refCode: r.ref_code,
+    restaurant: {
+      name: r.restaurant_name, contactName: r.contact_name, city: r.city,
+      province: r.province, postalCode: r.postal_code, contact: r.contact,
+      locale: r.contact_locale, relationship: r.relationship || null,
+    },
+    status: r.status,
+    submittedAt: r.submitted_at,
+    contactedAt: r.contacted_at,
+    liveAt: r.live_at,
+    creditAppliedAt: r.credit_applied_at,
+    tierAtSubmission: r.tier_at_submission,
+    tierAtLive: r.tier_at_live,
+    creditAmount: r.credit_amount === null ? null : Number(r.credit_amount),
+    currency: r.currency,
+    certificateCode: r.certificate_code || null,
+    hardwareDiscount: r.hardware_discount === null ? null : Number(r.hardware_discount),
+  };
+}
+
+// POST /api/pass/referrals — le formulaire. La validation double celle du client, parce
+// qu'un client peut être contourné et qu'ici chaque ligne acceptée engage de l'argent.
+app.post('/api/pass/referrals', authenticatePassToken, async (req, res) => {
+  const b = req.body || {};
+  const config = await getPassConfig();
+  if (!config.enabled) return res.status(403).json({ error: 'program_not_open' });
+  if (rateLimited(`passrefer:${req.passMember.id}`, 10, 60 * 60 * 1000)) {
+    return res.status(429).json({ error: 'too_many_referrals' });
+  }
+
+  const str = (v, max) => String(v ?? '').trim().slice(0, max);
+  const restaurantName = str(b.restaurantName, 255);
+  const contactName    = str(b.contactName, 255);
+  const city           = str(b.city, 255);
+  const province       = String(b.province || '').trim().toUpperCase();
+  const postalCode     = normalizePostalCode(b.postalCode);
+  const contact        = str(b.contact, 255);
+  const relationship   = str(b.relationship, 2000) || null;
+  const contactLocale  = passLocale(b.contactLocale);
+
+  const missing = [];
+  if (!restaurantName) missing.push('restaurantName');
+  if (!contactName) missing.push('contactName');
+  if (!city) missing.push('city');
+  if (!CA_PROVINCES.includes(province)) missing.push('province');
+  if (!postalCode) missing.push('postalCode');
+  if (!contact || !(isEmailLike(contact) || isCaPhone(contact))) missing.push('contact');
+  if (b.consent !== true) missing.push('consent');
+  if (missing.length) return res.status(400).json({ error: 'invalid_fields', fields: missing });
+
+  try {
+    // Le crédit est calculé au palier de MISE EN SERVICE, pas de soumission. Ce qu'on
+    // enregistre ici est donc un PLANCHER — sûr précisément parce que l'échelle ne
+    // redescend jamais, donc le montant annoncé au formulaire ne peut qu'augmenter.
+    const lifetime = Number(req.passMember.lifetime_live_referrals) || 0;
+    const tier = passTierFor(config, lifetime);
+
+    const code = (await pool.query(`SELECT 'CR-' || nextval('pass_referral_code_seq') AS code`)).rows[0].code;
+    const r = (await pool.query(
+      `INSERT INTO pass_referrals
+         (ref_code, member_id, restaurant_name, contact_name, city, province, postal_code,
+          contact, contact_locale, relationship, tier_at_submission, credit_amount, currency,
+          hardware_discount, consent_at, consent_locale)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW(),$15)
+       RETURNING *`,
+      [code, req.passMember.id, restaurantName, contactName, city, province, postalCode,
+       contact, contactLocale, relationship, tier.level, tier.credit, config.currency,
+       config.hardwareDiscount, passLocale(b.consentLocale || req.passMember.locale)]
+    )).rows[0];
+
+    // Lead CRM au fil de l'eau : c'est là que le spécialiste travaille. Best-effort — une
+    // panne du CRM ne doit jamais faire perdre une recommandation déjà consentie.
+    const lead = await createCrmLead({
+      business_name: restaurantName,
+      contact_last_name: contactName,
+      contact_email: isEmailLike(contact) ? contact : null,
+      contact_phone: isEmailLike(contact) ? null : contact,
+      lead_contact_method: 'Merchant Referral',
+      lead_source: 'The Pass',
+      description: [
+        `Recommandé par le marchand : ${req.passMember.business || req.passMember.email} (${req.passMember.email})`,
+        `Dossier La Passe : ${code}`,
+        `${city}, ${province} ${postalCode}`,
+        `Langue de correspondance du restaurant : ${contactLocale}`,
+        relationship ? `Lien avec le membre : ${relationship}` : null,
+      ].filter(Boolean).join('\n'),
+    });
+    await pool.query(
+      `UPDATE pass_referrals SET crm_lead_id = $2, crm_lead_error = $3 WHERE id = $1`,
+      [r.id, lead.leadId || null, lead.success ? null : (lead.error || 'unknown')]
+    );
+
+    await logActivity('pass_referral', String(r.id), 'created',
+      `Recommandation ${code} — ${restaurantName} (${city}, ${province})`, req.passMember.email,
+      { metadata: { memberId: req.passMember.id, tierAtSubmission: tier.level, creditFloor: tier.credit, crmLeadId: lead.leadId || null } });
+
+    res.status(201).json({ referral: passReferralPublic({ ...r, crm_lead_id: lead.leadId || null }) });
+  } catch (e) {
+    console.warn('[pass] referral submit failed:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/pass/referrals — les siennes, jamais celles des autres.
+app.get('/api/pass/referrals', authenticatePassToken, async (req, res) => {
+  try {
+    const rows = (await pool.query(
+      `SELECT * FROM pass_referrals WHERE member_id = $1 ORDER BY submitted_at DESC`,
+      [req.passMember.id]
+    )).rows;
+    const config = await getPassConfig();
+    res.json({
+      referrals: rows.map(passReferralPublic),
+      // Gains : ce qui est effectivement crédité, et ce qui est acquis mais pas encore
+      // appliqué. Les deux nombres répondent à deux questions différentes du membre, et
+      // les confondre ferait réclamer un crédit déjà promis mais pas encore passé.
+      earnings: {
+        credited: rows.filter(r => r.status === 'credit_applied').reduce((s, r) => s + Number(r.credit_amount || 0), 0),
+        pending: rows.filter(r => r.status === 'live').reduce((s, r) => s + Number(r.credit_amount || 0), 0),
+        currency: config.currency,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Ops (interne) --------------------------------------------------------
+// Permission PROPRE, distincte de pass:manage : configurer les montants du programme et
+// traiter les dossiers d'un marchand sont deux métiers différents, et la comptabilité qui
+// applique un crédit n'a rien à faire dans l'échelle des paliers.
+
+// GET /api/admin/pass/referrals?status=&q=
+app.get('/api/admin/pass/referrals', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'pass:referrals'))) return;
+  try {
+    const status = String(req.query.status || '').trim();
+    const q = String(req.query.q || '').trim();
+    const where = ['1=1'];
+    const params = [];
+    if (PASS_STATUSES.includes(status)) { params.push(status); where.push(`r.status = $${params.length}`); }
+    if (q) {
+      params.push(`%${q}%`);
+      where.push(`(r.restaurant_name ILIKE $${params.length} OR r.ref_code ILIKE $${params.length}
+                   OR r.city ILIKE $${params.length} OR m.business ILIKE $${params.length}
+                   OR m.email ILIKE $${params.length})`);
+    }
+    const rows = (await pool.query(
+      `SELECT r.*, m.email AS member_email, m.business AS member_business, m.full_name AS member_name,
+              m.locale AS member_locale, m.lifetime_live_referrals AS member_lifetime,
+              -- Doublon : le même restaurant, au même code postal, recommandé par un AUTRE
+              -- dossier. Signalé, jamais bloqué — l'arbitrage appartient aux ops.
+              EXISTS (SELECT 1 FROM pass_referrals d
+                       WHERE d.id <> r.id AND LOWER(d.restaurant_name) = LOWER(r.restaurant_name)
+                         AND d.postal_code = r.postal_code) AS possible_duplicate
+         FROM pass_referrals r JOIN pass_members m ON m.id = r.member_id
+        WHERE ${where.join(' AND ')}
+        ORDER BY r.submitted_at DESC LIMIT 500`,
+      params
+    )).rows;
+    res.json({
+      referrals: rows.map(r => ({
+        ...passReferralPublic(r),
+        possibleDuplicate: r.possible_duplicate,
+        crmLeadId: r.crm_lead_id || null,
+        crmLeadError: r.crm_lead_error || null,
+        member: {
+          id: r.member_id, email: r.member_email, name: r.member_name,
+          business: r.member_business, locale: r.member_locale,
+          lifetimeLiveReferrals: Number(r.member_lifetime) || 0,
+        },
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/pass/summary — la rangée d'indicateurs du tableau ops.
+app.get('/api/admin/pass/summary', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'pass:referrals'))) return;
+  try {
+    const r = (await pool.query(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE status = 'new')::int AS awaiting_contact,
+              COUNT(*) FILTER (WHERE live_at >= date_trunc('month', CURRENT_DATE))::int AS live_this_month,
+              COALESCE(SUM(credit_amount) FILTER (WHERE status = 'credit_applied'), 0)::float AS credit_issued,
+              COUNT(*) FILTER (WHERE status = 'live')::int AS credit_pending
+         FROM pass_referrals`
+    )).rows[0];
+    const members = (await pool.query(
+      `SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE status = 'active')::int AS active FROM pass_members`
+    )).rows[0];
+    res.json({ referrals: r, members });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PATCH /api/admin/pass/referrals/:id/status { status }
+// Les transitions sont contraintes : le tableau ops est la seule chose qui déclenche de
+// l'argent, donc « en service » ne doit pas pouvoir être atteint par erreur depuis un
+// dossier déjà crédité ni depuis un dossier écarté.
+const PASS_TRANSITIONS = {
+  new:            ['contacted', 'not_qualified'],
+  contacted:      ['live', 'not_qualified'],
+  live:           ['credit_applied', 'not_qualified'],
+  credit_applied: [],
+  not_qualified:  ['contacted'],
+};
+app.patch('/api/admin/pass/referrals/:id/status', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'pass:referrals'))) return;
+  const next = String(req.body?.status || '').trim();
+  if (!PASS_STATUSES.includes(next)) return res.status(400).json({ error: 'invalid_status' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Verrou sur la ligne : passer « en service » incrémente un compteur à vie qui décide
+    // de tous les montants suivants. Deux clics simultanés sans verrou le compteraient deux
+    // fois, et l'erreur ne se verrait qu'au versement.
+    const r = (await client.query(`SELECT * FROM pass_referrals WHERE id = $1 FOR UPDATE`, [req.params.id])).rows[0];
+    if (!r) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'not_found' }); }
+    if (r.status === next) { await client.query('ROLLBACK'); return res.json({ referral: passReferralPublic(r) }); }
+    if (!(PASS_TRANSITIONS[r.status] || []).includes(next)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'invalid_transition', from: r.status, to: next });
+    }
+
+    const config = await getPassConfig();
+    let updated;
+    if (next === 'live') {
+      const m = (await client.query(`SELECT * FROM pass_members WHERE id = $1 FOR UPDATE`, [r.member_id])).rows[0];
+      const before = Number(m.lifetime_live_referrals) || 0;
+      // Le palier se lit sur le compteur AVANT d'y ajouter ce dossier : la 1ʳᵉ mise en
+      // service d'un membre paie le palier 1, pas le palier atteint grâce à elle.
+      const tier = passTierFor(config, before);
+      const after = before + 1;
+      const newTier = passTierFor(config, after);
+      await client.query(
+        `UPDATE pass_members SET lifetime_live_referrals = $2, tier_level = $3, updated_at = NOW() WHERE id = $1`,
+        [m.id, after, newTier.level]
+      );
+      updated = (await client.query(
+        `UPDATE pass_referrals SET status = 'live', live_at = NOW(), tier_at_live = $2, credit_amount = $3
+          WHERE id = $1 RETURNING *`,
+        [r.id, tier.level, tier.credit]
+      )).rows[0];
+      await logActivity('pass_referral', String(r.id), 'live',
+        `${r.ref_code} en service — crédit ${tier.credit} ${config.currency} au palier ${tier.level} pour ${m.email}`,
+        req.user.email || 'admin',
+        { metadata: { memberId: m.id, lifetimeBefore: before, lifetimeAfter: after, tierAtSubmission: r.tier_at_submission, tierAtLive: tier.level, creditFloorAtSubmission: r.credit_amount === null ? null : Number(r.credit_amount), creditAmount: tier.credit } });
+    } else {
+      const col = next === 'contacted' ? 'contacted_at' : null;
+      updated = (await client.query(
+        `UPDATE pass_referrals SET status = $2${col ? `, ${col} = COALESCE(${col}, NOW())` : ''} WHERE id = $1 RETURNING *`,
+        [r.id, next]
+      )).rows[0];
+      await logActivity('pass_referral', String(r.id), next,
+        `${r.ref_code} — statut « ${next} »`, req.user.email || 'admin', { metadata: { from: r.status, to: next } });
+    }
+    await client.query('COMMIT');
+    res.json({ referral: passReferralPublic(updated) });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /api/admin/pass/referrals/:id/credit — applique le crédit.
+// La note de crédit Zoho Books exige le scope `creditnotes.CREATE`, PAS encore accordé
+// (reconnexion Zoho requise). En attendant, l'étape avise la comptabilité par courriel et
+// enregistre le certificat : le programme peut ouvrir sans ce scope, et le jour où il sera
+// accordé, c'est ici qu'il se branche.
+app.post('/api/admin/pass/referrals/:id/credit', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'pass:referrals'))) return;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const r = (await client.query(`SELECT * FROM pass_referrals WHERE id = $1 FOR UPDATE`, [req.params.id])).rows[0];
+    if (!r) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'not_found' }); }
+    if (r.status !== 'live') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'not_ready_for_credit', status: r.status });
+    }
+    const m = (await client.query(`SELECT * FROM pass_members WHERE id = $1`, [r.member_id])).rows[0];
+    const config = await getPassConfig();
+    const amount = Number(r.credit_amount) || 0;
+    // Certificat lisible au téléphone : le montant y est visible, donc une erreur de
+    // dossier se voit avant l'appel à la comptabilité, pas après.
+    const code = `CLSTR-${Math.round(amount)}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+    const updated = (await client.query(
+      `UPDATE pass_referrals SET status = 'credit_applied', credit_applied_at = NOW(), certificate_code = $2
+        WHERE id = $1 RETURNING *`,
+      [r.id, code]
+    )).rows[0];
+    await client.query('COMMIT');
+
+    const recipients = await getPassCreditRecipients();
+    let mail = { sent: false, reason: 'no_recipients' };
+    if (recipients.length) {
+      const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const html = mailChrome(`
+        <h1 style="margin:0 0 14px;color:#0f1722;font-size:20px;font-weight:700">La Passe — crédit à appliquer</h1>
+        <div style="color:#475569;font-size:14.5px;line-height:1.75">
+          <p style="margin:0 0 12px">Une recommandation est passée en service. Le crédit est dû au marchand qui l'a faite.</p>
+          <table cellpadding="0" cellspacing="0" style="font-size:14px;line-height:1.9">
+            <tr><td style="color:#94a3b8;padding-right:14px">Marchand</td><td><strong>${esc(m.business || m.email)}</strong> — ${esc(m.email)}</td></tr>
+            <tr><td style="color:#94a3b8;padding-right:14px">Restaurant</td><td>${esc(r.restaurant_name)} — ${esc(r.city)}, ${esc(r.province)}</td></tr>
+            <tr><td style="color:#94a3b8;padding-right:14px">Dossier</td><td>${esc(r.ref_code)}</td></tr>
+            <tr><td style="color:#94a3b8;padding-right:14px">Montant</td><td><strong>${passMoney(amount, 'fr-CA')}</strong> (palier ${r.tier_at_live || r.tier_at_submission})</td></tr>
+            <tr><td style="color:#94a3b8;padding-right:14px">Certificat</td><td>${esc(code)}</td></tr>
+          </table>
+          <p style="margin:16px 0 0">À porter au compte Zoho Books du marchand comme note de crédit.</p>
+        </div>`, `Crédit ${passMoney(amount, 'fr-CA')} — ${m.business || m.email}`);
+      mail = await sendMail(recipients.join(','), `La Passe — crédit à appliquer : ${r.ref_code} (${passMoney(amount, 'fr-CA')})`, html);
+    }
+    await logActivity('pass_referral', String(r.id), 'credit_applied',
+      `${r.ref_code} — crédit ${amount} ${config.currency} appliqué à ${m.email} (certificat ${code})`,
+      req.user.email || 'admin',
+      { metadata: { memberId: m.id, amount, certificateCode: code, accountingNotified: mail.sent, recipients } });
+
+    res.json({ referral: passReferralPublic(updated), accountingNotified: mail.sent, notifyReason: mail.sent ? null : mail.reason });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Destinataires de l'avis « crédit à appliquer » — même patron que les autres listes de la
+// section Admin → Notifications. Une liste vide ne fait AUCUN envoi (convention maison), et
+// l'action le dit en clair dans sa réponse plutôt que de laisser croire à un avis parti.
+async function getPassCreditRecipients() {
+  try {
+    const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'pass_credit_recipients'`);
+    const v = r.rows[0]?.value;
+    return Array.isArray(v) ? v.filter(e => typeof e === 'string') : [];
+  } catch { return []; }
+}
+app.get('/api/admin/pass/credit-recipients', authenticateToken, async (req, res) => {
+  if (!(await requirePermAny(req, res, ['pass:referrals', 'admin:notifications']))) return;
+  res.json({ recipients: await getPassCreditRecipients() });
+});
+app.put('/api/admin/pass/credit-recipients', authenticateToken, async (req, res) => {
+  if (!(await requirePermAny(req, res, ['pass:referrals', 'admin:notifications']))) return;
+  const list = Array.isArray(req.body?.recipients) ? req.body.recipients : null;
+  if (!list) return res.status(400).json({ error: 'recipients must be an array' });
+  const clean = [...new Set(list.map(e => String(e || '').trim().toLowerCase()).filter(isEmailLike))];
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('pass_credit_recipients', $1::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [JSON.stringify(clean)]
+    );
+    res.json({ recipients: clean });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
