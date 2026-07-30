@@ -2208,27 +2208,41 @@ function secretMatches(provided, expected) {
   return crypto.timingSafeEqual(a, b);
 }
 
-function presentsSecret(req, expected, { warnOnQuery = true } = {}) {
+// `allowQuery` est explicite parce que les deux familles d'appelants n'ont PAS
+// le meme choix : un webhook Zoho ne sait poster qu'une URL, il n'a pas d'autre
+// option que la query string. Nos propres outils d'admin, eux, peuvent envoyer
+// un en-tete — donc pour eux la query string est refusee.
+function presentsSecret(req, expected, { allowQuery = false } = {}) {
   if (secretMatches(req.headers['x-cluster-webhook-secret'], expected)) return true;
-  if (req.query && secretMatches(req.query.secret, expected)) {
-    if (warnOnQuery) {
-      console.warn(`[ops-secret] ${req.method} ${req.path} authentifie par QUERY STRING `
-        + `- passer a l'en-tete x-cluster-webhook-secret (les query strings finissent dans les logs).`);
-    }
+  if (allowQuery && req.query && secretMatches(req.query.secret, expected)) return true;
+  return false;
+}
+
+// Message explicite quand quelqu'un utilise encore l'ancienne forme `?secret=`,
+// plutot qu'un « No token provided » trompeur venant de authenticateToken.
+// Ne valide PAS la valeur fournie : ne revele donc pas si le secret etait bon.
+function rejectQuerySecret(req, res) {
+  if (req.query && req.query.secret !== undefined) {
+    console.warn(`[ops-secret] ${req.method} ${req.path} refuse : secret passe en query string.`);
+    res.status(401).json({
+      error: "Le secret en query string n'est plus accepte. Utiliser l'en-tete x-cluster-webhook-secret.",
+    });
     return true;
   }
   return false;
 }
 
 // Endpoints d'admin / diagnostic jusqu'ici gardes UNIQUEMENT par le secret.
-// Le secret continue de fonctionner ; une session admin est desormais acceptee
-// aussi. C'est ce qui rendra possible de couper la query string sans perdre
-// l'acces a ces outils.
+// Secret en EN-TETE, ou session admin. La query string a ete coupee le
+// 2026-07-30 : elle atterrissait dans les logs HTTP de Railway, dans
+// l'historique du navigateur et dans le Referer. Aucun appelant automatise
+// n'en dependait (verifie : ni cron, ni CI, ni auto-appel du worker).
 function requireOpsSecret(req, res, next) {
   if (presentsSecret(req, process.env.ZOHO_WEBHOOK_SECRET)) {
     req.viaSecret = true;
     return next();
   }
+  if (rejectQuerySecret(req, res)) return;
   return authenticateToken(req, res, () => {
     if (!req.user || !req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
     next();
@@ -2244,21 +2258,31 @@ function requireOpsSecretOrSession(req, res, next) {
     req.viaSecret = true;
     return next();
   }
+  if (rejectQuerySecret(req, res)) return;
   return authenticateToken(req, res, next);
 }
 
 // Vrais webhooks entrants : aucune session ne peut exister cote appelant, donc
-// secret uniquement, et pas d'avertissement query string (Zoho ne sait poster
-// qu'une URL). `primary` d'abord : des que la variable dediee est definie dans
-// Railway, le secret partage cesse d'ouvrir le webhook - et surtout, l'URL du
-// webhook (visible dans la console Zoho) cesse d'ouvrir les endpoints d'admin.
+// secret uniquement, et query string autorisee (Zoho ne sait poster qu'une URL).
+//
+// Les DEUX secrets sont acceptes tant que les deux sont definis. C'est
+// deliberement une transition sans fenetre de risque : ce qu'on cherche a
+// fermer, c'est que l'URL du webhook — VISIBLE dans la console Zoho — contienne
+// le secret qui ouvre aussi les 66 endpoints d'administration. Cette fuite est
+// fermee des que l'URL cote Zoho porte le secret dedie, que l'endpoint accepte
+// encore l'ancien ou non. Donc : definir la variable, basculer Zoho quand on
+// veut, puis retirer le repli une fois la bascule confirmee dans les logs.
 function requireWebhookSecret(primary, fallback) {
   return (req, res, next) => {
-    const expected = process.env[primary] || (fallback ? process.env[fallback] : null);
-    if (!presentsSecret(req, expected, { warnOnQuery: false })) {
-      return res.status(401).json({ error: 'invalid secret' });
+    if (presentsSecret(req, process.env[primary], { allowQuery: true })) return next();
+    if (fallback && presentsSecret(req, process.env[fallback], { allowQuery: true })) {
+      if (process.env[primary]) {
+        console.warn(`[webhook] ${req.path} authentifie avec le secret PARTAGE alors que ${primary} `
+          + `est defini — l'URL configuree dans Zoho n'a pas encore ete basculee.`);
+      }
+      return next();
     }
-    next();
+    return res.status(401).json({ error: 'invalid secret' });
   };
 }
 
@@ -11633,15 +11657,24 @@ app.post('/api/webhooks/zoho-books/invoice', async (req, res) => {
   // endpoint qui journalise ses tentatives REJETÉES dans webhook_log, et cette
   // trace alimente le diagnostic. Le middleware générique la ferait disparaître.
   // La comparaison passe quand même par presentsSecret (temps constant, fail-closed).
-  const expected = process.env.ZOHO_BOOKS_WEBHOOK_SECRET || process.env.ZOHO_WEBHOOK_SECRET;
-  if (!expected) {
+  // Même transition sans fenêtre de risque que requireWebhookSecret : les deux
+  // secrets sont acceptés tant que les deux sont définis.
+  const dedicated = process.env.ZOHO_BOOKS_WEBHOOK_SECRET;
+  const shared    = process.env.ZOHO_WEBHOOK_SECRET;
+  if (!dedicated && !shared) {
     await logAttempt(null, 'not_configured');
     return res.status(503).json({ error: 'webhook not configured (ZOHO_BOOKS_WEBHOOK_SECRET / ZOHO_WEBHOOK_SECRET unset)' });
   }
-  if (!presentsSecret(req, expected, { warnOnQuery: false })) {
+  const viaDedicated = presentsSecret(req, dedicated, { allowQuery: true });
+  const viaShared    = !viaDedicated && presentsSecret(req, shared, { allowQuery: true });
+  if (!viaDedicated && !viaShared) {
     await logAttempt(null, 'bad_secret');
     console.warn('🚫 Webhook rejected — bad secret');
     return res.status(401).json({ error: 'invalid secret' });
+  }
+  if (viaShared && dedicated) {
+    console.warn('[webhook] /api/webhooks/zoho-books/invoice authentifié avec le secret PARTAGÉ alors que '
+      + "ZOHO_BOOKS_WEBHOOK_SECRET est défini — l'URL configurée dans Zoho Books n'a pas encore été basculée.");
   }
 
   const invoiceNumber = req.body?.invoice_number || req.body?.InvoiceNumber || req.body?.invoiceNumber;
