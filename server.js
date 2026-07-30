@@ -2282,6 +2282,19 @@ function requireWebhookSecret(primary, fallback) {
       }
       return next();
     }
+    // Sans ceci, un rejet ici est TOTALEMENT invisible : contrairement au webhook
+    // Zoho Books, ces endpoints n'ecrivent pas dans webhook_log. C'est ce qui a
+    // rendu le diagnostic du 2026-07-30 inutilement long. LONGUEURS seulement,
+    // jamais les valeurs — un ecart de 1 trahit un caractere parasite dans l'URL
+    // (le `&` final ajoute par erreur, encode en %26, devient le 65e caractere).
+    const sent = String(req.headers['x-cluster-webhook-secret'] || (req.query && req.query.secret) || '');
+    console.warn(`🚫 ${req.path} rejete — mauvais secret`, {
+      recuLen:    sent.length,
+      attenduLen: String(process.env[primary] || (fallback ? process.env[fallback] : '') || '').length,
+      via:        req.headers['x-cluster-webhook-secret'] ? 'en-tete'
+                  : (req.query && req.query.secret !== undefined ? 'query' : 'aucun secret fourni'),
+      variable:   primary,
+    });
     return res.status(401).json({ error: 'invalid secret' });
   };
 }
