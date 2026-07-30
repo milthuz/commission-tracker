@@ -69,6 +69,7 @@ const PERMISSION_CATALOG = [
   { key: 'report:annual_reconciliation', label: 'View the annual reconciliation report (paid vs calculated)', category: 'Commission Report' },
   { key: 'report:adjustments',         label: 'Manage commission adjustments & reconciliation suggestions', category: 'Commission Report' },
   { key: 'report:quota_review',        label: 'Review quota-gated (forfeited) commissions',  category: 'Commission Report' },
+  { key: 'pass:manage',                label: 'Configure The Pass (merchant referral program)', category: 'The Pass' },
 
   // Dashboard
   { key: 'dashboard:view_admin',       label: 'View the Admin dashboard (company finance + action items)', category: 'Dashboard' },
@@ -14185,6 +14186,123 @@ app.put('/api/admin/report-recipients', authenticateToken, async (req, res) => {
       [JSON.stringify(emails)]
     );
     res.json({ recipients: emails });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================================
+// THE PASS / LA PASSE — configuration du programme de recommandation marchand
+// ============================================================================
+// Les montants et l'échelle de paliers vivent dans app_settings, PAS dans le
+// code : ils apparaissent sur la page programme, l'espace membre, le formulaire,
+// les quatre courriels et les actions ops. Le design insiste — « amounts are
+// configuration, not constants », Cluster les changera.
+//
+// L'échelle est à VIE et ne redescend jamais : le palier vient du nombre de
+// recommandations passées en service depuis toujours. Décalage voulu (voir le
+// contrat de données) : un membre à 3 mises en service est encore au palier 2,
+// et c'est sa 4ᵉ qui paie le montant du palier 3.
+//
+// Le crédit est calculé au palier de MISE EN SERVICE, pas de soumission
+// (décision 2026-07-30). C'est sûr précisément parce que l'échelle ne redescend
+// jamais : le montant annoncé au formulaire est un plancher, jamais une promesse
+// trahie. On persiste quand même les deux paliers pour que chaque versement
+// reste vérifiable.
+const PASS_CONFIG_DEFAULTS = {
+  enabled: false,             // on n'ouvre pas un programme de récompenses par accident
+  currency: 'CAD',
+  countries: ['CA'],          // Canada seulement — règle d'éligibilité, pas juste de la copie
+  hardwareDiscount: 500,      // ce que le restaurant RECOMMANDÉ obtient
+  // `from` = mises en service à vie déjà atteintes. Le premier palier commence à 0.
+  tiers: [
+    { level: 1, from: 0, credit: 500,  key: 'commis' },
+    { level: 2, from: 1, credit: 750,  key: 'sous'   },
+    { level: 3, from: 3, credit: 1000, key: 'chef'   },
+  ],
+};
+
+/** Palier applicable pour un nombre de mises en service à vie. */
+function passTierFor(config, lifetimeLive) {
+  const n = Number(lifetimeLive) || 0;
+  // Les paliers sont triés par seuil croissant ; on prend le dernier atteint.
+  return [...(config.tiers || [])]
+    .sort((a, b) => a.from - b.from)
+    .reduce((best, t) => (n >= t.from ? t : best), config.tiers[0]);
+}
+
+async function getPassConfig() {
+  try {
+    const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'pass_config'`);
+    const v = r.rows[0]?.value;
+    if (!v || typeof v !== 'object') return { ...PASS_CONFIG_DEFAULTS };
+    // Fusion superficielle avec les valeurs par défaut : un réglage sauvegardé
+    // avant l'ajout d'un champ ne doit pas faire disparaître ce champ.
+    return { ...PASS_CONFIG_DEFAULTS, ...v,
+             tiers: Array.isArray(v.tiers) && v.tiers.length ? v.tiers : PASS_CONFIG_DEFAULTS.tiers };
+  } catch { return { ...PASS_CONFIG_DEFAULTS }; }
+}
+
+// GET /api/admin/pass/config — la configuration courante (+ les défauts, pour
+// que l'interface puisse proposer « réinitialiser » sans les coder en dur).
+app.get('/api/admin/pass/config', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'pass:manage'))) return;
+  try { res.json({ config: await getPassConfig(), defaults: PASS_CONFIG_DEFAULTS }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/admin/pass/config — enregistre l'échelle et les montants.
+app.put('/api/admin/pass/config', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'pass:manage'))) return;
+  const body = req.body || {};
+  const num = (x) => (Number.isFinite(Number(x)) ? Number(x) : NaN);
+
+  const tiers = Array.isArray(body.tiers) ? body.tiers.map((t, i) => ({
+    level: i + 1,
+    from: num(t.from),
+    credit: num(t.credit),
+    key: String(t.key || `tier${i + 1}`).trim().slice(0, 40),
+  })) : null;
+
+  if (!tiers || tiers.length === 0) return res.status(400).json({ error: 'tiers required' });
+  if (tiers.some(t => !Number.isFinite(t.from) || t.from < 0 || !Number.isFinite(t.credit) || t.credit <= 0)) {
+    return res.status(400).json({ error: 'chaque palier exige un seuil >= 0 et un crédit > 0' });
+  }
+  // Le premier palier DOIT partir de 0, sinon un membre sans recommandation
+  // n'est dans aucun palier et l'espace membre n'a rien à afficher.
+  if (tiers[0].from !== 0) return res.status(400).json({ error: 'le premier palier doit commencer à 0' });
+  // Seuils strictement croissants : deux paliers au même seuil rendraient le
+  // montant versé dépendant de l'ordre du tableau, donc imprévisible.
+  for (let i = 1; i < tiers.length; i++) {
+    if (tiers[i].from <= tiers[i - 1].from) {
+      return res.status(400).json({ error: 'les seuils doivent être strictement croissants' });
+    }
+  }
+  const hardwareDiscount = num(body.hardwareDiscount);
+  if (!Number.isFinite(hardwareDiscount) || hardwareDiscount < 0) {
+    return res.status(400).json({ error: 'rabais matériel invalide' });
+  }
+
+  const next = {
+    ...PASS_CONFIG_DEFAULTS,
+    enabled: !!body.enabled,
+    hardwareDiscount,
+    tiers,
+  };
+  try {
+    const before = await getPassConfig();
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('pass_config', $1::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [JSON.stringify(next)]
+    );
+    // De l'argent promis à des marchands : on garde qui a changé quoi, et depuis
+    // quelles valeurs — sans l'état d'avant, un montant modifié deux fois ne
+    // raconte plus rien.
+    await logActivity('pass_config', 'pass_config', 'updated',
+      `Configuration de La Passe modifiée${before.enabled !== next.enabled ? (next.enabled ? ' — programme ACTIVÉ' : ' — programme DÉSACTIVÉ') : ''}`,
+      req.user.email || 'admin', { metadata: { before, after: next } });
+    res.json({ config: next });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
