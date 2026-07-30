@@ -69,6 +69,7 @@ const PERMISSION_CATALOG = [
   { key: 'report:annual_reconciliation', label: 'View the annual reconciliation report (paid vs calculated)', category: 'Commission Report' },
   { key: 'report:adjustments',         label: 'Manage commission adjustments & reconciliation suggestions', category: 'Commission Report' },
   { key: 'report:quota_review',        label: 'Review quota-gated (forfeited) commissions',  category: 'Commission Report' },
+  { key: 'report:co_sell',             label: 'Split a deal between two reps (co-selling)',  category: 'Commission Report' },
 
   // Dashboard
   { key: 'dashboard:view_admin',       label: 'View the Admin dashboard (company finance + action items)', category: 'Dashboard' },
@@ -18254,6 +18255,98 @@ app.get('/api/commissions/processing-bonus-statement', authenticateToken, async 
 // POST /api/commissions/approve — supports { repName, year, month } OR { invoiceNumbers: [...] }
 // Locks a commission for payroll: sets approval_status='approved' (does NOT mark as paid).
 // Use /mark-paid afterwards to record actual rep payout.
+// ============================================================================
+// CO-VENTE — partager un dossier entre deux vendeurs
+// ============================================================================
+// PUT  /api/commissions/:invoiceNumber/co-seller   { coSellerName, percent }
+//      coSellerName = null  -> retire le partage
+//
+// Ne touche PAS au montant de la commission : `invoices.commission` reste le
+// total du dossier. On enregistre seulement QUI partage et DANS QUELLE
+// PROPORTION ; tous les ecrans « argent d'un vendeur » derivent la part de la.
+app.put('/api/commissions/:invoiceNumber/co-seller', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'report:co_sell'))) return;
+  const invoiceNumber = String(req.params.invoiceNumber || '').trim();
+  const rawName = req.body?.coSellerName;
+  const clearing = rawName === null || rawName === undefined || String(rawName).trim() === '';
+  const coSellerName = clearing ? null : String(rawName).trim();
+  const percent = clearing ? null : Number(req.body?.percent);
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+
+  if (!clearing && (!Number.isFinite(percent) || percent <= 0 || percent >= 100)) {
+    return res.status(400).json({ error: 'percent doit etre strictement entre 0 et 100' });
+  }
+  try {
+    const inv = (await pool.query(
+      `SELECT invoice_number, salesperson_name, customer_name, commission::float AS commission,
+              approval_status, co_seller_name, co_seller_percent::float AS co_seller_percent
+         FROM invoices WHERE invoice_number = $1 AND organization_id = $2`,
+      [invoiceNumber, process.env.ZOHO_ORG_ID])).rows[0];
+    if (!inv) return res.status(404).json({ error: 'Invoice not found' });
+
+    // PAYE = GELE. Le moteur ne recalcule jamais une facture payee, donc changer
+    // le partage ici ne changerait RIEN au montant deja verse : on afficherait
+    // une repartition qui ne correspond a aucun versement. Refuser est honnete ;
+    // la correction d'un dossier deja paye passe par les Ajustements.
+    if (inv.approval_status === 'paid') {
+      return res.status(409).json({
+        error: 'Ce dossier est deja paye — le partage ne changerait pas ce qui a ete verse. '
+             + 'Passer par Admin -> Commissions -> Ajustements, qui laisse une trace comptable.',
+        code: 'ALREADY_PAID',
+      });
+    }
+    if (!clearing) {
+      if (coSellerName === inv.salesperson_name) {
+        return res.status(400).json({ error: 'Le co-vendeur ne peut pas etre le vendeur principal' });
+      }
+      const sp = (await pool.query(
+        `SELECT name, is_active FROM salespeople WHERE name = $1`, [coSellerName])).rows[0];
+      if (!sp) return res.status(400).json({ error: `Vendeur inconnu : ${coSellerName}` });
+      if (sp.is_active === false) {
+        return res.status(400).json({ error: `${coSellerName} n'est plus actif` });
+      }
+    }
+
+    await pool.query(
+      `UPDATE invoices
+          SET co_seller_name = $2, co_seller_percent = $3,
+              co_seller_set_by = $4, co_seller_set_at = CURRENT_TIMESTAMP,
+              updated_at = CURRENT_TIMESTAMP
+        WHERE invoice_number = $1 AND organization_id = $5`,
+      [invoiceNumber, coSellerName, percent, clearing ? null : actor, process.env.ZOHO_ORG_ID]);
+
+    const total = inv.commission || 0;
+    // On passe par repShareOf plutot que de recalculer ici : une deuxieme
+    // formule, meme identique aujourd'hui, finit par diverger d'un cent.
+    const after = { commission: total, co_seller_name: coSellerName, co_seller_percent: percent };
+    const coShare      = clearing ? 0     : repShareOf(after, coSellerName);
+    const primaryShare = clearing ? total : repShareOf(after, inv.salesperson_name);
+    await logActivity('invoice', invoiceNumber,
+      clearing ? 'co_seller_cleared' : 'co_seller_set',
+      clearing
+        ? `Partage retire — ${inv.salesperson_name} redevient seul sur ce dossier`
+        : `Dossier partage : ${inv.salesperson_name} ${(100 - percent)}% / ${coSellerName} ${percent}%`,
+      actor,
+      { amount: clearing ? null : coShare,
+        metadata: { customer: inv.customer_name, dealCommission: total,
+                    primary: inv.salesperson_name, coSeller: coSellerName, percent,
+                    previous: inv.co_seller_name
+                      ? { coSeller: inv.co_seller_name, percent: inv.co_seller_percent } : null } });
+
+    res.json({
+      success: true,
+      invoiceNumber,
+      primary:   { name: inv.salesperson_name, percent: clearing ? 100 : 100 - percent,
+                   share: primaryShare },
+      coSeller:  clearing ? null : { name: coSellerName, percent, share: coShare },
+      dealCommission: total,
+    });
+  } catch (e) {
+    console.error('co-seller error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/api/commissions/approve', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'report:approve'))) return;
   const { repName, year, month, invoiceNumbers } = req.body;
