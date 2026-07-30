@@ -14610,6 +14610,27 @@ function passMail(locale, title, bodyHtml, cta) {
   </body></html>`;
 }
 
+// GET /api/pass/program — PUBLIC. Les montants et l'échelle, tels qu'ils s'affichent sur
+// la page programme, l'écran d'adhésion et le formulaire. Public par nécessité : ces écrans
+// sont vus AVANT toute connexion, et le brief interdit de recopier les montants dans le
+// client (« amounts are configuration, not constants »). Ne sort que ce qui est déjà
+// destiné à être lu par un marchand — aucun réglage interne.
+app.get('/api/pass/program', async (req, res) => {
+  try {
+    const c = await getPassConfig();
+    res.json({
+      enabled: !!c.enabled,
+      currency: c.currency,
+      countries: c.countries,
+      hardwareDiscount: c.hardwareDiscount,
+      tiers: [...(c.tiers || [])].sort((a, b) => a.from - b.from)
+        .map(t => ({ level: t.level, key: t.key, from: t.from, credit: t.credit })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /api/pass/auth/request-link { email, locale, consent }
 // Un seul point d'entrée pour l'inscription ET la connexion : la première fois, le lien
 // crée le membre ; ensuite, il ouvre la session. Il n'y a rien à retenir entre les deux.
