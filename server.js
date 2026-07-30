@@ -2188,6 +2188,82 @@ const authenticateToken = async (req, res, next) => {
 };
 
 // ============================================================================
+// GARDE A SECRET PARTAGE - centralisee (SECURITE)
+// ============================================================================
+// Remplace ~70 controles copies-colles qui vivaient chacun dans son handler
+// (23 variantes textuelles pour le meme controle). Ce qui change :
+//   - comparaison a temps constant : le `!==` d'avant fuyait le secret octet par octet
+//   - fail-CLOSED si la variable d'env manque. Une variante comparait contre
+//     `(process.env.X || '')`, donc `?secret=` vide serait passe si la var disparaissait.
+//   - le secret fourni n'est JAMAIS ecrit dans un log
+//   - avertit quand le secret arrive par la QUERY STRING : Railway l'ecrit dans ses
+//     logs HTTP, et le navigateur le garde dans l'historique et le Referer.
+//     L'en-tete x-cluster-webhook-secret est la forme sure. Cet avertissement sert
+//     a identifier les derniers appelants avant de couper la query string.
+function secretMatches(provided, expected) {
+  if (!expected || !provided) return false;
+  const a = Buffer.from(String(provided));
+  const b = Buffer.from(String(expected));
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+function presentsSecret(req, expected, { warnOnQuery = true } = {}) {
+  if (secretMatches(req.headers['x-cluster-webhook-secret'], expected)) return true;
+  if (req.query && secretMatches(req.query.secret, expected)) {
+    if (warnOnQuery) {
+      console.warn(`[ops-secret] ${req.method} ${req.path} authentifie par QUERY STRING `
+        + `- passer a l'en-tete x-cluster-webhook-secret (les query strings finissent dans les logs).`);
+    }
+    return true;
+  }
+  return false;
+}
+
+// Endpoints d'admin / diagnostic jusqu'ici gardes UNIQUEMENT par le secret.
+// Le secret continue de fonctionner ; une session admin est desormais acceptee
+// aussi. C'est ce qui rendra possible de couper la query string sans perdre
+// l'acces a ces outils.
+function requireOpsSecret(req, res, next) {
+  if (presentsSecret(req, process.env.ZOHO_WEBHOOK_SECRET)) {
+    req.viaSecret = true;
+    return next();
+  }
+  return authenticateToken(req, res, () => {
+    if (!req.user || !req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
+    next();
+  });
+}
+
+// Endpoints qui etaient DEJA en double-garde. Volontairement sans controle
+// d'autorisation ici : leur handler fait le sien, et ce n'est pas toujours
+// isAdmin (plusieurs exigent report:mark_paid, admin:notifications...). Imposer
+// isAdmin ici retirerait l'acces aux gestionnaires qui ont ces permissions.
+function requireOpsSecretOrSession(req, res, next) {
+  if (presentsSecret(req, process.env.ZOHO_WEBHOOK_SECRET)) {
+    req.viaSecret = true;
+    return next();
+  }
+  return authenticateToken(req, res, next);
+}
+
+// Vrais webhooks entrants : aucune session ne peut exister cote appelant, donc
+// secret uniquement, et pas d'avertissement query string (Zoho ne sait poster
+// qu'une URL). `primary` d'abord : des que la variable dediee est definie dans
+// Railway, le secret partage cesse d'ouvrir le webhook - et surtout, l'URL du
+// webhook (visible dans la console Zoho) cesse d'ouvrir les endpoints d'admin.
+function requireWebhookSecret(primary, fallback) {
+  return (req, res, next) => {
+    const expected = process.env[primary] || (fallback ? process.env[fallback] : null);
+    if (!presentsSecret(req, expected, { warnOnQuery: false })) {
+      return res.status(401).json({ error: 'invalid secret' });
+    }
+    next();
+  };
+}
+
+
+// ============================================================================
 // DEMO MODE — a flagged account gets the real app with scrambled data, read-only.
 // Toggled per user in Admin → Users (user_tokens.demo_mode / local_users.demo_mode).
 // ============================================================================
@@ -4782,11 +4858,7 @@ app.get('/api/demo/kaizen-capacity', authenticateToken, async (req, res) => {
 
 // GET /api/admin/pos-activations-recent?secret=  — diagnostic: latest reseller POS
 // activations, to confirm the Zoho Form webhook is landing rows (and spot test/blank rows).
-app.get('/api/admin/pos-activations-recent', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/pos-activations-recent', requireOpsSecret, async (req, res) => {
   try {
     // Optional cleanup: ?delete=<id> removes one activation row (e.g. a blank test row).
     let deleted = null;
@@ -4807,11 +4879,7 @@ app.get('/api/admin/pos-activations-recent', async (req, res) => {
 // GET /api/admin/sync-health?secret=  — diagnostic: how recently did the WORKER run its
 // scheduled jobs? Reads timestamps the worker writes to the (shared) DB, so it works even
 // though the worker has no HTTP. Used to confirm the Railway worker is alive after the move.
-app.get('/api/admin/sync-health', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/sync-health', requireOpsSecret, async (req, res) => {
   try {
     const now = (await pool.query(`SELECT NOW() AS now`)).rows[0].now;
     const lastSync = (await pool.query(
@@ -4833,11 +4901,7 @@ app.get('/api/admin/sync-health', async (req, res) => {
 
 // GET /api/admin/kaizen-capacity-raw?secret=  — diagnostic: confirms the AWS creds can
 // call DescribeFleets/DescribeSessions (distinct IAM actions from CreateStreamingURL).
-app.get('/api/admin/kaizen-capacity-raw', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/kaizen-capacity-raw', requireOpsSecret, async (req, res) => {
   const client = getAppStream();
   if (!client) return res.status(503).json({ error: 'demo_not_configured' });
   try {
@@ -6088,11 +6152,7 @@ app.get('/api/crm/sync-debug', authenticateToken, async (req, res) => {
 
 // GET /api/admin/impersonation-debug?secret=&name=<rep>  — why does impersonating <rep> show
 // (or not show) menus? Mirrors the impersonation email-resolution + returns the effective perms.
-app.get('/api/admin/impersonation-debug', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/impersonation-debug', requireOpsSecret, async (req, res) => {
   const name = String(req.query.name || '').trim();
   if (!name) return res.status(400).json({ error: 'name required' });
   try {
@@ -6118,11 +6178,7 @@ app.get('/api/admin/impersonation-debug', async (req, res) => {
 
 // GET /api/admin/zoho-account-raw?secret=&id=&q=  — dump all fields of a Zoho Account record
 // (by id, real-time) or accounts matching a name, to find where the Adyen ID lives.
-app.get('/api/admin/zoho-account-raw', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/zoho-account-raw', requireOpsSecret, async (req, res) => {
   const id = String(req.query.id || '').trim();
   const q = String(req.query.q || '').trim();
   if (!id && !q) return res.status(400).json({ error: 'id or q required' });
@@ -6144,8 +6200,7 @@ app.get('/api/admin/zoho-account-raw', async (req, res) => {
 
 // GET /api/admin/crm-modules?secret= — list all CRM modules (incl. custom) with their api_name,
 // to find the custom "payment case" module that holds the Adyen Store ID (SH-14).
-app.get('/api/admin/crm-modules', async (req, res) => {
-  if ((req.query.secret || req.headers['x-cluster-webhook-secret']) !== process.env.ZOHO_WEBHOOK_SECRET) return res.status(401).json({ error: 'invalid secret' });
+app.get('/api/admin/crm-modules', requireOpsSecret, async (req, res) => {
   try {
     const crmToken = await ensureValidCrmToken();
     if (!crmToken) return res.status(400).json({ error: 'CRM not connected' });
@@ -6157,8 +6212,7 @@ app.get('/api/admin/crm-modules', async (req, res) => {
 
 // GET /api/admin/crm-module-raw?secret=&module=<api_name>[&q=name] — dump non-null fields of the
 // first few records (or a name search) of a CRM module, to find the Adyen Store ID field.
-app.get('/api/admin/crm-module-raw', async (req, res) => {
-  if ((req.query.secret || req.headers['x-cluster-webhook-secret']) !== process.env.ZOHO_WEBHOOK_SECRET) return res.status(401).json({ error: 'invalid secret' });
+app.get('/api/admin/crm-module-raw', requireOpsSecret, async (req, res) => {
   const module = String(req.query.module || '').trim();
   if (!module) return res.status(400).json({ error: 'module required' });
   const q = String(req.query.q || '').trim();
@@ -6192,8 +6246,7 @@ async function fetchAllCrmModule(crmToken, module, fields) {
 // SH-14 end-to-end coverage diagnostic: how many Zentact merchants link to a SaaS subscription
 // via Project_Cases.Adyen_Store_ID → account → Subscription_Number → Zoho Billing.
 // GET /api/admin/sh14-coverage?secret=
-app.get('/api/admin/sh14-coverage', async (req, res) => {
-  if ((req.query.secret || req.headers['x-cluster-webhook-secret']) !== process.env.ZOHO_WEBHOOK_SECRET) return res.status(401).json({ error: 'invalid secret' });
+app.get('/api/admin/sh14-coverage', requireOpsSecret, async (req, res) => {
   const norm = (s) => String(s || '').trim().toLowerCase();
   const lookupName = (v) => (v && (v.name || v)) || '';
   try {
@@ -6269,8 +6322,7 @@ app.get('/api/admin/sh14-coverage', async (req, res) => {
 
 // GET /api/admin/find-salesperson?secret=&q= — search the salespeople table AND recent Zoho
 // Books estimates for a salesperson name (to locate a rep who only has estimates, no invoices).
-app.get('/api/admin/find-salesperson', async (req, res) => {
-  if ((req.query.secret || req.headers['x-cluster-webhook-secret']) !== process.env.ZOHO_WEBHOOK_SECRET) return res.status(401).json({ error: 'invalid secret' });
+app.get('/api/admin/find-salesperson', requireOpsSecret, async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (!q) return res.status(400).json({ error: 'q required' });
   try {
@@ -6301,11 +6353,7 @@ app.get('/api/admin/find-salesperson', async (req, res) => {
 
 // GET /api/admin/zentact-raw?secret=  — dump the FULL raw merchant object from the Zentact API
 // (top-level fields, not just custom attributes) to find an Adyen/PSP identifier.
-app.get('/api/admin/zentact-raw', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/zentact-raw', requireOpsSecret, async (req, res) => {
   try {
     const zentact = new ZentactService(process.env.ZENTACT_API_KEY);
     const merchants = await zentact.getMerchantAccounts({ status: 'ACTIVE' });
@@ -6326,11 +6374,7 @@ app.get('/api/admin/zentact-raw', async (req, res) => {
 // GET /api/admin/zentact-store-raw?secret=&storeId=&merchantAccountId=  — probe Zentact's
 // dedicated /stores endpoint to discover whether it returns a human "Store Name" (the
 // merchant-accounts stores[] array only has storeId/storeReferenceId, no name).
-app.get('/api/admin/zentact-store-raw', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/zentact-store-raw', requireOpsSecret, async (req, res) => {
   const axios = require('axios');
   const base = process.env.ZENTACT_API_URL || 'https://api.zentact.com/api/v1';
   const headers = { 'X-API-Key': process.env.ZENTACT_API_KEY };
@@ -6353,11 +6397,7 @@ app.get('/api/admin/zentact-store-raw', async (req, res) => {
 
 // GET /api/admin/zentact-attrs?secret=  — distinct custom-attribute keys across all Zentact
 // merchants + a sample, to find which attribute holds the Adyen ID.
-app.get('/api/admin/zentact-attrs', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/zentact-attrs', requireOpsSecret, async (req, res) => {
   try {
     // raw_attributes is a JSONB array of objects; surface each object's keys + the 'name' values.
     const keyRows = (await pool.query(`
@@ -6376,11 +6416,7 @@ app.get('/api/admin/zentact-attrs', async (req, res) => {
 });
 
 // GET /api/admin/resources-count?secret=  — confirm the library + key tables are intact (diagnostic).
-app.get('/api/admin/resources-count', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/resources-count', requireOpsSecret, async (req, res) => {
   try {
     const resources = (await pool.query(`SELECT COUNT(*)::int c, COALESCE(SUM(file_size),0)::bigint bytes FROM resources`)).rows[0];
     const byCat = (await pool.query(`SELECT COALESCE(NULLIF(category,''),'(none)') cat, COUNT(*)::int c FROM resources GROUP BY 1 ORDER BY c DESC LIMIT 30`)).rows;
@@ -6395,11 +6431,7 @@ app.get('/api/admin/resources-count', async (req, res) => {
 
 // GET /api/admin/customer-lookup?secret=&q=  — distinct customer names matching q, with
 // invoice count + whether they're in excluded_customers (diagnose exact-match exclusion).
-app.get('/api/admin/customer-lookup', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/customer-lookup', requireOpsSecret, async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (!q) return res.status(400).json({ error: 'q required' });
   try {
@@ -6421,11 +6453,7 @@ app.get('/api/admin/customer-lookup', async (req, res) => {
 
 // GET /api/admin/customer-invoices?secret=&q=  — every invoice of customers matching q with
 // the full commission-relevant state (diagnose "why is X in this rep's report?").
-app.get('/api/admin/customer-invoices', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/customer-invoices', requireOpsSecret, async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (!q) return res.status(400).json({ error: 'q required' });
   try {
@@ -6448,11 +6476,7 @@ app.get('/api/admin/customer-invoices', async (req, res) => {
 // GET /api/admin/adjustments-audit?secret=&year=&month=  — read-only peek at commission_adjustments
 // for a target period, without needing a JWT session. Used to verify a delete/bulk-add actually
 // persisted server-side.
-app.get('/api/admin/adjustments-audit', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/adjustments-audit', requireOpsSecret, async (req, res) => {
   try {
     const year = parseInt(req.query.year), month = parseInt(req.query.month);
     const params = []; let where = '';
@@ -6472,11 +6496,7 @@ app.get('/api/admin/adjustments-audit', async (req, res) => {
 // GET /api/admin/saas-first-audit?secret=  — every saas_first invoice, flagged when the customer
 // already had a MUCH older SaaS invoice (suspect: an old customer re-classified as a new
 // activation because only their latest invoice got a subscription_activation_date).
-app.get('/api/admin/saas-first-audit', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/saas-first-audit', requireOpsSecret, async (req, res) => {
   try {
     const rows = (await pool.query(`
       SELECT i.invoice_number, i.customer_name, i.salesperson_name,
@@ -6509,11 +6529,7 @@ app.get('/api/admin/saas-first-audit', async (req, res) => {
 // Eaton failure mode), among those with a recent (≤270d) monthly-SaaS invoice. Use this to check
 // backfillActivationDates() progress (customers should drop off this list once their activation
 // date resolves) and to flag anything that still needs a human review afterward.
-app.get('/api/admin/first-month-fallback-preview', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/first-month-fallback-preview', requireOpsSecret, async (req, res) => {
   try {
     const rows = (await pool.query(`
       WITH earliest_saas AS (
@@ -6560,11 +6576,7 @@ app.get('/api/admin/first-month-fallback-preview', async (req, res) => {
 // the "prior" SaaS invoice is actually within 45 days beforehand — i.e. same onboarding week, not
 // a genuinely pre-existing customer. Used to size the blast radius of adding the same slack this
 // file already uses for the monthly-SaaS equivalent (INITIAL_GROUP_SLACK_MS) before touching it.
-app.get('/api/admin/annual-slack-preview', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/annual-slack-preview', requireOpsSecret, async (req, res) => {
   try {
     const rows = (await pool.query(`
       WITH first_saas AS (
@@ -6604,11 +6616,7 @@ app.get('/api/admin/annual-slack-preview', async (req, res) => {
 // GET /api/admin/saas-annual-paid-audit?secret=  — every saas_annual invoice currently earning
 // real (>0) commission, with rep/active status — used to reconcile the actual recalc-v2 impact
 // against the annual-slack-preview's estimate.
-app.get('/api/admin/saas-annual-paid-audit', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/saas-annual-paid-audit', requireOpsSecret, async (req, res) => {
   try {
     const rows = (await pool.query(`
       SELECT i.invoice_number, i.customer_name, i.salesperson_name, i.commission::float AS commission,
@@ -6622,11 +6630,7 @@ app.get('/api/admin/saas-annual-paid-audit', async (req, res) => {
 
 // GET /api/admin/customer-first-sale?secret=&q=  — read-only peek at customer_first_sale rows,
 // optionally filtered by a customer-name substring.
-app.get('/api/admin/customer-first-sale', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/customer-first-sale', requireOpsSecret, async (req, res) => {
   try {
     const q = String(req.query.q || '').trim();
     const params = []; let where = '';
@@ -6641,11 +6645,7 @@ app.get('/api/admin/customer-first-sale', async (req, res) => {
 // GET /api/admin/too-late-audit?secret=  — every frozen (paid) too_late invoice, with the
 // hardware commission it would now earn under the no-window rule (2026-07-13), for deciding
 // whether/how to retroactively carry them forward.
-app.get('/api/admin/too-late-audit', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/too-late-audit', requireOpsSecret, async (req, res) => {
   try {
     const spRes = await pool.query('SELECT name, commission_rate FROM salespeople');
     const rateMap = {};
@@ -6688,11 +6688,7 @@ app.get('/api/admin/too-late-audit', async (req, res) => {
 
 // GET /api/admin/exclude-add?secret=&name=  — replicate the exclude-customer INSERT at the DB
 // level (diagnose why the UI add doesn't persist) AND actually exclude the customer.
-app.get('/api/admin/exclude-add', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/exclude-add', requireOpsSecret, async (req, res) => {
   const name = String(req.query.name || '').trim();
   if (!name) return res.status(400).json({ error: 'name required' });
   try {
@@ -6712,11 +6708,7 @@ app.get('/api/admin/exclude-add', async (req, res) => {
 
 // GET /api/admin/rep-commission-debug?secret=&name=&year=  — explain a rep's dashboard money:
 // payable commission per month, what's pending (not yet unlocked), and this-month invoices.
-app.get('/api/admin/rep-commission-debug', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/rep-commission-debug', requireOpsSecret, async (req, res) => {
   const name = String(req.query.name || '').trim();
   const year = parseInt(req.query.year) || new Date().getFullYear();
   if (!name) return res.status(400).json({ error: 'name required' });
@@ -6752,11 +6744,7 @@ app.get('/api/admin/rep-commission-debug', async (req, res) => {
 });
 
 // GET /api/admin/rep-config?secret=&name=  — a rep's toggles + team settings (diagnostic).
-app.get('/api/admin/rep-config', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/rep-config', requireOpsSecret, async (req, res) => {
   const name = String(req.query.name || '').trim();
   if (!name) return res.status(400).json({ error: 'name required' });
   try {
@@ -6776,11 +6764,7 @@ app.get('/api/admin/rep-config', async (req, res) => {
 // repsNoRole query resolves to (user_tokens.display_name match, else salespeople.email) and
 // whether any user_roles row exists for THAT email — the two usually diverge on an accent/name
 // mismatch between the Zoho display name and the salespeople row.
-app.get('/api/admin/rep-role-debug', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/rep-role-debug', requireOpsSecret, async (req, res) => {
   const name = String(req.query.name || '').trim();
   if (!name) return res.status(400).json({ error: 'name required' });
   try {
@@ -6814,11 +6798,7 @@ app.get('/api/admin/rep-role-debug', async (req, res) => {
 // invoice can only be in ONE commission_payment_lines row (the import that settled it), so this
 // answers disputes like "Gabriella says X wasn't paid" definitively instead of guessing from
 // commission_status alone.
-app.get('/api/admin/invoice-payment-source', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/invoice-payment-source', requireOpsSecret, async (req, res) => {
   const number = String(req.query.number || '').trim();
   if (!number) return res.status(400).json({ error: 'number required' });
   try {
@@ -6849,11 +6829,7 @@ app.get('/api/admin/invoice-payment-source', async (req, res) => {
 // GET /api/admin/rep-imports?secret=&rep=<name>  — every commission_payment_imports row for a
 // rep, ordered by period. Answers "does a pay file even exist for month X?" (vs a specific
 // invoice just being omitted from an otherwise-complete import) when reconciling a dispute.
-app.get('/api/admin/rep-imports', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/rep-imports', requireOpsSecret, async (req, res) => {
   const rep = String(req.query.rep || '').trim();
   if (!rep) return res.status(400).json({ error: 'rep required' });
   try {
@@ -6870,11 +6846,7 @@ app.get('/api/admin/rep-imports', async (req, res) => {
 });
 
 // GET /api/admin/payroll-sends-dump?secret=  — raw rows from payroll_sends (diagnostic).
-app.get('/api/admin/payroll-sends-dump', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/payroll-sends-dump', requireOpsSecret, async (req, res) => {
   try {
     const rows = (await pool.query(
       `SELECT id, rep_name, period::date AS period, sent_at, sent_by, sent_to, total
@@ -6886,11 +6858,7 @@ app.get('/api/admin/payroll-sends-dump', async (req, res) => {
 
 // GET /api/admin/zoho-deal-raw?secret=&q=<name>  — current RAW Zoho deal(s) matching a name,
 // exposing every source/lead field + the stored value, to diagnose a stale lead source.
-app.get('/api/admin/zoho-deal-raw', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/zoho-deal-raw', requireOpsSecret, async (req, res) => {
   const q = String(req.query.q || '').trim();
   const byId = String(req.query.id || '').trim();
   if (!q && !byId) return res.status(400).json({ error: 'q or id required' });
@@ -6922,11 +6890,7 @@ app.get('/api/admin/zoho-deal-raw', async (req, res) => {
 });
 
 // GET /api/admin/crm-deals?secret=&q=<name>  — stored CRM deals matching a name (diagnostic).
-app.get('/api/admin/crm-deals', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/crm-deals', requireOpsSecret, async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (!q) return res.status(400).json({ error: 'q required' });
   try {
@@ -6946,11 +6910,7 @@ app.get('/api/admin/crm-deals', async (req, res) => {
 // that NO LONGER exist in Zoho (deleted there). The regular sync only upserts, so a deal deleted
 // in Zoho lingers as a stale row + phantom point. This prunes ONLY the gone ones (preserves
 // lead-source overrides on everything else, unlike the full TRUNCATE reset).
-app.post('/api/admin/prune-deleted-deal', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.post('/api/admin/prune-deleted-deal', requireOpsSecret, async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (!q) return res.status(400).json({ error: 'q required' });
   try {
@@ -9377,8 +9337,7 @@ app.get('/api/billing/metrics', authenticateToken, async (req, res) => {
 
 // Secret diagnostic: confirms the durable cache rows exist + their age, without needing
 // direct DB access. GET /api/admin/durable-cache-status?secret=
-app.get('/api/admin/durable-cache-status', async (req, res) => {
-  if (req.query.secret !== (process.env.ZOHO_WEBHOOK_SECRET || '')) return res.status(401).json({ error: 'bad secret' });
+app.get('/api/admin/durable-cache-status', requireOpsSecret, async (req, res) => {
   try {
     const rows = (await pool.query(
       `SELECT key, updated_at, length(value::text) AS bytes FROM app_settings
@@ -9390,8 +9349,7 @@ app.get('/api/admin/durable-cache-status', async (req, res) => {
 
 // Secret diagnostic: raw billing metrics so the numbers can be validated against the
 // Zoho Billing dashboard before wiring the UI. GET /api/admin/billing-metrics-raw?secret=
-app.get('/api/admin/billing-metrics-raw', async (req, res) => {
-  if (req.query.secret !== (process.env.ZOHO_WEBHOOK_SECRET || '')) return res.status(401).json({ error: 'bad secret' });
+app.get('/api/admin/billing-metrics-raw', requireOpsSecret, async (req, res) => {
   try {
     const data = await billingMetricsCache.warm(computeBillingMetrics); // also (re)warms the shared cache
     res.json(data);
@@ -10431,8 +10389,7 @@ app.put('/api/admin/merchant-links/:merchantId', authenticateToken, async (req, 
 // Secret calibration diagnostic: per-status breakdown for ONE org (count + MRR via `amount`
 // vs `sub_total`) + the subscription field keys, to nail the exact MRR/active definition that
 // matches the Zoho dashboard. GET /api/admin/billing-debug?secret=&org=
-app.get('/api/admin/billing-debug', async (req, res) => {
-  if (req.query.secret !== (process.env.ZOHO_WEBHOOK_SECRET || '')) return res.status(401).json({ error: 'bad secret' });
+app.get('/api/admin/billing-debug', requireOpsSecret, async (req, res) => {
   const orgId = String(req.query.org || ZOHO_BILLING_ORG_IDS[0]);
   try {
     const { accessToken, apiDomain } = await getAdminBooksAuth();
@@ -10458,8 +10415,7 @@ app.get('/api/admin/billing-debug', async (req, res) => {
 // GET /api/admin/billing-sub-debug?secret=&num= — find a subscription by number and list ALL
 // active subscriptions of its customer, to explain why a customer's matched MRR may exceed one
 // subscription's amount (we aggregate per customer).
-app.get('/api/admin/billing-sub-debug', async (req, res) => {
-  if ((req.query.secret || req.headers['x-cluster-webhook-secret']) !== process.env.ZOHO_WEBHOOK_SECRET) return res.status(401).json({ error: 'invalid secret' });
+app.get('/api/admin/billing-sub-debug', requireOpsSecret, async (req, res) => {
   const num = String(req.query.num || '').trim().toLowerCase();
   if (!num) return res.status(400).json({ error: 'num required' });
   try {
@@ -10487,8 +10443,7 @@ app.get('/api/admin/billing-sub-debug', async (req, res) => {
 // SH-14 feasibility diagnostic: how well do Zentact merchants join to SaaS subscriptions?
 // Tests the CRM-Deal-ID bridge (merchant.opportunity_id == subscription.zcrm_potential_id)
 // plus a name-match fallback. GET /api/admin/merchant-saas-link-debug?secret=
-app.get('/api/admin/merchant-saas-link-debug', async (req, res) => {
-  if (req.query.secret !== (process.env.ZOHO_WEBHOOK_SECRET || '')) return res.status(401).json({ error: 'bad secret' });
+app.get('/api/admin/merchant-saas-link-debug', requireOpsSecret, async (req, res) => {
   const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   try {
     const { accessToken, apiDomain } = await getAdminBooksAuth();
@@ -11254,11 +11209,7 @@ const logoFromBody = (b) => (b ? Buffer.from(String(b).replace(/^data:[^,]+,/, '
 // GET /api/admin/proposal-email-debug?secret=[&estimateId=]  — diagnose client-email prefill.
 // No id → list a few recent estimates (id/number/customer). With id → run getEstimateDetail +
 // report the raw contacts-call HTTP status (401 = missing ZohoBooks.contacts.READ scope).
-app.get('/api/admin/proposal-email-debug', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/proposal-email-debug', requireOpsSecret, async (req, res) => {
   try {
     // Direct CRM-failover test: ?crmName=Benedetta → what email the CRM lookup returns.
     const crmName = String(req.query.crmName || '').trim();
@@ -11288,11 +11239,7 @@ app.get('/api/admin/proposal-email-debug', async (req, res) => {
 
 // GET /api/admin/mail-test?secret=[&to=]  — diagnose SMTP/SendGrid: config presence, a live
 // transporter.verify() (auth check), and an optional real send to `to`.
-app.get('/api/admin/mail-test', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/mail-test', requireOpsSecret, async (req, res) => {
   const cfg = {
     host: process.env.SMTP_HOST || null, port: process.env.SMTP_PORT || null,
     user: process.env.SMTP_USER ? '(set)' : null, pass: process.env.SMTP_PASS ? '(set)' : null,
@@ -11666,11 +11613,6 @@ async function upsertInvoiceFromZoho(inv) {
 // Note: we deliberately re-fetch the full invoice from Zoho rather than trust
 // the webhook body — keeps our logic robust if Zoho changes payload format.
 app.post('/api/webhooks/zoho-books/invoice', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  const expected = process.env.ZOHO_WEBHOOK_SECRET;
-  // Log every call (even rejected ones) — gives us a trail of who fired what,
-  // including the User-Agent and source IP so we can tell Zoho's calls apart
-  // from curl/manual tests.
   const userAgent = String(req.headers['user-agent'] || '').slice(0, 500);
   const sourceIp  = String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim().slice(0, 64);
   const logAttempt = async (action, result) => {
@@ -11687,13 +11629,18 @@ app.post('/api/webhooks/zoho-books/invoice', async (req, res) => {
     } catch (_e) { /* don't fail the request just because logging failed */ }
   };
 
+  // Authentification en ligne plutôt que via requireWebhookSecret : c'est le seul
+  // endpoint qui journalise ses tentatives REJETÉES dans webhook_log, et cette
+  // trace alimente le diagnostic. Le middleware générique la ferait disparaître.
+  // La comparaison passe quand même par presentsSecret (temps constant, fail-closed).
+  const expected = process.env.ZOHO_BOOKS_WEBHOOK_SECRET || process.env.ZOHO_WEBHOOK_SECRET;
   if (!expected) {
     await logAttempt(null, 'not_configured');
-    return res.status(503).json({ error: 'webhook not configured (ZOHO_WEBHOOK_SECRET unset)' });
+    return res.status(503).json({ error: 'webhook not configured (ZOHO_BOOKS_WEBHOOK_SECRET / ZOHO_WEBHOOK_SECRET unset)' });
   }
-  if (provided !== expected) {
+  if (!presentsSecret(req, expected, { warnOnQuery: false })) {
     await logAttempt(null, 'bad_secret');
-    console.warn('🚫 Webhook rejected — bad secret', { providedLen: (provided || '').length });
+    console.warn('🚫 Webhook rejected — bad secret');
     return res.status(401).json({ error: 'invalid secret' });
   }
 
@@ -11788,11 +11735,7 @@ app.post('/api/webhooks/zoho-books/invoice', async (req, res) => {
 // Full dump of every "Unassigned" earned-commission invoice (no salesperson on the Zoho
 // invoice), with a SUGGESTED rep where the customer name matches a Zentact merchant that
 // has one. Working list for fixing attribution IN ZOHO (sync overwrites local edits).
-app.get('/api/admin/unassigned-invoices', (req, res, next) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) { req.viaSecret = true; return next(); }
-  return authenticateToken(req, res, next);
-}, async (req, res) => {
+app.get('/api/admin/unassigned-invoices', requireOpsSecretOrSession, async (req, res) => {
   if (!req.viaSecret && !(await requirePermAny(req, res, ['admin:notifications', 'admin:data_health']))) return;
   // Default scope matches the Data Health card exactly (unassigned invoices from 2026-01-01
   // on — the old pre-2026 backlog is accepted, permanent noise per the 2026-06-08 "leave as-is"
@@ -11886,11 +11829,7 @@ app.get('/api/admin/unassigned-invoices', (req, res, next) => {
 // GET /api/admin/rep-customers?secret=<shared>&rep=<name-or-part>&from=YYYY-MM-DD&to=YYYY-MM-DD
 // Distinct customers (accounts) on a rep's commission invoices, with activity stats and
 // whether the account was a NEW activation (has a saas_first invoice) in the window.
-app.get('/api/admin/rep-customers', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/rep-customers', requireOpsSecret, async (req, res) => {
   const rep = String(req.query.rep || '').trim();
   if (!rep) return res.status(400).json({ error: 'rep required' });
   const from = req.query.from || '2025-01-01';
@@ -11925,11 +11864,7 @@ app.get('/api/admin/rep-customers', async (req, res) => {
 
 // GET /api/admin/invoice-lookup?secret=<shared>&numbers=INV-1,INV-2
 // Debug helper: full commission-relevant state for specific invoices.
-app.get('/api/admin/invoice-lookup', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/invoice-lookup', requireOpsSecret, async (req, res) => {
   const numbers = String(req.query.numbers || '').split(',').map(s => s.trim()).filter(Boolean);
   if (!numbers.length) return res.status(400).json({ error: 'numbers required (comma-separated)' });
   try {
@@ -11953,11 +11888,7 @@ app.get('/api/admin/invoice-lookup', async (req, res) => {
 
 // GET /api/admin/annual-audit?secret=  — every saas_annual invoice still paying 10%, flagged
 // with whether the customer had an EARLIER SaaS invoice (had_prior_saas=true ⇒ should be 0%).
-app.get('/api/admin/annual-audit', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/annual-audit', requireOpsSecret, async (req, res) => {
   try {
     const rows = (await pool.query(
       `WITH first_saas AS (
@@ -11991,11 +11922,7 @@ app.get('/api/admin/annual-audit', async (req, res) => {
 // GET /api/admin/customer-invoices?secret=&q=<name>  — all invoices for customers matching q,
 // oldest first, with annual-plan line names. Used to check whether an "annual sub (10%)" is a
 // genuine first occurrence or a renewal that should be 0%.
-app.get('/api/admin/customer-invoices', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/customer-invoices', requireOpsSecret, async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (!q) return res.status(400).json({ error: 'q (customer name) required' });
   try {
@@ -12021,11 +11948,7 @@ app.get('/api/admin/customer-invoices', async (req, res) => {
 // (default 2026-04-01: the report era ≤ Apr 2026 is frozen history anyway).
 // Fire-and-forget; poll progress via ?status=1 (rows remaining).
 let subtotalBackfill = { status: 'idle', processed: 0, total: 0, errors: 0 };
-app.post('/api/admin/backfill-subtotals', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.post('/api/admin/backfill-subtotals', requireOpsSecret, async (req, res) => {
   if (req.query.status) return res.json(subtotalBackfill);
   if (subtotalBackfill.status === 'running') return res.status(409).json({ error: 'already running', ...subtotalBackfill });
   const from = req.query.from || '2026-04-01';
@@ -12115,11 +12038,7 @@ app.post('/api/admin/backfill-subtotals', async (req, res) => {
 // Maintenance: flip STORED hardware lines whose name matches the noncommission rules
 // (shipping/livraison/freight — classifyLineType already excludes them going forward)
 // and recompute hardware_amount on the touched invoices. Idempotent; run recalc-v2 after.
-app.post('/api/admin/reclassify-noncommission', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.post('/api/admin/reclassify-noncommission', requireOpsSecret, async (req, res) => {
   try {
     const flip = await pool.query(`
       WITH affected AS (
@@ -12159,11 +12078,7 @@ app.post('/api/admin/reclassify-noncommission', async (req, res) => {
   }
 });
 
-app.get('/api/admin/db-stats', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/db-stats', requireOpsSecret, async (req, res) => {
   try {
     const counts = {};
     const tables = [
@@ -12364,11 +12279,7 @@ app.get('/api/admin/db-stats', async (req, res) => {
 // (and from a cron). Fire-and-forget (the job can take minutes); poll the summary.
 //   ?from=YYYY-MM&to=YYYY-MM  → backfill a range
 //   ?monthsBack=N             → last N months (default 2)
-app.get('/api/admin/zentact-revenue-sync', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/zentact-revenue-sync', requireOpsSecret, async (req, res) => {
   if (revenueSyncJob.running) return res.json({ alreadyRunning: true, job: revenueSyncJob });
   let periods, resume;
   if (req.query.from && req.query.to) {
@@ -12387,11 +12298,7 @@ app.get('/api/admin/zentact-revenue-sync', async (req, res) => {
 
 // Trigger the OTHER-REVENUE backfill (statement PDFs → recurring/terminal fees).
 //   ?from=YYYY-MM&to=YYYY-MM (resumes by default; &force=1 re-does) | ?monthsBack=N
-app.get('/api/admin/zentact-otherrev-sync', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/zentact-otherrev-sync', requireOpsSecret, async (req, res) => {
   if (otherRevJob.running) return res.json({ alreadyRunning: true, job: otherRevJob });
   let periods, resume;
   if (req.query.from && req.query.to) {
@@ -12408,11 +12315,7 @@ app.get('/api/admin/zentact-otherrev-sync', async (req, res) => {
 });
 
 // Other-revenue progress + totals.
-app.get('/api/admin/zentact-otherrev-summary', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/zentact-otherrev-summary', requireOpsSecret, async (req, res) => {
   try {
     const t = (await pool.query(
       `SELECT COUNT(*) FILTER (WHERE other_revenue_cents IS NOT NULL)::int AS rows_with_other,
@@ -12436,11 +12339,7 @@ app.get('/api/admin/zentact-otherrev-summary', async (req, res) => {
 
 // Revenue summary — row counts + totals (cents) by salesperson and by reseller.
 // Used to verify the import and to feed the eventual UI.
-app.get('/api/admin/zentact-revenue-summary', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/admin/zentact-revenue-summary', requireOpsSecret, async (req, res) => {
   try {
     const totals = (await pool.query(
       `SELECT COUNT(*)::int AS rows, COUNT(DISTINCT merchant_account_id)::int AS merchants,
@@ -13691,11 +13590,8 @@ app.get('/api/resellers/unassigned-emails', authenticateToken, async (req, res) 
 //   reseller_name (required, link key), license_type, quantity, customer_name, submitted_at
 app.post('/api/webhooks/zoho-form/license-order',
   bodyParser.urlencoded({ extended: true }), // also accept form-encoded payloads
+  requireWebhookSecret('ZOHO_FORM_WEBHOOK_SECRET', 'ZOHO_WEBHOOK_SECRET'),
   async (req, res) => {
-    const expected = process.env.ZOHO_FORM_WEBHOOK_SECRET || process.env.ZOHO_WEBHOOK_SECRET;
-    if (!expected || req.query.secret !== expected) {
-      return res.status(401).json({ error: 'Invalid webhook secret' });
-    }
     try {
       const b = req.body || {};
       // Tolerate both payload shapes: the clean keys the current form sends
@@ -14685,16 +14581,7 @@ app.put('/api/admin/report-years', authenticateToken, async (req, res) => {
 // and how much earned commission is still UNPAID per the app's model. Lets the user spot
 // at a glance which pay files are missing (report era ≤ Apr 2026) and which platform
 // periods (May 2026+) haven't been committed yet.
-app.get('/api/admin/commission-imports/coverage/matrix', (req, res, next) => {
-  // Shared-secret bypass (same as rep-customers/db-stats) so reconciliation state
-  // can be audited without a session.
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) {
-    req.viaSecret = true;
-    return next();
-  }
-  return authenticateToken(req, res, next);
-}, async (req, res) => {
+app.get('/api/admin/commission-imports/coverage/matrix', requireOpsSecretOrSession, async (req, res) => {
   if (!req.viaSecret && !(await requirePerm(req, res, 'report:mark_paid'))) return;
   try {
     // Months from 2025-01 through the current month (minus admin-disabled years)
@@ -14795,11 +14682,7 @@ app.get('/api/admin/commission-imports/coverage/matrix', (req, res, next) => {
 // GET /api/webhooks/log?secret=<shared>&invoice=<optional>&limit=<optional>
 // Returns the last N rows of webhook_log so we can audit incoming calls without
 // needing Heroku log access. Gated by the same shared secret as the webhook.
-app.get('/api/webhooks/log', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(401).json({ error: 'invalid secret' });
-  }
+app.get('/api/webhooks/log', requireOpsSecret, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 500);
   const invoice = (req.query.invoice || '').trim() || null;
   try {
@@ -16203,11 +16086,7 @@ app.delete('/api/roles/:id', authenticateToken, async (req, res) => {
 // salesperson who doesn't already have a role. Resolves each rep's email via their login
 // account (user_tokens.display_name) or the "Courriel de connexion" on their card. Reps
 // with neither are returned in `noEmail` so the admin can set their email. Idempotent.
-app.post('/api/admin/assign-default-rep-role', (req, res, next) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) { req.viaSecret = true; return next(); }
-  return authenticateToken(req, res, next);
-}, async (req, res) => {
+app.post('/api/admin/assign-default-rep-role', requireOpsSecretOrSession, async (req, res) => {
   if (!req.viaSecret && !req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   try {
     const role = (await pool.query(`SELECT id FROM roles WHERE name = 'Sales Rep' LIMIT 1`)).rows[0];
@@ -16888,14 +16767,7 @@ async function backfillActivationDates(onlyNumbers = null) {
 
 // POST /api/invoices/enrich/backfill-activation-dates — manual trigger for the retry pass above
 // (it also runs automatically after every sync). Dual-gated like recalc-v2/start.
-app.post('/api/invoices/enrich/backfill-activation-dates', (req, res, next) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) {
-    req.viaSecret = true;
-    return next();
-  }
-  return authenticateToken(req, res, next);
-}, async (req, res) => {
+app.post('/api/invoices/enrich/backfill-activation-dates', requireOpsSecretOrSession, async (req, res) => {
   if (!req.viaSecret && !req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   try {
     const numbers = Array.isArray(req.body?.invoiceNumbers) ? req.body.invoiceNumbers.map(String) : null;
@@ -16963,14 +16835,7 @@ async function backfillCustomerFirstSale(onlyNames = null) {
 
 // POST /api/invoices/enrich/backfill-customer-first-sale — manual trigger (also runs
 // automatically after every sync). Dual-gated like recalc-v2/start.
-app.post('/api/invoices/enrich/backfill-customer-first-sale', (req, res, next) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) {
-    req.viaSecret = true;
-    return next();
-  }
-  return authenticateToken(req, res, next);
-}, async (req, res) => {
+app.post('/api/invoices/enrich/backfill-customer-first-sale', requireOpsSecretOrSession, async (req, res) => {
   if (!req.viaSecret && !req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   try {
     const names = Array.isArray(req.body?.customerNames) ? req.body.customerNames.map(String) : null;
@@ -17186,11 +17051,7 @@ app.post('/api/invoices/enrich/stop', authenticateToken, (req, res) => {
 // GET /api/admin/zoho-invoice-raw?secret=&number=INV-xxxx  — raw Zoho line items for one invoice
 // (item_total, discount per line + invoice discount fields). Diagnostic to see how Zoho records
 // a discount (free line item_total=0 vs entity-level discount).
-app.get('/api/admin/zoho-invoice-raw', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
+app.get('/api/admin/zoho-invoice-raw', requireOpsSecret, async (req, res) => {
   const number = String(req.query.number || '').trim();
   if (!number) return res.status(400).json({ error: 'number required' });
   try {
@@ -17229,11 +17090,7 @@ app.get('/api/admin/zoho-invoice-raw', async (req, res) => {
 // POST /api/admin/reclassify-saas?secret=&count=  — re-classify STORED line_items so lines named
 // "...saas..." that were mislabeled 'hardware' become 'saas' (classifier now matches "saas").
 // Recomputes hardware_amount/saas_amount/type per invoice (no Zoho), then auto-recalcs.
-app.post('/api/admin/reclassify-saas', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
+app.post('/api/admin/reclassify-saas', requireOpsSecret, async (req, res) => {
   const orgId = process.env.ZOHO_ORG_ID;
   // Affected = a stored line currently typed 'hardware' whose name contains "saas".
   const findSql = `
@@ -17279,11 +17136,7 @@ app.post('/api/admin/reclassify-saas', async (req, res) => {
 // small list of invoices (re-fetch from Zoho, re-store line_items/hardware/saas/gross with the
 // fixed item_total=0 parse). Bypasses the flaky in-memory enrichJob (2 web dynos) so a targeted
 // fix is reliable. Keep the list small (<= ~20) to stay under the 30s request limit.
-app.post('/api/admin/reenrich-invoices', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
+app.post('/api/admin/reenrich-invoices', requireOpsSecret, async (req, res) => {
   const numbers = String(req.query.numbers || req.body?.numbers || '').split(',').map(s => s.trim()).filter(Boolean);
   if (!numbers.length) return res.status(400).json({ error: 'numbers required (comma-separated)' });
   try {
@@ -17346,11 +17199,7 @@ app.post('/api/admin/reenrich-invoices', async (req, res) => {
 // invoices (sub_total < gross_line_total) so 100%-discounted/free lines, which the old parser
 // stored at full price (item_total=0 fell back to rate*qty), get their correct net amount (0).
 // Bounded re-fetch from Zoho, then auto-recalc. ?count=1 reports how many would be processed.
-app.post('/api/admin/reenrich-discounted', async (req, res) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (!process.env.ZOHO_WEBHOOK_SECRET || provided !== process.env.ZOHO_WEBHOOK_SECRET) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
+app.post('/api/admin/reenrich-discounted', requireOpsSecret, async (req, res) => {
   const where = `AND sub_total IS NOT NULL AND gross_line_total IS NOT NULL AND sub_total < gross_line_total - 0.01`;
   try {
     if (req.query.count === '1') {
@@ -20499,11 +20348,7 @@ app.post('/api/commissions/payroll/send', authenticateToken, async (req, res) =>
 // GET /api/commissions/processing-bonus/committed?year=&month=  (month must be 6 or 12)
 // Read-only per-rep breakdown of the ALREADY-COMMITTED bi-annual bonus for a period — what the
 // send action below would actually email, without sending anything.
-app.get('/api/commissions/processing-bonus/committed', (req, res, next) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) { req.viaSecret = true; return next(); }
-  return authenticateToken(req, res, next);
-}, async (req, res) => {
+app.get('/api/commissions/processing-bonus/committed', requireOpsSecretOrSession, async (req, res) => {
   if (!req.viaSecret && !(await requirePerm(req, res, 'report:mark_paid'))) return;
   const year = parseInt(req.query.year), month = parseInt(req.query.month);
   if (!year || (month !== 6 && month !== 12)) return res.status(400).json({ error: 'year + month (6 or 12) required' });
@@ -20815,11 +20660,7 @@ async function computeProcessingBonuses(payoutYear, payoutMonth) {
 
 // GET /api/admin/processing-bonus?secret=&year=&month=  — preview the bi-annual bonus
 // (month must be 6 or 12). Without secret, falls back to JWT report:mark_paid.
-app.get('/api/admin/processing-bonus', (req, res, next) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) { req.viaSecret = true; return next(); }
-  return authenticateToken(req, res, next);
-}, async (req, res) => {
+app.get('/api/admin/processing-bonus', requireOpsSecretOrSession, async (req, res) => {
   if (!req.viaSecret && !(await requirePerm(req, res, 'report:mark_paid'))) return;
   const year = parseInt(req.query.year), month = parseInt(req.query.month);
   if (!year || (month !== 6 && month !== 12)) return res.status(400).json({ error: 'year + month (6 or 12) required' });
@@ -20921,11 +20762,7 @@ app.post('/api/commissions/processing-bonus/uncommit', authenticateToken, async 
 // Diagnostic: why is (or isn't) an account excluded from the bi-annual payout?
 // Returns the matching Zentact merchants + every recorded 'processing' bonus matching q,
 // and whether the fuzzy name-exclusion in computeProcessingBonuses would catch it.
-app.get('/api/admin/processing-bonus/debug', (req, res, next) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) { req.viaSecret = true; return next(); }
-  return authenticateToken(req, res, next);
-}, async (req, res) => {
+app.get('/api/admin/processing-bonus/debug', requireOpsSecretOrSession, async (req, res) => {
   if (!req.viaSecret && !(await requirePerm(req, res, 'report:mark_paid'))) return;
   const q = String(req.query.q || '').trim();
   if (!q) return res.status(400).json({ error: 'q (merchant name) required' });
@@ -20973,11 +20810,7 @@ app.get('/api/admin/processing-bonus/debug', (req, res, next) => {
 // Lists every recorded 'processing' bonus with matched_zentact_id NULL and, for each, whether
 // the fuzzy matcher (accent/space-insensitive) can still find a Zentact merchant by name.
 // `unmatched` rows match NOTHING → potential silent leaks into the bi-annual (typos to relink).
-app.get('/api/admin/processing-bonus/audit', (req, res, next) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) { req.viaSecret = true; return next(); }
-  return authenticateToken(req, res, next);
-}, async (req, res) => {
+app.get('/api/admin/processing-bonus/audit', requireOpsSecretOrSession, async (req, res) => {
   if (!req.viaSecret && !(await requirePerm(req, res, 'report:mark_paid'))) return;
   try {
     const matchZentact = await buildZentactMatcher();
@@ -21018,11 +20851,7 @@ app.get('/api/admin/processing-bonus/audit', (req, res, next) => {
 // matched_zentact_id + rewrites merchant_name to the canonical Zentact business_name so the
 // account is then excluded from the bi-annual payout. `match` is an ILIKE substring of the
 // CURRENT (mistyped) merchant_name. dryRun=true previews without writing.
-app.post('/api/admin/processing-bonus/relink', (req, res, next) => {
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) { req.viaSecret = true; return next(); }
-  return authenticateToken(req, res, next);
-}, async (req, res) => {
+app.post('/api/admin/processing-bonus/relink', requireOpsSecretOrSession, async (req, res) => {
   if (!req.viaSecret && !(await requirePerm(req, res, 'report:mark_paid'))) return;
   const match = String(req.body.match || '').trim();
   const zentactId = String(req.body.zentactId || '').trim();
@@ -21672,15 +21501,7 @@ async function runRecalcV2(source = 'manual') {
 }
 
 // HTTP endpoint — fire-and-forget wrapper around runRecalcV2
-app.post('/api/commissions/recalc-v2/start', (req, res, next) => {
-  // Shared-secret bypass (same as db-stats) so a recalc can be kicked off without a session.
-  const provided = req.query.secret || req.headers['x-cluster-webhook-secret'];
-  if (process.env.ZOHO_WEBHOOK_SECRET && provided === process.env.ZOHO_WEBHOOK_SECRET) {
-    req.viaSecret = true;
-    return next();
-  }
-  return authenticateToken(req, res, next);
-}, async (req, res) => {
+app.post('/api/commissions/recalc-v2/start', requireOpsSecretOrSession, async (req, res) => {
   if (!req.viaSecret && !req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   if (recalcV2Job.status === 'running') {
     return res.status(409).json({ error: 'Already running' });
