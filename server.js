@@ -11669,7 +11669,17 @@ app.post('/api/webhooks/zoho-books/invoice', async (req, res) => {
   const viaShared    = !viaDedicated && presentsSecret(req, shared, { allowQuery: true });
   if (!viaDedicated && !viaShared) {
     await logAttempt(null, 'bad_secret');
-    console.warn('🚫 Webhook rejected — bad secret');
+    // LONGUEURS seulement, jamais les valeurs. C'est ce qui distingue « mauvaise
+    // valeur collée » (longueurs égales) de « secret tronqué / absent / ancien
+    // format » (longueurs différentes) sans rien révéler d'exploitable.
+    const sent = String(req.headers['x-cluster-webhook-secret'] || (req.query && req.query.secret) || '');
+    console.warn('🚫 Webhook rejected — bad secret', {
+      recuLen:    sent.length,
+      attenduLen: String(dedicated || shared || '').length,
+      via:        req.headers['x-cluster-webhook-secret'] ? 'en-tete'
+                  : (req.query && req.query.secret !== undefined ? 'query' : 'aucun secret fourni'),
+      dedieDefini: !!dedicated,
+    });
     return res.status(401).json({ error: 'invalid secret' });
   }
   if (viaShared && dedicated) {
