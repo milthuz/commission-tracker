@@ -14428,12 +14428,21 @@ app.put('/api/admin/pass/config', authenticateToken, async (req, res) => {
 // savoir QUE quelqu'un a consenti ne vaut rien si on ne sait plus à QUOI.
 const PASS_TERMS_VERSION = '2026-07';
 
-// Deux expéditeurs, un par langue — le programme porte deux noms. ⚠️ Les deux
-// adresses doivent être vérifiées comme expéditeurs dans SendGrid avant le premier
-// envoi, sinon l'envoi échoue en silence (sendMail avale l'erreur par conception).
+// Deux expéditeurs, un par langue — le programme porte deux noms.
+//
+// Sur clustersystems.com et NON sur le clusterpos.ca du deck (décision utilisateur
+// 2026-07-31) : ce domaine est déjà authentifié dans SendGrid, donc n'importe quelle
+// adresse y est autorisée à envoyer sans nouvelle vérification ni changement DNS.
+// L'alternative aurait coûté trois enregistrements CNAME sur un domaine de plus, pour
+// une différence que seul le marchand attentif aurait remarquée.
+//
+// ⚠️ Les DEUX adresses doivent exister comme boîtes ou renvois : l'envoi partira de
+// toute façon (le domaine suffit pour ça), mais une réponse à une adresse inexistante
+// rebondit — et un marchand qui répond à un courriel du programme, c'est exactement
+// quelqu'un à qui on veut parler.
 const PASS_SENDERS = {
-  'fr-CA': { name: 'La Passe chez Cluster', address: 'lapasse@clusterpos.ca' },
-  'en-CA': { name: 'The Pass at Cluster',   address: 'thepass@clusterpos.ca' },
+  'fr-CA': { name: 'La Passe chez Cluster', address: 'lapasse@clustersystems.com' },
+  'en-CA': { name: 'The Pass at Cluster',   address: 'thepass@clustersystems.com' },
 };
 
 // La langue est celle du MEMBRE, pas celle de l'interface au moment du clic : c'est
@@ -14603,7 +14612,7 @@ function passMail(locale, title, bodyHtml, cta) {
         </td></tr>
         <tr><td style="padding:26px 36px 0"><div style="border-top:1px solid #eef1f6;font-size:0;line-height:0">&nbsp;</div></td></tr>
         <tr><td style="padding:16px 36px 30px">
-          <p style="margin:0;color:#94a3b8;font-size:12px;line-height:1.7">${foot}<br>Cluster — clusterpos.ca</p>
+          <p style="margin:0;color:#94a3b8;font-size:12px;line-height:1.7">${foot}<br>Cluster — clusterpos.com</p>
         </td></tr>
       </table>
     </td></tr></table>
