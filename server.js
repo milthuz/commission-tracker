@@ -14804,6 +14804,69 @@ app.get('/api/pass/resources/:id/file', authenticatePassToken, async (req, res) 
   }
 });
 
+// --- Admin de la bibliothèque (perm pass:manage) --------------------------
+// 10 Mo : ce sont des argumentaires et des visuels destinés à être envoyés par courriel
+// à un restaurateur, pas des vidéos. Au-delà, le fichier est de toute façon inutilisable
+// pour l'usage prévu.
+const uploadPassResource = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+
+app.get('/api/admin/pass/resources', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'pass:manage'))) return;
+  try {
+    const rows = (await pool.query(
+      `SELECT id, title_fr, title_en, meta_fr, meta_en, file_name, mime_type, file_size,
+              sort_order, uploaded_by, created_at
+         FROM pass_resources ORDER BY sort_order, id`
+    )).rows;
+    res.json({ resources: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/pass/resources', authenticateToken, uploadPassResource.single('file'), async (req, res) => {
+  if (!(await requirePerm(req, res, 'pass:manage'))) return;
+  const b = req.body || {};
+  const str = (v, max) => String(v ?? '').trim().slice(0, max);
+  const titleFr = str(b.titleFr, 300);
+  const titleEn = str(b.titleEn, 300);
+  // Les DEUX titres sont exigés : la bibliothèque s'affiche dans la langue du membre, et
+  // un titre manquant laisserait un anglophone devant une ligne vide. Le brief est ferme
+  // là-dessus — le bilinguisme n'est pas une option.
+  if (!titleFr || !titleEn) return res.status(400).json({ error: 'titles_required' });
+  if (!req.file) return res.status(400).json({ error: 'file_required' });
+  try {
+    const r = (await pool.query(
+      `INSERT INTO pass_resources (title_fr, title_en, meta_fr, meta_en, file_name, mime_type,
+                                   file_size, file_data, sort_order, uploaded_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       RETURNING id, title_fr, title_en, meta_fr, meta_en, file_name, mime_type, file_size, sort_order, created_at`,
+      [titleFr, titleEn, str(b.metaFr, 150), str(b.metaEn, 150), req.file.originalname,
+       req.file.mimetype, req.file.size, req.file.buffer,
+       Number.isFinite(Number(b.sortOrder)) ? Number(b.sortOrder) : 0, req.user.email || 'admin']
+    )).rows[0];
+    await logActivity('pass_resource', String(r.id), 'created',
+      `Contenu ajouté à la bibliothèque de La Passe — ${titleFr}`, req.user.email || 'admin',
+      { metadata: { fileName: req.file.originalname, size: req.file.size } });
+    res.status(201).json({ resource: r });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/admin/pass/resources/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'pass:manage'))) return;
+  try {
+    const r = (await pool.query(`DELETE FROM pass_resources WHERE id = $1 RETURNING title_fr`, [req.params.id])).rows[0];
+    if (!r) return res.status(404).json({ error: 'not_found' });
+    await logActivity('pass_resource', String(req.params.id), 'deleted',
+      `Contenu retiré de la bibliothèque de La Passe — ${r.title_fr}`, req.user.email || 'admin');
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // --- La page publique du lien : /pass/{slug} ------------------------------
 // GET /api/pass/link/:slug — PUBLIC. Ce que la page personnalisée affiche du référent.
 // Ne sort que le prénom et la raison sociale : c'est ce que la copie du designer place
