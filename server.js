@@ -3084,10 +3084,34 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // Render each transactional email with sample data so an admin can see the look
 // & feel in the panel and send a test copy. Mirrors the real builders so the
 // preview reflects exactly what recipients get.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded'];
+// ⚠️ Convention maison : un gabarit se déclare en QUATRE endroits — ici, dans
+// sampleEmail(), dans TEMPLATE_TYPES de EmailPreview.tsx, et dans les libellés i18n.
+// Les quatre `pass_*` sont les courriels du programme La Passe ; ils sont les seuls de la
+// liste à partir d'une adresse et d'une enveloppe qui ne sont pas celles de Sales Hub.
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  // Les courriels de La Passe passent par leur VRAI constructeur, avec un membre fictif :
+  // un aperçu qui recopierait le gabarit à côté finirait par montrer autre chose que ce
+  // qui part réellement, ce qui est exactement le contraire du but d'un outil d'aperçu.
+  if (type.startsWith('pass_')) {
+    const key = type.slice(5);
+    const locale = passLocale(lang);
+    const fr = locale === 'fr-CA';
+    const m = { email: 'julie@bistroducoin.ca', full_name: 'Julie Tremblay', business: 'Bistro du Coin', locale };
+    const amt = (n) => passMoney(n, locale);
+    const vars = {
+      received: { restaurant: 'Café Merlebleu', referenceId: 'CR-20423', hardware: amt(500), tier: 'Sous', amount: amt(750) },
+      live: { restaurant: 'Café Merlebleu', amount: amt(750) },
+      tier_up: { restaurant: 'Café Merlebleu', nth: passOrdinal(4, locale), tier: 'Chef', amount: amt(1000) },
+      credit: { restaurant: 'Café Merlebleu', amount: amt(750), certificateCode: 'CLSTR-750-4QX9' },
+    }[key] || {};
+    const built = passEmailPreview(key, m, { firstName: passFirstName(m), ...vars });
+    return built || { subject: `(${type})`, html: `<p>${fr ? 'Gabarit inconnu' : 'Unknown template'}</p>` };
+  }
+
   switch (type) {
     case 'reset':
       return { subject: 'Réinitialisation du mot de passe — Sales Hub / Password reset',
@@ -14618,6 +14642,214 @@ function passMail(locale, title, bodyHtml, cta) {
   </body></html>`;
 }
 
+// ---------------------------------------------------------------------------
+// Les quatre courriels du programme
+// ---------------------------------------------------------------------------
+// La copie vient du deck du designer, à une réécriture près : ses phrases figent les
+// montants (« 750 $ de crédit », « rabais matériel de 500 $ », « votre quatrième
+// recommandation »), écrits pour la persona de sa maquette. Envoyés à un membre d'un
+// autre palier, ils annoncent LE MAUVAIS MONTANT — dans un courriel, c'est-à-dire dans
+// une trace écrite qu'il garde. La règle 4 du brief (« amounts are configuration »)
+// l'emporte donc ici comme ailleurs : mêmes phrases, montants injectés.
+//
+// La copie vit dans le backend et NON dans l'i18n du frontend : c'est lui seul qui envoie
+// ces courriels, et une copie partagée mais utilisée d'un seul côté finit toujours par
+// diverger de celle qui sert vraiment. Les clés `pass.emails.*` du frontend restent la
+// référence du designer — à re-synchroniser à la main à chaque livraison.
+const PASS_EMAIL_COPY = {
+  'fr-CA': {
+    received: {
+      subject: 'Nous avons bien reçu {restaurant}',
+      preview: 'Votre recommandation est sur le passe — voici la suite.',
+      greeting: 'Bonjour {firstName},',
+      paras: [
+        'Merci de nous avoir passé {restaurant}. La recommandation est enregistrée sous la référence {referenceId}.',
+        "Un spécialiste les joindra dans les 2 jours ouvrables et gérera toute l'installation — y compris le rabais matériel de {hardware} qui accompagne votre recommandation.",
+        'Vous êtes actuellement {tier} : celle-ci vaut donc {amount} de crédit au compte dès leur mise en service.',
+      ],
+      cta: 'Suivre dans mon espace',
+    },
+    live: {
+      subject: '{restaurant} est en service sur Cluster',
+      preview: "Votre recommandation vient d'entrer en service — crédit confirmé.",
+      greeting: 'Bonjour {firstName},',
+      paras: [
+        '{restaurant} a terminé son installation et prend maintenant ses commandes sur Cluster.',
+        'Cela confirme {amount} de crédit au compte. Votre certificat arrivera par courriel dans un jour ouvrable.',
+        "Merci d'avoir aidé un autre restaurateur à mieux s'outiller.",
+      ],
+      cta: 'Voir mon espace',
+    },
+    tier_up: {
+      subject: 'Vous avez atteint {tier}',
+      preview: 'Votre palier vient de changer.',
+      greeting: 'Bonjour {firstName},',
+      paras: [
+        '{restaurant} était votre {nth} recommandation à entrer en service — vous voilà à {tier}.',
+        'Désormais, chaque recommandation en service vous rapporte {amount} de crédit au compte.',
+      ],
+      cta: 'Voir mon palier',
+      banner: 'Nouveau palier atteint',
+      bannerSub: '{amount} de crédit pour chaque recommandation à partir de maintenant',
+    },
+    credit: {
+      subject: 'Votre crédit de {amount} est prêt',
+      preview: 'Certificat pour la recommandation {restaurant}.',
+      greeting: 'Bonjour {firstName},',
+      paras: [
+        'Voici votre crédit pour la recommandation {restaurant}.',
+        'La comptabilité a été avisée : le montant sera porté à vos prochaines factures Cluster et apparaîtra automatiquement sur votre prochain relevé.',
+      ],
+      cta: 'Voir mon espace',
+      certTitle: 'Crédit au compte Cluster',
+      certCode: 'Code du certificat',
+      cadNote: 'en dollars canadiens',
+    },
+  },
+  'en-CA': {
+    received: {
+      subject: "We've got {restaurant}",
+      preview: "Your referral is on the pass — here's what happens next.",
+      greeting: 'Hi {firstName},',
+      paras: [
+        "Thanks for sending {restaurant} our way. It's logged under reference {referenceId}.",
+        'A specialist reaches out within 2 business days and runs the whole setup — including the {hardware} hardware discount that travels with your referral.',
+        "You're currently {tier}, so this one is worth {amount} in account credit the day they go live.",
+      ],
+      cta: 'Track it in your hub',
+    },
+    live: {
+      subject: '{restaurant} is live on Cluster',
+      preview: 'Your referral just went live — credit confirmed.',
+      greeting: 'Hi {firstName},',
+      paras: [
+        '{restaurant} finished setup and is now taking orders on Cluster.',
+        "That's {amount} in account credit confirmed. Your certificate arrives in a separate email within one business day.",
+        'Thanks for handing another operator a better setup.',
+      ],
+      cta: 'See your hub',
+    },
+    tier_up: {
+      subject: "You've reached {tier}",
+      preview: 'Your tier just changed.',
+      greeting: 'Hi {firstName},',
+      paras: [
+        '{restaurant} was your {nth} referral to go live — which puts you at {tier}.',
+        'From here, every referral that goes live earns you {amount} in account credit.',
+      ],
+      cta: 'View your tier',
+      banner: 'New tier unlocked',
+      bannerSub: '{amount} credit for every referral from here on',
+    },
+    credit: {
+      subject: 'Your {amount} Cluster credit is ready',
+      preview: 'Certificate for the {restaurant} referral.',
+      greeting: 'Hi {firstName},',
+      paras: [
+        "Here's your credit for the {restaurant} referral.",
+        "Accounting has been notified — it'll be applied against your upcoming Cluster invoices and appear on your next statement automatically.",
+      ],
+      cta: 'View your hub',
+      certTitle: 'Cluster Account Credit',
+      certCode: 'Certificate code',
+      cadNote: 'in Canadian dollars',
+    },
+  },
+};
+
+// « quatrième » était figé dans la copie du deck. Les rangs ne se construisent pas pareil
+// dans les deux langues, d'où ce petit helper plutôt qu'une concaténation.
+function passOrdinal(n, locale) {
+  const i = Number(n) || 0;
+  if (passLocale(locale) === 'fr-CA') return i === 1 ? '1ʳᵉ' : `${i}ᵉ`;
+  const rest10 = i % 10, rest100 = i % 100;
+  if (rest10 === 1 && rest100 !== 11) return `${i}st`;
+  if (rest10 === 2 && rest100 !== 12) return `${i}nd`;
+  if (rest10 === 3 && rest100 !== 13) return `${i}rd`;
+  return `${i}th`;
+}
+
+const passFirstName = (m) => String(m?.full_name || m?.email || '').split(/[\s@]/)[0];
+
+// Les noms de paliers sont des mots FRANÇAIS choisis pour être identiques dans les deux
+// langues (décision 2026-07-30) — il n'y a donc rien à traduire, et le backend n'a pas
+// besoin de l'i18n du frontend pour les nommer.
+const PASS_TIER_LABELS = { commis: 'Commis', sous: 'Sous', chef: 'Chef' };
+const passTierLabel = (tier) =>
+  PASS_TIER_LABELS[tier?.key] || (tier?.key ? tier.key[0].toUpperCase() + tier.key.slice(1) : '');
+
+const passFill = (s, vars) =>
+  Object.entries(vars).reduce((out, [k, v]) => out.split(`{${k}}`).join(String(v ?? '')), String(s || ''));
+
+/**
+ * Construit un des quatre courriels du programme → `{ subject, html }`, ou `null` si la
+ * clé est inconnue. Séparé de l'envoi pour que l'outil d'aperçu affiche EXACTEMENT ce qui
+ * part : un aperçu qui recopierait le gabarit finirait par mentir.
+ *
+ * La langue est celle du MEMBRE, jamais celle de l'employé qui a déclenché l'action.
+ */
+function buildPassEmail(key, member, vars = {}) {
+  const locale = passLocale(member.locale);
+  const tpl = (PASS_EMAIL_COPY[locale] || PASS_EMAIL_COPY['fr-CA'])[key];
+  if (!tpl) return null;
+
+  {
+    const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const v = Object.fromEntries(Object.entries(vars).map(([k, val]) => [k, esc(val)]));
+    const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+
+    let inner = `<p style="margin:0 0 16px">${passFill(tpl.greeting, v)}</p>`;
+    for (const p of tpl.paras) inner += `<p style="margin:0 0 14px">${passFill(p, v)}</p>`;
+
+    // Bandeau de palier — le franchissement est la seule bonne nouvelle du programme qui
+    // ne se lit pas dans un montant, donc elle est affichée, pas seulement racontée.
+    if (key === 'tier_up') {
+      inner += `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:22px 0 4px">
+        <tr><td style="border:1px solid #FBCDB5;background:#FDE6DA;border-radius:12px;padding:18px 20px">
+          <p style="margin:0;color:#8A4220;font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase">${esc(tpl.banner)}</p>
+          <p style="margin:8px 0 0;color:#141414;font-size:15px;line-height:1.5">${passFill(tpl.bannerSub, v)}</p>
+        </td></tr></table>`;
+    }
+
+    // Certificat — le membre garde ce courriel comme preuve, donc le montant et le code
+    // sont donnés en clair plutôt que noyés dans une phrase.
+    if (key === 'credit') {
+      inner += `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:22px 0 4px">
+        <tr><td align="center" style="border:1px solid #FBCDB5;background:#FDE6DA;border-radius:12px;padding:24px 20px">
+          <p style="margin:0;color:#8A4220;font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase">${esc(tpl.certTitle)}</p>
+          <p style="margin:10px 0 0;color:#141414;font-size:34px;font-weight:700;line-height:1">${esc(vars.amount)}</p>
+          <p style="margin:6px 0 0;color:#8A4220;font-size:12px">${esc(tpl.cadNote)}</p>
+          <p style="margin:16px 0 0;color:#8A4220;font-size:12px">${esc(tpl.certCode)}</p>
+          <p style="margin:4px 0 0;color:#141414;font-size:15px;font-family:ui-monospace,Menlo,monospace;letter-spacing:.05em">${esc(vars.certificateCode)}</p>
+        </td></tr></table>`;
+    }
+
+    const subject = passFill(tpl.subject, v);
+    return { subject, html: passMail(locale, subject, inner, { label: tpl.cta, url: `${base}/pass` }) };
+  }
+}
+const passEmailPreview = buildPassEmail;
+
+/**
+ * Envoie le courriel construit ci-dessus. Ne LANCE JAMAIS : un envoi raté ne doit défaire
+ * ni une recommandation déjà enregistrée ni un crédit déjà appliqué. L'échec part au
+ * journal, et l'appelant décide s'il veut le remonter.
+ */
+async function sendPassEmail(key, member, vars = {}) {
+  try {
+    const built = buildPassEmail(key, member, vars);
+    if (!built) return { sent: false, reason: 'unknown_template' };
+    const res = await sendMail(member.email, built.subject, built.html, {
+      from: PASS_SENDERS[passLocale(member.locale)],
+    });
+    if (!res.sent) console.warn(`[pass-mail] ${key} → ${member.email} non envoyé :`, res.reason);
+    return res;
+  } catch (e) {
+    console.warn(`[pass-mail] ${key} a échoué :`, e.message);
+    return { sent: false, reason: e.message };
+  }
+}
+
 // GET /api/pass/program — PUBLIC. Les montants et l'échelle, tels qu'ils s'affichent sur
 // la page programme, l'écran d'adhésion et le formulaire. Public par nécessité : ces écrans
 // sont vus AVANT toute connexion, et le brief interdit de recopier les montants dans le
@@ -14895,6 +15127,17 @@ app.post('/api/pass/referrals', authenticatePassToken, async (req, res) => {
       `Recommandation ${code} — ${restaurantName} (${city}, ${province})`, req.passMember.email,
       { metadata: { memberId: req.passMember.id, tierAtSubmission: tier.level, creditFloor: tier.credit, crmLeadId: lead.leadId || null } });
 
+    // Accusé de réception. Best-effort : la recommandation est enregistrée, un courriel
+    // qui ne part pas ne doit pas la faire échouer.
+    sendPassEmail('received', req.passMember, {
+      firstName: passFirstName(req.passMember),
+      restaurant: restaurantName,
+      referenceId: code,
+      hardware: passMoney(config.hardwareDiscount, req.passMember.locale),
+      tier: passTierLabel(tier),
+      amount: passMoney(tier.credit, req.passMember.locale),
+    });
+
     res.status(201).json({ referral: passReferralPublic({ ...r, crm_lead_id: lead.leadId || null }) });
   } catch (e) {
     console.warn('[pass] referral submit failed:', e.message);
@@ -15014,6 +15257,7 @@ app.patch('/api/admin/pass/referrals/:id/status', authenticateToken, async (req,
   const next = String(req.body?.status || '').trim();
   if (!PASS_STATUSES.includes(next)) return res.status(400).json({ error: 'invalid_status' });
   const client = await pool.connect();
+  const mails = []; // rempli dans la transaction, envoyé APRÈS le commit
   try {
     await client.query('BEGIN');
     // Verrou sur la ligne : passer « en service » incrémente un compteur à vie qui décide
@@ -15050,6 +15294,27 @@ app.patch('/api/admin/pass/referrals/:id/status', authenticateToken, async (req,
         `${r.ref_code} en service — crédit ${tier.credit} ${config.currency} au palier ${tier.level} pour ${m.email}`,
         req.user.email || 'admin',
         { metadata: { memberId: m.id, lifetimeBefore: before, lifetimeAfter: after, tierAtSubmission: r.tier_at_submission, tierAtLive: tier.level, creditFloorAtSubmission: r.credit_amount === null ? null : Number(r.credit_amount), creditAmount: tier.credit } });
+
+      // Les courriels partent APRÈS le COMMIT (voir plus bas) : tant que la transaction
+      // n'est pas validée, annoncer un crédit au marchand serait une promesse que la base
+      // pourrait encore annuler. On retient donc seulement quoi envoyer.
+      mails.push(['live', m, {
+        firstName: passFirstName(m),
+        restaurant: r.restaurant_name,
+        amount: passMoney(tier.credit, m.locale),
+      }]);
+      // Le palier a-t-il changé grâce à CETTE mise en service ? Comparé sur les paliers
+      // calculés avant et après, jamais déduit d'un compteur : c'est le seul moment où
+      // l'annonce est vraie, et la répéter serait pire que de l'omettre.
+      if (newTier.level > tier.level) {
+        mails.push(['tier_up', m, {
+          firstName: passFirstName(m),
+          restaurant: r.restaurant_name,
+          nth: passOrdinal(after, m.locale),
+          tier: passTierLabel(newTier),
+          amount: passMoney(newTier.credit, m.locale),
+        }]);
+      }
     } else {
       const col = next === 'contacted' ? 'contacted_at' : null;
       updated = (await client.query(
@@ -15060,6 +15325,7 @@ app.patch('/api/admin/pass/referrals/:id/status', authenticateToken, async (req,
         `${r.ref_code} — statut « ${next} »`, req.user.email || 'admin', { metadata: { from: r.status, to: next } });
     }
     await client.query('COMMIT');
+    for (const [key, member, vars] of mails) sendPassEmail(key, member, vars);
     res.json({ referral: passReferralPublic(updated) });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
@@ -15117,10 +15383,20 @@ app.post('/api/admin/pass/referrals/:id/credit', authenticateToken, async (req, 
         </div>`, `Crédit ${passMoney(amount, 'fr-CA')} — ${m.business || m.email}`);
       mail = await sendMail(recipients.join(','), `La Passe — crédit à appliquer : ${r.ref_code} (${passMoney(amount, 'fr-CA')})`, html);
     }
+    // Le certificat au MEMBRE, en plus de l'avis à la comptabilité. Ce sont deux
+    // destinataires et deux besoins : la comptabilité doit agir, le marchand doit avoir
+    // une trace écrite du montant qui lui revient.
+    const memberMail = await sendPassEmail('credit', m, {
+      firstName: passFirstName(m),
+      restaurant: r.restaurant_name,
+      amount: passMoney(amount, m.locale),
+      certificateCode: code,
+    });
+
     await logActivity('pass_referral', String(r.id), 'credit_applied',
       `${r.ref_code} — crédit ${amount} ${config.currency} appliqué à ${m.email} (certificat ${code})`,
       req.user.email || 'admin',
-      { metadata: { memberId: m.id, amount, certificateCode: code, accountingNotified: mail.sent, recipients } });
+      { metadata: { memberId: m.id, amount, certificateCode: code, accountingNotified: mail.sent, memberNotified: memberMail.sent, recipients } });
 
     res.json({ referral: passReferralPublic(updated), accountingNotified: mail.sent, notifyReason: mail.sent ? null : mail.reason });
   } catch (e) {
