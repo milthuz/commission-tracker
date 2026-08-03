@@ -25,7 +25,6 @@ const Anthropic = require('@anthropic-ai/sdk');
 const { ZohoCRMService, MONTHLY_QUOTA, MONTHLY_BONUS_TIERS, ANNUAL_BONUS_TIERS, PLAN_START_DATE } = require('./services/zohoCRMService');
 const { ZentactService } = require('./services/zentactService');
 const { ZohoBillingService } = require('./services/zohoBillingService');
-const { computeSavings: computeSavingsEngine } = require('./services/savingsCalc');
 
 dotenv.config();
 
@@ -120,10 +119,6 @@ const PERMISSION_CATALOG = [
 
   // Proposals (build + send a client proposal from a Zoho Books estimate)
   { key: 'proposals:send',             label: 'Build & send client proposals (from Zoho estimates)',            category: 'Proposals' },
-
-  // Rate / Savings calculator (analyze a competitor merchant statement → savings offer)
-  { key: 'savings:use',                label: 'Use the payment savings calculator',                             category: 'Rate Calculator' },
-  { key: 'savings:manage_pricing',     label: 'Manage pricing templates + assign them to reps',                 category: 'Rate Calculator' },
 
   // Hardware (product catalog reference tool)
   { key: 'hardware:view',              label: 'View the Hardware Overview catalog',                             category: 'Hardware' },
@@ -1198,53 +1193,6 @@ async function initializeDatabase() {
         resolved_by    VARCHAR(255)
       );
     `);
-    // Rate/Savings calculator: pricing templates (Cluster rates + internal costs), per-rep
-    // assignment, and saved analyses. See services/savingsCalc.js for the model.
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS pricing_templates (
-        id          SERIAL PRIMARY KEY,
-        name        VARCHAR(120) NOT NULL,
-        is_default  BOOLEAN DEFAULT false,
-        active      BOOLEAN DEFAULT true,
-        config      JSONB NOT NULL,
-        created_at  TIMESTAMPTZ DEFAULT NOW(),
-        updated_at  TIMESTAMPTZ DEFAULT NOW()
-      );
-    `);
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS pricing_template_assignments (
-        rep_email   VARCHAR(255) PRIMARY KEY,
-        template_id INT NOT NULL REFERENCES pricing_templates(id) ON DELETE CASCADE,
-        updated_at  TIMESTAMPTZ DEFAULT NOW()
-      );
-    `);
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS savings_analyses (
-        id           SERIAL PRIMARY KEY,
-        rep_email    VARCHAR(255),
-        rep_name     VARCHAR(255),
-        merchant_name VARCHAR(255),
-        template_id  INT,
-        inputs       JSONB NOT NULL,
-        results      JSONB NOT NULL,
-        created_at   TIMESTAMPTZ DEFAULT NOW()
-      );
-    `);
-    // Seed a default pricing template from the Excel's Cluster values (only if none exists).
-    {
-      const has = (await pool.query(`SELECT 1 FROM pricing_templates LIMIT 1`)).rows.length;
-      if (!has) {
-        const cfg = {
-          rates: { debit:{rate:0,perTrx:0.05}, credit:{rate:0.0015,perTrx:0.05}, amex:{rate:0.0015,perTrx:0.05} },
-          fixedUnit: { terminalS1F2:25, terminalWired:25, pci:7.5, acctOnFile:9, batch:7, lte:0 },
-          costs: { perTrx:0.035, discountRate:0.0005, t1Rate:0.0001, monthlyFixed:5.5, terminalS1F2:34.72, terminalWired:27.5 },
-        };
-        await pool.query(
-          `INSERT INTO pricing_templates (name, is_default, active, config) VALUES ($1, true, true, $2::jsonb)`,
-          ['Standard Cluster', JSON.stringify(cfg)]
-        );
-      }
-    }
     // Seed preset roles (only inserted once if name not already present)
     await pool.query(`
       INSERT INTO roles (name, description, permissions, is_system)
@@ -2509,7 +2457,7 @@ const DEMO_NAME_KEYS = new Set([
   'linked_customer_name', 'linkedcustomername',
 ]);
 // Numeric keys that are MONEY → scaled. Counts/ids/rates are excluded below.
-const DEMO_MONEY_RE = /(commission|revenue|amount|total|salary|profit|balance|price|mrr|arr|ltv|arpu|sub_total|subtotal|bonus|savings|margin|fee|paid|earned|value|cost)/i;
+const DEMO_MONEY_RE = /(commission|revenue|amount|total|salary|profit|balance|price|mrr|arr|ltv|arpu|sub_total|subtotal|bonus|margin|fee|paid|earned|value|cost)/i;
 const DEMO_NOT_MONEY_RE = /(count|issues|qty|quantity|number|_id$|^id$|pct|percent|rate|points|page|index|threshold|days|months|year|interval|clients$|invoices$|merchants$|subs$|periods)/i;
 
 function demoScramble(node, keyHint) {
@@ -2535,7 +2483,7 @@ function demoScramble(node, keyHint) {
 }
 
 // Endpoints a demo user may still POST to (pure computation / no data written that matters).
-const DEMO_POST_ALLOW = new Set(['/api/assistant/chat', '/api/savings/calculate']);
+const DEMO_POST_ALLOW = new Set(['/api/assistant/chat']);
 // GET endpoints that stream real data OUT of the scrambler (files/exports) → blocked.
 const DEMO_BLOCKED_GET_RE = /(excel|export|dump|download|\.xlsx?|\/pdf)/i;
 
@@ -4823,7 +4771,6 @@ THE APP'S SECTIONS (left sidebar):
 - Hardware Overview: the full Cluster hardware catalog (POS terminals, printers, payment devices, displays, networking, peripherals) — searchable, filterable by Kaizen(V2)/V1 compatibility and lifecycle status, with a compare tool (up to 4 side by side) and one-click SKU copy.
 - Services & Pricing Guide: Cluster's pricing reference (SaaS, Rental, Menu Build, Installation, Support, Online Ordering, Shipping, On-Site/XPERIO) with a monthly/yearly toggle and a built-in quote builder that totals recurring vs one-time costs.
 - Proposals: build and send a branded sales proposal (cover + company deck + optional Zoho Books estimate) to a client, with open/click tracking.
-- Savings calculator: turn a competitor's payment statement into a savings offer for a prospect.
 - What each user sees depends on their permissions — some sections may not be visible to everyone.
 
 THE COMMISSION MODEL:
@@ -13938,333 +13885,6 @@ app.get('/api/resellers/pos-activations', authenticateToken, async (req, res) =>
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
-});
-
-// ============================================================================
-// RATE / SAVINGS CALCULATOR — analyze a competitor merchant statement → savings offer.
-// Pricing templates (Cluster rates + costs) are admin-managed and assignable per rep;
-// reps use their template's prices (locked), an admin can override prices per deal.
-// Engine = services/savingsCalc.js (validated against the source Excel).
-// ============================================================================
-async function getEffectiveTemplate(email) {
-  let row = email ? (await pool.query(
-    `SELECT t.* FROM pricing_template_assignments a JOIN pricing_templates t ON t.id = a.template_id
-     WHERE LOWER(a.rep_email) = LOWER($1) AND t.active = true`, [email])).rows[0] : null;
-  if (!row) row = (await pool.query(`SELECT * FROM pricing_templates WHERE is_default = true AND active = true LIMIT 1`)).rows[0];
-  if (!row) row = (await pool.query(`SELECT * FROM pricing_templates WHERE active = true ORDER BY id LIMIT 1`)).rows[0];
-  return row || null;
-}
-// Build the engine's `cluster` object from a template config + per-deal quantities (+ admin overrides).
-function buildClusterForEngine(config, qty, currentInterchange, overrides) {
-  const cfg = JSON.parse(JSON.stringify(config));
-  if (overrides) {
-    if (overrides.rates) for (const k of ['debit','credit','amex']) if (overrides.rates[k]) Object.assign(cfg.rates[k], overrides.rates[k]);
-    if (overrides.fixedUnit) Object.assign(cfg.fixedUnit, overrides.fixedUnit);
-    if (overrides.costs) Object.assign(cfg.costs, overrides.costs);
-  }
-  const q = qty || {};
-  const u = cfg.fixedUnit;
-  return {
-    rates: cfg.rates,
-    interchange: (overrides && overrides.interchange != null) ? overrides.interchange : currentInterchange,
-    fixed: {
-      terminalS1F2: { qty: q.terminalS1F2 || 0, unit: u.terminalS1F2 || 0 },
-      terminalWired: { qty: q.terminalWired || 0, unit: u.terminalWired || 0 },
-      pci:        { qty: q.pci || 0,        unit: u.pci || 0 },
-      acctOnFile: { qty: q.acctOnFile || 0, unit: u.acctOnFile || 0 },
-      batch:      { qty: q.batch || 0,      unit: u.batch || 0 },
-      lte:        { qty: q.lte || 0,        unit: u.lte || 0 },
-    },
-    costs: cfg.costs,
-  };
-}
-
-// --- Pricing templates (admin) ---
-app.get('/api/savings/templates', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'savings:manage_pricing'))) return;
-  try {
-    const rows = (await pool.query(`SELECT id, name, is_default, active, config, updated_at FROM pricing_templates ORDER BY is_default DESC, name`)).rows;
-    res.json({ templates: rows });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.post('/api/savings/templates', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'savings:manage_pricing'))) return;
-  const name = String(req.body.name || '').trim();
-  const config = req.body.config;
-  if (!name || !config || !config.rates || !config.fixedUnit || !config.costs) return res.status(400).json({ error: 'name + valid config required' });
-  try {
-    if (req.body.isDefault) await pool.query(`UPDATE pricing_templates SET is_default = false`);
-    const row = (await pool.query(
-      `INSERT INTO pricing_templates (name, is_default, active, config) VALUES ($1, $2, true, $3::jsonb) RETURNING id`,
-      [name, !!req.body.isDefault, JSON.stringify(config)])).rows[0];
-    res.json({ id: row.id });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.put('/api/savings/templates/:id', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'savings:manage_pricing'))) return;
-  const id = parseInt(req.params.id, 10);
-  try {
-    if (req.body.isDefault) await pool.query(`UPDATE pricing_templates SET is_default = false`);
-    const sets = ['updated_at = NOW()']; const params = []; let i = 1;
-    if (req.body.name !== undefined) { sets.push(`name = $${i++}`); params.push(String(req.body.name).trim()); }
-    if (req.body.config !== undefined) { sets.push(`config = $${i++}::jsonb`); params.push(JSON.stringify(req.body.config)); }
-    if (req.body.active !== undefined) { sets.push(`active = $${i++}`); params.push(!!req.body.active); }
-    if (req.body.isDefault !== undefined) { sets.push(`is_default = $${i++}`); params.push(!!req.body.isDefault); }
-    params.push(id);
-    await pool.query(`UPDATE pricing_templates SET ${sets.join(', ')} WHERE id = $${i}`, params);
-    res.json({ updated: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.delete('/api/savings/templates/:id', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'savings:manage_pricing'))) return;
-  try { await pool.query(`DELETE FROM pricing_templates WHERE id = $1`, [parseInt(req.params.id, 10)]); res.json({ deleted: true }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-// --- Assignments (admin) ---
-app.get('/api/savings/assignments', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'savings:manage_pricing'))) return;
-  try { res.json({ assignments: (await pool.query(`SELECT rep_email, template_id FROM pricing_template_assignments ORDER BY rep_email`)).rows }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.put('/api/savings/assignments', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'savings:manage_pricing'))) return;
-  const repEmail = String(req.body.repEmail || '').trim().toLowerCase();
-  const templateId = req.body.templateId;
-  if (!repEmail) return res.status(400).json({ error: 'repEmail required' });
-  try {
-    if (templateId == null) { await pool.query(`DELETE FROM pricing_template_assignments WHERE LOWER(rep_email) = $1`, [repEmail]); }
-    else {
-      await pool.query(
-        `INSERT INTO pricing_template_assignments (rep_email, template_id, updated_at) VALUES ($1, $2, NOW())
-         ON CONFLICT (rep_email) DO UPDATE SET template_id = EXCLUDED.template_id, updated_at = NOW()`,
-        [repEmail, parseInt(templateId, 10)]);
-    }
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-// --- Rep: the pricing template to prefill the Cluster side ---
-app.get('/api/savings/my-template', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'savings:use'))) return;
-  try {
-    const t = await getEffectiveTemplate(req.user.email);
-    if (!t) return res.status(404).json({ error: 'no_template' });
-    res.json({ templateId: t.id, name: t.name, config: t.config, canOverride: req.user.isAdmin === true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-// --- Compute (server recomputes; reps can't change prices, admins may override) ---
-app.post('/api/savings/calculate', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'savings:use'))) return;
-  try {
-    const { volumes, current, clusterQty } = req.body;
-    if (!volumes || !current || !current.rates) return res.status(400).json({ error: 'volumes + current required' });
-    let t = null;
-    if (req.user.isAdmin && req.body.templateId) t = (await pool.query(`SELECT * FROM pricing_templates WHERE id = $1`, [parseInt(req.body.templateId, 10)])).rows[0];
-    if (!t) t = await getEffectiveTemplate(req.user.email);
-    if (!t) return res.status(404).json({ error: 'no_template' });
-    const overrides = req.user.isAdmin === true ? req.body.overrides : null; // price overrides = admin only
-    const cluster = buildClusterForEngine(t.config, clusterQty, current.interchange || 0, overrides);
-    const results = computeSavingsEngine({ volumes, current, cluster });
-    res.json({ templateId: t.id, templateName: t.name, clusterResolved: cluster, results });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-// --- Phase 2: AI statement parsing (upload a competitor PDF → prefill the form) ---
-const uploadStatement = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
-const STATEMENT_SCHEMA = {
-  type: 'object', additionalProperties: false,
-  properties: {
-    merchantName: { type: 'string' },
-    currency: { type: 'string' },
-    period: { type: 'string' },
-    volumes: {
-      type: 'object', additionalProperties: false,
-      properties: {
-        debit:  { type: 'object', additionalProperties: false, properties: { trx: { type: 'number' }, amount: { type: 'number' } }, required: ['trx', 'amount'] },
-        credit: { type: 'object', additionalProperties: false, properties: { trx: { type: 'number' }, amount: { type: 'number' } }, required: ['trx', 'amount'] },
-        amex:   { type: 'object', additionalProperties: false, properties: { trx: { type: 'number' }, amount: { type: 'number' } }, required: ['trx', 'amount'] },
-      }, required: ['debit', 'credit', 'amex'],
-    },
-    currentRates: {
-      type: 'object', additionalProperties: false,
-      properties: {
-        debit:  { type: 'object', additionalProperties: false, properties: { ratePct: { type: 'number' }, perTrx: { type: 'number' } }, required: ['ratePct', 'perTrx'] },
-        credit: { type: 'object', additionalProperties: false, properties: { ratePct: { type: 'number' }, perTrx: { type: 'number' } }, required: ['ratePct', 'perTrx'] },
-        amex:   { type: 'object', additionalProperties: false, properties: { ratePct: { type: 'number' }, perTrx: { type: 'number' } }, required: ['ratePct', 'perTrx'] },
-      }, required: ['debit', 'credit', 'amex'],
-    },
-    interchange: { type: 'number' },
-    totalTransactionCharge: { type: 'number' },
-    currentFixed: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { label: { type: 'string' }, qty: { type: 'number' }, unit: { type: 'number' } }, required: ['label', 'qty', 'unit'] } },
-    statementTotalMonthly: { type: 'number' },
-    notes: { type: 'string' },
-  },
-  required: ['merchantName', 'currency', 'period', 'volumes', 'currentRates', 'interchange', 'totalTransactionCharge', 'currentFixed', 'statementTotalMonthly', 'notes'],
-};
-const STATEMENT_PROMPT = `You are extracting data from a competitor merchant payment-processing statement (relevé marchand) to feed a savings calculator. The statement may be in French or English, from a Canadian/Québec processor (Moneris, Global Payments, Chase, TD, Square, Stripe, Elavon, Desjardins, etc.).
-
-Extract, as JSON matching the schema:
-- merchantName: the business name on the statement.
-- currency: e.g. "CAD".
-- period: the statement period (e.g. "2026-05" or "May 2026"), as text.
-- volumes: monthly transaction COUNT (trx) and dollar AMOUNT for three buckets. BUCKET BY HOW THE CARD IS PRICED, not by card category:
-    • debit = ONLY flat per-transaction Interac debit (labels: "Interac", "Interac Flash"/"IF", "IDEBT"). These are charged a flat $/transaction, 0%.
-    • credit = Visa + Mastercard + Visa Debit (VCDBT) + UnionPay — i.e. every card charged a PERCENTAGE discount rate. ⚠️ "Visa Debit"/"VCDBT" is a debit card but is charged the % rate, so it goes in CREDIT, never in debit.
-    • amex = American Express + Discover.
-- currentRates: the processor's MARKUP per bucket from the discount-rate / "Taux d'escompte" table — ratePct = percentage markup AS A PERCENT NUMBER (e.g. 0.15 means 0.15%), perTrx = per-transaction fee in dollars. For debit this is typically 0% + a flat $/trx (e.g. 0.04); for credit/amex typically a % + 0$.
-- totalTransactionCharge: the statement's TOTAL card-processing charge that bundles the markup AND interchange together — e.g. the "Frais de service" / "Service charge" / total "discount" amount (as a positive number). MANY statements (Clover, Commerce Control, Global, TD) report the separate "Frais d'interchange"/"Interchange" line as 0 and put everything in this one bundled total. When that is the case, fill totalTransactionCharge with that bundled total and set interchange to 0 — the app derives interchange = totalTransactionCharge − markup, so do NOT also report the bundled total as interchange (that would double-count the markup).
-- interchange: ONLY use this when the statement genuinely lists a SEPARATE interchange/card-brand pass-through amount distinct from the markup. Otherwise set 0 and use totalTransactionCharge instead.
-- currentFixed: list of fixed/recurring monthly fees (terminal/equipment rental, monthly/statement fee, PCI, account/admin fee) — each {label, qty, unit price}. Capture ALL of them (often under "Autres frais"/"Other fees"); do NOT include per-transaction interchange line items here.
-- statementTotalMonthly: the statement's grand total of all fees/charges for the period if shown (for cross-check).
-- notes: what you could not determine, assumptions made, and your confidence (write in the statement's language).
-
-Rules: numbers only (no $ or % signs, no minus signs — use positive magnitudes). Use 0 for anything you genuinely cannot find — do NOT invent values.`;
-
-// POST /api/savings/parse-statement — upload a competitor PDF → Claude extracts the inputs.
-app.post('/api/savings/parse-statement', authenticateToken, uploadStatement.single('file'), async (req, res) => {
-  if (!(await requirePerm(req, res, 'savings:use'))) return;
-  if (!req.file) return res.status(400).json({ error: 'file required' });
-  const client = getAnthropic();
-  if (!client) return res.status(503).json({ error: 'ai_not_configured' });
-  try {
-    const resp = await client.messages.create({
-      model: 'claude-opus-4-8',
-      max_tokens: 3000,
-      thinking: { type: 'adaptive' },
-      output_config: { format: { type: 'json_schema', schema: STATEMENT_SCHEMA }, effort: 'medium' },
-      messages: [{ role: 'user', content: [
-        { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: req.file.buffer.toString('base64') } },
-        { type: 'text', text: STATEMENT_PROMPT },
-      ] }],
-    });
-    if (resp.stop_reason === 'refusal') return res.status(422).json({ error: 'refused' });
-    const text = (resp.content.find(b => b.type === 'text') || {}).text || '{}';
-    let data; try { data = JSON.parse(text); } catch { return res.status(502).json({ error: 'parse_failed' }); }
-    // Derive interchange deterministically when the statement bundles it into a single total
-    // charge (e.g. Clover "Frais de service"): interchange = totalTransactionCharge − markup,
-    // so markup + interchange equals the real charge instead of double-counting the markup.
-    try {
-      const v = data.volumes || {}, r = data.currentRates || {};
-      const part = (vol, rate) => ((vol?.trx || 0) * (rate?.perTrx || 0)) + ((vol?.amount || 0) * ((rate?.ratePct || 0) / 100));
-      const markup = part(v.debit, r.debit) + part(v.credit, r.credit) + part(v.amex, r.amex);
-      const total = data.totalTransactionCharge || 0;
-      if (total > 0 && total >= markup) {
-        data.interchange = Math.round((total - markup) * 100) / 100;
-        data.interchangeDerived = true;
-      }
-    } catch { /* leave model's interchange as-is */ }
-    res.json({ extracted: data });
-  } catch (e) {
-    console.warn('[savings/parse-statement]', e.name, e.message);
-    res.status(502).json({ error: 'ai_error', detail: e.message });
-  }
-});
-
-// --- Saved analyses ---
-app.post('/api/savings/analyses', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'savings:use'))) return;
-  try {
-    const row = (await pool.query(
-      `INSERT INTO savings_analyses (rep_email, rep_name, merchant_name, template_id, inputs, results)
-       VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb) RETURNING id`,
-      [req.user.realAdminEmail || req.user.email || null, req.user.name || null,
-       String(req.body.merchantName || '').slice(0, 255), req.body.templateId || null,
-       JSON.stringify(req.body.inputs || {}), JSON.stringify(req.body.results || {})])).rows[0];
-    res.json({ id: row.id });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.get('/api/savings/analyses', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'savings:use'))) return;
-  try {
-    const all = req.user.isAdmin === true;
-    const rows = (await pool.query(
-      `SELECT id, rep_email, rep_name, merchant_name, template_id, results, created_at FROM savings_analyses
-       ${all ? '' : 'WHERE LOWER(rep_email) = LOWER($1)'} ORDER BY created_at DESC LIMIT 100`,
-      all ? [] : [req.user.email || ''])).rows;
-    res.json({ analyses: rows });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.get('/api/savings/analyses/:id', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'savings:use'))) return;
-  try {
-    const r = (await pool.query(`SELECT * FROM savings_analyses WHERE id = $1`, [parseInt(req.params.id, 10)])).rows[0];
-    if (!r) return res.status(404).json({ error: 'not_found' });
-    if (req.user.isAdmin !== true && (r.rep_email || '').toLowerCase() !== (req.user.email || '').toLowerCase()) return res.status(403).json({ error: 'forbidden' });
-    res.json({ analysis: r });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-// Standalone branded savings offer PDF (client-facing). pdfkit, one page, bilingual.
-function buildSavingsPdf({ merchant, lang, results, dateStr }) {
-  const fr = lang !== 'en';
-  const fmt = new Intl.NumberFormat(fr ? 'fr-CA' : 'en-CA', { style: 'currency', currency: 'CAD' });
-  const $ = (n) => fmt.format(n || 0);
-  const T = fr ? {
-    title: "Analyse d'économies — paiements", prepared: 'Préparé pour', save: "VOS ÉCONOMIES ESTIMÉES", mo: 'par mois', yr: 'par année',
-    comp: 'Comparaison mensuelle', cur: 'Processeur actuel', cl: 'Avec Cluster', txn: 'Frais de transaction', fix: 'Frais fixes', tax: 'Taxe', tot: 'Total mensuel',
-    disc: "Estimations basées sur le relevé fourni, avant taxes applicables sur certains frais. Montants indicatifs.",
-  } : {
-    title: 'Payment savings analysis', prepared: 'Prepared for', save: 'YOUR ESTIMATED SAVINGS', mo: 'per month', yr: 'per year',
-    comp: 'Monthly comparison', cur: 'Current processor', cl: 'With Cluster', txn: 'Transaction fees', fix: 'Fixed fees', tax: 'Tax', tot: 'Monthly total',
-    disc: 'Estimates based on the statement provided, before applicable taxes on certain fees. Indicative figures.',
-  };
-  const doc = new PDFDocument({ size: 'LETTER', margin: 0 });
-  const W = 612, M = 56;
-  // Header
-  doc.rect(0, 0, W, 92).fill('#0f1722');
-  try { doc.image(require('path').join(__dirname, 'assets', 'brand', 'saleshub-mark-192.png'), M, 24, { width: 34, height: 34 }); } catch (_e) { /* optional */ }
-  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(22).text('Sales Hub', M + 44, 30, { continued: true }).fillColor('#f97316').text('.');
-  doc.fillColor('#8a99af').font('Helvetica').fontSize(10).text('by Cluster Systems', M + 44, 60);
-  doc.rect(0, 92, W, 4).fill('#f97316');
-  // Title + merchant
-  doc.fillColor('#0f1722').font('Helvetica-Bold').fontSize(18).text(T.title, M, 124);
-  doc.fillColor('#475569').font('Helvetica').fontSize(11).text(`${T.prepared}: ${merchant || '—'}   ·   ${dateStr}`, M, 150);
-  // Savings hero
-  const hy = 184;
-  doc.roundedRect(M, hy, W - 2 * M, 104, 10).fill('#e8f6ef');
-  doc.fillColor('#0f6e56').font('Helvetica-Bold').fontSize(11).text(T.save, M, hy + 16, { width: W - 2 * M, align: 'center' });
-  doc.fillColor('#0f6e56').font('Helvetica-Bold').fontSize(34).text($(results.savings.monthly), M, hy + 34, { width: W - 2 * M, align: 'center' });
-  doc.fillColor('#0f6e56').font('Helvetica').fontSize(12).text(`${T.mo}  ·  ${$(results.savings.yearly)} ${T.yr}`, M, hy + 76, { width: W - 2 * M, align: 'center' });
-  // Comparison table
-  let y = hy + 140;
-  doc.fillColor('#0f1722').font('Helvetica-Bold').fontSize(13).text(T.comp, M, y); y += 26;
-  const c1 = M, c2 = 320, c3 = 470, rowH = 26;
-  doc.font('Helvetica-Bold').fontSize(10).fillColor('#94a3b8');
-  doc.text('', c1, y); doc.text(T.cur, c2, y, { width: 120, align: 'right' }); doc.text(T.cl, c3, y, { width: W - M - c3, align: 'right' });
-  y += 20;
-  const row = (label, a, b, bold) => {
-    doc.moveTo(M, y - 4).lineTo(W - M, y - 4).strokeColor('#eef1f6').stroke();
-    doc.font(bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(bold ? 12 : 11).fillColor(bold ? '#0f1722' : '#475569');
-    doc.text(label, c1, y); doc.text($(a), c2, y, { width: 120, align: 'right' }); doc.text($(b), c3, y, { width: W - M - c3, align: 'right' });
-    y += rowH;
-  };
-  row(T.txn, results.current.txnFees, results.cluster.txnFees);
-  row(T.fix, results.current.fixed, results.cluster.fixed);
-  row(T.tax, results.current.tax, results.cluster.tax);
-  row(T.tot, results.current.total, results.cluster.total, true);
-  // Footer
-  doc.font('Helvetica').fontSize(9).fillColor('#94a3b8').text(T.disc, M, 720, { width: W - 2 * M });
-  doc.fillColor('#94a3b8').fontSize(9).text('saleshub@clustersystems.com  ·  clusterpos.com', M, 752, { width: W - 2 * M, align: 'center' });
-  return new Promise((resolve, reject) => { const ch = []; doc.on('data', d => ch.push(d)); doc.on('end', () => resolve(Buffer.concat(ch))); doc.on('error', reject); doc.end(); });
-}
-// POST /api/savings/pdf — recompute server-side + return the branded offer PDF.
-app.post('/api/savings/pdf', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'savings:use'))) return;
-  try {
-    const { volumes, current, clusterQty, lang } = req.body;
-    if (!volumes || !current || !current.rates) return res.status(400).json({ error: 'volumes + current required' });
-    let t = null;
-    if (req.user.isAdmin && req.body.templateId) t = (await pool.query(`SELECT * FROM pricing_templates WHERE id = $1`, [parseInt(req.body.templateId, 10)])).rows[0];
-    if (!t) t = await getEffectiveTemplate(req.user.email);
-    if (!t) return res.status(404).json({ error: 'no_template' });
-    const overrides = req.user.isAdmin === true ? req.body.overrides : null;
-    const cluster = buildClusterForEngine(t.config, clusterQty, current.interchange || 0, overrides);
-    const results = computeSavingsEngine({ volumes, current, cluster });
-    const buf = await buildSavingsPdf({
-      merchant: String(req.body.merchantName || ''), lang,
-      results, dateStr: new Date().toLocaleDateString(lang === 'en' ? 'en-CA' : 'fr-CA'),
-    });
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="savings-${String(req.body.merchantName || 'offer').replace(/[^a-z0-9]+/gi, '-').slice(0, 40) || 'offer'}.pdf"`);
-    res.send(buf);
-  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ============================================================================
