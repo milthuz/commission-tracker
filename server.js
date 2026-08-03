@@ -14839,17 +14839,27 @@ app.get('/api/pass/link/:slug', async (req, res) => {
  * (`not_qualified`) ne comptent PAS : sinon un refus pour une raison sans rapport
  * bloquerait à jamais ce restaurant pour tout le monde.
  *
- * Le rapprochement se fait sur nom + code postal — le même couple que le signalement de
- * doublon du tableau ops, pour que ce qu'on bloque soit exactement ce qui s'y affiche.
+ * Le rapprochement se fait sur nom + VILLE, et non sur nom + code postal comme le
+ * signalement de doublon du tableau ops. Raison : le formulaire public de la page du lien
+ * ne DEMANDE PAS le code postal — le designer l'a volontairement réduit à cinq champs pour
+ * ne pas décourager un inconnu. Une clé qui inclurait le code postal ne pourrait donc
+ * jamais rapprocher une soumission du lien d'une soumission du formulaire membre : la
+ * préséance échouerait précisément dans le cas inter-canal qui la justifie.
+ *
+ * Nom + ville est un peu plus large. Deux restaurants au même nom dans la même ville sont
+ * presque toujours le même ; dans deux villes différentes ce sont deux commerces. Le
+ * compromis penche donc du bon côté : on risque d'écarter un doublon réel plutôt que de
+ * payer deux fois le même restaurant.
  */
-async function findPassPrecedingReferral(restaurantName, postalCode) {
+async function findPassPrecedingReferral(restaurantName, city) {
   const r = await pool.query(
     `SELECT r.id, r.ref_code, r.member_id, r.submitted_at, m.business, m.email
        FROM pass_referrals r JOIN pass_members m ON m.id = r.member_id
-      WHERE LOWER(r.restaurant_name) = LOWER($1) AND r.postal_code = $2
+      WHERE LOWER(TRIM(r.restaurant_name)) = LOWER(TRIM($1))
+        AND LOWER(TRIM(r.city)) = LOWER(TRIM($2))
         AND r.status <> 'not_qualified'
       ORDER BY r.submitted_at ASC LIMIT 1`,
-    [restaurantName, postalCode]
+    [restaurantName, city]
   );
   return r.rows[0] || null;
 }
@@ -14874,7 +14884,11 @@ app.post('/api/pass/link/:slug/refer', async (req, res) => {
     const contactName = str(b.contactName, 255);
     const city = str(b.city, 255);
     const province = String(b.province || '').trim().toUpperCase();
-    const postalCode = normalizePostalCode(b.postalCode);
+    // Code postal FACULTATIF sur ce canal : le formulaire public n'en demande pas — cinq
+    // champs seulement, pour ne pas décourager un inconnu. Le spécialiste le recueillera
+    // au premier appel. La province, elle, reste obligatoire : « Canada seulement » est
+    // une règle d'éligibilité, pas un détail d'adresse.
+    const postalCode = normalizePostalCode(b.postalCode) || '';
     const contact = str(b.contact, 255);
     const contactLocale = passLocale(b.contactLocale);
 
@@ -14883,7 +14897,6 @@ app.post('/api/pass/link/:slug/refer', async (req, res) => {
     if (!contactName) missing.push('contactName');
     if (!city) missing.push('city');
     if (!CA_PROVINCES.includes(province)) missing.push('province');
-    if (!postalCode) missing.push('postalCode');
     if (!contact || !(isEmailLike(contact) || isCaPhone(contact))) missing.push('contact');
     if (b.consent !== true) missing.push('consent');
     if (missing.length) return res.status(400).json({ error: 'invalid_fields', fields: missing });
@@ -14892,7 +14905,7 @@ app.post('/api/pass/link/:slug/refer', async (req, res) => {
     // de plus. Le visiteur reçoit une confirmation — il a fait sa part, et lui annoncer
     // qu'un autre restaurateur l'a devancé ne le concerne pas —, mais aucun deuxième
     // dossier n'est créé et aucun deuxième crédit ne peut naître.
-    const first = await findPassPrecedingReferral(restaurantName, postalCode);
+    const first = await findPassPrecedingReferral(restaurantName, city);
     if (first) {
       await logActivity('pass_referral', String(first.id), 'duplicate_blocked',
         `Deuxième soumission pour ${restaurantName} — préséance au dossier ${first.ref_code}`,
@@ -15410,7 +15423,7 @@ app.post('/api/pass/referrals', authenticatePassToken, async (req, res) => {
   try {
     // Préséance du premier arrivé — la MÊME garde que sur la page du lien, sinon la règle
     // se contournerait en passant simplement par l'autre canal.
-    const first = await findPassPrecedingReferral(restaurantName, postalCode);
+    const first = await findPassPrecedingReferral(restaurantName, city);
     if (first) {
       await logActivity('pass_referral', String(first.id), 'duplicate_blocked',
         `Soumission refusée pour ${restaurantName} — préséance au dossier ${first.ref_code}`,
