@@ -2875,6 +2875,20 @@ async function revokeTrustedDevices(email, userType) {
     await pool.query(`DELETE FROM trusted_devices WHERE LOWER(email) = LOWER($1) AND user_type = $2`, [email, userType]);
   } catch (e) { console.warn('[trusted-devices] revoke failed:', e.message); }
 }
+// Libellé « issuer » écrit dans le QR code TOTP. Il DOIT différer entre les surfaces.
+//
+// 🐛 Les quatre points d'enrôlement publiaient tous « Sales Hub ». Une même adresse peut
+// exister à la fois comme compte externe et comme compte partenaire — deux tables, deux
+// mots de passe, et surtout DEUX SECRETS TOTP DIFFÉRENTS. Les deux enrôlements
+// apparaissaient alors dans l'application d'authentification sous un libellé
+// rigoureusement identique (« Sales Hub », même adresse), donc impossibles à distinguer :
+// lire le mauvais des deux donne « Code invalide » indéfiniment, sans le moindre indice.
+// Signalé par un vrai cas, lafleur.david@gmail.com, le 2026-08-03.
+//
+// ⚠️ Ne corrige que les enrôlements FUTURS : un QR déjà scanné garde son libellé, la chaîne
+// n'existant plus que dans l'application du téléphone.
+const PARTNER_TOTP_ISSUER = 'Sales Hub Partners';
+
 authenticator.options = { window: 1 }; // tolerate ±30s clock drift
 
 // SMTP mailer — Heroku config vars: SMTP_HOST, SMTP_PORT (465=TLS), SMTP_USER,
@@ -3524,7 +3538,8 @@ app.post('/api/partner-auth/invite/accept', async (req, res) => {
       `UPDATE partner_users SET password_hash = $2, totp_secret = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
       [pu.id, await bcrypt.hash(password, 10), secret]
     );
-    const otpauth = authenticator.keyuri(pu.email, 'Sales Hub', secret);
+    // Libellé DISTINCT de celui des comptes Sales Hub — voir PASS/PARTNER_TOTP_ISSUER.
+    const otpauth = authenticator.keyuri(pu.email, PARTNER_TOTP_ISSUER, secret);
     const qrDataUrl = await QRCode.toDataURL(otpauth, { margin: 1, width: 220 });
     res.json({ success: true, qrDataUrl, secret, setupToken: signMfaJwt(pu.email, 'partner-2fa-setup') });
   } catch (e) {
@@ -3842,7 +3857,7 @@ app.post('/api/partner-portal/2fa/reset', authenticatePartnerToken, async (req, 
   } catch (e) { return res.status(500).json({ error: e.message }); }
   try {
     const secret = authenticator.generateSecret();
-    const otpauth = authenticator.keyuri(req.partnerUser.email, 'Sales Hub', secret);
+    const otpauth = authenticator.keyuri(req.partnerUser.email, PARTNER_TOTP_ISSUER, secret);
     const qrDataUrl = await QRCode.toDataURL(otpauth, { margin: 1, width: 220 });
     const setupToken = jwt.sign(
       { email: req.partnerUser.email, purpose: 'partner-2fa-reset', secret }, JWT_SECRET, { expiresIn: '15m' }
