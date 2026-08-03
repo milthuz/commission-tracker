@@ -14430,11 +14430,10 @@ const PASS_TERMS_VERSION = '2026-07';
 
 // Deux expéditeurs, un par langue — le programme porte deux noms.
 //
-// Sur clustersystems.com et NON sur le clusterpos.ca du deck (décision utilisateur
-// 2026-07-31) : ce domaine est déjà authentifié dans SendGrid, donc n'importe quelle
-// adresse y est autorisée à envoyer sans nouvelle vérification ni changement DNS.
-// L'alternative aurait coûté trois enregistrements CNAME sur un domaine de plus, pour
-// une différence que seul le marchand attentif aurait remarquée.
+// Sur clustersystems.com, et NON sur le domaine .ca que proposait le deck (décision
+// utilisateur 2026-07-31, réaffirmée le 2026-08-03 : ce domaine n'est pas utilisé, le
+// site est clusterpos.com). clustersystems.com est déjà authentifié dans SendGrid, donc
+// n'importe quelle adresse y est autorisée à envoyer sans vérification ni changement DNS.
 //
 // ⚠️ Les DEUX adresses doivent exister comme boîtes ou renvois : l'envoi partira de
 // toute façon (le domaine suffit pour ça), mais une réponse à une adresse inexistante
