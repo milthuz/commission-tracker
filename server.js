@@ -1683,6 +1683,49 @@ async function initializeDatabase() {
     // à qui revient la décision.
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_pass_referrals_dupe ON pass_referrals(LOWER(restaurant_name), postal_code)`);
 
+    // Lien de recommandation personnel + carte de membre (v2 du design). Le `slug` est
+    // l'adresse publique du membre (`/pass/{slug}`) et le `member_no` ce qu'affiche sa
+    // carte : les deux sont STABLES et publics, donc dérivés une seule fois puis persistés.
+    // Les recalculer à la lecture les ferait changer si la raison sociale change — un lien
+    // déjà partagé cesserait de fonctionner.
+    await pool.query(`ALTER TABLE pass_members ADD COLUMN IF NOT EXISTS slug VARCHAR(60)`);
+    await pool.query(`ALTER TABLE pass_members ADD COLUMN IF NOT EXISTS member_no VARCHAR(24)`);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_pass_members_slug ON pass_members(slug) WHERE slug IS NOT NULL`);
+
+    // Clics sur le lien. Une LIGNE par clic plutôt qu'un compteur : « ce mois-ci » est
+    // alors une question qu'on pose aux données, et non un compteur à remettre à zéro le
+    // 1er du mois — remise à zéro qu'il faudrait déclencher, et qui effacerait l'historique.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS pass_link_clicks (
+        id         SERIAL PRIMARY KEY,
+        member_id  INT NOT NULL REFERENCES pass_members(id) ON DELETE CASCADE,
+        clicked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_pass_link_clicks_member ON pass_link_clicks(member_id, clicked_at DESC)`);
+
+    // Une recommandation arrivée PAR le lien, à distinguer de celle saisie au formulaire.
+    await pool.query(`ALTER TABLE pass_referrals ADD COLUMN IF NOT EXISTS via_link BOOLEAN DEFAULT false`);
+
+    // Bibliothèque de contenu que le membre envoie à ses contacts. Fichiers EN BASE, comme
+    // la bibliothèque de ressources interne — ce produit n'a pas de stockage d'objets.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS pass_resources (
+        id          SERIAL PRIMARY KEY,
+        title_fr    VARCHAR(300) NOT NULL,
+        title_en    VARCHAR(300) NOT NULL,
+        meta_fr     VARCHAR(150) DEFAULT '',
+        meta_en     VARCHAR(150) DEFAULT '',
+        file_name   VARCHAR(400) NOT NULL,
+        mime_type   VARCHAR(150),
+        file_size   INT,
+        file_data   BYTEA NOT NULL,
+        sort_order  INT DEFAULT 0,
+        uploaded_by VARCHAR(255),
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
     // Resellers — third-party companies that resell licenses. POS activations come from a
     // Zoho Form; residual payments come from Zentact. Linked by reseller name for now.
     await pool.query(`
@@ -14643,6 +14686,289 @@ function passMail(locale, title, bodyHtml, cta) {
 }
 
 // ---------------------------------------------------------------------------
+// Lien personnel, carte de membre, bibliothèque
+// ---------------------------------------------------------------------------
+
+/** `Bistro du Coin` → `bistroducoin`. Sans accents, sans ponctuation, borné. */
+function passSlugify(raw) {
+  return String(raw || '')
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .toLowerCase().replace(/[^a-z0-9]+/g, '')
+    .slice(0, 40);
+}
+
+// Chiffres et lettres sans I, O, 0 ni 1 : le numéro de membre se lit au téléphone et
+// s'écrit à la main sur une carte, donc les caractères confondables sont exclus.
+const PASS_NO_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+
+/**
+ * Attribue au membre son `slug` et son `member_no` s'il n'en a pas, puis retourne la ligne
+ * à jour. Dérivés UNE FOIS puis persistés : recalculés à la lecture, ils changeraient si la
+ * raison sociale change, et un lien déjà partagé cesserait de fonctionner.
+ *
+ * ⚠️ Le préfixe du numéro est `PASS-` dans les DEUX langues, là où la maquette montre
+ * `PASSE-` en français. Un identifiant imprimé sur une carte et dicté au soutien ne peut
+ * pas changer selon la langue de l'interface — la même personne y lirait deux numéros.
+ */
+async function ensurePassMemberIdentity(member) {
+  if (member.slug && member.member_no) return member;
+
+  let slug = member.slug;
+  if (!slug) {
+    const base = passSlugify(member.business) || passSlugify(member.email.split('@')[0]) || 'membre';
+    slug = base;
+    // Collision : on suffixe plutôt que d'échouer. Deux « Chez Georges » existent.
+    for (let n = 2; n <= 99; n++) {
+      const taken = (await pool.query(`SELECT 1 FROM pass_members WHERE slug = $1 AND id <> $2`, [slug, member.id])).rowCount;
+      if (!taken) break;
+      slug = `${base}${n}`;
+    }
+  }
+
+  let memberNo = member.member_no;
+  if (!memberNo) {
+    const pick = () => Array.from(crypto.randomBytes(4))
+      .map((b) => PASS_NO_ALPHABET[b % PASS_NO_ALPHABET.length]).join('');
+    memberNo = `PASS-${pick()}`;
+    for (let n = 0; n < 20; n++) {
+      const taken = (await pool.query(`SELECT 1 FROM pass_members WHERE member_no = $1 AND id <> $2`, [memberNo, member.id])).rowCount;
+      if (!taken) break;
+      memberNo = `PASS-${pick()}`;
+    }
+  }
+
+  const r = await pool.query(
+    `UPDATE pass_members SET slug = $2, member_no = $3, updated_at = NOW() WHERE id = $1 RETURNING *`,
+    [member.id, slug, memberNo]
+  );
+  return r.rows[0] || member;
+}
+
+const passLinkUrl = (slug) =>
+  `${(process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com').replace(/^https?:\/\//, '')}/pass/${slug}`;
+
+// GET /api/pass/me/share — le lien personnel et ses deux compteurs.
+app.get('/api/pass/me/share', authenticatePassToken, async (req, res) => {
+  try {
+    const m = await ensurePassMemberIdentity(req.passMember);
+    const stats = (await pool.query(
+      `SELECT (SELECT COUNT(*) FROM pass_link_clicks
+                WHERE member_id = $1 AND clicked_at >= date_trunc('month', CURRENT_DATE))::int AS clicks_this_month,
+              (SELECT COUNT(*) FROM pass_referrals WHERE member_id = $1 AND via_link)::int AS referrals_via_link`,
+      [m.id]
+    )).rows[0];
+    res.json({
+      slug: m.slug,
+      url: passLinkUrl(m.slug),
+      memberNo: m.member_no,
+      clicksThisMonth: stats.clicks_this_month,
+      referralsViaLink: stats.referrals_via_link,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/pass/resources — la bibliothèque, sans les octets.
+app.get('/api/pass/resources', authenticatePassToken, async (req, res) => {
+  try {
+    const rows = (await pool.query(
+      `SELECT id, title_fr, title_en, meta_fr, meta_en, file_name, mime_type, file_size
+         FROM pass_resources ORDER BY sort_order, id`
+    )).rows;
+    const fr = passLocale(req.passMember.locale) === 'fr-CA';
+    res.json({
+      resources: rows.map(r => ({
+        id: r.id,
+        title: fr ? r.title_fr : r.title_en,
+        meta: fr ? r.meta_fr : r.meta_en,
+        fileName: r.file_name,
+        size: r.file_size,
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/pass/resources/:id/file — le fichier lui-même.
+app.get('/api/pass/resources/:id/file', authenticatePassToken, async (req, res) => {
+  try {
+    const r = (await pool.query(`SELECT file_name, mime_type, file_data FROM pass_resources WHERE id = $1`, [req.params.id])).rows[0];
+    if (!r) return res.status(404).json({ error: 'not_found' });
+    res.setHeader('Content-Type', r.mime_type || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(r.file_name)}"`);
+    res.send(r.file_data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- La page publique du lien : /pass/{slug} ------------------------------
+// GET /api/pass/link/:slug — PUBLIC. Ce que la page personnalisée affiche du référent.
+// Ne sort que le prénom et la raison sociale : c'est ce que la copie du designer place
+// dans le titre et le pied d'attribution, et rien de plus n'a à sortir d'ici.
+app.get('/api/pass/link/:slug', async (req, res) => {
+  try {
+    const config = await getPassConfig();
+    if (!config.enabled) return res.status(403).json({ error: 'program_not_open' });
+    const m = (await pool.query(
+      `SELECT full_name, business FROM pass_members WHERE slug = $1 AND status = 'active'`,
+      [String(req.params.slug || '').toLowerCase()]
+    )).rows[0];
+    if (!m) return res.status(404).json({ error: 'not_found' });
+    res.json({
+      referrerFirstName: passFirstName(m),
+      referrerName: m.full_name || '',
+      referrerBusiness: m.business || '',
+      hardwareDiscount: config.hardwareDiscount,
+      currency: config.currency,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/**
+ * PRÉSÉANCE DU PREMIER ARRIVÉ (règle utilisateur 2026-08-03).
+ *
+ * Deux membres peuvent recommander le même restaurant — par leurs liens respectifs ou par
+ * le formulaire. Le crédit revient à celui qui a soumis EN PREMIER.
+ *
+ * Retourne la recommandation antérieure encore en jeu, ou `null`. Les dossiers déjà écartés
+ * (`not_qualified`) ne comptent PAS : sinon un refus pour une raison sans rapport
+ * bloquerait à jamais ce restaurant pour tout le monde.
+ *
+ * Le rapprochement se fait sur nom + code postal — le même couple que le signalement de
+ * doublon du tableau ops, pour que ce qu'on bloque soit exactement ce qui s'y affiche.
+ */
+async function findPassPrecedingReferral(restaurantName, postalCode) {
+  const r = await pool.query(
+    `SELECT r.id, r.ref_code, r.member_id, r.submitted_at, m.business, m.email
+       FROM pass_referrals r JOIN pass_members m ON m.id = r.member_id
+      WHERE LOWER(r.restaurant_name) = LOWER($1) AND r.postal_code = $2
+        AND r.status <> 'not_qualified'
+      ORDER BY r.submitted_at ASC LIMIT 1`,
+    [restaurantName, postalCode]
+  );
+  return r.rows[0] || null;
+}
+
+// POST /api/pass/link/:slug/refer — PUBLIC. Le restaurant recommandé se présente lui-même
+// depuis la page du lien ; l'attribution vient du slug, pas d'un champ du formulaire.
+app.post('/api/pass/link/:slug/refer', async (req, res) => {
+  const b = req.body || {};
+  try {
+    const config = await getPassConfig();
+    if (!config.enabled) return res.status(403).json({ error: 'program_not_open' });
+    if (rateLimited(`passlinkrefer:${req.ip}`, 8)) return res.status(429).json({ error: 'too_many_attempts' });
+
+    const member = (await pool.query(
+      `SELECT * FROM pass_members WHERE slug = $1 AND status = 'active'`,
+      [String(req.params.slug || '').toLowerCase()]
+    )).rows[0];
+    if (!member) return res.status(404).json({ error: 'not_found' });
+
+    const str = (v, max) => String(v ?? '').trim().slice(0, max);
+    const restaurantName = str(b.restaurantName, 255);
+    const contactName = str(b.contactName, 255);
+    const city = str(b.city, 255);
+    const province = String(b.province || '').trim().toUpperCase();
+    const postalCode = normalizePostalCode(b.postalCode);
+    const contact = str(b.contact, 255);
+    const contactLocale = passLocale(b.contactLocale);
+
+    const missing = [];
+    if (!restaurantName) missing.push('restaurantName');
+    if (!contactName) missing.push('contactName');
+    if (!city) missing.push('city');
+    if (!CA_PROVINCES.includes(province)) missing.push('province');
+    if (!postalCode) missing.push('postalCode');
+    if (!contact || !(isEmailLike(contact) || isCaPhone(contact))) missing.push('contact');
+    if (b.consent !== true) missing.push('consent');
+    if (missing.length) return res.status(400).json({ error: 'invalid_fields', fields: missing });
+
+    // Préséance : si ce restaurant est déjà au dossier de quelqu'un, on n'enregistre RIEN
+    // de plus. Le visiteur reçoit une confirmation — il a fait sa part, et lui annoncer
+    // qu'un autre restaurateur l'a devancé ne le concerne pas —, mais aucun deuxième
+    // dossier n'est créé et aucun deuxième crédit ne peut naître.
+    const first = await findPassPrecedingReferral(restaurantName, postalCode);
+    if (first) {
+      await logActivity('pass_referral', String(first.id), 'duplicate_blocked',
+        `Deuxième soumission pour ${restaurantName} — préséance au dossier ${first.ref_code}`,
+        member.email, { metadata: { blockedForMemberId: member.id, blockedForSlug: member.slug, existingRefCode: first.ref_code } });
+      return res.status(200).json({ ok: true, alreadyReferred: true });
+    }
+
+    const tier = passTierFor(config, Number(member.lifetime_live_referrals) || 0);
+    const code = (await pool.query(`SELECT 'CR-' || nextval('pass_referral_code_seq') AS code`)).rows[0].code;
+    const r = (await pool.query(
+      `INSERT INTO pass_referrals
+         (ref_code, member_id, restaurant_name, contact_name, city, province, postal_code,
+          contact, contact_locale, tier_at_submission, credit_amount, currency,
+          hardware_discount, consent_at, consent_locale, via_link)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW(),$14,true)
+       RETURNING *`,
+      [code, member.id, restaurantName, contactName, city, province, postalCode, contact,
+       contactLocale, tier.level, tier.credit, config.currency, config.hardwareDiscount, contactLocale]
+    )).rows[0];
+
+    const lead = await createCrmLead({
+      business_name: restaurantName,
+      contact_last_name: contactName,
+      contact_email: isEmailLike(contact) ? contact : null,
+      contact_phone: isEmailLike(contact) ? null : contact,
+      lead_contact_method: 'Merchant Referral',
+      lead_source: 'The Pass',
+      description: [
+        `Arrivé par le LIEN de ${member.business || member.email} (/pass/${member.slug})`,
+        `Dossier La Passe : ${code}`,
+        `${city}, ${province} ${postalCode}`,
+        `Langue de correspondance : ${contactLocale}`,
+      ].join('\n'),
+    });
+    await pool.query(`UPDATE pass_referrals SET crm_lead_id = $2, crm_lead_error = $3 WHERE id = $1`,
+      [r.id, lead.leadId || null, lead.success ? null : (lead.error || 'unknown')]);
+
+    await logActivity('pass_referral', String(r.id), 'created',
+      `Recommandation ${code} par LIEN — ${restaurantName} (${city}, ${province})`, member.email,
+      { metadata: { memberId: member.id, viaLink: true, slug: member.slug, tierAtSubmission: tier.level } });
+
+    // Le MEMBRE est prévenu : c'est son lien qui a produit la recommandation, il n'a rien
+    // rempli lui-même et n'aurait autrement aucun moyen de le savoir.
+    sendPassEmail('received', member, {
+      firstName: passFirstName(member),
+      restaurant: restaurantName,
+      referenceId: code,
+      hardware: passMoney(config.hardwareDiscount, member.locale),
+      tier: passTierLabel(tier),
+      amount: passMoney(tier.credit, member.locale),
+    });
+
+    res.status(201).json({ ok: true, refCode: code });
+  } catch (e) {
+    console.warn('[pass] soumission par lien échouée :', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/pass/link/:slug/click — PUBLIC, sans corps. Enregistre une visite.
+// Best-effort et silencieux : un compteur qui échoue ne doit pas empêcher la page de
+// s'afficher, et le visiteur n'a rien à savoir de tout ça.
+app.post('/api/pass/link/:slug/click', async (req, res) => {
+  try {
+    if (rateLimited(`passclick:${req.ip}`, 60)) return res.json({ ok: true });
+    await pool.query(
+      `INSERT INTO pass_link_clicks (member_id) SELECT id FROM pass_members WHERE slug = $1 AND status = 'active'`,
+      [String(req.params.slug || '').toLowerCase()]
+    );
+  } catch (e) {
+    console.warn('[pass] click non enregistré :', e.message);
+  }
+  res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
 // Les quatre courriels du programme
 // ---------------------------------------------------------------------------
 // La copie vient du deck du designer, à une réécriture près : ses phrases figent les
@@ -15082,6 +15408,24 @@ app.post('/api/pass/referrals', authenticatePassToken, async (req, res) => {
   if (missing.length) return res.status(400).json({ error: 'invalid_fields', fields: missing });
 
   try {
+    // Préséance du premier arrivé — la MÊME garde que sur la page du lien, sinon la règle
+    // se contournerait en passant simplement par l'autre canal.
+    const first = await findPassPrecedingReferral(restaurantName, postalCode);
+    if (first) {
+      await logActivity('pass_referral', String(first.id), 'duplicate_blocked',
+        `Soumission refusée pour ${restaurantName} — préséance au dossier ${first.ref_code}`,
+        req.passMember.email,
+        { metadata: { blockedForMemberId: req.passMember.id, existingRefCode: first.ref_code, sameMember: first.member_id === req.passMember.id } });
+      // On le DIT au membre, contrairement à la page publique : c'est lui qui remplit le
+      // formulaire et attend un dossier ; le laisser croire qu'il en a un serait lui
+      // promettre un crédit qui n'arrivera jamais.
+      return res.status(409).json({
+        error: 'already_referred',
+        mine: first.member_id === req.passMember.id,
+        refCode: first.member_id === req.passMember.id ? first.ref_code : undefined,
+      });
+    }
+
     // Le crédit est calculé au palier de MISE EN SERVICE, pas de soumission. Ce qu'on
     // enregistre ici est donc un PLANCHER — sûr précisément parce que l'échelle ne
     // redescend jamais, donc le montant annoncé au formulaire ne peut qu'augmenter.
