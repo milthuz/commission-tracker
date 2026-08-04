@@ -3848,6 +3848,28 @@ app.put('/api/partner-portal/profile', authenticatePartnerToken, async (req, res
   }
 });
 
+// PUT /api/partner-portal/locale { locale } — la bascule FR/EN de l'en-tete.
+//
+// Elle ne faisait que changer l'affichage, en memoire du NAVIGATEUR (localStorage).
+// Un partenaire pouvait donc lire le portail en anglais depuis des mois et continuer
+// de recevoir ses courriels en francais, parce que sa langue avait ete fixee une fois
+// pour toutes par la personne qui l'avait invite.
+//
+// Endpoint separe et non un champ de PUT /profile : ce dernier ecrit display_name sans
+// condition, donc un appel ne portant que la langue effacerait le nom.
+app.put('/api/partner-portal/locale', authenticatePartnerToken, async (req, res) => {
+  const locale = isFrLocale(req.body.locale) ? 'fr' : 'en';
+  try {
+    await pool.query(
+      `UPDATE partner_users SET locale = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [req.partnerUser.id, locale]
+    );
+    res.json({ success: true, locale });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /api/partner-portal/change-password { currentPassword, newPassword }
 app.post('/api/partner-portal/change-password', authenticatePartnerToken, async (req, res) => {
   const currentPassword = String(req.body.currentPassword || '');
