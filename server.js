@@ -2104,6 +2104,26 @@ initializeDatabase().then(() => { dbReady = true; });
 // Don't advertise the stack (Express sets X-Powered-By by default).
 app.disable('x-powered-by');
 
+// Chaque public a sa porte d'entrée. Les partenaires et les membres de La Passe ne sont
+// pas des employés : leur envoyer un lien vers `saleshub.` expose un nom d'outil interne
+// et rallonge une adresse qu'ils doivent parfois dicter.
+//
+// ⚠️ Tant que la variable n'est PAS définie, on retombe sur FRONTEND_URL. C'est
+// volontaire : le code peut donc partir en production AVANT que le DNS réponde, sans
+// casser un seul lien déjà en circulation. Le basculement se fait en posant la variable
+// sur Railway, le jour où le domaine résout — pas au déploiement.
+//
+// La Passe est segmentée par langue (deux jeux de textes, deux expéditeurs), donc deux
+// domaines. Les courriels partenaires, eux, sont bilingues dans un même envoi : un
+// domaine par langue y serait un pile ou face, donc un seul.
+const PASS_WEB_BASE = (lang) =>
+  (String(lang || 'fr').toLowerCase().startsWith('fr')
+    ? process.env.PASS_URL_FR
+    : process.env.PASS_URL_EN) || process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+
+const PARTNER_WEB_BASE = () =>
+  process.env.PARTNER_URL || process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+
 // Origines autorisées à ENCADRER nos réponses (aperçus PDF affichés en iframe)
 // ET à faire des requêtes cross-origin. Une seule liste : deux listes qui
 // divergent, c'est une origine ajoutée d'un côté et pas de l'autre.
@@ -2113,6 +2133,13 @@ const ALLOWED_ORIGINS = [
   'http://localhost:3001',
   'https://sparkly-kulfi-c7641a.netlify.app', // Netlify (default)
   'https://saleshub.clusterpos.com',          // custom domain
+  // Portes d'entrée dédiées (le même site Netlify, servi sous un autre nom). Sans ces
+  // entrées, chaque appel API depuis ces domaines est refusé par CORS — l'application
+  // s'afficherait mais ne chargerait aucune donnée.
+  'https://partenaires.clusterpos.com',
+  'https://partners.clusterpos.com',
+  'https://lapasse.clusterpos.com',
+  'https://thepass.clusterpos.com',
   // (Removed a stale Vercel preview origin — that deployment is dead, and leaving a domain we
   //  no longer control in the allowlist is a needless risk.)
 ].filter(Boolean);
@@ -3582,7 +3609,7 @@ app.post('/api/partner-auth/forgot-password', async (req, res) => {
           'Réinitialiser votre mot de passe · Reset your password',
           `Une réinitialisation du mot de passe a été demandée pour votre compte du Portail partenaire Sales Hub. Le lien expire dans 1 heure. Si vous n'êtes pas à l'origine de cette demande, ignorez ce courriel.<br><br>A password reset was requested for your Sales Hub Partner Portal account. The link expires in 1 hour. If you didn't request this, you can ignore this email.`,
           'Réinitialiser / Reset password',
-          `${base}/partner-portal/reset-password?token=${raw}`
+          `${PARTNER_WEB_BASE()}/partner-portal/reset-password?token=${raw}`
         )
       );
     }
@@ -3907,7 +3934,7 @@ app.post('/api/partner-portal/team/invite', authenticatePartnerToken, async (req
       [req.partnerUser.partnerId, email, name || null, role, sha256hex(raw), expires, req.partnerUser.email]
     );
     const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
-    const inviteUrl = `${base}/partner-portal/accept-invite?token=${raw}`;
+    const inviteUrl = `${PARTNER_WEB_BASE()}/partner-portal/accept-invite?token=${raw}`;
     const mail = await sendMail(
       email,
       'Invitation — Sales Hub Partner Portal',
@@ -4238,7 +4265,7 @@ app.post('/api/admin/partners/:id/invite-admin', authenticateToken, async (req, 
       [partnerId, email, name || null, sha256hex(raw), expires, actor]
     );
     const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
-    const inviteUrl = `${base}/partner-portal/accept-invite?token=${raw}`;
+    const inviteUrl = `${PARTNER_WEB_BASE()}/partner-portal/accept-invite?token=${raw}`;
     const mail = await sendMail(
       email,
       'Invitation — Sales Hub Partner Portal',
@@ -14379,8 +14406,10 @@ async function ensurePassMemberIdentity(member) {
   return r.rows[0] || member;
 }
 
-const passLinkUrl = (slug) =>
-  `${(process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com').replace(/^https?:\/\//, '')}/pass/${slug}`;
+// Affiché SANS le protocole : c'est un lien qu'un membre lit à voix haute ou recopie
+// sur une carte, pas qu'il clique.
+const passLinkUrl = (slug, lang) =>
+  `${PASS_WEB_BASE(lang).replace(/^https?:\/\//, '')}/pass/${slug}`;
 
 // GET /api/pass/me/share — le lien personnel et ses deux compteurs.
 app.get('/api/pass/me/share', authenticatePassToken, async (req, res) => {
@@ -14953,7 +14982,7 @@ app.post('/api/pass/auth/request-link', async (req, res) => {
       [email, sha256hex(raw), new Date(Date.now() + 15 * 60 * 1000), context ? JSON.stringify(context) : null]
     );
     const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
-    const url = `${base}/pass/connexion?token=${raw}&lang=${locale === 'fr-CA' ? 'fr' : 'en'}`;
+    const url = `${PASS_WEB_BASE(locale)}/pass/connexion?token=${raw}&lang=${locale === 'fr-CA' ? 'fr' : 'en'}`;
     const fr = locale === 'fr-CA';
     const html = passMail(locale,
       fr ? (member ? 'Votre lien de connexion' : 'Bienvenue dans La Passe') : (member ? 'Your sign-in link' : 'Welcome to The Pass'),
