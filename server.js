@@ -136,6 +136,7 @@ const PERMISSION_CATALOG = [
   // Partner Portal (internal staff side — manage partner companies + review submissions;
   // partner accounts themselves never touch this permission system, see partner_users)
   { key: 'partners:manage',            label: 'Manage partner companies and review submitted opportunities',   category: 'Partners' },
+  { key: 'partners:delete',            label: 'Delete a partner company AND all its history (destructive)',     category: 'Partners' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -4309,12 +4310,46 @@ app.put('/api/admin/partners/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// DELETE /api/admin/partners/:id — supprime une entreprise partenaire.
+//
+// La ligne `partners` a CINQ tables filles en ON DELETE CASCADE : comptes, opportunites,
+// factures, cycles de versement et notifications. Autrement dit, un seul DELETE efface
+// tout l'historique commercial du partenaire, et rien de tout cela ne se recupere.
+//
+// L'endpoint refuse donc (409) tant qu'il reste des donnees rattachees, en RENVOYANT le
+// decompte : l'interface peut alors dire exactement ce qui va disparaitre au lieu de
+// demander une confirmation dans le vide. `?force=1` passe outre — c'est le deuxieme
+// oui, celui donne en connaissance de cause.
+//
+// Permission distincte de partners:manage : gerer un partenaire et effacer ses factures
+// ne sont pas le meme pouvoir.
 app.delete('/api/admin/partners/:id', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  if (!(await requirePerm(req, res, 'partners:delete'))) return;
+  const id = parseInt(req.params.id, 10);
   try {
-    const r = await pool.query(`DELETE FROM partners WHERE id = $1 RETURNING id`, [parseInt(req.params.id, 10)]);
-    if (!r.rowCount) return res.status(404).json({ error: 'Partner not found' });
-    res.json({ success: true });
+    const partner = (await pool.query(`SELECT name FROM partners WHERE id = $1`, [id])).rows[0];
+    if (!partner) return res.status(404).json({ error: 'Partner not found' });
+
+    const counts = (await pool.query(
+      `SELECT (SELECT COUNT(*) FROM partner_users          WHERE partner_id = $1)::int AS users,
+              (SELECT COUNT(*) FROM partner_opportunities  WHERE partner_id = $1)::int AS opportunities,
+              (SELECT COUNT(*) FROM partner_invoices       WHERE partner_id = $1)::int AS invoices,
+              (SELECT COUNT(*) FROM partner_payout_runs    WHERE partner_id = $1)::int AS payout_runs`,
+      [id]
+    )).rows[0];
+
+    // Les comptes ne comptent pas comme de l'historique : ils se recreent par invitation.
+    const heavy = counts.opportunities + counts.invoices + counts.payout_runs;
+    if (heavy > 0 && req.query.force !== '1') {
+      return res.status(409).json({ error: 'partner_has_data', name: partner.name, counts });
+    }
+
+    await pool.query(`DELETE FROM partners WHERE id = $1`, [id]);
+    logActivity('partner', partner.name, 'deleted',
+      `${partner.name} deleted with ${counts.users} user(s), ${counts.opportunities} opportunity(ies), ` +
+      `${counts.invoices} invoice(s), ${counts.payout_runs} payout run(s)`,
+      req.user.realAdminEmail || req.user.email);
+    res.json({ success: true, counts });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
