@@ -2954,7 +2954,7 @@ async function sendMail(to, subject, html, opts = {}) {
 // white content card, and a bilingual footer. `inner` is arbitrary trusted HTML (already
 // escaped by the caller). Every transactional email funnels through here so they all look
 // identical — pay stubs and payroll included.
-// cluster-logo-email.png est un PNG TRANSPARENT (RVBA), rendu a 2x depuis
+// cluster-logo-email.png est un PNG TRANSPARENT (RVBA), rendu a 2x depuis le kit 2026,
 // src/images/logo/cluster-wordmark-on-dark.svg — d'ou l'affichage a 128x30 pour 1160x272
 // de pixels reels : net sur ecran haute densite. Il se pose donc sur n'importe quel fond.
 // Une version opaque l'avait precede : sa plaque #1c2434 se detachait en rectangle sur
@@ -2983,7 +2983,7 @@ function mailChrome(inner, preheaderRaw, brand, lang, home) {
             <table role="presentation" cellpadding="0" cellspacing="0"><tr>
               <td style="padding-right:12px;vertical-align:middle">
                 ${brand === 'cluster'
-                  ? `<img src="${base}/cluster-logo-email.png" width="128" height="30" alt="Cluster" style="display:block;border:0">`
+                  ? `<img src="${base}/cluster-logo-email.png" width="128" height="29" alt="Cluster" style="display:block;border:0">`
                   : `<img src="${base}/saleshub-icon-192.png" width="36" height="36" alt="Sales Hub" style="display:block;border:0;border-radius:9px">`}
               </td>
               <td style="vertical-align:middle">
