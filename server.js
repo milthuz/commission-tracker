@@ -3601,7 +3601,6 @@ app.post('/api/partner-auth/forgot-password', async (req, res) => {
         `UPDATE partner_users SET reset_token_hash = $2, reset_expires_at = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
         [pu.id, sha256hex(raw), new Date(Date.now() + 3600 * 1000)]
       );
-      const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
       await sendMail(
         email,
         'Réinitialisation du mot de passe — Sales Hub / Password reset',
@@ -3933,7 +3932,6 @@ app.post('/api/partner-portal/team/invite', authenticatePartnerToken, async (req
          invite_expires_at = $6, invited_by = $7, updated_at = CURRENT_TIMESTAMP`,
       [req.partnerUser.partnerId, email, name || null, role, sha256hex(raw), expires, req.partnerUser.email]
     );
-    const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
     const inviteUrl = `${PARTNER_WEB_BASE()}/partner-portal/accept-invite?token=${raw}`;
     const mail = await sendMail(
       email,
@@ -4264,7 +4262,6 @@ app.post('/api/admin/partners/:id/invite-admin', authenticateToken, async (req, 
          invite_expires_at = $5, invited_by = $6, updated_at = CURRENT_TIMESTAMP`,
       [partnerId, email, name || null, sha256hex(raw), expires, actor]
     );
-    const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
     const inviteUrl = `${PARTNER_WEB_BASE()}/partner-portal/accept-invite?token=${raw}`;
     const mail = await sendMail(
       email,
