@@ -368,6 +368,12 @@ async function initializeDatabase() {
     `);
 
     // Add columns if they don't exist (for existing tables)
+    // Langue du partenaire, choisie par la personne qui l'invite. Les courriels du
+    // portail étaient bilingues dans un même envoi (« Activer mon compte / Activate my
+    // account ») : lisible, mais c'est le premier contact d'un partenaire avec Cluster,
+    // et il méritait mieux qu'un message écrit deux fois. 'fr' par défaut — marché
+    // principal, et c'est ce que recevaient les partenaires existants.
+    await pool.query(`ALTER TABLE partner_users ADD COLUMN IF NOT EXISTS locale VARCHAR(5) DEFAULT 'fr'`);
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_access_token TEXT`);
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_refresh_token TEXT`);
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_expires_at BIGINT`);
@@ -2121,8 +2127,52 @@ const PASS_WEB_BASE = (lang) =>
     ? process.env.PASS_URL_FR
     : process.env.PASS_URL_EN) || process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
 
-const PARTNER_WEB_BASE = () =>
-  process.env.PARTNER_URL || process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+const PARTNER_WEB_BASE = (lang) =>
+  (String(lang || 'fr').toLowerCase().startsWith('fr')
+    ? (process.env.PARTNER_URL_FR || process.env.PARTNER_URL)
+    : (process.env.PARTNER_URL_EN || process.env.PARTNER_URL))
+  || process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+
+const isFrLocale = (lang) => String(lang || 'fr').toLowerCase().startsWith('fr');
+
+// Textes des courriels du portail partenaire, une version par langue.
+//
+// Ils etaient bilingues dans un meme envoi - chaque phrase ecrite deux fois, separee
+// par un point median ou une barre. Lisible, mais l'invitation est le PREMIER contact
+// d'un partenaire avec Cluster : elle merite d'etre ecrite dans sa langue, pas dans les
+// deux. La langue est choisie par la personne qui invite et conservee sur le compte
+// (partner_users.locale), donc la reinitialisation de mot de passe la retrouve seule.
+const PARTNER_EMAIL_COPY = {
+  invite: {
+    fr: {
+      subject: 'Invitation — Portail partenaire Sales Hub',
+      title: 'Vous êtes invité au Portail partenaire Sales Hub',
+      intro: (name) => `${name ? name + ', ' : ''}un compte vous a été préparé sur le Portail partenaire Sales Hub. Cliquez ci-dessous pour choisir votre mot de passe et activer votre accès.`,
+      cta: 'Activer mon compte',
+    },
+    en: {
+      subject: 'Invitation — Sales Hub Partner Portal',
+      title: 'You are invited to the Sales Hub Partner Portal',
+      intro: (name) => `${name ? name + ', ' : ''}an account has been created for you on the Sales Hub Partner Portal. Click below to choose your password and activate your access.`,
+      cta: 'Activate my account',
+    },
+  },
+  reset: {
+    fr: {
+      subject: 'Réinitialisation du mot de passe — Sales Hub',
+      title: 'Réinitialiser votre mot de passe',
+      intro: `Une réinitialisation du mot de passe a été demandée pour votre compte du Portail partenaire Sales Hub. Le lien expire dans 1 heure. Si vous n'êtes pas à l'origine de cette demande, ignorez ce courriel.`,
+      cta: 'Réinitialiser',
+    },
+    en: {
+      subject: 'Password reset — Sales Hub',
+      title: 'Reset your password',
+      intro: `A password reset was requested for your Sales Hub Partner Portal account. The link expires in 1 hour. If you didn't request it, ignore this email.`,
+      cta: 'Reset password',
+    },
+  },
+};
+const partnerCopy = (kind, lang) => PARTNER_EMAIL_COPY[kind][isFrLocale(lang) ? 'fr' : 'en'];
 
 // Origines autorisées à ENCADRER nos réponses (aperçus PDF affichés en iframe)
 // ET à faire des requêtes cross-origin. Une seule liste : deux listes qui
@@ -2936,14 +2986,19 @@ function mailChrome(inner, preheaderRaw) {
   </body></html>`;
 }
 // Convenience wrapper for the common "heading + paragraph + optional CTA" email.
-function mailShell(title, intro, ctaLabel, ctaUrl) {
+// `lang` omis = pied de page bilingue, tel qu'avant. Seuls les courriels partenaires le
+// passent ; les envois internes, eux, s'adressent à une équipe qui lit les deux langues.
+function mailShell(title, intro, ctaLabel, ctaUrl, lang) {
   const inner = `<h1 style="margin:0 0 14px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${title}</h1>
             <div style="color:#475569;font-size:14.5px;line-height:1.65">${intro}</div>
             ${(ctaUrl && ctaLabel) ? `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:26px 0 4px"><tr><td style="border-radius:9px;background:#3c50e0">
               <a href="${ctaUrl}" style="display:inline-block;padding:13px 30px;color:#ffffff;font-size:14px;font-weight:700;text-decoration:none;border-radius:9px">${ctaLabel}</a>
             </td></tr></table>
-            <p style="margin:18px 0 0;color:#94a3b8;font-size:12px;line-height:1.6">Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :<br>
-            If the button doesn't work, copy this link into your browser:<br>
+            <p style="margin:18px 0 0;color:#94a3b8;font-size:12px;line-height:1.6">${lang === undefined
+              ? `Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :<br>If the button doesn't work, copy this link into your browser:`
+              : (isFrLocale(lang)
+                  ? `Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :`
+                  : `If the button doesn't work, copy this link into your browser:`)}<br>
             <a href="${ctaUrl}" style="color:#3c50e0;word-break:break-all">${ctaUrl}</a></p>` : ''}`;
   return mailChrome(inner, title);
 }
@@ -3593,7 +3648,7 @@ app.post('/api/partner-auth/forgot-password', async (req, res) => {
   if (rateLimited(`pforgot:${req.ip}`)) return res.status(429).json({ error: 'Too many attempts — try again later' });
   try {
     const pu = (await pool.query(
-      `SELECT id, display_name FROM partner_users WHERE email = $1 AND status = 'active'`, [email]
+      `SELECT id, display_name, locale FROM partner_users WHERE email = $1 AND status = 'active'`, [email]
     )).rows[0];
     if (pu) {
       const raw = newRawToken();
@@ -3603,12 +3658,13 @@ app.post('/api/partner-auth/forgot-password', async (req, res) => {
       );
       await sendMail(
         email,
-        'Réinitialisation du mot de passe — Sales Hub / Password reset',
+        partnerCopy('reset', pu.locale).subject,
         mailShell(
-          'Réinitialiser votre mot de passe · Reset your password',
-          `Une réinitialisation du mot de passe a été demandée pour votre compte du Portail partenaire Sales Hub. Le lien expire dans 1 heure. Si vous n'êtes pas à l'origine de cette demande, ignorez ce courriel.<br><br>A password reset was requested for your Sales Hub Partner Portal account. The link expires in 1 hour. If you didn't request this, you can ignore this email.`,
-          'Réinitialiser / Reset password',
-          `${PARTNER_WEB_BASE()}/partner-portal/reset-password?token=${raw}`
+          partnerCopy('reset', pu.locale).title,
+          partnerCopy('reset', pu.locale).intro,
+          partnerCopy('reset', pu.locale).cta,
+          `${PARTNER_WEB_BASE(pu.locale)}/partner-portal/reset-password?token=${raw}`,
+          pu.locale
         )
       );
     }
@@ -3921,26 +3977,31 @@ app.post('/api/partner-portal/team/invite', authenticatePartnerToken, async (req
     if (existing && existing.status === 'active') return res.status(409).json({ error: 'User already active' });
     const raw = newRawToken();
     const expires = new Date(Date.now() + 7 * 24 * 3600 * 1000);
+    // Langue du courriel d'invitation, choisie par la personne qui invite. Conservee sur
+    // le compte : la reinitialisation de mot de passe, plus tard, n'a personne a qui la
+    // demander.
+    const locale = isFrLocale(req.body.locale) ? 'fr' : 'en';
     await pool.query(
       // partner_id = $1 in the DO UPDATE is deliberate and load-bearing: it re-asserts ownership
       // on the conflict path so a re-invite can never leave a row pointing at another company
       // (mirrors the internal admin twin, /api/admin/partners/:id/invite-admin).
-      `INSERT INTO partner_users (partner_id, email, display_name, role, status, invite_token_hash, invite_expires_at, invited_by)
-       VALUES ($1,$2,$3,$4,'invited',$5,$6,$7)
+      `INSERT INTO partner_users (partner_id, email, display_name, role, status, invite_token_hash, invite_expires_at, invited_by, locale)
+       VALUES ($1,$2,$3,$4,'invited',$5,$6,$7,$8)
        ON CONFLICT (email) DO UPDATE SET
          partner_id = $1, display_name = $3, role = $4, status = 'invited', invite_token_hash = $5,
-         invite_expires_at = $6, invited_by = $7, updated_at = CURRENT_TIMESTAMP`,
-      [req.partnerUser.partnerId, email, name || null, role, sha256hex(raw), expires, req.partnerUser.email]
+         invite_expires_at = $6, invited_by = $7, locale = $8, updated_at = CURRENT_TIMESTAMP`,
+      [req.partnerUser.partnerId, email, name || null, role, sha256hex(raw), expires, req.partnerUser.email, locale]
     );
-    const inviteUrl = `${PARTNER_WEB_BASE()}/partner-portal/accept-invite?token=${raw}`;
+    const inviteUrl = `${PARTNER_WEB_BASE(locale)}/partner-portal/accept-invite?token=${raw}`;
     const mail = await sendMail(
       email,
-      'Invitation — Sales Hub Partner Portal',
+      partnerCopy('invite', locale).subject,
       mailShell(
-        'Vous êtes invité au Portail partenaire Sales Hub · You are invited to the Sales Hub Partner Portal',
-        `${name ? name + ', ' : ''}un compte vous a été préparé sur le Portail partenaire Sales Hub. Cliquez ci-dessous pour choisir votre mot de passe et activer la vérification en deux étapes. Le lien expire dans 7 jours.<br><br>An account has been prepared for you on the Sales Hub Partner Portal. Click below to set your password and enable two-step verification. The link expires in 7 days.`,
-        'Activer mon compte / Activate my account',
-        inviteUrl
+        partnerCopy('invite', locale).title,
+        partnerCopy('invite', locale).intro(name),
+        partnerCopy('invite', locale).cta,
+        inviteUrl,
+        locale
       )
     );
     logActivity('partner_user', email, 'invited', `${email}${name ? ` (${name})` : ''} invited by ${req.partnerUser.email}`, req.partnerUser.email);
@@ -4254,23 +4315,28 @@ app.post('/api/admin/partners/:id/invite-admin', authenticateToken, async (req, 
     const raw = newRawToken();
     const expires = new Date(Date.now() + 7 * 24 * 3600 * 1000);
     const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+    // Langue du courriel d'invitation, choisie par la personne qui invite. Conservee sur
+    // le compte : la reinitialisation de mot de passe, plus tard, n'a personne a qui la
+    // demander.
+    const locale = isFrLocale(req.body.locale) ? 'fr' : 'en';
     await pool.query(
-      `INSERT INTO partner_users (partner_id, email, display_name, role, status, invite_token_hash, invite_expires_at, invited_by)
-       VALUES ($1,$2,$3,'admin','invited',$4,$5,$6)
+      `INSERT INTO partner_users (partner_id, email, display_name, role, status, invite_token_hash, invite_expires_at, invited_by, locale)
+       VALUES ($1,$2,$3,'admin','invited',$4,$5,$6,$7)
        ON CONFLICT (email) DO UPDATE SET
          partner_id = $1, display_name = $3, role = 'admin', status = 'invited', invite_token_hash = $4,
-         invite_expires_at = $5, invited_by = $6, updated_at = CURRENT_TIMESTAMP`,
-      [partnerId, email, name || null, sha256hex(raw), expires, actor]
+         invite_expires_at = $5, invited_by = $6, locale = $7, updated_at = CURRENT_TIMESTAMP`,
+      [partnerId, email, name || null, sha256hex(raw), expires, actor, locale]
     );
-    const inviteUrl = `${PARTNER_WEB_BASE()}/partner-portal/accept-invite?token=${raw}`;
+    const inviteUrl = `${PARTNER_WEB_BASE(locale)}/partner-portal/accept-invite?token=${raw}`;
     const mail = await sendMail(
       email,
-      'Invitation — Sales Hub Partner Portal',
+      partnerCopy('invite', locale).subject,
       mailShell(
-        'Vous êtes invité au Portail partenaire Sales Hub · You are invited to the Sales Hub Partner Portal',
-        `${name ? name + ', ' : ''}un compte administrateur pour ${partner.name} vous a été préparé sur le Portail partenaire Sales Hub. Cliquez ci-dessous pour choisir votre mot de passe et activer la vérification en deux étapes. Le lien expire dans 7 jours.<br><br>An admin account for ${partner.name} has been prepared for you on the Sales Hub Partner Portal. Click below to set your password and enable two-step verification. The link expires in 7 days.`,
-        'Activer mon compte / Activate my account',
-        inviteUrl
+        partnerCopy('invite', locale).title,
+        partnerCopy('invite', locale).intro(name),
+        partnerCopy('invite', locale).cta,
+        inviteUrl,
+        locale
       )
     );
     logActivity('partner_user', email, 'invited', `${email}${name ? ` (${name})` : ''} invited as Partner Admin for ${partner.name} by ${actor}`, actor);
