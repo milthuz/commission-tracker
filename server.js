@@ -2920,7 +2920,15 @@ async function revokeTrustedDevices(email, userType) {
 //
 // ⚠️ Ne corrige que les enrôlements FUTURS : un QR déjà scanné garde son libellé, la chaîne
 // n'existant plus que dans l'application du téléphone.
-const PARTNER_TOTP_ISSUER = 'Sales Hub Partners';
+// Ce libelle est ce que le partenaire lit dans son application d'authentification. Il
+// doit nommer ce qu'il voit a l'ecran — le Portail partenaire Cluster — et non l'outil
+// interne qui le sert.
+//
+// ⚠️ Les codes deja enroles ne cassent PAS : le libelle est inscrit dans l'application
+// d'authentification au moment de l'enrolement, il n'entre pas dans le calcul du code.
+// Consequence : les partenaires deja inscrits continueront de voir « Sales Hub Partners »
+// jusqu'a un reenrolement. Seules les nouvelles inscriptions portent le nouveau nom.
+const PARTNER_TOTP_ISSUER = 'Cluster Partner Portal';
 
 authenticator.options = { window: 1 }; // tolerate ±30s clock drift
 
