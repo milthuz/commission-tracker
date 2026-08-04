@@ -2954,12 +2954,11 @@ async function sendMail(to, subject, html, opts = {}) {
 // white content card, and a bilingual footer. `inner` is arbitrary trusted HTML (already
 // escaped by the caller). Every transactional email funnels through here so they all look
 // identical — pay stubs and payroll included.
-// ⚠️ Le fond de l'en-tete SUIT la marque, et ce n'est pas un choix esthetique :
-// cluster-logo-email.png est un PNG en RVB SANS canal alpha, dont le fond est peint a
-// #1c2434. Sur le #0f1722 de l'en-tete Sales Hub, sa plaque se detachait en rectangle
-// visible. Tant que ce fichier n'aura pas de transparence, les deux valeurs doivent
-// rester identiques — le jour ou le logo est remplace par une version transparente,
-// cette condition peut disparaitre.
+// cluster-logo-email.png est un PNG TRANSPARENT (RVBA), rendu a 2x depuis
+// src/images/logo/cluster-wordmark-on-dark.svg — d'ou l'affichage a 128x30 pour 1160x272
+// de pixels reels : net sur ecran haute densite. Il se pose donc sur n'importe quel fond.
+// Une version opaque l'avait precede : sa plaque #1c2434 se detachait en rectangle sur
+// l'en-tete. Si le fichier est un jour remplace, verifier qu'il garde son canal alpha.
 // `brand: 'cluster'` renverse l'ordre des deux marques dans l'en-tete. Les partenaires
 // font affaire avec Cluster, pas avec l'outil interne qui sert le portail : c'est Cluster
 // qu'ils doivent lire en premier, Sales Hub venant en mention. Sans le parametre, rien ne
@@ -2980,11 +2979,11 @@ function mailChrome(inner, preheaderRaw, brand, lang, home) {
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f6;padding:32px 12px">
       <tr><td align="center">
         <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(16,23,34,.08),0 10px 28px rgba(16,23,34,.07)">
-          <tr><td style="background:${brand === 'cluster' ? '#1c2434' : '#0f1722'};padding:22px 36px">
+          <tr><td style="background:#0f1722;padding:22px 36px">
             <table role="presentation" cellpadding="0" cellspacing="0"><tr>
               <td style="padding-right:12px;vertical-align:middle">
                 ${brand === 'cluster'
-                  ? `<img src="${base}/cluster-logo-email.png" width="126" height="30" alt="Cluster" style="display:block;border:0">`
+                  ? `<img src="${base}/cluster-logo-email.png" width="128" height="30" alt="Cluster" style="display:block;border:0">`
                   : `<img src="${base}/saleshub-icon-192.png" width="36" height="36" alt="Sales Hub" style="display:block;border:0;border-radius:9px">`}
               </td>
               <td style="vertical-align:middle">
