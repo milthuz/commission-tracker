@@ -2146,29 +2146,29 @@ const isFrLocale = (lang) => String(lang || 'fr').toLowerCase().startsWith('fr')
 const PARTNER_EMAIL_COPY = {
   invite: {
     fr: {
-      subject: 'Invitation — Portail partenaire Sales Hub',
-      title: 'Vous êtes invité au Portail partenaire Sales Hub',
-      intro: (name) => `${name ? name + ', ' : ''}un compte vous a été préparé sur le Portail partenaire Sales Hub. Cliquez ci-dessous pour choisir votre mot de passe et activer votre accès.`,
+      subject: 'Invitation — Portail partenaire Cluster',
+      title: 'Vous êtes invité au Portail partenaire Cluster',
+      intro: (name) => `${name ? name + ', ' : ''}un compte vous a été préparé sur le Portail partenaire Cluster. Cliquez ci-dessous pour choisir votre mot de passe et activer votre accès.`,
       cta: 'Activer mon compte',
     },
     en: {
-      subject: 'Invitation — Sales Hub Partner Portal',
-      title: 'You are invited to the Sales Hub Partner Portal',
-      intro: (name) => `${name ? name + ', ' : ''}an account has been created for you on the Sales Hub Partner Portal. Click below to choose your password and activate your access.`,
+      subject: 'Invitation — Cluster Partner Portal',
+      title: 'You are invited to the Cluster Partner Portal',
+      intro: (name) => `${name ? name + ', ' : ''}an account has been created for you on the Cluster Partner Portal. Click below to choose your password and activate your access.`,
       cta: 'Activate my account',
     },
   },
   reset: {
     fr: {
-      subject: 'Réinitialisation du mot de passe — Sales Hub',
+      subject: 'Réinitialisation du mot de passe — Cluster',
       title: 'Réinitialiser votre mot de passe',
-      intro: `Une réinitialisation du mot de passe a été demandée pour votre compte du Portail partenaire Sales Hub. Le lien expire dans 1 heure. Si vous n'êtes pas à l'origine de cette demande, ignorez ce courriel.`,
+      intro: `Une réinitialisation du mot de passe a été demandée pour votre compte du Portail partenaire Cluster. Le lien expire dans 1 heure. Si vous n'êtes pas à l'origine de cette demande, ignorez ce courriel.`,
       cta: 'Réinitialiser',
     },
     en: {
-      subject: 'Password reset — Sales Hub',
+      subject: 'Password reset — Cluster',
       title: 'Reset your password',
-      intro: `A password reset was requested for your Sales Hub Partner Portal account. The link expires in 1 hour. If you didn't request it, ignore this email.`,
+      intro: `A password reset was requested for your Cluster Partner Portal account. The link expires in 1 hour. If you didn't request it, ignore this email.`,
       cta: 'Reset password',
     },
   },
@@ -2947,7 +2947,11 @@ async function sendMail(to, subject, html, opts = {}) {
 // white content card, and a bilingual footer. `inner` is arbitrary trusted HTML (already
 // escaped by the caller). Every transactional email funnels through here so they all look
 // identical — pay stubs and payroll included.
-function mailChrome(inner, preheaderRaw) {
+// `brand: 'cluster'` renverse l'ordre des deux marques dans l'en-tete. Les partenaires
+// font affaire avec Cluster, pas avec l'outil interne qui sert le portail : c'est Cluster
+// qu'ils doivent lire en premier, Sales Hub venant en mention. Sans le parametre, rien ne
+// change — tous les envois internes gardent leur en-tete a l'identique.
+function mailChrome(inner, preheaderRaw, brand) {
   const year = new Date().getFullYear();
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const preheader = String(preheaderRaw || '').replace(/<[^>]+>/g, '');
@@ -2963,11 +2967,14 @@ function mailChrome(inner, preheaderRaw) {
           <tr><td style="background:#0f1722;padding:22px 36px">
             <table role="presentation" cellpadding="0" cellspacing="0"><tr>
               <td style="padding-right:12px;vertical-align:middle">
-                <img src="${base}/saleshub-icon-192.png" width="36" height="36" alt="Sales Hub" style="display:block;border:0;border-radius:9px">
+                <img src="${base}/${brand === 'cluster' ? 'cluster-logo-email.png' : 'saleshub-icon-192.png'}" width="36" height="36" alt="${brand === 'cluster' ? 'Cluster' : 'Sales Hub'}" style="display:block;border:0;border-radius:9px">
               </td>
               <td style="vertical-align:middle">
-                <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-.3px">Sales&nbsp;Hub</span><span style="color:#f97316;font-size:22px;font-weight:700">.</span>
-                <span style="display:block;color:#8a99af;font-size:12px;margin-top:2px;letter-spacing:.2px">by Cluster Systems</span>
+                ${brand === 'cluster'
+                  ? `<span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-.3px">Cluster</span>`
+                    + `<span style="display:block;color:#8a99af;font-size:12px;margin-top:2px;letter-spacing:.2px">Portail partenaire &middot; Partner Portal</span>`
+                  : `<span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-.3px">Sales&nbsp;Hub</span><span style="color:#f97316;font-size:22px;font-weight:700">.</span>
+                <span style="display:block;color:#8a99af;font-size:12px;margin-top:2px;letter-spacing:.2px">by Cluster Systems</span>`}
               </td>
             </tr></table>
           </td></tr>
@@ -2989,7 +2996,7 @@ function mailChrome(inner, preheaderRaw) {
 // Convenience wrapper for the common "heading + paragraph + optional CTA" email.
 // `lang` omis = pied de page bilingue, tel qu'avant. Seuls les courriels partenaires le
 // passent ; les envois internes, eux, s'adressent à une équipe qui lit les deux langues.
-function mailShell(title, intro, ctaLabel, ctaUrl, lang) {
+function mailShell(title, intro, ctaLabel, ctaUrl, lang, brand) {
   const inner = `<h1 style="margin:0 0 14px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${title}</h1>
             <div style="color:#475569;font-size:14.5px;line-height:1.65">${intro}</div>
             ${(ctaUrl && ctaLabel) ? `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:26px 0 4px"><tr><td style="border-radius:9px;background:#3c50e0">
@@ -3001,7 +3008,7 @@ function mailShell(title, intro, ctaLabel, ctaUrl, lang) {
                   ? `Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :`
                   : `If the button doesn't work, copy this link into your browser:`)}<br>
             <a href="${ctaUrl}" style="color:#3c50e0;word-break:break-all">${ctaUrl}</a></p>` : ''}`;
-  return mailChrome(inner, title);
+  return mailChrome(inner, title, brand);
 }
 
 // Simple in-memory rate limiter for credential endpoints (per dyno — good enough).
@@ -3665,7 +3672,8 @@ app.post('/api/partner-auth/forgot-password', async (req, res) => {
           partnerCopy('reset', pu.locale).intro,
           partnerCopy('reset', pu.locale).cta,
           `${PARTNER_WEB_BASE(pu.locale)}/partner-portal/reset-password?token=${raw}`,
-          pu.locale
+          pu.locale,
+          'cluster'
         )
       );
     }
@@ -4024,7 +4032,8 @@ app.post('/api/partner-portal/team/invite', authenticatePartnerToken, async (req
         partnerCopy('invite', locale).intro(name),
         partnerCopy('invite', locale).cta,
         inviteUrl,
-        locale
+        locale,
+        'cluster'
       )
     );
     logActivity('partner_user', email, 'invited', `${email}${name ? ` (${name})` : ''} invited by ${req.partnerUser.email}`, req.partnerUser.email);
@@ -4095,7 +4104,7 @@ app.get('/api/partner-portal/organization/logo/:partnerId', async (req, res) => 
 // features (mirrors the isAdmin/non-admin split above, but keyed on the partner's own role).
 // ============================================================================
 
-const PARTNER_ASSISTANT_SYSTEM = `You are the in-app assistant for the "Sales Hub Partner Portal", where Cluster Systems' referral partners submit and track business opportunities. Your job: help partner users understand and navigate the portal, in a friendly, concise way.
+const PARTNER_ASSISTANT_SYSTEM = `You are the in-app assistant for the "Cluster Partner Portal" (powered by Sales Hub), where Cluster Systems' referral partners submit and track business opportunities. Your job: help partner users understand and navigate the portal, in a friendly, concise way.
 
 LANGUAGE: Always reply in the user's language (French or English).
 
@@ -4393,7 +4402,8 @@ app.post('/api/admin/partners/:id/invite-admin', authenticateToken, async (req, 
         partnerCopy('invite', locale).intro(name),
         partnerCopy('invite', locale).cta,
         inviteUrl,
-        locale
+        locale,
+        'cluster'
       )
     );
     logActivity('partner_user', email, 'invited', `${email}${name ? ` (${name})` : ''} invited as Partner Admin for ${partner.name} by ${actor}`, actor);
