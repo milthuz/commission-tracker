@@ -375,6 +375,13 @@ async function initializeDatabase() {
     // et il méritait mieux qu'un message écrit deux fois. 'fr' par défaut — marché
     // principal, et c'est ce que recevaient les partenaires existants.
     await pool.query(`ALTER TABLE partner_users ADD COLUMN IF NOT EXISTS locale VARCHAR(5) DEFAULT 'fr'`);
+    // Suivi des invitations. `invite_opened_at` est pose quand le LIEN est ouvert, pas
+    // quand le courriel l'est : un pixel de suivi se fait bloquer par la moitie des
+    // clients de messagerie, alors qu'un clic sur le lien est un fait cote serveur.
+    // Le signal est donc plus rare mais il ne ment jamais.
+    await pool.query(`ALTER TABLE partner_users ADD COLUMN IF NOT EXISTS invited_at TIMESTAMP`);
+    await pool.query(`ALTER TABLE partner_users ADD COLUMN IF NOT EXISTS invite_opened_at TIMESTAMP`);
+    await pool.query(`ALTER TABLE partner_users ADD COLUMN IF NOT EXISTS activated_at TIMESTAMP`);
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_access_token TEXT`);
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_refresh_token TEXT`);
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_expires_at BIGINT`);
@@ -2951,9 +2958,12 @@ async function sendMail(to, subject, html, opts = {}) {
 // font affaire avec Cluster, pas avec l'outil interne qui sert le portail : c'est Cluster
 // qu'ils doivent lire en premier, Sales Hub venant en mention. Sans le parametre, rien ne
 // change — tous les envois internes gardent leur en-tete a l'identique.
-function mailChrome(inner, preheaderRaw, brand) {
+function mailChrome(inner, preheaderRaw, brand, lang, home) {
   const year = new Date().getFullYear();
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+  // Le pied de page nommait toujours le domaine INTERNE, y compris dans un courriel
+  // partenaire ou le lien juste au-dessus pointait ailleurs.
+  home = home || base;
   const preheader = String(preheaderRaw || '').replace(/<[^>]+>/g, '');
   return `<!doctype html><html lang="fr"><head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2967,14 +2977,15 @@ function mailChrome(inner, preheaderRaw, brand) {
           <tr><td style="background:#0f1722;padding:22px 36px">
             <table role="presentation" cellpadding="0" cellspacing="0"><tr>
               <td style="padding-right:12px;vertical-align:middle">
-                <img src="${base}/${brand === 'cluster' ? 'cluster-logo-email.png' : 'saleshub-icon-192.png'}" width="36" height="36" alt="${brand === 'cluster' ? 'Cluster' : 'Sales Hub'}" style="display:block;border:0;border-radius:9px">
+                ${brand === 'cluster'
+                  ? `<img src="${base}/cluster-logo-email.png" width="126" height="30" alt="Cluster" style="display:block;border:0">`
+                  : `<img src="${base}/saleshub-icon-192.png" width="36" height="36" alt="Sales Hub" style="display:block;border:0;border-radius:9px">`}
               </td>
               <td style="vertical-align:middle">
                 ${brand === 'cluster'
-                  ? `<span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-.3px">Cluster</span>`
-                    + `<span style="display:block;color:#8a99af;font-size:12px;margin-top:2px;letter-spacing:.2px">Portail partenaire &middot; Partner Portal</span>`
-                  : `<span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-.3px">Sales&nbsp;Hub</span><span style="color:#f97316;font-size:22px;font-weight:700">.</span>
-                <span style="display:block;color:#8a99af;font-size:12px;margin-top:2px;letter-spacing:.2px">by Cluster Systems</span>`}
+                  ? `<span style="display:block;color:#8a99af;font-size:12px;letter-spacing:.2px">Portail partenaire &middot; Partner Portal</span>`
+                  : `<span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-.3px">Sales&nbsp;Hub</span><span style="color:#f97316;font-size:22px;font-weight:700">.</span>`
+                    + `<span style="display:block;color:#8a99af;font-size:12px;margin-top:2px;letter-spacing:.2px">by Cluster Systems</span>`}
               </td>
             </tr></table>
           </td></tr>
@@ -2983,8 +2994,8 @@ function mailChrome(inner, preheaderRaw, brand) {
           <tr><td style="padding:26px 36px 0"><div style="border-top:1px solid #eef1f6;font-size:0;line-height:0">&nbsp;</div></td></tr>
           <tr><td style="padding:16px 36px 30px">
             <p style="margin:0;color:#94a3b8;font-size:12px;line-height:1.7">
-              Une question ? / Questions? <a href="mailto:saleshub@clustersystems.com" style="color:#3c50e0;text-decoration:none">saleshub@clustersystems.com</a><br>
-              © ${year} Cluster Systems — <a href="${base}" style="color:#94a3b8;text-decoration:none">saleshub.clusterpos.com</a>
+              ${lang === undefined ? 'Une question ? / Questions?' : (isFrLocale(lang) ? 'Une question ?' : 'Questions?')} <a href="mailto:saleshub@clustersystems.com" style="color:#3c50e0;text-decoration:none">saleshub@clustersystems.com</a><br>
+              © ${year} Cluster Systems — <a href="${home}" style="color:#94a3b8;text-decoration:none">${String(home).replace(/^https?:\/\//, '')}</a>
             </p>
           </td></tr>
         </table>
@@ -3008,7 +3019,7 @@ function mailShell(title, intro, ctaLabel, ctaUrl, lang, brand) {
                   ? `Si le bouton ne fonctionne pas, copiez ce lien dans votre navigateur :`
                   : `If the button doesn't work, copy this link into your browser:`)}<br>
             <a href="${ctaUrl}" style="color:#3c50e0;word-break:break-all">${ctaUrl}</a></p>` : ''}`;
-  return mailChrome(inner, title, brand);
+  return mailChrome(inner, title, brand, lang, brand === 'cluster' ? PARTNER_WEB_BASE(lang) : undefined);
 }
 
 // Simple in-memory rate limiter for credential endpoints (per dyno — good enough).
@@ -3550,6 +3561,15 @@ app.get('/api/partner-auth/invite-info', async (req, res) => {
         WHERE pu.invite_token_hash = $1`,
       [sha256hex(raw)]
     )).rows[0];
+    // Premiere ouverture SEULEMENT : on veut la date du clic, pas celle du dernier
+    // rechargement de la page. Et c'est le lien qu'on mesure, pas le courriel : un pixel
+    // de suivi se fait bloquer par la moitie des clients de messagerie, alors qu'un clic
+    // est un fait cote serveur. Signal plus rare, mais qui ne ment jamais.
+    await pool.query(
+      `UPDATE partner_users SET invite_opened_at = COALESCE(invite_opened_at, NOW())
+        WHERE invite_token_hash = $1 AND status = 'invited'`,
+      [sha256hex(raw)]
+    );
     if (!pu || pu.status !== 'invited') return res.status(404).json({ error: 'Invalid invitation' });
     if (new Date(pu.invite_expires_at) < new Date()) return res.status(410).json({ error: 'Invitation expired' });
     res.json({ valid: true, email: pu.email, name: pu.display_name, partnerName: pu.partner_name });
@@ -3596,7 +3616,7 @@ app.post('/api/partner-auth/invite/verify-2fa', async (req, res) => {
       return res.status(401).json({ error: 'Invalid code' });
     }
     await pool.query(
-      `UPDATE partner_users SET totp_enabled = true, status = 'active', invite_token_hash = NULL,
+      `UPDATE partner_users SET totp_enabled = true, status = 'active', activated_at = NOW(), invite_token_hash = NULL,
               invite_expires_at = NULL, last_login_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
        WHERE id = $1`, [pu.id]
     );
@@ -4016,11 +4036,12 @@ app.post('/api/partner-portal/team/invite', authenticatePartnerToken, async (req
       // partner_id = $1 in the DO UPDATE is deliberate and load-bearing: it re-asserts ownership
       // on the conflict path so a re-invite can never leave a row pointing at another company
       // (mirrors the internal admin twin, /api/admin/partners/:id/invite-admin).
-      `INSERT INTO partner_users (partner_id, email, display_name, role, status, invite_token_hash, invite_expires_at, invited_by, locale)
-       VALUES ($1,$2,$3,$4,'invited',$5,$6,$7,$8)
+      `INSERT INTO partner_users (partner_id, email, display_name, role, status, invite_token_hash, invite_expires_at, invited_by, locale, invited_at, invite_opened_at, activated_at)
+       VALUES ($1,$2,$3,$4,'invited',$5,$6,$7,$8,NOW(),NULL,NULL)
        ON CONFLICT (email) DO UPDATE SET
          partner_id = $1, display_name = $3, role = $4, status = 'invited', invite_token_hash = $5,
-         invite_expires_at = $6, invited_by = $7, locale = $8, updated_at = CURRENT_TIMESTAMP`,
+         invite_expires_at = $6, invited_by = $7, locale = $8,
+         invited_at = NOW(), invite_opened_at = NULL, activated_at = NULL, updated_at = CURRENT_TIMESTAMP`,
       [req.partnerUser.partnerId, email, name || null, role, sha256hex(raw), expires, req.partnerUser.email, locale]
     );
     const inviteUrl = `${PARTNER_WEB_BASE(locale)}/partner-portal/accept-invite?token=${raw}`;
@@ -4319,6 +4340,33 @@ app.put('/api/admin/partners/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /api/admin/partner-invites — suivi des invitations envoyees au portail.
+//
+// Trois dates, trois faits distincts : envoyee, lien ouvert, compte active. On ne
+// prétend PAS savoir si le courriel a ete ouvert — voir le commentaire sur
+// invite_opened_at : c'est le clic sur le lien qui est mesure, pas l'ouverture du
+// message. Mieux vaut un signal rare et vrai qu'un signal frequent et faux.
+app.get('/api/admin/partner-invites', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const rows = (await pool.query(
+      `SELECT pu.id, pu.email, pu.display_name, pu.role, pu.status, pu.locale,
+              pu.invited_by, pu.invited_at, pu.invite_opened_at, pu.activated_at,
+              pu.invite_expires_at, pu.last_login_at, p.name AS partner_name
+         FROM partner_users pu JOIN partners p ON p.id = pu.partner_id
+        ORDER BY COALESCE(pu.invited_at, pu.created_at) DESC NULLS LAST, pu.id DESC`
+    )).rows;
+    res.json({ invites: rows.map((r) => ({
+      id: r.id, email: r.email, name: r.display_name, role: r.role, status: r.status,
+      locale: r.locale, partnerName: r.partner_name, invitedBy: r.invited_by,
+      invitedAt: r.invited_at, openedAt: r.invite_opened_at, activatedAt: r.activated_at,
+      expiresAt: r.invite_expires_at, lastLoginAt: r.last_login_at,
+    })) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // DELETE /api/admin/partners/:id — supprime une entreprise partenaire.
 //
 // La ligne `partners` a CINQ tables filles en ON DELETE CASCADE : comptes, opportunites,
@@ -4386,11 +4434,12 @@ app.post('/api/admin/partners/:id/invite-admin', authenticateToken, async (req, 
     // demander.
     const locale = isFrLocale(req.body.locale) ? 'fr' : 'en';
     await pool.query(
-      `INSERT INTO partner_users (partner_id, email, display_name, role, status, invite_token_hash, invite_expires_at, invited_by, locale)
-       VALUES ($1,$2,$3,'admin','invited',$4,$5,$6,$7)
+      `INSERT INTO partner_users (partner_id, email, display_name, role, status, invite_token_hash, invite_expires_at, invited_by, locale, invited_at, invite_opened_at, activated_at)
+       VALUES ($1,$2,$3,'admin','invited',$4,$5,$6,$7,NOW(),NULL,NULL)
        ON CONFLICT (email) DO UPDATE SET
          partner_id = $1, display_name = $3, role = 'admin', status = 'invited', invite_token_hash = $4,
-         invite_expires_at = $5, invited_by = $6, locale = $7, updated_at = CURRENT_TIMESTAMP`,
+         invite_expires_at = $5, invited_by = $6, locale = $7,
+         invited_at = NOW(), invite_opened_at = NULL, activated_at = NULL, updated_at = CURRENT_TIMESTAMP`,
       [partnerId, email, name || null, sha256hex(raw), expires, actor, locale]
     );
     const inviteUrl = `${PARTNER_WEB_BASE(locale)}/partner-portal/accept-invite?token=${raw}`;
