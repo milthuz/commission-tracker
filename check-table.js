@@ -1,7 +1,15 @@
 // check-table.js
 const { Client } = require('pg');
 
-const DATABASE_URL = 'postgresql://postgres:0frhwDjuCMrkVqnGaCicYvjxTLBvSHFt@maglev.proxy.rlwy.net:38230/railway';
+// Connexion depuis l'EXTÉRIEUR de Railway : il faut l'URL publique (proxy), l'hôte
+// interne `postgres.railway.internal` n'étant joignable que depuis les conteneurs.
+// À lancer via `railway run --service Postgres node check-table.js`, qui injecte
+// les variables du service.
+const DATABASE_URL = process.env.DATABASE_PUBLIC_URL || process.env.DATABASE_URL;
+if (!DATABASE_URL) {
+  console.error('❌ Aucune URL de base. Lancer via: railway run --service Postgres node check-table.js');
+  process.exit(1);
+}
 
 async function checkTable() {
   const client = new Client({

@@ -1,15 +1,22 @@
 // replace-invoices-table.js
 const { Client } = require('pg');
 
-async function replaceTable() {
-  // Railway sets DATABASE_URL when using 'railway run'
-  if (!process.env.DATABASE_URL) {
-    console.error('❌ DATABASE_URL not found. Make sure to run with: railway run node replace-invoices-table.js');
-    process.exit(1);
-  }
+// Connexion depuis l'EXTÉRIEUR de Railway : il faut l'URL publique (proxy), l'hôte
+// interne `postgres.railway.internal` n'étant joignable que depuis les conteneurs.
+// À lancer via `railway run --service Postgres node replace-invoices-table.js`,
+// qui injecte les variables du service.
+const DATABASE_URL = process.env.DATABASE_PUBLIC_URL || process.env.DATABASE_URL;
+if (!DATABASE_URL) {
+  console.error('❌ Aucune URL de base. Lancer via: railway run --service Postgres node replace-invoices-table.js');
+  process.exit(1);
+}
 
+async function replaceTable() {
   const client = new Client({
-    connectionString: process.env.DATABASE_URL
+    connectionString: DATABASE_URL,
+    ssl: {
+      rejectUnauthorized: false
+    }
   });
 
   try {
