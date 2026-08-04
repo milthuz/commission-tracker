@@ -4367,6 +4367,39 @@ app.get('/api/admin/partner-invites', authenticateToken, async (req, res) => {
   }
 });
 
+// DELETE /api/admin/partner-invites/:id — revoquer une invitation EN ATTENTE.
+//
+// La ligne est supprimee plutot que son jeton efface : un compte jamais active n'a ni
+// mot de passe ni historique, ce n'est pas un compte, c'est une invitation. La supprimer
+// libere aussi l'adresse (contrainte UNIQUE), donc on peut reinviter la meme personne
+// ailleurs — chez un autre partenaire, par exemple, ce qui est le cas le plus courant
+// d'une revocation.
+//
+// Un compte ACTIF est refuse (409) : lui retirer son acces est une autre action, avec
+// d'autres consequences, et elle ne doit pas se cacher derriere le mot « revoquer ».
+//
+// Meme permission que l'invitation elle-meme : qui peut inviter peut desinviter.
+app.delete('/api/admin/partner-invites/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const pu = (await pool.query(
+      `SELECT pu.email, pu.status, p.name AS partner_name
+         FROM partner_users pu JOIN partners p ON p.id = pu.partner_id WHERE pu.id = $1`,
+      [parseInt(req.params.id, 10)]
+    )).rows[0];
+    if (!pu) return res.status(404).json({ error: 'Invitation not found' });
+    if (pu.status !== 'invited') return res.status(409).json({ error: 'already_active' });
+
+    await pool.query(`DELETE FROM partner_users WHERE id = $1`, [parseInt(req.params.id, 10)]);
+    logActivity('partner_user', pu.email, 'invite_revoked',
+      `Invitation to ${pu.email} (${pu.partner_name}) revoked`,
+      req.user.realAdminEmail || req.user.email);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // DELETE /api/admin/partners/:id — supprime une entreprise partenaire.
 //
 // La ligne `partners` a CINQ tables filles en ON DELETE CASCADE : comptes, opportunites,
