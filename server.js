@@ -12001,22 +12001,25 @@ async function checkCrmDuplicate({ businessName, contactEmail, contactPhone }) {
     const name = String(businessName || '').trim();
     const email = String(contactEmail || '').trim();
     const phone = String(contactPhone || '').trim();
+    // `matchedOn` : SUR QUOI la fiche a matche. Un compteur nu ne veut rien dire — « 30 sur le
+    // courriel » (une adresse partagee ou de test) et « 1 sur le nom d'entreprise » appellent des
+    // reactions opposees, et sans cette information l'admin ne peut pas trancher.
     const searches = [];
     if (name) {
       const enc = encodeURIComponent(name);
-      searches.push({ module: 'Accounts', url: `https://www.zohoapis.com/crm/v2/Accounts/search?criteria=(Account_Name:equals:${enc})`, nameField: 'Account_Name' });
-      searches.push({ module: 'Leads', url: `https://www.zohoapis.com/crm/v2/Leads/search?criteria=(Company:equals:${enc})`, nameField: 'Company' });
+      searches.push({ module: 'Accounts', matchedOn: 'name', url: `https://www.zohoapis.com/crm/v2/Accounts/search?criteria=(Account_Name:equals:${enc})`, nameField: 'Account_Name' });
+      searches.push({ module: 'Leads', matchedOn: 'name', url: `https://www.zohoapis.com/crm/v2/Leads/search?criteria=(Company:equals:${enc})`, nameField: 'Company' });
     }
     if (email) {
       const encE = encodeURIComponent(email);
-      searches.push({ module: 'Contacts', url: `https://www.zohoapis.com/crm/v2/Contacts/search?email=${encE}`, nameField: 'Full_Name' });
-      searches.push({ module: 'Leads', url: `https://www.zohoapis.com/crm/v2/Leads/search?email=${encE}`, nameField: 'Full_Name' });
+      searches.push({ module: 'Contacts', matchedOn: 'email', url: `https://www.zohoapis.com/crm/v2/Contacts/search?email=${encE}`, nameField: 'Full_Name' });
+      searches.push({ module: 'Leads', matchedOn: 'email', url: `https://www.zohoapis.com/crm/v2/Leads/search?email=${encE}`, nameField: 'Full_Name' });
     }
     if (phone) {
       const encP = encodeURIComponent(phone);
-      searches.push({ module: 'Contacts', url: `https://www.zohoapis.com/crm/v2/Contacts/search?phone=${encP}`, nameField: 'Full_Name' });
-      searches.push({ module: 'Leads', url: `https://www.zohoapis.com/crm/v2/Leads/search?phone=${encP}`, nameField: 'Full_Name' });
-      searches.push({ module: 'Accounts', url: `https://www.zohoapis.com/crm/v2/Accounts/search?criteria=(Phone:equals:${encP})`, nameField: 'Account_Name' });
+      searches.push({ module: 'Contacts', matchedOn: 'phone', url: `https://www.zohoapis.com/crm/v2/Contacts/search?phone=${encP}`, nameField: 'Full_Name' });
+      searches.push({ module: 'Leads', matchedOn: 'phone', url: `https://www.zohoapis.com/crm/v2/Leads/search?phone=${encP}`, nameField: 'Full_Name' });
+      searches.push({ module: 'Accounts', matchedOn: 'phone', url: `https://www.zohoapis.com/crm/v2/Accounts/search?criteria=(Phone:equals:${encP})`, nameField: 'Account_Name' });
     }
     for (const s of searches) {
       const r = await axios.get(s.url, { headers, validateStatus: () => true });
@@ -12030,6 +12033,7 @@ async function checkCrmDuplicate({ businessName, contactEmail, contactPhone }) {
           : (rec.Account_Name?.name || null);
         matches.push({
           module: s.module,
+          matchedOn: s.matchedOn,
           id: rec.id,
           name: rec[s.nameField] || rec.Account_Name || rec.Company || rec.Full_Name || '(unnamed)',
           company,
@@ -12043,13 +12047,21 @@ async function checkCrmDuplicate({ businessName, contactEmail, contactPhone }) {
     console.warn('[partner-crm] duplicate check failed:', e.message);
     return { status: 'check_failed', matches: [], summary: null };
   }
-  const seen = new Set();
-  const deduped = matches.filter((m) => {
+  // Deduplication qui FUSIONNE les criteres au lieu de garder le premier venu : une meme fiche
+  // trouvee a la fois par le nom ET par le courriel est un signal de doublon bien plus fort que
+  // deux fiches distinctes trouvees chacune par un seul critere. Jeter le second critere, comme le
+  // faisait le filtre precedent, effacait justement l'information la plus utile.
+  const byKey = new Map();
+  for (const m of matches) {
     const k = `${m.module}:${m.id}`;
-    if (seen.has(k)) return false;
-    seen.add(k);
-    return true;
-  });
+    const prev = byKey.get(k);
+    if (prev) {
+      if (!prev.matchedOn.includes(m.matchedOn)) prev.matchedOn.push(m.matchedOn);
+      continue;
+    }
+    byKey.set(k, { ...m, matchedOn: [m.matchedOn] });
+  }
+  const deduped = [...byKey.values()];
   // Org-less deep link: https://crm.zoho.com/crm/org<id>/tab/... required a numeric org ID that
   // turned out not to be resolvable from GET /crm/v2/org's "id" field (confirmed dead end live —
   // even the bare org+module URL, with no record id, errored). Omitting the org segment lets Zoho
