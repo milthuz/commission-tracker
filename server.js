@@ -1563,6 +1563,16 @@ async function initializeDatabase() {
     // once the deal has clearly become a real, invoiced customer.
     await pool.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS payout_rate DECIMAL(10,2)`);
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS linked_customer_name VARCHAR(255)`);
+    // Etat du Deal Zoho, RETENU en base (2026-08-05). L'eligibilite au versement se lit desormais
+    // dans `crm_deposit_date` — voir PARTNER_PAYOUT_ELIGIBLE_SQL. Il faut le stocker, et pas
+    // seulement l'afficher : la valeur ne se lisait que lorsqu'un partenaire ouvrait son portail,
+    // donc un versement aurait dependu de qui se connecte. Un travail planifie la rafraichit.
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_deposit_date DATE`);
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_deal_stage VARCHAR(120)`);
+    // Pourquoi le Deal n'a PAS pu etre resolu : 'ambiguous' (plusieurs deals homonymes — on n'en
+    // choisit alors aucun, cf. resolvePartnerDeal) ou 'not_found'. Sans cette trace, une affaire
+    // vendue mais introuvable resterait « non eligible » sans que personne ne sache pourquoi.
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_deal_lookup VARCHAR(20)`);
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS payout_status VARCHAR(20) NOT NULL DEFAULT 'not_eligible'`);
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS payout_run_id INTEGER`);
     await pool.query(`
@@ -3944,18 +3954,29 @@ async function resolvePartnerDeal(crmToken, businessName, knownDealId) {
   if (knownDealId) return await readDeal(knownDealId);
   const name = String(businessName || '').trim();
   if (!name) return null;
+  // Le Lead a disparu (204), donc il a ete CONVERTI : `leadConverted` reste vrai meme quand on
+  // n'arrive pas a mettre la main sur le Deal. `lookup` dit POURQUOI on a echoue — depuis que
+  // l'eligibilite au versement depend de la date de depot, un echec silencieux ici vaut un
+  // partenaire non paye sans explication.
+  const unresolved = (lookup) => ({
+    leadStage: null, leadConverted: true, dealId: null,
+    dealStage: null, depositDate: null, lookup,
+  });
   try {
     const sr = await axios.get(
       `https://www.zohoapis.com/crm/v2/Deals/search?criteria=(Deal_Name:equals:${encodeURIComponent(name)})`,
       { headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true }
     );
     const found = sr.status === 200 ? (sr.data?.data || []) : [];
-    if (found.length !== 1) return null;   // 0 = pas encore de deal ; >1 = ambigu, on se tait
+    // 0 = pas encore de deal ; >1 = homonymes, on n'en choisit AUCUN (voir l'avertissement plus
+    // haut : verser sur le mauvais deal serait pire que ne rien verser).
+    if (found.length !== 1) return unresolved(found.length > 1 ? 'ambiguous' : 'not_found');
     const deal = found[0];
     return {
       leadStage: null, leadConverted: true, dealId: deal.id,
       dealStage: deal.Stage || null,
       depositDate: deal.Deposit_Information_Received || null,
+      lookup: null,
     };
   } catch {
     return null;
@@ -4019,7 +4040,7 @@ app.get('/api/partner-portal/opportunities', authenticatePartnerToken, async (re
       `SELECT o.id, o.business_name, o.contact_first_name, o.contact_last_name, o.contact_phone, o.contact_email,
               o.rep_first_name, o.rep_last_name, o.rep_phone, o.rep_email, o.notes, o.status, o.reviewed_at,
               o.rejection_reason, o.created_at, o.crm_owner_name, o.crm_lead_id, o.crm_deal_id, o.payout_run_id,
-              o.payout_status, o.linked_customer_name,
+              o.payout_status, o.linked_customer_name, o.crm_deposit_date,
               pu.display_name AS submitted_by_name, pu.email AS submitted_by_email
          FROM partner_opportunities o
          LEFT JOIN partner_users pu ON pu.id = o.submitted_by
@@ -4033,14 +4054,20 @@ app.get('/api/partner-portal/opportunities', authenticatePartnerToken, async (re
     const stages = await Promise.all(rows.map((r) => (r.status === 'approved' && r.crm_lead_id)
       ? getCrmLeadStage(r.crm_lead_id, r.business_name, r.crm_deal_id)
       : Promise.resolve(null)));
-    // On retient le Deal des qu'il est resolu : la prochaine lecture ira droit au but au lieu
-    // de repayer une recherche par nom. Sans attendre — l'affichage n'en depend pas.
+    // On retient ce que Zoho vient de nous apprendre : le Deal (pour ne plus repayer une recherche
+    // par nom) et la date de depot, dont depend l'eligibilite au versement. Sans attendre —
+    // l'affichage n'en depend pas. Le travail planifie du worker fait le meme travail a l'heure ;
+    // ceci ne fait que profiter d'une lecture deja payee.
     rows.forEach((r, i) => {
-      const found = stages[i]?.dealId;
-      if (found && found !== r.crm_deal_id) {
-        pool.query(`UPDATE partner_opportunities SET crm_deal_id = $2 WHERE id = $1`, [r.id, found])
-          .catch((e) => console.warn('[partner-crm] crm_deal_id non retenu', r.id, e.message));
-      }
+      const s = stages[i];
+      if (!s) return;
+      pool.query(
+        `UPDATE partner_opportunities
+            SET crm_deal_id = COALESCE($2::varchar, crm_deal_id), crm_deal_stage = $3::varchar,
+                crm_deposit_date = $4::date, crm_deal_lookup = $5::varchar
+          WHERE id = $1`,
+        [r.id, s.dealId || null, s.dealStage || null, s.depositDate || null, s.lookup || null]
+      ).catch((e) => console.warn('[partner-crm] etat du Deal non retenu', r.id, e.message));
     });
     res.json({ opportunities: rows.map((r, i) => ({
       ...mapOpportunityRow(r),
@@ -4048,10 +4075,11 @@ app.get('/api/partner-portal/opportunities', authenticatePartnerToken, async (re
       leadStage: stages[i]?.leadStage || null,
       leadConverted: !!stages[i]?.leadConverted,
       dealStage: stages[i]?.dealStage || null,
-      // Date de depot : exposee pour l'affichage. L'eligibilite au VERSEMENT n'est pas encore
-      // branchee dessus — a faire volontairement a part, c'est de l'argent.
-      depositDate: stages[i]?.depositDate || null,
-      leadConverted: stages[i]?.leadConverted || false,
+      // Date de depot : c'est ELLE qui commande l'eligibilite au versement depuis 2026-08-05
+      // (voir PARTNER_PAYOUT_ELIGIBLE_SQL). On expose la valeur fraiche si Zoho a repondu, sinon
+      // celle retenue en base — le partenaire ne doit pas voir sa date disparaitre parce qu'un
+      // appel a echoue.
+      depositDate: stages[i]?.depositDate || r.crm_deposit_date || null,
       // SH-39 — payout status is partner-safe (it's their own money); linked_customer_name is the
       // admin's internal matching detail and stays out of this response.
       payoutStatus: r.payout_status,
@@ -4909,7 +4937,7 @@ app.get('/api/admin/partner-opportunities', authenticateToken, async (req, res) 
               o.rep_first_name, o.rep_last_name, o.rep_phone, o.rep_email, o.notes, o.status,
               o.reviewed_by, o.reviewed_at, o.rejection_reason, o.created_at,
               o.crm_match_status, o.crm_match_summary, o.crm_match_records, o.crm_lead_id, o.crm_lead_error,
-              o.linked_customer_name, o.payout_status,
+              o.linked_customer_name, o.payout_status, o.crm_deposit_date, o.crm_deal_stage, o.crm_deal_lookup,
               p.name AS partner_name, pu.email AS submitted_by_email
          FROM partner_opportunities o
          JOIN partners p ON p.id = o.partner_id
@@ -4929,6 +4957,12 @@ app.get('/api/admin/partner-opportunities', authenticateToken, async (req, res) 
       crmLeadError: r.crm_lead_error,
       linkedCustomerName: r.linked_customer_name,
       payoutStatus: r.payout_status,
+      // Ce qui COMMANDE le versement, expose pour que l'admin puisse voir pourquoi une ligne est
+      // eligible ou non — sans avoir a deviner. `crmDealLookup` = 'ambiguous' (homonymes, aucun
+      // deal choisi) ou 'not_found' : les deux seuls cas ou une vente reelle peut rester bloquee.
+      crmDepositDate: r.crm_deposit_date,
+      crmDealStage: r.crm_deal_stage,
+      crmDealLookup: r.crm_deal_lookup,
     })) });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -5035,20 +5069,27 @@ app.get('/api/admin/partner-opportunities/crm-reps', authenticateToken, async (r
   }
 });
 
-// Le predicat d'eligibilite au versement partenaire, ecrit UNE SEULE fois : il faut une facture
-// PAYEE au nom du client rattache. Meme regle que le moteur de commissions des representants
-// (SH-40/41) : jamais eligible au seul motif qu'un Lead Zoho a ete converti.
+// Le predicat d'eligibilite au versement partenaire, ecrit UNE SEULE fois.
 //
-// ⚠️ Une date de depot dans Zoho (`Deposit_Information_Received`) NE suffit PAS et n'entre pas
-// dans ce predicat : c'est un champ de CRM, pas une preuve d'encaissement. Decision de David,
-// 2026-08-05, sur la question posee explicitement.
-const PARTNER_PAYOUT_ELIGIBLE_SQL = `
-  EXISTS (SELECT 1 FROM invoices i
-           WHERE i.customer_name = o.linked_customer_name
-             AND i.status = 'paid' AND i.paid_date IS NOT NULL)`;
+// Le declencheur est `Deposit_Information_Received` sur le Deal Zoho — le MEME champ que celui
+// qui compte une vente pour les representants (zohoCRMService.getSoldDeals). Une DATE, pas une
+// etape : un deal qui franchit l'etape puis avance n'y est plus, mais il a bel et bien ete vendu.
+//
+// ⚠️ Decision de David, 2026-08-05, apres avoir d'abord demande l'inverse (« facture payee ») :
+// on abandonne la condition de facture payee. Ce qu'on gagne est structurel — la facture obligeait
+// a rattacher A LA MAIN chaque opportunite au client facture (les noms ne concordent pas entre le
+// portail et Zoho Books), une etape impossible a faire au moment de l'approbation, declenchee par
+// un evenement dans un autre systeme, et SILENCIEUSE quand on l'oubliait : le partenaire n'etait
+// alors jamais paye et rien ne le signalait. La date de depot vient du Deal qu'on resout deja
+// tout seul, donc plus aucune intervention manuelle.
+// Ce qu'on accepte en echange : on peut payer avant l'encaissement reel. Si l'affaire tombe
+// ensuite, il faut un ajustement pour recuperer — le montant est un forfait, l'exposition est
+// bornee. `linked_customer_name` reste pour la tenue de compte de l'admin, mais ne commande plus
+// rien.
+const PARTNER_PAYOUT_ELIGIBLE_SQL = `(o.crm_deposit_date IS NOT NULL)`;
 
-// `opportunityId` null = TOUTES les opportunites rattachees (passage groupe, une seule requete —
-// la base est chez Railway en acces public, donc on evite les allers-retours par ligne).
+// `opportunityId` null = TOUTES les opportunites (passage groupe, une seule requete — la base est
+// chez Railway en acces public, donc on evite les allers-retours par ligne).
 //
 // Les lignes 'in_run' / 'paid' sont gelees : un run de versement les a deja reclamees, meme
 // principe PAID=FROZEN que le moteur des representants. Le filtre `IS DISTINCT FROM` evite les
@@ -5059,7 +5100,7 @@ async function recomputePartnerPayoutStatus(opportunityId = null) {
   const r = await pool.query(
     `UPDATE partner_opportunities o
         SET payout_status = ${verdict}
-      WHERE o.linked_customer_name IS NOT NULL
+      WHERE o.status = 'approved'
         AND o.payout_status NOT IN ('in_run', 'paid')
         AND ($1::int IS NULL OR o.id = $1)
         AND o.payout_status IS DISTINCT FROM (${verdict})
@@ -5070,6 +5111,66 @@ async function recomputePartnerPayoutStatus(opportunityId = null) {
     console.log(`💰 [partner-payout] « ${row.business_name} » (#${row.id}) → ${row.payout_status}`);
   }
   return r.rows;
+}
+
+// Rafraichit l'etat du Deal Zoho des opportunites approuvees, puis recalcule l'eligibilite.
+//
+// Indispensable : la date de depot n'etait lue QUE lorsqu'un partenaire ouvrait son portail. Un
+// versement aurait donc dependu de qui se connecte et quand — un partenaire discret n'aurait
+// jamais ete paye. C'est le worker qui doit poser la question a Zoho, pas l'affichage.
+//
+// Une seule requete Zoho par opportunite, en sequence : le volume est faible et on prefere etre
+// lent qu'agressif sur l'API. Les lignes gelees ('in_run'/'paid') sont exclues des la requete.
+const PARTNER_DEAL_SYNC_LIMIT = 250;
+async function syncPartnerDealState() {
+  const rows = (await pool.query(
+    `SELECT id, business_name, crm_lead_id, crm_deal_id
+       FROM partner_opportunities
+      WHERE status = 'approved' AND crm_lead_id IS NOT NULL
+        AND payout_status NOT IN ('in_run', 'paid')
+      ORDER BY crm_deposit_date NULLS FIRST, id
+      LIMIT ${PARTNER_DEAL_SYNC_LIMIT + 1}`
+  )).rows;
+  if (!rows.length) return;
+  // Pas de troncature silencieuse : si le plafond est atteint, on le DIT, sinon « tout est a
+  // jour » et « on n'a pas tout regarde » se ressemblent dans les journaux.
+  if (rows.length > PARTNER_DEAL_SYNC_LIMIT) {
+    console.warn(`⚠️ [partner-deals] plus de ${PARTNER_DEAL_SYNC_LIMIT} opportunites a verifier — le reste attend le prochain passage`);
+    rows.length = PARTNER_DEAL_SYNC_LIMIT;
+  }
+
+  let changed = 0;
+  for (const r of rows) {
+    const state = await getCrmLeadStage(r.crm_lead_id, r.business_name, r.crm_deal_id);
+    // Zoho injoignable → on ne conclut RIEN. Ecrire null ici effacerait une date de depot deja
+    // connue et retirerait au partenaire une eligibilite acquise, sur une simple panne reseau.
+    if (!state) continue;
+    const up = await pool.query(
+      // Les types sont FORCES sur chaque parametre. Sans le cast sur $2, Postgres echoue avec
+      // « could not determine data type of parameter » : il ne peut pas l'inferer, le parametre
+      // servant a la fois dans un COALESCE et dans un IS NOT NULL. Verifie par le test PGlite.
+      `UPDATE partner_opportunities
+          SET crm_deal_id      = COALESCE($2::varchar, crm_deal_id),
+              crm_deal_stage   = $3::varchar,
+              crm_deposit_date = $4::date,
+              crm_deal_lookup  = $5::varchar
+        WHERE id = $1
+          AND (crm_deal_stage   IS DISTINCT FROM $3::varchar
+            OR crm_deposit_date IS DISTINCT FROM $4::date
+            OR crm_deal_lookup  IS DISTINCT FROM $5::varchar
+            OR (crm_deal_id IS NULL AND $2::varchar IS NOT NULL))
+        RETURNING id`,
+      [r.id, state.dealId || null, state.dealStage || null, state.depositDate || null, state.lookup || null]
+    );
+    if (up.rows.length) {
+      changed++;
+      if (state.lookup) {
+        console.warn(`⚠️ [partner-deals] « ${r.business_name} » (#${r.id}) : Deal ${state.lookup === 'ambiguous' ? 'AMBIGU (homonymes, aucun choisi)' : 'introuvable par le nom'}`);
+      }
+    }
+  }
+  if (changed) console.log(`🤝 [partner-deals] ${changed} opportunite(s) mise(s) a jour depuis Zoho`);
+  await recomputePartnerPayoutStatus();
 }
 
 // GET /api/admin/partner-opportunities/customer-search?q= — autocomplete against Sales Hub's own
@@ -5103,11 +5204,16 @@ app.put('/api/admin/partner-opportunities/:id/link-customer', authenticateToken,
     if (['in_run', 'paid'].includes(current.payout_status)) {
       return res.status(409).json({ error: 'This opportunity is already part of a payout run and can no longer be relinked.' });
     }
+    // ⚠️ Ne remet PLUS payout_status a 'not_eligible' : depuis que l'eligibilite se lit sur la date
+    // de depot, le rattachement d'un client n'a plus rien a voir avec elle. Remettre a zero ici
+    // retirait une eligibilite acquise a chaque fois qu'on corrigeait un nom de client, et le
+    // recalcul qui suivait etait conditionne a `customerName` — donc un DE-rattachement laissait la
+    // ligne bloquee sur 'not_eligible'.
     await pool.query(
-      `UPDATE partner_opportunities SET linked_customer_name = $2, payout_status = 'not_eligible' WHERE id = $1`,
+      `UPDATE partner_opportunities SET linked_customer_name = $2 WHERE id = $1`,
       [id, customerName]
     );
-    if (customerName) await recomputePartnerPayoutStatus(id);
+    await recomputePartnerPayoutStatus(id);
     const updated = (await pool.query(`SELECT linked_customer_name, payout_status FROM partner_opportunities WHERE id = $1`, [id])).rows[0];
     res.json({ success: true, linkedCustomerName: updated.linked_customer_name, payoutStatus: updated.payout_status });
   } catch (e) {
@@ -5155,8 +5261,8 @@ app.delete('/api/admin/partner-opportunities/:id', authenticateToken, async (req
 });
 
 // ============================================================================
-// PARTNER PAYOUTS (SH-40/41) — quarterly runs against opportunities the partner
-// manager has linked to a real, paid Sales Hub customer (see recomputePartnerPayoutStatus).
+// PARTNER PAYOUTS (SH-40/41) — quarterly runs against opportunities whose Zoho Deal carries a
+// deposit date (voir PARTNER_PAYOUT_ELIGIBLE_SQL et recomputePartnerPayoutStatus).
 // ============================================================================
 
 // GET /api/admin/partner-payouts/pending — every partner with ≥1 'eligible' opportunity not yet
@@ -5332,7 +5438,9 @@ app.delete('/api/admin/partner-payouts/runs/:id', authenticateToken, async (req,
     if (run.status !== 'draft') return res.status(409).json({ error: 'Only draft runs can be cancelled' });
     const items = (await pool.query(`SELECT id FROM partner_opportunities WHERE payout_run_id = $1`, [id])).rows.map((r) => r.id);
     await pool.query(`UPDATE partner_opportunities SET payout_run_id = NULL, payout_status = 'not_eligible' WHERE id = ANY($1::int[])`, [items]);
-    await Promise.all(items.map((oid) => recomputePartnerPayoutStatus(oid)));
+    // Un seul passage groupe au lieu d'un aller-retour par ligne : les lignes viennent d'etre
+    // degelees, donc le recalcul general les rattrape toutes.
+    await recomputePartnerPayoutStatus();
     await pool.query(`DELETE FROM partner_payout_runs WHERE id = $1`, [id]);
     res.json({ success: true });
   } catch (e) {
@@ -8357,11 +8465,6 @@ async function autoSyncInvoices() {
             await backfillCustomerFirstSale().catch(e => console.warn('[AUTO-SYNC] customer-first-sale backfill failed:', e.message));
           }
           await runRecalcV2('post-sync');
-          // Filet de securite horaire pour l'eligibilite des versements partenaires. Le poll
-          // delta (5 min) la recalcule deja quand une facture change ; ce passage-ci rattrape ce
-          // que le delta n'a pas vu — reconciliation complete, donc aussi les suppressions.
-          await recomputePartnerPayoutStatus().catch((e) =>
-            console.warn('[partner-payout] recalcul post-sync echoue:', e.message));
         } catch (e) {
           console.warn('[AUTO-SYNC] post-sync enrich+recalc failed:', e.message);
         }
@@ -8650,6 +8753,16 @@ function startAutoSync() {
     checkProbationNotifications();
     setInterval(checkProbationNotifications, 24 * 60 * 60 * 1000);
   }, 3 * 60 * 1000);
+
+  // Etat des Deals partenaires (etape + date de depot) → eligibilite au versement. Horaire :
+  // c'est de l'argent du a des partenaires, une reactivite d'une heure suffit et menage l'API
+  // Zoho. Premier passage 4 min apres le demarrage, decale des autres travaux.
+  setTimeout(() => {
+    const run = () => syncPartnerDealState()
+      .catch((e) => console.warn('[partner-deals] passage planifie echoue:', e.message));
+    run();
+    setInterval(run, 60 * 60 * 1000);
+  }, 4 * 60 * 1000);
 
   // SaaS Increase insights (subscription tenure + last price change) — one live Zoho call per
   // subscription, so nightly not hourly. First run ~20 min after boot, then every 24h.
@@ -16962,13 +17075,6 @@ async function deltaSyncInvoices() {
 
     if (processed > 0) {
       console.log(`[DELTA] synced ${processed} modified invoices (cutoff: ${cutoff.toISOString()})`);
-      // 🐛 Une facture qui passe a « payee » rend une opportunite partenaire eligible au
-      // versement. Ce recalcul n'existait qu'au moment ou l'admin rattache un client : dans la
-      // chronologie reelle (rattachement d'abord, encaissement des semaines plus tard) il
-      // concluait « pas eligible » et rien ne le rappelait jamais. Le partenaire n'etait donc
-      // jamais paye, sans que personne ne le voie. C'est ici que l'information arrive.
-      await recomputePartnerPayoutStatus().catch((e) =>
-        console.warn('[partner-payout] recalcul apres delta echoue:', e.message));
     }
   } catch (e) {
     console.error('[DELTA] error:', e.message);
