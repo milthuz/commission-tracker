@@ -2155,13 +2155,13 @@ const PARTNER_EMAIL_COPY = {
     fr: {
       subject: 'Invitation — Portail partenaire Cluster',
       title: 'Vous êtes invité au Portail partenaire Cluster',
-      intro: (name) => `${name ? name + ', ' : ''}un compte vous a été préparé sur le Portail partenaire Cluster. Cliquez ci-dessous pour choisir votre mot de passe et activer votre accès.`,
+      intro: (name, partner) => `${name ? name + ', ' : ''}un compte vous a été préparé sur le Portail partenaire Cluster${partner ? ` pour ${partner}` : ''}. Cliquez ci-dessous pour choisir votre mot de passe et activer votre accès.`,
       cta: 'Activer mon compte',
     },
     en: {
       subject: 'Invitation — Cluster Partner Portal',
       title: 'You are invited to the Cluster Partner Portal',
-      intro: (name) => `${name ? name + ', ' : ''}an account has been created for you on the Cluster Partner Portal. Click below to choose your password and activate your access.`,
+      intro: (name, partner) => `${name ? name + ', ' : ''}an account has been created for you on the Cluster Partner Portal${partner ? ` for ${partner}` : ''}. Click below to choose your password and activate your access.`,
       cta: 'Activate my account',
     },
   },
@@ -4045,6 +4045,12 @@ app.post('/api/partner-portal/team/invite', authenticatePartnerToken, async (req
     // le compte : la reinitialisation de mot de passe, plus tard, n'a personne a qui la
     // demander.
     const locale = isFrLocale(req.body.locale) ? 'fr' : 'en';
+    // Le nom de l'entreprise partenaire, pour que l'invite sache AU NOM DE QUI on
+    // l'invite : quelqu'un qui traite avec plusieurs fournisseurs ne devine pas d'ou
+    // vient le courriel.
+    const partnerName = (await pool.query(
+      `SELECT name FROM partners WHERE id = $1`, [req.partnerUser.partnerId]
+    )).rows[0]?.name || null;
     await pool.query(
       // partner_id = $1 in the DO UPDATE is deliberate and load-bearing: it re-asserts ownership
       // on the conflict path so a re-invite can never leave a row pointing at another company
@@ -4063,7 +4069,7 @@ app.post('/api/partner-portal/team/invite', authenticatePartnerToken, async (req
       partnerCopy('invite', locale).subject,
       mailShell(
         partnerCopy('invite', locale).title,
-        partnerCopy('invite', locale).intro(name),
+        partnerCopy('invite', locale).intro(name, partnerName),
         partnerCopy('invite', locale).cta,
         inviteUrl,
         locale,
@@ -4527,6 +4533,7 @@ app.post('/api/admin/partners/:id/invite-admin', authenticateToken, async (req, 
     // le compte : la reinitialisation de mot de passe, plus tard, n'a personne a qui la
     // demander.
     const locale = isFrLocale(req.body.locale) ? 'fr' : 'en';
+    const partnerName = partner.name || null;
     await pool.query(
       `INSERT INTO partner_users (partner_id, email, display_name, role, status, invite_token_hash, invite_expires_at, invited_by, locale, invited_at, invite_opened_at, activated_at)
        VALUES ($1,$2,$3,'admin','invited',$4,$5,$6,$7,NOW(),NULL,NULL)
@@ -4542,7 +4549,7 @@ app.post('/api/admin/partners/:id/invite-admin', authenticateToken, async (req, 
       partnerCopy('invite', locale).subject,
       mailShell(
         partnerCopy('invite', locale).title,
-        partnerCopy('invite', locale).intro(name),
+        partnerCopy('invite', locale).intro(name, partnerName),
         partnerCopy('invite', locale).cta,
         inviteUrl,
         locale,
