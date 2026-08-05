@@ -375,6 +375,9 @@ async function initializeDatabase() {
     // et il méritait mieux qu'un message écrit deux fois. 'fr' par défaut — marché
     // principal, et c'est ce que recevaient les partenaires existants.
     await pool.query(`ALTER TABLE partner_users ADD COLUMN IF NOT EXISTS locale VARCHAR(5) DEFAULT 'fr'`);
+    // Deal issu de la conversion du Lead. Retenu parce que la resolution passe par une
+    // RECHERCHE par nom, couteuse et ambigue : une fois trouve, on n'y revient plus.
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_deal_id VARCHAR(50)`);
     // Suivi des invitations. `invite_opened_at` est pose quand le LIEN est ouvert, pas
     // quand le courriel l'est : un pixel de suivi se fait bloquer par la moitie des
     // clients de messagerie, alors qu'un clic sur le lien est un fait cote serveur.
@@ -3772,15 +3775,66 @@ function mapOpportunityRow(r) {
 // Best-effort live Zoho CRM Lead status for the partner-facing opportunity list — never throws;
 // returns null on any failure so one bad lookup can't break the whole list. $converted is Zoho's
 // read-only system field marking a Lead that's been converted into a Contact/Account/Deal.
-async function getCrmLeadStage(leadId) {
+// Retrouve le Deal d'une opportunite partenaire quand son Lead n'est plus lisible.
+//
+// `knownDealId` court-circuite la recherche : une fois le Deal resolu et retenu en base, on
+// lit directement, sans repayer une recherche a chaque affichage de la liste.
+//
+// ⚠️ Ambiguite : la recherche par nom peut ramener plusieurs deals homonymes. On n'en choisit
+// alors AUCUN. Cette colonne finira par declencher des versements — afficher l'etape du
+// mauvais deal serait pire que n'afficher rien, parce que personne ne saurait que c'est faux.
+async function resolvePartnerDeal(crmToken, businessName, knownDealId) {
+  const readDeal = async (dealId) => {
+    const d = await axios.get(`https://www.zohoapis.com/crm/v2/Deals/${dealId}`, {
+      headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true,
+    });
+    const deal = d.status === 200 ? d.data?.data?.[0] : null;
+    if (!deal) return null;
+    return {
+      leadStage: null, leadConverted: true, dealId,
+      dealStage: deal.Stage || null,
+      depositDate: deal.Deposit_Information_Received || null,
+    };
+  };
+
+  if (knownDealId) return await readDeal(knownDealId);
+  const name = String(businessName || '').trim();
+  if (!name) return null;
+  try {
+    const sr = await axios.get(
+      `https://www.zohoapis.com/crm/v2/Deals/search?criteria=(Deal_Name:equals:${encodeURIComponent(name)})`,
+      { headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true }
+    );
+    const found = sr.status === 200 ? (sr.data?.data || []) : [];
+    if (found.length !== 1) return null;   // 0 = pas encore de deal ; >1 = ambigu, on se tait
+    const deal = found[0];
+    return {
+      leadStage: null, leadConverted: true, dealId: deal.id,
+      dealStage: deal.Stage || null,
+      depositDate: deal.Deposit_Information_Received || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function getCrmLeadStage(leadId, businessName, knownDealId) {
   try {
     const crmToken = await ensureValidCrmToken();
     const r = await axios.get(`https://www.zohoapis.com/crm/v2/Leads/${leadId}`, {
       headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true,
     });
-    if (r.status !== 200) return null;
-    const lead = r.data?.data?.[0];
-    if (!lead) return null;
+    // 🐛 Zoho renvoie 204 « No Content » — pas 404 — des qu'un Lead est CONVERTI : il sort du
+    // module Leads. L'ancien `if (status !== 200) return null` faisait donc retomber sur null
+    // TOUTE opportunite convertie, systematiquement. Ce n'etait pas un cas limite.
+    //
+    // Le Lead ayant disparu, on rejoint le Deal par le nom de l'entreprise — la meme recherche
+    // que celle deja utilisee pour les deals des representants.
+    const lead = r.status === 200 ? (r.data?.data?.[0] || null) : null;
+    if (!lead) {
+      const viaDeal = await resolvePartnerDeal(crmToken, businessName, knownDealId);
+      return viaDeal || null;
+    }
     const converted = !!lead.$converted;
 
     // Un Lead CONVERTI n'a plus de statut utile : l'information vit sur le Deal. On suivait
@@ -3820,7 +3874,7 @@ app.get('/api/partner-portal/opportunities', authenticatePartnerToken, async (re
     const rows = (await pool.query(
       `SELECT o.id, o.business_name, o.contact_first_name, o.contact_last_name, o.contact_phone, o.contact_email,
               o.rep_first_name, o.rep_last_name, o.rep_phone, o.rep_email, o.notes, o.status, o.reviewed_at,
-              o.rejection_reason, o.created_at, o.crm_owner_name, o.crm_lead_id, o.payout_run_id,
+              o.rejection_reason, o.created_at, o.crm_owner_name, o.crm_lead_id, o.crm_deal_id, o.payout_run_id,
               o.payout_status, o.linked_customer_name,
               pu.display_name AS submitted_by_name, pu.email AS submitted_by_email
          FROM partner_opportunities o
@@ -3832,7 +3886,18 @@ app.get('/api/partner-portal/opportunities', authenticatePartnerToken, async (re
     // Assigned rep + live Lead stage are partner-safe (unlike crm_match_*/crm_lead_error, which
     // stay admin-only — see mapOpportunityRow's comment) — only fetched for approved rows that
     // actually have a Lead, so a partner with no approved deals costs zero Zoho calls.
-    const stages = await Promise.all(rows.map((r) => (r.status === 'approved' && r.crm_lead_id) ? getCrmLeadStage(r.crm_lead_id) : Promise.resolve(null)));
+    const stages = await Promise.all(rows.map((r) => (r.status === 'approved' && r.crm_lead_id)
+      ? getCrmLeadStage(r.crm_lead_id, r.business_name, r.crm_deal_id)
+      : Promise.resolve(null)));
+    // On retient le Deal des qu'il est resolu : la prochaine lecture ira droit au but au lieu
+    // de repayer une recherche par nom. Sans attendre — l'affichage n'en depend pas.
+    rows.forEach((r, i) => {
+      const found = stages[i]?.dealId;
+      if (found && found !== r.crm_deal_id) {
+        pool.query(`UPDATE partner_opportunities SET crm_deal_id = $2 WHERE id = $1`, [r.id, found])
+          .catch((e) => console.warn('[partner-crm] crm_deal_id non retenu', r.id, e.message));
+      }
+    });
     res.json({ opportunities: rows.map((r, i) => ({
       ...mapOpportunityRow(r),
       assignedRepName: r.crm_owner_name,
