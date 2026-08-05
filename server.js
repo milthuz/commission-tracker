@@ -3781,7 +3781,32 @@ async function getCrmLeadStage(leadId) {
     if (r.status !== 200) return null;
     const lead = r.data?.data?.[0];
     if (!lead) return null;
-    return { leadStage: lead.Lead_Status || null, leadConverted: !!lead.$converted };
+    const converted = !!lead.$converted;
+
+    // Un Lead CONVERTI n'a plus de statut utile : l'information vit sur le Deal. On suivait
+    // `$converted` sans jamais s'en servir, d'ou la colonne vide des que le flux avancait.
+    //
+    // `Deposit_Information_Received` est le meme signal que celui des commissions des
+    // representants (voir zohoCRMService.getSoldDeals) : une DATE, pas une etape. C'est
+    // deliberé de leur cote et ca vaut ici aussi — un deal qui franchit l'etape puis avance
+    // n'y est plus, mais il a bel et bien ete vendu. Se fier au Stage ferait disparaitre la
+    // vente au premier mouvement dans Zoho.
+    let dealStage = null, depositDate = null, dealId = null;
+    if (converted) {
+      dealId = lead.$converted_detail?.deal || lead.$converted_detail?.deal_id || null;
+      if (dealId) {
+        const d = await axios.get(
+          `https://www.zohoapis.com/crm/v2/Deals/${dealId}`,
+          { headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true }
+        );
+        const deal = d.status === 200 ? d.data?.data?.[0] : null;
+        if (deal) {
+          dealStage = deal.Stage || null;
+          depositDate = deal.Deposit_Information_Received || null;
+        }
+      }
+    }
+    return { leadStage: lead.Lead_Status || null, leadConverted: converted, dealId, dealStage, depositDate };
   } catch {
     return null;
   }
@@ -3812,6 +3837,11 @@ app.get('/api/partner-portal/opportunities', authenticatePartnerToken, async (re
       ...mapOpportunityRow(r),
       assignedRepName: r.crm_owner_name,
       leadStage: stages[i]?.leadStage || null,
+      leadConverted: !!stages[i]?.leadConverted,
+      dealStage: stages[i]?.dealStage || null,
+      // Date de depot : exposee pour l'affichage. L'eligibilite au VERSEMENT n'est pas encore
+      // branchee dessus — a faire volontairement a part, c'est de l'argent.
+      depositDate: stages[i]?.depositDate || null,
       leadConverted: stages[i]?.leadConverted || false,
       // SH-39 — payout status is partner-safe (it's their own money); linked_customer_name is the
       // admin's internal matching detail and stays out of this response.
