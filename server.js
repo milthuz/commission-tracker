@@ -137,6 +137,7 @@ const PERMISSION_CATALOG = [
   // partner accounts themselves never touch this permission system, see partner_users)
   { key: 'partners:manage',            label: 'Manage partner companies and review submitted opportunities',   category: 'Partners' },
   { key: 'partners:delete',            label: 'Delete a partner company AND all its history (destructive)',     category: 'Partners' },
+  { key: 'partners:migrate',           label: 'Bulk-import partners, portal users and opportunities (migration)', category: 'Partners' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -1575,6 +1576,14 @@ async function initializeDatabase() {
     // choisit alors aucun, cf. resolvePartnerDeal) ou 'not_found'. Sans cette trace, une affaire
     // vendue mais introuvable resterait « non eligible » sans que personne ne sache pourquoi.
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_deal_lookup VARCHAR(20)`);
+    // Migration de l'ancien portail Zoho Creator (2026-08-05). `payout_excluded` sort la ligne du
+    // calcul d'eligibilite : ces dossiers sont anterieurs au programme de versement et ne doivent
+    // JAMAIS le declencher. Sans ce garde-fou, les 95 deals « Closed Won » importes devenaient
+    // eligibles des que le worker lisait leur date de depot dans Zoho — une dette inventee.
+    // `migration_source` trace l'origine : on doit pouvoir distinguer, plus tard, une opportunite
+    // reellement soumise dans Sales Hub d'une ligne reprise de l'ancien outil.
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS payout_excluded BOOLEAN NOT NULL DEFAULT false`);
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS migration_source VARCHAR(50)`);
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS payout_status VARCHAR(20) NOT NULL DEFAULT 'not_eligible'`);
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS payout_run_id INTEGER`);
     await pool.query(`
@@ -4761,6 +4770,177 @@ app.get('/api/admin/partner-opportunities/:id/crm-debug', authenticateToken, asy
   }
 });
 
+// POST /api/admin/partner-migration — reprise en masse de l'ancien portail Zoho Creator.
+//
+// La transformation (filtrage, dedoublonnage, rattachement deal->lead) est faite HORS de la
+// production et livree ici sous forme de charge utile deja normalisee. Deliberé : cette logique
+// ne servira qu'une fois, elle n'a pas a vivre dans server.js pour toujours, et la verifier
+// localement contre un vrai Postgres est plus sur que la deboguer en production.
+//
+// Trois garde-fous, dans l'ordre d'importance :
+//   1. `dryRun` vaut VRAI par defaut. Un appel qui oublie le drapeau SIMULE, il n'ecrit pas.
+//   2. Tout se joue dans UNE transaction, annulee en simulation — le rapport est donc produit par
+//      les vraies requetes, sur les vraies contraintes, et non par une approximation.
+//   3. Idempotent : reexecutable sans creer de doublon. L'appariement se fait sur `crm_lead_id`,
+//      sinon sur `crm_deal_id`. Une ligne sans aucun des deux est REFUSEE — elle serait
+//      introuvable a la reexecution et se dupliquerait a chaque passage (defaut trouve en
+//      simulation, pas en production).
+//
+// Ecritures REGROUPEES : 851 insertions ligne par ligne feraient expirer la requete, la base
+// etant joignable par un proxy public cross-cloud (voir la note sur la latence).
+app.post('/api/admin/partner-migration', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:migrate'))) return;
+  const body = req.body || {};
+  // Fail-safe : seul un `false` explicite autorise l'ecriture.
+  const dryRun = body.dryRun !== false;
+  const source = String(body.source || '').trim().slice(0, 50) || null;
+  const partnerName = String(body.partner?.name || '').trim();
+  const leadSource = String(body.partner?.leadSource || '').trim() || null;
+  const users = Array.isArray(body.users) ? body.users : [];
+  const opportunities = Array.isArray(body.opportunities) ? body.opportunities : [];
+
+  if (!partnerName) return res.status(400).json({ error: 'partner.name is required' });
+  if (users.length > 2000 || opportunities.length > 10000) {
+    return res.status(400).json({ error: 'Payload too large — split it' });
+  }
+
+  const report = {
+    dryRun, source, partner: partnerName,
+    users: { created: 0, alreadyThere: 0, refused: [] },
+    opportunities: { created: 0, alreadyThere: 0, refused: [], attributed: 0, withDeal: 0 },
+  };
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const pr = await client.query(
+      `INSERT INTO partners (name, lead_source) VALUES ($1, $2)
+       ON CONFLICT (name) DO UPDATE SET lead_source = COALESCE(partners.lead_source, EXCLUDED.lead_source)
+       RETURNING id`,
+      [partnerName, leadSource]
+    );
+    const partnerId = pr.rows[0].id;
+
+    // --- usagers : une seule requete, statut « imported » (ni connexion ni activation possibles
+    // avant une vraie invitation, qui passera par le chemin habituel ON CONFLICT (email)).
+    const uRows = [];
+    for (const u of users) {
+      const email = String(u?.email || '').trim().toLowerCase();
+      if (!email || !email.includes('@')) { report.users.refused.push({ email: u?.email || null, why: 'courriel manquant ou invalide' }); continue; }
+      uRows.push([email, String(u.displayName || '').trim() || null,
+                  u.role === 'admin' ? 'admin' : 'standard',
+                  String(u.locale || 'en').slice(0, 5)]);
+    }
+    if (uRows.length) {
+      // ⚠️ Aucun parametre inutilise : un $n present dans la liste mais absent de la requete fait
+      // echouer Postgres avec « could not determine data type of parameter » — il ne peut pas
+      // deviner le type de quelque chose qui ne sert nulle part. Les numeros partent donc a $2
+      // sans trou. (Defaut trouve en repetition, il rendait le premier appel reel impossible.)
+      const vals = uRows.map((_, k) => `($1,$${k * 4 + 2},$${k * 4 + 3},$${k * 4 + 4},'imported',$${k * 4 + 5})`).join(',');
+      const params = [partnerId];
+      for (const r of uRows) params.push(...r);
+      const ins = await client.query(
+        `INSERT INTO partner_users (partner_id, email, display_name, role, status, locale)
+         VALUES ${vals} ON CONFLICT (email) DO NOTHING RETURNING email`,
+        params
+      );
+      report.users.created = ins.rowCount;
+      report.users.alreadyThere = uRows.length - ins.rowCount;
+    }
+
+    // courriel -> id, pour attribuer chaque opportunite a son auteur reel. Sans cela, un usager
+    // « standard » ouvrirait un portail VIDE : il ne voit que ses propres soumissions.
+    const idByEmail = new Map();
+    for (const r of (await client.query(
+      `SELECT id, LOWER(email) AS email FROM partner_users WHERE partner_id = $1`, [partnerId]
+    )).rows) idByEmail.set(r.email, r.id);
+
+    // --- opportunites : on lit d'abord ce qui existe deja (2 requetes), puis on insere en lots.
+    const existingLead = new Set();
+    const existingDeal = new Set();
+    for (const r of (await client.query(
+      `SELECT crm_lead_id, crm_deal_id FROM partner_opportunities WHERE crm_lead_id IS NOT NULL OR crm_deal_id IS NOT NULL`
+    )).rows) {
+      if (r.crm_lead_id) existingLead.add(String(r.crm_lead_id));
+      if (r.crm_deal_id) existingDeal.add(String(r.crm_deal_id));
+    }
+
+    const toInsert = [];
+    const seen = new Set();
+    for (const o of opportunities) {
+      const biz = String(o?.businessName || '').trim();
+      const leadId = String(o?.crmLeadId || '').trim() || null;
+      const dealId = String(o?.crmDealId || '').trim() || null;
+      if (!biz) { report.opportunities.refused.push({ key: leadId || dealId, why: 'nom d entreprise manquant' }); continue; }
+      if (!leadId && !dealId) { report.opportunities.refused.push({ key: biz, why: 'aucun identifiant Zoho — la reexecution creerait un doublon' }); continue; }
+      const key = leadId ? 'L:' + leadId : 'D:' + dealId;
+      if (seen.has(key)) { report.opportunities.refused.push({ key: biz, why: 'doublon a l interieur de la charge utile' }); continue; }
+      seen.add(key);
+      if ((leadId && existingLead.has(leadId)) || (!leadId && dealId && existingDeal.has(dealId))) {
+        report.opportunities.alreadyThere++;
+        continue;
+      }
+      const submittedBy = o.submittedByEmail ? (idByEmail.get(String(o.submittedByEmail).toLowerCase()) || null) : null;
+      if (submittedBy) report.opportunities.attributed++;
+      if (dealId) report.opportunities.withDeal++;
+      toInsert.push([
+        submittedBy, biz,
+        String(o.contactFirstName || '').trim() || null, String(o.contactLastName || '').trim() || null,
+        String(o.contactPhone || '').trim() || null, String(o.contactEmail || '').trim() || null,
+        String(o.repFirstName || '').trim() || null, String(o.repLastName || '').trim() || null,
+        String(o.repEmail || '').trim() || null, String(o.notes || '').trim() || null,
+        o.createdAt || null, String(o.crmOwnerName || '').trim() || null,
+        leadId, dealId, String(o.crmDealStage || '').trim() || null,
+      ]);
+    }
+
+    const COLS = 15;
+    const CHUNK = 150;   // 150 x 15 = 2250 parametres par requete, loin de la limite Postgres
+    for (let i = 0; i < toInsert.length; i += CHUNK) {
+      const slice = toInsert.slice(i, i + CHUNK);
+      const vals = slice.map((_, k) => {
+        const b = k * COLS + 3;
+        return `($1,$${b},$${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8},$${b + 9},` +
+               `'approved',COALESCE($${b + 10}::timestamptz, NOW()),$${b + 11},$${b + 12},$${b + 13},$${b + 14},` +
+               `'not_eligible',true,$2)`;
+      }).join(',');
+      const params = [partnerId, source];
+      for (const r of slice) params.push(...r);
+      await client.query(
+        `INSERT INTO partner_opportunities
+           (partner_id, submitted_by, business_name, contact_first_name, contact_last_name,
+            contact_phone, contact_email, rep_first_name, rep_last_name, rep_email, notes,
+            status, created_at, crm_owner_name, crm_lead_id, crm_deal_id, crm_deal_stage,
+            payout_status, payout_excluded, migration_source)
+         VALUES ${vals}`,
+        params
+      );
+      report.opportunities.created += slice.length;
+    }
+
+    if (dryRun) {
+      await client.query('ROLLBACK');
+    } else {
+      await client.query('COMMIT');
+      logActivity('partner', partnerName, 'migrated',
+        `${report.users.created} portal user(s) and ${report.opportunities.created} opportunity(ies) imported from ${source || 'unknown source'}`,
+        req.user.realAdminEmail || req.user.email);
+    }
+    // Les refus sont TRONQUES pour l'affichage mais leur nombre reste exact : « rien a signaler »
+    // et « on ne t'a pas tout dit » ne doivent pas se ressembler.
+    report.users.refusedCount = report.users.refused.length;
+    report.opportunities.refusedCount = report.opportunities.refused.length;
+    report.users.refused = report.users.refused.slice(0, 25);
+    report.opportunities.refused = report.opportunities.refused.slice(0, 25);
+    res.json(report);
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    res.status(500).json({ error: e.message, report });
+  } finally {
+    client.release();
+  }
+});
+
 // GET /api/admin/partner-invites — suivi des invitations envoyees au portail.
 //
 // Trois dates, trois faits distincts : envoyee, lien ouvert, compte active. On ne
@@ -5088,7 +5268,9 @@ app.get('/api/admin/partner-opportunities/crm-reps', authenticateToken, async (r
 // ensuite, il faut un ajustement pour recuperer — le montant est un forfait, l'exposition est
 // bornee. `linked_customer_name` reste pour la tenue de compte de l'admin, mais ne commande plus
 // rien.
-const PARTNER_PAYOUT_ELIGIBLE_SQL = `(o.crm_deposit_date IS NOT NULL)`;
+// `payout_excluded` : les dossiers reprits de l'ancien portail sont anterieurs au programme et ne
+// doivent jamais declencher un versement, meme s'ils portent une date de depot. Voir la migration.
+const PARTNER_PAYOUT_ELIGIBLE_SQL = `(o.crm_deposit_date IS NOT NULL AND NOT o.payout_excluded)`;
 
 // `opportunityId` null = TOUTES les opportunites (passage groupe, une seule requete — la base est
 // chez Railway en acces public, donc on evite les allers-retours par ligne).
@@ -5126,10 +5308,14 @@ async function recomputePartnerPayoutStatus(opportunityId = null) {
 const PARTNER_DEAL_SYNC_LIMIT = 250;
 async function syncPartnerDealState() {
   const rows = (await pool.query(
+    // `NOT payout_excluded` n'est pas une optimisation cosmetique : sans lui, les 674 dossiers
+    // repris de l'ancien portail declenchaient 674 appels Zoho PAR HEURE pour une eligibilite
+    // qu'ils ne peuvent de toute facon jamais obtenir. On ne paye que ce qui peut servir.
     `SELECT id, business_name, crm_lead_id, crm_deal_id
        FROM partner_opportunities
       WHERE status = 'approved' AND crm_lead_id IS NOT NULL
         AND payout_status NOT IN ('in_run', 'paid')
+        AND NOT payout_excluded
       ORDER BY crm_deposit_date NULLS FIRST, id
       LIMIT ${PARTNER_DEAL_SYNC_LIMIT + 1}`
   )).rows;
