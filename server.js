@@ -4497,8 +4497,7 @@ app.get('/api/admin/partner-opportunities/:id/crm-debug', authenticateToken, asy
     res.json(out);
   } catch (e) {
     // Ici on REMONTE l'erreur au lieu de l'avaler : c'est tout l'objet de ce point de sortie.
-    res.status(500).json({ error: e.message, stack: String(e.stack || '').split('
-').slice(0, 4) });
+    res.status(500).json({ error: e.message });
   }
 });
 
