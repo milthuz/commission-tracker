@@ -4437,6 +4437,71 @@ app.delete('/api/admin/partners/:id/logo', authenticateToken, async (req, res) =
   }
 });
 
+// GET /api/admin/partner-opportunities/:id/crm-debug — que renvoie VRAIMENT Zoho ?
+//
+// getCrmLeadStage avale ses erreurs par conception : un Lead illisible ne doit pas casser la
+// liste du partenaire. Bon en production, aveugle en diagnostic — on ne distingue pas « Lead
+// introuvable » de « champ absent », les deux donnant un tiret.
+//
+// Ce point de sortie refait les memes appels SANS rien avaler : code HTTP, corps brut, et la
+// presence des champs qui nous interessent. Lecture seule, aucun effet de bord.
+//
+// Meme permission que la gestion des partenaires : memes donnees, meme public, rien de plus
+// expose ici que dans l'ecran d'a cote.
+app.get('/api/admin/partner-opportunities/:id/crm-debug', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const row = (await pool.query(
+      `SELECT id, business_name, status, crm_lead_id FROM partner_opportunities WHERE id = $1`,
+      [parseInt(req.params.id, 10)]
+    )).rows[0];
+    if (!row) return res.status(404).json({ error: 'Opportunity not found' });
+    if (!row.crm_lead_id) return res.json({ opportunity: row, note: 'aucun crm_lead_id — le Lead n a jamais ete cree' });
+
+    const crmToken = await ensureValidCrmToken();
+    const lead = await axios.get(`https://www.zohoapis.com/crm/v2/Leads/${row.crm_lead_id}`, {
+      headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true,
+    });
+    const leadBody = lead.data?.data?.[0] || null;
+
+    const out = {
+      opportunity: row,
+      lead: {
+        httpStatus: lead.status,
+        found: !!leadBody,
+        // Les champs dont depend l'affichage, isoles pour se lire d'un coup d'oeil.
+        Lead_Status: leadBody?.Lead_Status ?? null,
+        $converted: leadBody?.$converted ?? null,
+        $converted_detail: leadBody?.$converted_detail ?? null,
+        // Corps complet en dernier : c'est lui qui tranchera si les champs ci-dessus mentent.
+        raw: lead.status === 200 ? leadBody : lead.data,
+      },
+      deal: null,
+    };
+
+    const dealId = leadBody?.$converted_detail?.deal || leadBody?.$converted_detail?.deal_id || null;
+    if (dealId) {
+      const deal = await axios.get(`https://www.zohoapis.com/crm/v2/Deals/${dealId}`, {
+        headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true,
+      });
+      const dealBody = deal.data?.data?.[0] || null;
+      out.deal = {
+        dealId,
+        httpStatus: deal.status,
+        found: !!dealBody,
+        Stage: dealBody?.Stage ?? null,
+        Deposit_Information_Received: dealBody?.Deposit_Information_Received ?? null,
+        raw: deal.status === 200 ? dealBody : deal.data,
+      };
+    }
+    res.json(out);
+  } catch (e) {
+    // Ici on REMONTE l'erreur au lieu de l'avaler : c'est tout l'objet de ce point de sortie.
+    res.status(500).json({ error: e.message, stack: String(e.stack || '').split('
+').slice(0, 4) });
+  }
+});
+
 // GET /api/admin/partner-invites — suivi des invitations envoyees au portail.
 //
 // Trois dates, trois faits distincts : envoyee, lien ouvert, compte active. On ne
