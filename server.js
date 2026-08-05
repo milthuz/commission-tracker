@@ -11601,7 +11601,32 @@ async function createCrmLead(o) {
     );
     const result = r.data?.data?.[0];
     if (r.status >= 200 && r.status < 300 && result?.status === 'success') {
-      return { success: true, leadId: result.details?.id || null };
+      const leadId = result.details?.id || null;
+      // La note du partenaire va dans la liste liee « Notes » du Lead — c'est la que les
+      // representants la cherchent, et non dans la Description. Ce n'est pas un champ de la
+      // fiche mais un enregistrement a part, d'ou ce SECOND appel, apres la creation.
+      //
+      // Volontairement tolerant : si l'appel echoue (jeton, limite de debit), le Lead reste
+      // cree et la note demeure dans la Description, ou elle continue d'etre ecrite. Perdre
+      // une note serait pire que la voir en double.
+      if (leadId && o.notes) {
+        try {
+          await axios.post(
+            'https://www.zohoapis.com/crm/v2/Notes',
+            { data: [{
+              Note_Title: 'Note du partenaire',
+              Note_Content: String(o.notes),
+              Parent_Id: { id: leadId },
+              se_module: 'Leads',
+            }] },
+            { headers: { Authorization: `Zoho-oauthtoken ${crmToken}`, 'Content-Type': 'application/json' },
+              validateStatus: () => true }
+          );
+        } catch (e) {
+          console.warn('[crm] note non attachee au Lead', leadId, e.message);
+        }
+      }
+      return { success: true, leadId };
     }
     const msg = result?.message || r.data?.message || `HTTP ${r.status}`;
     console.warn('[partner-crm] Lead creation failed:', msg);
