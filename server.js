@@ -9428,7 +9428,7 @@ app.get('/api/invoices', authenticateToken, async (req, res) => {
       const myName = await resolveOwnRepName(email, req.user.name);
       // No resolvable rep identity → no invoices, rather than falling through to everything.
       query += ` AND salesperson_name = $${paramIndex}`;
-      params.push(myName || ' __no_such_rep__');
+      params.push(myName || '__no_such_rep__');
       paramIndex++;
     } else if (salesperson) {
       // Admins only: honour the comma-separated filter.
@@ -9909,7 +9909,7 @@ app.get('/api/invoices/stats', authenticateToken, async (req, res) => {
     if (!req.user.isAdmin) {
       const myName = await resolveOwnRepName(req.user.email, req.user.name);
       where += ` AND salesperson_name = $${idx}`;
-      params.push(myName || ' __no_such_rep__'); idx++;
+      params.push(myName || '__no_such_rep__'); idx++;
     } else if (salesperson) {
       const names = salesperson.split(',').map(s => s.trim()).filter(Boolean);
       if (names.length === 1) {
