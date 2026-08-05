@@ -4544,6 +4544,27 @@ app.get('/api/admin/partner-opportunities/:id/crm-debug', authenticateToken, asy
       deal: null,
     };
 
+    // Le Lead disparaissant a la conversion (204), c'est la RECHERCHE par nom qui decide en
+    // pratique. On l'execute ici avec les deux criteres pour voir lequel repond, et on montre
+    // les noms trouves : si la liste est vide, c'est que le Deal ne porte pas ce nom-la.
+    for (const crit of ['equals', 'starts_with']) {
+      try {
+        const sr = await axios.get(
+          `https://www.zohoapis.com/crm/v2/Deals/search?criteria=(Deal_Name:${crit}:${encodeURIComponent(row.business_name)})`,
+          { headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true }
+        );
+        const list = sr.status === 200 ? (sr.data?.data || []) : [];
+        out['search_' + crit] = {
+          httpStatus: sr.status,
+          count: list.length,
+          names: list.slice(0, 5).map((d) => ({ id: d.id, Deal_Name: d.Deal_Name, Stage: d.Stage })),
+          body: sr.status === 200 ? undefined : sr.data,
+        };
+      } catch (e) {
+        out['search_' + crit] = { error: e.message };
+      }
+    }
+
     const dealId = leadBody?.$converted_detail?.deal || leadBody?.$converted_detail?.deal_id || null;
     if (dealId) {
       const deal = await axios.get(`https://www.zohoapis.com/crm/v2/Deals/${dealId}`, {
