@@ -1555,12 +1555,14 @@ async function initializeDatabase() {
     // internal review data (crm_match_*, crm_lead_error stay admin-only).
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_owner_name VARCHAR(255)`);
 
-    // SH-40/41 — partner payouts. Mirrors the rep commission gate exactly: a flat $ amount per
-    // partner (payout_rate), paid ONCE per opportunity (not recurring like SaaS renewals) once the
-    // referred merchant has an actual PAID invoice in Sales Hub. There's no automatic link from a
-    // Zoho CRM Lead to a Sales Hub invoice, so linked_customer_name is set manually by the partner
-    // manager (same fuzzy-matching-by-hand pattern as the existing unassigned-invoices tooling)
-    // once the deal has clearly become a real, invoiced customer.
+    // SH-40/41 — partner payouts : un forfait par partenaire (payout_rate), verse UNE fois par
+    // opportunite (pas de recurrence comme les renouvellements SaaS).
+    //
+    // ⚠️ Le declencheur n'est PLUS une facture payee depuis le 2026-08-05 : c'est la date de depot
+    // du Deal Zoho (voir PARTNER_PAYOUT_ELIGIBLE_SQL, qui porte le detail de la decision).
+    // `linked_customer_name` survit uniquement comme tenue de compte de l'admin — il ne commande
+    // plus l'eligibilite. Il n'existe aucun lien automatique entre un Lead Zoho et un client
+    // facture Sales Hub, c'est justement ce qui a fait abandonner cette condition.
     await pool.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS payout_rate DECIMAL(10,2)`);
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS linked_customer_name VARCHAR(255)`);
     // Etat du Deal Zoho, RETENU en base (2026-08-05). L'eligibilite au versement se lit desormais
@@ -5173,10 +5175,10 @@ async function syncPartnerDealState() {
   await recomputePartnerPayoutStatus();
 }
 
-// GET /api/admin/partner-opportunities/customer-search?q= — autocomplete against Sales Hub's own
-// invoiced customers, used by the partner manager to manually link a converted opportunity to the
-// real merchant once it's clear which one it became (there's no automatic Zoho Lead → Sales Hub
-// customer link).
+// GET /api/admin/partner-opportunities/customer-search?q= — autocompletion sur les clients
+// factures de Sales Hub, pour que l'admin puisse noter quel marchand une opportunite est devenue.
+// ⚠️ Tenue de compte uniquement : ce rattachement ne conditionne PLUS le versement (voir
+// PARTNER_PAYOUT_ELIGIBLE_SQL). Il n'existe aucun lien automatique Lead Zoho → client facture.
 app.get('/api/admin/partner-opportunities/customer-search', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'partners:manage'))) return;
   const q = String(req.query.q || '').trim();
