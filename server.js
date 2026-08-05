@@ -296,6 +296,70 @@ async function requirePermAny(req, res, permList) {
   return false;
 }
 
+// ============================================================================
+// ZOHO CONNECTION HEALTH
+// Zoho's token endpoint answers invalid_grant / invalid_code / invalid_client when
+// the refresh_token is permanently dead (app revoked, scopes changed, 30 days of
+// inactivity). Retrying can never fix that — only a fresh OAuth grant will. We flag
+// the service on the user_tokens row so /api/auth/connections-status can surface a
+// reconnect banner instead of the syncs failing silently.
+// ============================================================================
+// Every open tab polls the status endpoint each minute; the DB sits behind a
+// cross-cloud proxy, so serve a short-lived shared snapshot instead. Invalidated
+// immediately whenever a flag actually flips.
+let connectionsStatusCache = null;   // { at: epochMs, payload }
+const CONNECTIONS_STATUS_TTL_MS = 30_000;
+
+function isPermanentZohoAuthFailure(payload) {
+  if (!payload) return false;
+  const text = typeof payload === 'string' ? payload : JSON.stringify(payload);
+  return /invalid_grant|invalid_code|invalid_client/i.test(text);
+}
+
+// Column names per service — keeps the two UPDATEs below from duplicating the mapping.
+function connectionColumns(service) {
+  return service === 'books'
+    ? { status: 'books_connection_status', reason: 'books_disconnect_reason', at: 'books_disconnected_at' }
+    : { status: 'crm_connection_status',   reason: 'crm_disconnect_reason',   at: 'crm_disconnected_at' };
+}
+
+async function markServiceDisconnected(service, email, reason) {
+  if (!email) return;
+  const c = connectionColumns(service);
+  const safe = String(reason || 'unknown').slice(0, 500);
+  try {
+    await pool.query(
+      `UPDATE user_tokens
+       SET ${c.status} = 'disconnected', ${c.reason} = $1, ${c.at} = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+       WHERE email = $2`,
+      [safe, email]
+    );
+    connectionsStatusCache = null;   // the banner should see this on its next poll
+    console.warn(`🔌 Marked ${service} connection as disconnected for ${email}: ${safe.slice(0, 200)}`);
+  } catch (e) {
+    console.warn(`Failed to mark ${service} disconnected:`, e.message);
+  }
+}
+
+// Called after every SUCCESSFUL refresh, so reconnecting through the OAuth flow
+// clears the flag on its own — no manual reset anywhere.
+async function markServiceConnected(service, email) {
+  if (!email) return;
+  const c = connectionColumns(service);
+  try {
+    const r = await pool.query(
+      `UPDATE user_tokens
+       SET ${c.status} = 'active', ${c.reason} = NULL, ${c.at} = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE email = $1 AND COALESCE(${c.status}, 'active') <> 'active'`,
+      [email]
+    );
+    if (r.rowCount > 0) {
+      connectionsStatusCache = null;
+      console.log(`🔌 ${service} connection restored for ${email}`);
+    }
+  } catch { /* health flag only — never break a working refresh over it */ }
+}
+
 // Check helper: wildcards (*) grant all
 function userHasPermission(permSet, requiredPerm) {
   if (!permSet) return false;
@@ -393,6 +457,14 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS display_name VARCHAR(255)`);
     // Demo mode: this account sees scrambled data (fake client names, scaled amounts) read-only
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS demo_mode BOOLEAN DEFAULT false`);
+    // Connection health flags — flipped to 'disconnected' when Zoho revokes the
+    // refresh_token, so the UI can surface a reconnect banner (see markServiceDisconnected)
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS books_connection_status VARCHAR(20) DEFAULT 'active'`);
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS books_disconnect_reason TEXT`);
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS books_disconnected_at TIMESTAMPTZ`);
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_connection_status VARCHAR(20) DEFAULT 'active'`);
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_disconnect_reason TEXT`);
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_disconnected_at TIMESTAMPTZ`);
 
     // Invoices table
     await pool.query(`
@@ -2733,6 +2805,10 @@ app.get('/api/auth/callback', async (req, res) => {
       );
       isFirstLogin = upsert.rows[0]?.is_new === true;
       console.log('✅ Tokens stored in database for:', userEmail);
+      // A consent screen (reconsent=1) is the only thing that hands back a fresh
+      // refresh_token — so this is a repaired connection. Clear the flag now instead
+      // of waiting for the next hourly refresh to do it, or the banner would linger.
+      if (refresh_token) await markServiceConnected('books', userEmail);
     } catch (dbError) {
       console.error('❌ Database error:', dbError.message);
       return res.status(500).json({ error: 'Failed to store tokens in database' });
@@ -2803,6 +2879,74 @@ app.get('/api/auth/callback', async (req, res) => {
 // the whole org, so any XSS or malicious browser extension would have escalated from "a Sales Hub
 // session" to org-wide write access on Zoho Books and Billing. The server holds these tokens and
 // calls Zoho itself (ensureValidToken / ensureValidCrmToken) — the browser never needs one.
+
+// GET /api/auth/connections-status — Books + CRM OAuth health for the sticky banner
+// in DefaultLayout (polled every 60s by ConnectionStatusBanner.tsx).
+//
+// Only admins and holders of admin:integrations can act on a broken connection — a
+// rep clicking "Reconnect" would just re-run OAuth on their own row and fix nothing.
+// Everyone else gets a quiet all-connected payload: no banner, and no 403 noise in
+// the console for a request the frontend fires on every page.
+app.get('/api/auth/connections-status', authenticateToken, async (req, res) => {
+  const quiet = {
+    books: { connected: true, disconnected: false, reason: null, disconnectedAt: null, reconnectUrl: '/api/auth/zoho?reconsent=1' },
+    crm:   { connected: true, disconnected: false, reason: null, disconnectedAt: null, reconnectUrl: '/api/auth/zoho-crm' },
+  };
+  try {
+    const canSee = req.user.isAdmin === true ||
+      userHasPermission(await getUserPermissions(req.user.email), 'admin:integrations');
+    if (!canSee) return res.json(quiet);
+
+    if (connectionsStatusCache && Date.now() - connectionsStatusCache.at < CONNECTIONS_STATUS_TTL_MS) {
+      return res.json(connectionsStatusCache.payload);
+    }
+
+    // Aggregated per service across all admin rows: the service counts as connected
+    // as long as ONE admin token still works, since that is the token the syncs use.
+    const row = (await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE COALESCE(books_connection_status,'active') = 'active' AND refresh_token IS NOT NULL)     AS books_ok,
+         COUNT(*) FILTER (WHERE books_connection_status = 'disconnected')                                                AS books_dc,
+         COUNT(*) FILTER (WHERE COALESCE(crm_connection_status,'active') = 'active' AND crm_refresh_token IS NOT NULL)   AS crm_ok,
+         COUNT(*) FILTER (WHERE crm_connection_status = 'disconnected')                                                   AS crm_dc,
+         MAX(books_disconnected_at) FILTER (WHERE books_connection_status = 'disconnected')                               AS books_at,
+         MAX(crm_disconnected_at)   FILTER (WHERE crm_connection_status = 'disconnected')                                  AS crm_at,
+         (SELECT books_disconnect_reason FROM user_tokens
+           WHERE is_admin = true AND books_connection_status = 'disconnected'
+           ORDER BY books_disconnected_at DESC LIMIT 1)                                                                   AS books_reason,
+         (SELECT crm_disconnect_reason FROM user_tokens
+           WHERE is_admin = true AND crm_connection_status = 'disconnected'
+           ORDER BY crm_disconnected_at DESC LIMIT 1)                                                                     AS crm_reason
+       FROM user_tokens
+       WHERE is_admin = true`
+    )).rows[0] || {};
+
+    const payload = {
+      books: {
+        connected:      parseInt(row.books_ok) > 0,
+        disconnected:   parseInt(row.books_dc) > 0 && parseInt(row.books_ok) === 0,
+        reason:         row.books_reason || null,
+        disconnectedAt: row.books_at || null,
+        // ?reconsent=1 forces Zoho's consent screen, which is what re-issues a
+        // refresh_token — a silent re-login would hand back the same dead grant.
+        reconnectUrl:   '/api/auth/zoho?reconsent=1',
+      },
+      crm: {
+        connected:      parseInt(row.crm_ok) > 0,
+        disconnected:   parseInt(row.crm_dc) > 0 && parseInt(row.crm_ok) === 0,
+        reason:         row.crm_reason || null,
+        disconnectedAt: row.crm_at || null,
+        reconnectUrl:   '/api/auth/zoho-crm',   // already forces prompt=consent
+      },
+    };
+    connectionsStatusCache = { at: Date.now(), payload };
+    res.json(payload);
+  } catch (e) {
+    console.warn('connections-status failed:', e.message);
+    // A status probe must never paint a red banner because the probe itself broke.
+    res.json(quiet);
+  }
+});
 
 // 4. Verify JWT token
 app.get('/api/auth/verify', authenticateToken, async (req, res) => {
@@ -4891,24 +5035,41 @@ app.get('/api/admin/partner-opportunities/crm-reps', authenticateToken, async (r
   }
 });
 
-// Recomputes payout eligibility for one opportunity from its linked_customer_name — mirrors
-// runRecalcV2's own commission gate exactly (SH-40/41): eligible only once a real, PAID invoice
-// exists for that customer, never merely because a Zoho Lead converted. Never downgrades a row
-// that's already 'in_run' or 'paid' — those are frozen once a payout run has claimed them,
-// same PAID=FROZEN principle as the rep commission engine.
-async function recomputePartnerPayoutStatus(opportunityId) {
-  const o = (await pool.query(
-    `SELECT linked_customer_name, payout_status FROM partner_opportunities WHERE id = $1`, [opportunityId]
-  )).rows[0];
-  if (!o || !o.linked_customer_name || ['in_run', 'paid'].includes(o.payout_status)) return;
-  const paid = (await pool.query(
-    `SELECT 1 FROM invoices WHERE customer_name = $1 AND status = 'paid' AND paid_date IS NOT NULL LIMIT 1`,
-    [o.linked_customer_name]
-  )).rows.length > 0;
-  const nextStatus = paid ? 'eligible' : 'not_eligible';
-  if (nextStatus !== o.payout_status) {
-    await pool.query(`UPDATE partner_opportunities SET payout_status = $2 WHERE id = $1`, [opportunityId, nextStatus]);
+// Le predicat d'eligibilite au versement partenaire, ecrit UNE SEULE fois : il faut une facture
+// PAYEE au nom du client rattache. Meme regle que le moteur de commissions des representants
+// (SH-40/41) : jamais eligible au seul motif qu'un Lead Zoho a ete converti.
+//
+// ⚠️ Une date de depot dans Zoho (`Deposit_Information_Received`) NE suffit PAS et n'entre pas
+// dans ce predicat : c'est un champ de CRM, pas une preuve d'encaissement. Decision de David,
+// 2026-08-05, sur la question posee explicitement.
+const PARTNER_PAYOUT_ELIGIBLE_SQL = `
+  EXISTS (SELECT 1 FROM invoices i
+           WHERE i.customer_name = o.linked_customer_name
+             AND i.status = 'paid' AND i.paid_date IS NOT NULL)`;
+
+// `opportunityId` null = TOUTES les opportunites rattachees (passage groupe, une seule requete —
+// la base est chez Railway en acces public, donc on evite les allers-retours par ligne).
+//
+// Les lignes 'in_run' / 'paid' sont gelees : un run de versement les a deja reclamees, meme
+// principe PAID=FROZEN que le moteur des representants. Le filtre `IS DISTINCT FROM` evite les
+// ecritures inutiles, donc `RETURNING` ne remonte que les VRAIS changements — c'est ce qui rend
+// le journal exploitable.
+async function recomputePartnerPayoutStatus(opportunityId = null) {
+  const verdict = `CASE WHEN ${PARTNER_PAYOUT_ELIGIBLE_SQL} THEN 'eligible' ELSE 'not_eligible' END`;
+  const r = await pool.query(
+    `UPDATE partner_opportunities o
+        SET payout_status = ${verdict}
+      WHERE o.linked_customer_name IS NOT NULL
+        AND o.payout_status NOT IN ('in_run', 'paid')
+        AND ($1::int IS NULL OR o.id = $1)
+        AND o.payout_status IS DISTINCT FROM (${verdict})
+      RETURNING o.id, o.business_name, o.payout_status`,
+    [opportunityId]
+  );
+  for (const row of r.rows) {
+    console.log(`💰 [partner-payout] « ${row.business_name} » (#${row.id}) → ${row.payout_status}`);
   }
+  return r.rows;
 }
 
 // GET /api/admin/partner-opportunities/customer-search?q= — autocomplete against Sales Hub's own
@@ -5695,6 +5856,10 @@ app.get('/api/auth/crm-callback', async (req, res) => {
        WHERE email = $4`,
       [access_token, refresh_token, Date.now() + (expires_in * 1000), adminEmail]
     );
+
+    // Reconnection succeeded — drop any 'disconnected' flag right away so the
+    // banner clears instead of waiting on the next token refresh.
+    if (refresh_token) await markServiceConnected('crm', adminEmail);
 
     console.log(`✅ CRM tokens stored for ${adminEmail}, expires at ${new Date(Date.now() + expires_in * 1000).toISOString()}`);
 
@@ -8192,6 +8357,11 @@ async function autoSyncInvoices() {
             await backfillCustomerFirstSale().catch(e => console.warn('[AUTO-SYNC] customer-first-sale backfill failed:', e.message));
           }
           await runRecalcV2('post-sync');
+          // Filet de securite horaire pour l'eligibilite des versements partenaires. Le poll
+          // delta (5 min) la recalcule deja quand une facture change ; ce passage-ci rattrape ce
+          // que le delta n'a pas vu — reconciliation complete, donc aussi les suppressions.
+          await recomputePartnerPayoutStatus().catch((e) =>
+            console.warn('[partner-payout] recalcul post-sync echoue:', e.message));
         } catch (e) {
           console.warn('[AUTO-SYNC] post-sync enrich+recalc failed:', e.message);
         }
@@ -8917,6 +9087,12 @@ async function ensureValidCrmToken() {
 
       if (!newToken) {
         console.error('❌ CRM refresh returned no access_token:', JSON.stringify(refreshRes.data));
+        // invalid_grant & friends mean the grant is dead for good — flag it so the
+        // reconnect banner appears. We still fall back to the existing access_token
+        // below when it has life left in it: the flag is a warning, not a kill switch.
+        if (isPermanentZohoAuthFailure(refreshRes.data)) {
+          await markServiceDisconnected('crm', row.email, JSON.stringify(refreshRes.data));
+        }
         // Don't throw if existing token is still valid
         if (expiresAt && expiresAt > Date.now()) {
           console.warn('⚠️ Using existing token despite refresh failure');
@@ -8924,6 +9100,9 @@ async function ensureValidCrmToken() {
         }
         throw new Error(`CRM token refresh failed: ${JSON.stringify(refreshRes.data).slice(0, 200)}`);
       }
+
+      // Refresh worked — clear any stale 'disconnected' flag
+      await markServiceConnected('crm', row.email);
 
       // Update the SPECIFIC row (by email) to avoid touching other admins' rows
       await pool.query(
@@ -9822,9 +10001,20 @@ app.post('/api/invoices/bulk-import', authenticateToken, async (req, res) => {
 
 // Returns a fresh admin access_token + api_domain. Auto-refreshes if expired.
 async function getAdminBooksAuth() {
-  const admin = (await pool.query(
-    'SELECT email, access_token, refresh_token, api_domain, expires_at FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
+  // Prefer an admin whose Books connection is still healthy; only fall back to a
+  // flagged-disconnected row when there is nothing else to try.
+  let admin = (await pool.query(
+    `SELECT email, access_token, refresh_token, api_domain, expires_at
+     FROM user_tokens
+     WHERE is_admin = true AND COALESCE(books_connection_status, 'active') = 'active'
+     ORDER BY updated_at DESC LIMIT 1`
   )).rows[0];
+  if (!admin) {
+    admin = (await pool.query(
+      `SELECT email, access_token, refresh_token, api_domain, expires_at
+       FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1`
+    )).rows[0];
+  }
   if (!admin) throw new Error('No admin Zoho account connected');
   // Refresh if token expired (or within 60s of expiry)
   if (admin.refresh_token && (!admin.expires_at || Date.now() > admin.expires_at - 60_000)) {
@@ -9836,15 +10026,25 @@ async function getAdminBooksAuth() {
         client_secret: process.env.ZOHO_CLIENT_SECRET,
         refresh_token: admin.refresh_token,
       }),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+      // Read Zoho's error body instead of letting axios throw on 400 — that body is
+      // the only way to tell a dead grant from a transient outage.
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, validateStatus: () => true }
     );
-    const newToken = r.data.access_token;
+    const newToken = r.data?.access_token;
+    if (!newToken) {
+      if (isPermanentZohoAuthFailure(r.data)) {
+        await markServiceDisconnected('books', admin.email, JSON.stringify(r.data));
+        throw new Error(`Books connection revoked — needs re-auth. Reason: ${JSON.stringify(r.data).slice(0, 200)}`);
+      }
+      throw new Error(`Books token refresh failed: ${JSON.stringify(r.data).slice(0, 200)}`);
+    }
     const newExpires = Date.now() + ((parseInt(r.data.expires_in) || 3600) * 1000);
     await pool.query(
       `UPDATE user_tokens SET access_token = $1, expires_at = $2, updated_at = CURRENT_TIMESTAMP WHERE email = $3`,
       [newToken, newExpires, admin.email]
     );
     admin.access_token = newToken;
+    await markServiceConnected('books', admin.email);
   }
   return { accessToken: admin.access_token, apiDomain: admin.api_domain };
 }
@@ -16762,6 +16962,13 @@ async function deltaSyncInvoices() {
 
     if (processed > 0) {
       console.log(`[DELTA] synced ${processed} modified invoices (cutoff: ${cutoff.toISOString()})`);
+      // 🐛 Une facture qui passe a « payee » rend une opportunite partenaire eligible au
+      // versement. Ce recalcul n'existait qu'au moment ou l'admin rattache un client : dans la
+      // chronologie reelle (rattachement d'abord, encaissement des semaines plus tard) il
+      // concluait « pas eligible » et rien ne le rappelait jamais. Le partenaire n'etait donc
+      // jamais paye, sans que personne ne le voie. C'est ici que l'information arrive.
+      await recomputePartnerPayoutStatus().catch((e) =>
+        console.warn('[partner-payout] recalcul apres delta echoue:', e.message));
     }
   } catch (e) {
     console.error('[DELTA] error:', e.message);
