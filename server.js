@@ -11657,7 +11657,20 @@ async function getEstimateStatus(estimateId) {
   } catch { return null; }
 }
 
-const proposalFileName = (clientName) => `Proposition_ClusterPOS_${String(clientName || 'client').replace(/[^a-z0-9]+/gi, '_').slice(0, 40)}.pdf`;
+// Nom du fichier envoye au client. L'ancien filtre etait `[^a-z0-9]+` : il remplacait
+// donc TOUT ce qui n'est pas une lettre non accentuee, accents compris. « Societe de
+// transport de l'Outaouais » devenait « Soci_t_de_transport_de_l_outaouais » — un nom de
+// fichier qu'un client recoit par courriel et qui donne l'impression d'un envoi casse.
+//
+// On garde desormais les lettres de toute langue et les chiffres (\p{L}, \p{N}), et on
+// remplace le reste par un seul soulignement. Les accents survivent, l'apostrophe devient
+// un soulignement — c'est le comportement voulu, une apostrophe dans un nom de fichier
+// posant probleme sur certains systemes.
+const proposalFileName = (clientName) =>
+  `Proposition_ClusterPOS_${String(clientName || 'client')
+    .replace(/[^\p{L}\p{N}]+/gu, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 60) || 'client'}.pdf`;
 const logoFromBody = (b) => (b ? Buffer.from(String(b).replace(/^data:[^,]+,/, ''), 'base64') : null);
 
 // GET /api/admin/proposal-email-debug?secret=[&estimateId=]  — diagnose client-email prefill.
