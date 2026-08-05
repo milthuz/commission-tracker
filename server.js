@@ -4353,6 +4353,54 @@ app.put('/api/admin/partners/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// Logo d'un partenaire, cote INTERNE. Jumeau de POST/DELETE
+// /api/partner-portal/organization/logo, qui n'est accessible qu'au partenaire lui-meme.
+//
+// POURQUOI les deux : un partenaire qui vient d'etre cree n'a pas encore de compte actif,
+// donc personne ne peut deposer son logo — or c'est au moment de l'integration qu'on l'a
+// sous la main. Cluster peut desormais le poser pour lui, et le partenaire le remplacer
+// ensuite depuis son portail. Meme colonne, deux portes.
+//
+// La LECTURE reste l'endpoint public existant : un logo de co-marquage doit s'afficher dans
+// un <img src> ordinaire, qui ne peut pas porter d'en-tete d'autorisation.
+app.post('/api/admin/partners/:id/logo', authenticateToken, uploadPartnerLogo.single('file'), async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  const file = req.file;
+  if (!file) return res.status(400).json({ error: 'file required (multipart field "file")' });
+  if (!/^image\//.test(file.mimetype)) return res.status(400).json({ error: 'logo must be an image' });
+  try {
+    const id = parseInt(req.params.id, 10);
+    const r = await pool.query(
+      `UPDATE partners SET logo_data = $2, logo_mime_type = $3, logo_file_name = $4, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1 RETURNING name`,
+      [id, file.buffer, file.mimetype, file.originalname]
+    );
+    if (!r.rowCount) return res.status(404).json({ error: 'Partner not found' });
+    logActivity('partner', r.rows[0].name, 'logo_set', `Logo set for ${r.rows[0].name} (${file.originalname})`,
+      req.user.realAdminEmail || req.user.email);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/admin/partners/:id/logo', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const r = await pool.query(
+      `UPDATE partners SET logo_data = NULL, logo_mime_type = NULL, logo_file_name = NULL,
+              updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING name`,
+      [parseInt(req.params.id, 10)]
+    );
+    if (!r.rowCount) return res.status(404).json({ error: 'Partner not found' });
+    logActivity('partner', r.rows[0].name, 'logo_cleared', `Logo cleared for ${r.rows[0].name}`,
+      req.user.realAdminEmail || req.user.email);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/admin/partner-invites — suivi des invitations envoyees au portail.
 //
 // Trois dates, trois faits distincts : envoyee, lien ouvert, compte active. On ne
