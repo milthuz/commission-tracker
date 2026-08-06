@@ -1588,6 +1588,27 @@ async function initializeDatabase() {
     // reellement soumise dans Sales Hub d'une ligne reprise de l'ancien outil.
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS payout_excluded BOOLEAN NOT NULL DEFAULT false`);
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS migration_source VARCHAR(50)`);
+    // Historique des reprises de donnees partenaires. Meme idee que `commission_payment_imports` :
+    // une ligne de resume par import, avec qui, quand, et le rapport EXACT tel que l'ecran l'a
+    // affiche. Sans cette trace, « qu'est-ce qui a ete repris, et qu'est-ce qui a ete ecarte ? »
+    // n'a plus de reponse une fois l'onglet ferme.
+    //
+    // ⚠️ Seuls les imports APPLIQUES sont enregistres. Une simulation ne change rien ; l'inscrire
+    // ferait croire a une reprise qui n'a pas eu lieu.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS partner_data_imports (
+        id           SERIAL PRIMARY KEY,
+        kind         VARCHAR(30) NOT NULL,
+        partner_name VARCHAR(255),
+        source       VARCHAR(60),
+        file_name    VARCHAR(300),
+        imported_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        imported_by  VARCHAR(255),
+        report       JSONB NOT NULL
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_partner_data_imports_at ON partner_data_imports(imported_at DESC)`);
+
     // Reference du versement REGLE HORS Sales Hub (numero de facture Moneris, ex. FTIN020952).
     // Sans elle, un dossier marque « paye » sans run de versement n'a aucune trace de ce qui l'a
     // regle : on ne pourrait ni le justifier ni le retrouver.
@@ -4798,6 +4819,38 @@ app.get('/api/admin/partner-opportunities/:id/crm-debug', authenticateToken, asy
   }
 });
 
+// Enregistre une reprise APPLIQUEE. Jamais une simulation : elle ne change rien, et l'inscrire
+// laisserait croire le contraire. Ne casse jamais l'import lui-meme — perdre la trace est ennuyeux,
+// perdre l'import parce que la trace a echoue serait absurde.
+async function logPartnerDataImport(client, { kind, partnerName, source, fileName, importedBy, report }) {
+  try {
+    await client.query(
+      `INSERT INTO partner_data_imports (kind, partner_name, source, file_name, imported_by, report)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
+      [kind, partnerName || null, source || null, (fileName || null), importedBy || null, JSON.stringify(report)]
+    );
+  } catch (e) {
+    console.warn('[partner-import] trace non enregistree:', e.message);
+  }
+}
+
+// GET /api/admin/partner-data-imports — historique des reprises appliquees, la plus recente d'abord.
+app.get('/api/admin/partner-data-imports', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:migrate'))) return;
+  try {
+    const rows = (await pool.query(
+      `SELECT id, kind, partner_name, source, file_name, imported_at, imported_by, report
+         FROM partner_data_imports ORDER BY imported_at DESC LIMIT 100`
+    )).rows;
+    res.json({ imports: rows.map((r) => ({
+      id: r.id, kind: r.kind, partnerName: r.partner_name, source: r.source, fileName: r.file_name,
+      importedAt: r.imported_at, importedBy: r.imported_by, report: r.report,
+    })) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /api/admin/partner-migration — reprise en masse de l'ancien portail Zoho Creator.
 //
 // La transformation (filtrage, dedoublonnage, rattachement deal->lead) est faite HORS de la
@@ -4954,6 +5007,13 @@ app.post('/api/admin/partner-migration', authenticateToken, async (req, res) => 
     if (dryRun) {
       await client.query('ROLLBACK');
     } else {
+      // La trace est ecrite AVANT le COMMIT, dans la meme transaction : soit la reprise et son
+      // historique existent tous les deux, soit aucun des deux. Une reprise sans trace serait un
+      // trou dans l'historique, une trace sans reprise serait un mensonge.
+      await logPartnerDataImport(client, {
+        kind: 'portal-migration', partnerName, source, fileName: body.fileName,
+        importedBy: req.user.realAdminEmail || req.user.email, report,
+      });
       await client.query('COMMIT');
       logActivity('partner', partnerName, 'migrated',
         `${report.users.created} portal user(s) and ${report.opportunities.created} opportunity(ies) imported from ${source || 'unknown source'}`,
@@ -5315,6 +5375,10 @@ app.post('/api/admin/partner-payouts/import-history', authenticateToken, async (
 
     if (dryRun) await client.query('ROLLBACK');
     else {
+      await logPartnerDataImport(client, {
+        kind: 'payout-history', partnerName, source: body.source, fileName: body.fileName,
+        importedBy: req.user.realAdminEmail || req.user.email, report,
+      });
       await client.query('COMMIT');
       logActivity('partner', partnerName, 'payout_history_imported',
         `${report.markedPaid} payout(s) marked settled and ${report.markedDue} marked due, by ${req.user.realAdminEmail || req.user.email}`,
