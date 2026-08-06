@@ -18952,7 +18952,9 @@ app.get('/api/admin/users', authenticateToken, async (req, res) => {
       roles:     rolesByUser[r.email.toLowerCase()] || [],
     }));
     const localRes = await pool.query(
-      `SELECT email, display_name, status, demo_mode, created_at, last_login_at AS last_login FROM local_users ORDER BY created_at DESC`
+      // `id` et `status` remontent maintenant : sans eux, cette liste ne pouvait que MONTRER un
+      // compte externe, pas le desactiver — l'operation vivait dans une autre carte.
+      `SELECT id, email, display_name, status, demo_mode, created_at, last_login_at AS last_login FROM local_users ORDER BY created_at DESC`
     );
     for (const r of localRes.rows) {
       if (seen.has(r.email.toLowerCase())) continue;
@@ -18965,7 +18967,40 @@ app.get('/api/admin/users', authenticateToken, async (req, res) => {
         createdAt: r.created_at,
         lastLogin: r.last_login,
         userType:  'external',
+        localUserId: r.id,
+        status:    r.status,
         roles:     rolesByUser[r.email.toLowerCase()] || [],
+      });
+    }
+
+    // Comptes du PORTAIL PARTENAIRE. Volontairement PAS dedupliques contre les precedents : un
+    // compte de portail est un compte a part entiere, avec ses propres identifiants et ses propres
+    // acces. Une adresse presente des deux cotes (le cas existe) doit apparaitre DEUX fois — les
+    // fusionner afficherait un seul compte la ou il y en a deux, et l'action « desactiver »
+    // deviendrait ambigue. Ils n'entrent pas non plus dans `seen`, pour ne pas masquer un role
+    // Sales Hub attribue a la meme adresse.
+    const partnerRes = await pool.query(
+      `SELECT pu.id, pu.email, pu.display_name, pu.role, pu.status, pu.created_at, pu.last_login_at,
+              p.name AS partner_name
+         FROM partner_users pu JOIN partners p ON p.id = pu.partner_id
+        ORDER BY p.name, pu.created_at DESC`
+    );
+    for (const r of partnerRes.rows) {
+      users.push({
+        email:     r.email,
+        displayName: r.display_name || null,
+        isAdmin:   false,
+        isDemo:    false,
+        createdAt: r.created_at,
+        lastLogin: r.last_login_at,
+        userType:  'partner',
+        partnerUserId: r.id,
+        partnerName: r.partner_name,
+        partnerRole: r.role,
+        status:    r.status,
+        // Les roles Sales Hub ne s'appliquent pas a un compte de portail : en afficher donnerait
+        // a croire que ce compte a des droits internes.
+        roles:     [],
       });
     }
     for (const email of Object.keys(rolesByUser)) {
