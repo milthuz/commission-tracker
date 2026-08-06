@@ -5446,18 +5446,8 @@ app.put('/api/admin/partner-opportunities/:id', authenticateToken, async (req, r
     if (!r.rowCount) return res.status(404).json({ error: 'Opportunity not found' });
     logActivity('partner_opportunity', req.params.id, status, `${r.rows[0].business_name} ${status} by ${actor}`, actor);
 
-    // Le versement INITIAL est du des l'approbation : c'est le moment ou Cluster valide que le lead
-    // est reel et nouveau. Le declencher a la soumission rendrait payant n'importe quel depot, y
-    // compris les doublons que la verification detecte justement pendant la revue.
-    // `IS DISTINCT FROM 'paid'` et l'exclusion de 'in_run' protegent l'idempotence : reapprouver
-    // une opportunite deja payee ne doit pas la rendre reclamable une seconde fois.
-    if (status === 'approved') {
-      await pool.query(
-        `UPDATE partner_opportunities SET initial_payout_status = 'eligible'
-          WHERE id = $1 AND initial_payout_status = 'not_eligible' AND initial_paid_at IS NULL`,
-        [parseInt(req.params.id, 10)]
-      );
-    }
+    // ⚠️ L'approbation ne rend PLUS rien reclamable. Un lead approuve qui ne conclut jamais ne vaut
+    // aucun versement — c'est la regle historique, confirmee par David le 2026-08-06.
 
     let crmLead = null;
     if (status === 'approved') {
@@ -5538,14 +5528,29 @@ app.get('/api/admin/partner-opportunities/crm-reps', authenticateToken, async (r
 // ensuite, il faut un ajustement pour recuperer — le montant est un forfait, l'exposition est
 // bornee. `linked_customer_name` reste pour la tenue de compte de l'admin, mais ne commande plus
 // rien.
-// `payout_excluded` : les dossiers reprits de l'ancien portail sont anterieurs au programme et ne
-// doivent jamais declencher un versement, meme s'ils portent une date de depot. Voir la migration.
-const PARTNER_PAYOUT_ELIGIBLE_SQL = `(o.crm_deposit_date IS NOT NULL AND NOT o.payout_excluded)`;
+// UN SEUL versement partenaire, et il est du quand l'affaire CONCLUT — decision de David le
+// 2026-08-06, apres lecture de son historique de paiements Moneris : chaque versement passe y
+// correspond a une facture Cluster (INV-xxxxxx), jamais a un simple lead approuve. Le versement
+// « initial du des l'approbation », construit le matin meme, est donc abandonne.
+//
+// « Conclut » = une facture PAYEE existe au nom du client rattache. Payee et non emise : on ne
+// verse pas avant d'avoir encaisse (reponse de David du 2026-08-05).
+//
+// `payout_excluded` sort les dossiers repris de l'ancien portail : ils sont anterieurs au
+// programme. L'import de la liste de David rouvre nommement les 15 qui restent dus.
+const PARTNER_PAYOUT_ELIGIBLE_SQL = `(NOT o.payout_excluded AND EXISTS (
+    SELECT 1 FROM invoices i
+     WHERE i.customer_name = o.linked_customer_name
+       AND i.status = 'paid' AND i.paid_date IS NOT NULL))`;
 
 // Les deux cycles de versement, et les colonnes qui les portent. ⚠️ Ces noms sont interpoles dans
 // du SQL : ils viennent donc de cette liste BLANCHE, jamais d'une valeur de requete. `payoutCols`
 // refuse tout type inconnu au lieu de retomber silencieusement sur un cycle par defaut — se
 // tromper de cycle, c'est payer deux fois ou pas du tout.
+// ⚠️ ÉTAT AU 2026-08-06 : seul `conversion` est utilise. Le cycle `initial` a ete abandonne le jour
+// meme de sa construction (David : « je paye le lead seulement si ca close »), et ses colonnes
+// restent en base sans etre lues — les supprimer en production coute plus qu'elles ne genent. Ne
+// pas recabler `initial` en croyant reparer un oubli : c'est une decision.
 const PAYOUT_KINDS = {
   initial:    { status: 'initial_payout_status', run: 'initial_payout_run_id', rate: 'initial_payout_rate' },
   conversion: { status: 'payout_status',         run: 'payout_run_id',         rate: 'payout_rate' },
@@ -5743,38 +5748,31 @@ app.delete('/api/admin/partner-opportunities/:id', authenticateToken, async (req
 app.get('/api/admin/partner-payouts/pending', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'partners:manage'))) return;
   try {
-    // Une entree par (partenaire, TYPE de versement) : un partenaire peut avoir simultanement des
-    // versements initiaux et des versements de conversion en attente, et ils ne se payent pas
-    // ensemble. Les additionner en une seule ligne aurait produit un montant impossible a justifier.
-    const groups = [];
-    for (const kind of ['initial', 'conversion']) {
-      const c = payoutCols(kind);
-      const rows = (await pool.query(
-        `SELECT o.id, o.business_name, o.linked_customer_name, o.created_at,
-                p.id AS partner_id, p.name AS partner_name, p.${c.rate} AS rate
-           FROM partner_opportunities o
-           JOIN partners p ON p.id = o.partner_id
-          WHERE o.${c.status} = 'eligible'
-          ORDER BY p.name, o.created_at`
-      )).rows;
-      const byPartner = new Map();
-      for (const r of rows) {
-        if (!byPartner.has(r.partner_id)) {
-          byPartner.set(r.partner_id, {
-            partnerId: r.partner_id, partnerName: r.partner_name, kind,
-            payoutRate: r.rate !== null ? parseFloat(r.rate) : null,
-            opportunities: [],
-          });
-        }
-        byPartner.get(r.partner_id).opportunities.push({
-          id: r.id, businessName: r.business_name, linkedCustomerName: r.linked_customer_name, createdAt: r.created_at,
+    // Un seul type de versement depuis le 2026-08-06 : le second cycle a ete abandonne.
+    const rows = (await pool.query(
+      `SELECT o.id, o.business_name, o.linked_customer_name, o.created_at,
+              p.id AS partner_id, p.name AS partner_name, p.payout_rate AS rate
+         FROM partner_opportunities o
+         JOIN partners p ON p.id = o.partner_id
+        WHERE o.payout_status = 'eligible'
+        ORDER BY p.name, o.created_at`
+    )).rows;
+    const byPartner = new Map();
+    for (const r of rows) {
+      if (!byPartner.has(r.partner_id)) {
+        byPartner.set(r.partner_id, {
+          partnerId: r.partner_id, partnerName: r.partner_name, kind: 'conversion',
+          payoutRate: r.rate !== null ? parseFloat(r.rate) : null,
+          opportunities: [],
         });
       }
-      for (const g of byPartner.values()) {
-        groups.push({ ...g, suggestedAmount: g.payoutRate !== null ? Math.round(g.payoutRate * g.opportunities.length * 100) / 100 : null });
-      }
+      byPartner.get(r.partner_id).opportunities.push({
+        id: r.id, businessName: r.business_name, linkedCustomerName: r.linked_customer_name, createdAt: r.created_at,
+      });
     }
-    groups.sort((a, b) => a.partnerName.localeCompare(b.partnerName) || a.kind.localeCompare(b.kind));
+    const groups = [...byPartner.values()].map((g) => ({
+      ...g, suggestedAmount: g.payoutRate !== null ? Math.round(g.payoutRate * g.opportunities.length * 100) / 100 : null,
+    })).sort((a, b) => a.partnerName.localeCompare(b.partnerName));
     res.json({ partners: groups });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -5846,9 +5844,9 @@ app.post('/api/admin/partner-payouts/runs', authenticateToken, async (req, res) 
   const partnerId = parseInt(req.body.partnerId, 10);
   const periodLabel = String(req.body.periodLabel || '').trim();
   const opportunityIds = Array.isArray(req.body.opportunityIds) ? req.body.opportunityIds.map((x) => parseInt(x, 10)) : [];
-  // Type OBLIGATOIRE et explicite : pas de defaut. Deviner ici, c'est payer le mauvais versement.
-  const kind = req.body.kind;
-  if (!PAYOUT_KINDS[kind]) return res.status(400).json({ error: "kind must be 'initial' or 'conversion'" });
+  // Un seul type existe desormais ; on l'accepte encore dans le corps pour ne pas casser un appel
+  // en vol, mais il n'y a plus de choix a faire.
+  const kind = 'conversion';
   if (!partnerId || !periodLabel || !opportunityIds.length) {
     return res.status(400).json({ error: 'partnerId, periodLabel, and at least one opportunity are required' });
   }
