@@ -5577,6 +5577,7 @@ app.get('/api/admin/partner-opportunities', authenticateToken, async (req, res) 
               o.rep_first_name, o.rep_last_name, o.rep_phone, o.rep_email, o.notes, o.status,
               o.reviewed_by, o.reviewed_at, o.rejection_reason, o.created_at,
               o.crm_match_status, o.crm_match_summary, o.crm_match_records, o.crm_lead_id, o.crm_lead_error,
+              o.crm_owner_name,
               o.linked_customer_name, o.payout_status, o.crm_deposit_date, o.crm_deal_stage, o.crm_deal_lookup,
               p.name AS partner_name, pu.email AS submitted_by_email
          FROM partner_opportunities o
@@ -5600,6 +5601,10 @@ app.get('/api/admin/partner-opportunities', authenticateToken, async (req, res) 
       // Ce qui COMMANDE le versement, expose pour que l'admin puisse voir pourquoi une ligne est
       // eligible ou non — sans avoir a deviner. `crmDealLookup` = 'ambiguous' (homonymes, aucun
       // deal choisi) ou 'not_found' : les deux seuls cas ou une vente reelle peut rester bloquee.
+      // Le representant CLUSTER a qui le Lead a ete assigne dans Zoho. Celui du PARTENAIRE arrive
+      // deja par mapOpportunityRow (repFirstName/repLastName/repEmail) : deux personnes
+      // differentes, et l'ecran doit pouvoir les distinguer.
+      crmOwnerName: r.crm_owner_name,
       crmDepositDate: r.crm_deposit_date,
       crmDealStage: r.crm_deal_stage,
       crmDealLookup: r.crm_deal_lookup,
