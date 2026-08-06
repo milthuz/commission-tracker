@@ -4813,13 +4813,18 @@ app.post('/api/admin/partner-migration', authenticateToken, async (req, res) => 
   try {
     await client.query('BEGIN');
 
+    // `xmax = 0` distingue une ligne INSEREE d'une ligne mise a jour sur le chemin ON CONFLICT
+    // (meme astuce que la detection de premiere connexion Zoho). On peut donc annoncer si le
+    // partenaire est cree ou reutilise — sans ca, l'operateur ne sait pas ou ses 674 lignes vont
+    // atterrir, et c'est exactement la question qu'il a fini par poser.
     const pr = await client.query(
       `INSERT INTO partners (name, lead_source) VALUES ($1, $2)
        ON CONFLICT (name) DO UPDATE SET lead_source = COALESCE(partners.lead_source, EXCLUDED.lead_source)
-       RETURNING id`,
+       RETURNING id, (xmax = 0) AS created`,
       [partnerName, leadSource]
     );
     const partnerId = pr.rows[0].id;
+    report.partnerCreated = pr.rows[0].created;
 
     // --- usagers : une seule requete, statut « imported » (ni connexion ni activation possibles
     // avant une vraie invitation, qui passera par le chemin habituel ON CONFLICT (email)).
