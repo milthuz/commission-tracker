@@ -5119,6 +5119,85 @@ app.delete('/api/partner-portal/team/:id', authenticatePartnerToken, async (req,
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST /api/admin/partner-users/invite { ids: [] } — inviter des comptes DEJA en base.
+//
+// Distinct de /partners/:id/invite-admin, qui CREE un administrateur : ici les comptes existent
+// (repris de l'ancien portail, statut « imported »), on ne fait que leur envoyer leur invitation.
+// Deux differences deliberees avec ce jumeau : on CONSERVE le role et la langue enregistres au
+// lieu de forcer 'admin' et une langue choisie par l'invitant. Ecraser le role de 173 personnes
+// parce qu'on les invite en lot serait une regression silencieuse.
+//
+// ⚠️ Plafond de 50 par appel. Deux raisons, pas une : chaque envoi SMTP prend quelques centaines
+// de millisecondes, donc 177 d'un coup ferait expirer la requete HTTP ; et un lot court rend
+// l'echec PARTIEL exploitable — on sait exactement qui a recu quoi. L'interface envoie par
+// tranches et cumule le rapport.
+const PARTNER_INVITE_BATCH_MAX = 50;
+app.post('/api/admin/partner-users/invite', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  const ids = Array.isArray(req.body.ids) ? req.body.ids.map((x) => parseInt(x, 10)).filter((n) => !isNaN(n)) : [];
+  if (!ids.length) return res.status(400).json({ error: 'ids required' });
+  if (ids.length > PARTNER_INVITE_BATCH_MAX) {
+    return res.status(400).json({ error: 'batch_too_large', max: PARTNER_INVITE_BATCH_MAX });
+  }
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  const report = { sent: [], skipped: [], failed: [] };
+  try {
+    const rows = (await pool.query(
+      `SELECT pu.id, pu.email, pu.display_name, pu.role, pu.status, pu.locale, p.id AS partner_id, p.name AS partner_name
+         FROM partner_users pu JOIN partners p ON p.id = pu.partner_id
+        WHERE pu.id = ANY($1::int[])`, [ids]
+    )).rows;
+
+    for (const u of rows) {
+      // Un compte ACTIF a deja son acces : lui renvoyer une invitation reinitialiserait son
+      // mot de passe et sa 2FA. On refuse, en le disant.
+      if (u.status === 'active') { report.skipped.push({ email: u.email, why: 'already_active' }); continue; }
+      if (u.status === 'disabled') { report.skipped.push({ email: u.email, why: 'disabled' }); continue; }
+      try {
+        const raw = newRawToken();
+        const expires = new Date(Date.now() + 7 * 24 * 3600 * 1000);
+        const locale = isFrLocale(u.locale) ? 'fr' : 'en';
+        await pool.query(
+          // NI le role NI la langue ne sont touches : ils appartiennent au compte, pas a l'envoi.
+          `UPDATE partner_users
+              SET status = 'invited', invite_token_hash = $2, invite_expires_at = $3, invited_by = $4,
+                  invited_at = NOW(), invite_opened_at = NULL, activated_at = NULL,
+                  updated_at = CURRENT_TIMESTAMP
+            WHERE id = $1`,
+          [u.id, sha256hex(raw), expires, actor]
+        );
+        const inviteUrl = `${PARTNER_WEB_BASE(locale)}/partner-portal/accept-invite?token=${raw}`;
+        const mail = await sendMail(
+          u.email,
+          partnerCopy('invite', locale).subject,
+          mailShell(
+            partnerCopy('invite', locale).title,
+            partnerCopy('invite', locale).intro(u.display_name, u.partner_name),
+            partnerCopy('invite', locale).cta,
+            inviteUrl, locale, 'cluster'
+          )
+        );
+        if (mail.sent) {
+          report.sent.push({ email: u.email });
+          logActivity('partner_user', u.email, 'invited',
+            `${u.email} invited to the ${u.partner_name} portal by ${actor}`, actor);
+        } else {
+          // Le jeton reste valide : l'envoi a echoue, pas l'invitation. Un nouvel essai plus tard
+          // fonctionnera, et le compte n'est pas coince dans un etat intermediaire.
+          report.failed.push({ email: u.email, why: mail.reason || 'send_failed' });
+        }
+      } catch (e) {
+        report.failed.push({ email: u.email, why: e.message });
+      }
+    }
+    const missing = ids.filter((id) => !rows.some((r) => r.id === id));
+    for (const id of missing) report.failed.push({ email: `#${id}`, why: 'not_found' });
+    res.json(report);
+  } catch (e) {
+    res.status(500).json({ error: e.message, report });
+  }
+});
+
 // GET /api/admin/partner-invites — suivi des invitations envoyees au portail.
 //
 // Trois dates, trois faits distincts : envoyee, lien ouvert, compte active. On ne
