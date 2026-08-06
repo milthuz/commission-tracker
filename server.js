@@ -1590,6 +1590,18 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS migration_source VARCHAR(50)`);
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS payout_status VARCHAR(20) NOT NULL DEFAULT 'not_eligible'`);
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS payout_run_id INTEGER`);
+    // DEUXIEME cycle de versement (2026-08-06) : l'initial, du pour le lead lui-meme meme si
+    // l'affaire ne se conclut pas. Il FAUT un cycle distinct et non une colonne de plus : la meme
+    // opportunite sera dans DEUX runs a des moments differents (l'initial ce trimestre, la
+    // conversion l'an prochain), ce qu'un unique payout_run_id ne peut pas exprimer.
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS initial_payout_status VARCHAR(20) NOT NULL DEFAULT 'not_eligible'`);
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS initial_payout_run_id INTEGER`);
+    // Regle a l'exterieur de Sales Hub (ancien programme Moneris) : marque 'paid' sans run.
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS initial_paid_at DATE`);
+    // Un run ne melange JAMAIS les deux types : la facture envoyee au partenaire doit dire ce
+    // qu'elle paye. Defaut 'conversion' pour que les runs existants gardent leur sens.
+    await pool.query(`ALTER TABLE partner_payout_runs ADD COLUMN IF NOT EXISTS kind VARCHAR(20) NOT NULL DEFAULT 'conversion'`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_partner_opps_initial_payout ON partner_opportunities(initial_payout_status)`);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS partner_payout_runs (
         id             SERIAL PRIMARY KEY,
@@ -5206,6 +5218,19 @@ app.put('/api/admin/partner-opportunities/:id', authenticateToken, async (req, r
     if (!r.rowCount) return res.status(404).json({ error: 'Opportunity not found' });
     logActivity('partner_opportunity', req.params.id, status, `${r.rows[0].business_name} ${status} by ${actor}`, actor);
 
+    // Le versement INITIAL est du des l'approbation : c'est le moment ou Cluster valide que le lead
+    // est reel et nouveau. Le declencher a la soumission rendrait payant n'importe quel depot, y
+    // compris les doublons que la verification detecte justement pendant la revue.
+    // `IS DISTINCT FROM 'paid'` et l'exclusion de 'in_run' protegent l'idempotence : reapprouver
+    // une opportunite deja payee ne doit pas la rendre reclamable une seconde fois.
+    if (status === 'approved') {
+      await pool.query(
+        `UPDATE partner_opportunities SET initial_payout_status = 'eligible'
+          WHERE id = $1 AND initial_payout_status = 'not_eligible' AND initial_paid_at IS NULL`,
+        [parseInt(req.params.id, 10)]
+      );
+    }
+
     let crmLead = null;
     if (status === 'approved') {
       // SH-30 — create the Lead now, synchronously, so the admin sees success/failure in the
@@ -5288,6 +5313,20 @@ app.get('/api/admin/partner-opportunities/crm-reps', authenticateToken, async (r
 // `payout_excluded` : les dossiers reprits de l'ancien portail sont anterieurs au programme et ne
 // doivent jamais declencher un versement, meme s'ils portent une date de depot. Voir la migration.
 const PARTNER_PAYOUT_ELIGIBLE_SQL = `(o.crm_deposit_date IS NOT NULL AND NOT o.payout_excluded)`;
+
+// Les deux cycles de versement, et les colonnes qui les portent. ⚠️ Ces noms sont interpoles dans
+// du SQL : ils viennent donc de cette liste BLANCHE, jamais d'une valeur de requete. `payoutCols`
+// refuse tout type inconnu au lieu de retomber silencieusement sur un cycle par defaut — se
+// tromper de cycle, c'est payer deux fois ou pas du tout.
+const PAYOUT_KINDS = {
+  initial:    { status: 'initial_payout_status', run: 'initial_payout_run_id', rate: 'initial_payout_rate' },
+  conversion: { status: 'payout_status',         run: 'payout_run_id',         rate: 'payout_rate' },
+};
+const payoutCols = (kind) => {
+  const c = PAYOUT_KINDS[kind];
+  if (!c) throw new Error(`Unknown payout kind: ${kind}`);
+  return c;
+};
 
 // `opportunityId` null = TOUTES les opportunites (passage groupe, une seule requete — la base est
 // chez Railway en acces public, donc on evite les allers-retours par ligne).
@@ -5476,31 +5515,39 @@ app.delete('/api/admin/partner-opportunities/:id', authenticateToken, async (req
 app.get('/api/admin/partner-payouts/pending', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'partners:manage'))) return;
   try {
-    const rows = (await pool.query(
-      `SELECT o.id, o.business_name, o.linked_customer_name, o.created_at,
-              p.id AS partner_id, p.name AS partner_name, p.payout_rate
-         FROM partner_opportunities o
-         JOIN partners p ON p.id = o.partner_id
-        WHERE o.payout_status = 'eligible'
-        ORDER BY p.name, o.created_at`
-    )).rows;
-    const byPartner = new Map();
-    for (const r of rows) {
-      if (!byPartner.has(r.partner_id)) {
-        byPartner.set(r.partner_id, {
-          partnerId: r.partner_id, partnerName: r.partner_name,
-          payoutRate: r.payout_rate !== null ? parseFloat(r.payout_rate) : null,
-          opportunities: [],
+    // Une entree par (partenaire, TYPE de versement) : un partenaire peut avoir simultanement des
+    // versements initiaux et des versements de conversion en attente, et ils ne se payent pas
+    // ensemble. Les additionner en une seule ligne aurait produit un montant impossible a justifier.
+    const groups = [];
+    for (const kind of ['initial', 'conversion']) {
+      const c = payoutCols(kind);
+      const rows = (await pool.query(
+        `SELECT o.id, o.business_name, o.linked_customer_name, o.created_at,
+                p.id AS partner_id, p.name AS partner_name, p.${c.rate} AS rate
+           FROM partner_opportunities o
+           JOIN partners p ON p.id = o.partner_id
+          WHERE o.${c.status} = 'eligible'
+          ORDER BY p.name, o.created_at`
+      )).rows;
+      const byPartner = new Map();
+      for (const r of rows) {
+        if (!byPartner.has(r.partner_id)) {
+          byPartner.set(r.partner_id, {
+            partnerId: r.partner_id, partnerName: r.partner_name, kind,
+            payoutRate: r.rate !== null ? parseFloat(r.rate) : null,
+            opportunities: [],
+          });
+        }
+        byPartner.get(r.partner_id).opportunities.push({
+          id: r.id, businessName: r.business_name, linkedCustomerName: r.linked_customer_name, createdAt: r.created_at,
         });
       }
-      byPartner.get(r.partner_id).opportunities.push({
-        id: r.id, businessName: r.business_name, linkedCustomerName: r.linked_customer_name, createdAt: r.created_at,
-      });
+      for (const g of byPartner.values()) {
+        groups.push({ ...g, suggestedAmount: g.payoutRate !== null ? Math.round(g.payoutRate * g.opportunities.length * 100) / 100 : null });
+      }
     }
-    const partners = [...byPartner.values()].map((p) => ({
-      ...p, suggestedAmount: p.payoutRate !== null ? Math.round(p.payoutRate * p.opportunities.length * 100) / 100 : null,
-    }));
-    res.json({ partners });
+    groups.sort((a, b) => a.partnerName.localeCompare(b.partnerName) || a.kind.localeCompare(b.kind));
+    res.json({ partners: groups });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -5511,16 +5558,21 @@ app.get('/api/admin/partner-payouts/runs', authenticateToken, async (req, res) =
   if (!(await requirePerm(req, res, 'partners:manage'))) return;
   try {
     const rows = (await pool.query(
+      // La jointure suit le TYPE du run : un run initial est relie par initial_payout_run_id. Sans
+      // cette distinction, tout run initial s'affichait avec « 0 opportunite ».
       `SELECT r.id, r.period_label, r.status, r.total_amount, r.created_by, r.created_at, r.finalized_by, r.finalized_at,
-              p.name AS partner_name, COUNT(o.id)::int AS opportunity_count
+              r.kind, p.name AS partner_name, COUNT(o.id)::int AS opportunity_count
          FROM partner_payout_runs r
          JOIN partners p ON p.id = r.partner_id
-         LEFT JOIN partner_opportunities o ON o.payout_run_id = r.id
+         LEFT JOIN partner_opportunities o
+                ON (r.kind = 'initial'    AND o.initial_payout_run_id = r.id)
+                OR (r.kind <> 'initial'   AND o.payout_run_id         = r.id)
         GROUP BY r.id, p.name
         ORDER BY r.created_at DESC`
     )).rows;
     res.json({ runs: rows.map((r) => ({
       id: r.id, partnerName: r.partner_name, periodLabel: r.period_label, status: r.status,
+      kind: r.kind || 'conversion',
       totalAmount: parseFloat(r.total_amount), opportunityCount: r.opportunity_count,
       createdBy: r.created_by, createdAt: r.created_at, finalizedBy: r.finalized_by, finalizedAt: r.finalized_at,
     })) });
@@ -5539,13 +5591,16 @@ app.get('/api/admin/partner-payouts/runs/:id', authenticateToken, async (req, re
       `SELECT r.*, p.name AS partner_name FROM partner_payout_runs r JOIN partners p ON p.id = r.partner_id WHERE r.id = $1`, [id]
     )).rows[0];
     if (!run) return res.status(404).json({ error: 'Run not found' });
+    // Meme piege que dans la liste : lire les lignes par payout_run_id affichait un run initial
+    // comme s'il ne contenait rien.
+    const cRun = payoutCols(run.kind || 'conversion');
     const items = (await pool.query(
-      `SELECT id, business_name, linked_customer_name FROM partner_opportunities WHERE payout_run_id = $1 ORDER BY business_name`, [id]
+      `SELECT id, business_name, linked_customer_name FROM partner_opportunities WHERE ${cRun.run} = $1 ORDER BY business_name`, [id]
     )).rows;
     res.json({
       run: {
         id: run.id, partnerId: run.partner_id, partnerName: run.partner_name, periodLabel: run.period_label,
-        status: run.status, totalAmount: parseFloat(run.total_amount),
+        status: run.status, kind: run.kind || 'conversion', totalAmount: parseFloat(run.total_amount),
         createdBy: run.created_by, createdAt: run.created_at, finalizedBy: run.finalized_by, finalizedAt: run.finalized_at,
         opportunities: items.map((o) => ({ id: o.id, businessName: o.business_name, linkedCustomerName: o.linked_customer_name })),
       },
@@ -5563,12 +5618,16 @@ app.post('/api/admin/partner-payouts/runs', authenticateToken, async (req, res) 
   const partnerId = parseInt(req.body.partnerId, 10);
   const periodLabel = String(req.body.periodLabel || '').trim();
   const opportunityIds = Array.isArray(req.body.opportunityIds) ? req.body.opportunityIds.map((x) => parseInt(x, 10)) : [];
+  // Type OBLIGATOIRE et explicite : pas de defaut. Deviner ici, c'est payer le mauvais versement.
+  const kind = req.body.kind;
+  if (!PAYOUT_KINDS[kind]) return res.status(400).json({ error: "kind must be 'initial' or 'conversion'" });
   if (!partnerId || !periodLabel || !opportunityIds.length) {
     return res.status(400).json({ error: 'partnerId, periodLabel, and at least one opportunity are required' });
   }
   try {
+    const c = payoutCols(kind);
     const eligible = (await pool.query(
-      `SELECT id FROM partner_opportunities WHERE partner_id = $1 AND payout_status = 'eligible' AND id = ANY($2::int[])`,
+      `SELECT id FROM partner_opportunities WHERE partner_id = $1 AND ${c.status} = 'eligible' AND id = ANY($2::int[])`,
       [partnerId, opportunityIds]
     )).rows.map((r) => r.id);
     if (eligible.length !== opportunityIds.length) {
@@ -5578,15 +5637,15 @@ app.post('/api/admin/partner-payouts/runs', authenticateToken, async (req, res) 
     if (isNaN(totalAmount) || totalAmount < 0) return res.status(400).json({ error: 'Total amount must be a positive number' });
     const actor = req.user.realAdminEmail || req.user.email || 'unknown';
     const run = await pool.query(
-      `INSERT INTO partner_payout_runs (partner_id, period_label, total_amount, created_by) VALUES ($1, $2, $3, $4) RETURNING id`,
-      [partnerId, periodLabel, totalAmount, actor]
+      `INSERT INTO partner_payout_runs (partner_id, period_label, total_amount, created_by, kind) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      [partnerId, periodLabel, totalAmount, actor, kind]
     );
     const runId = run.rows[0].id;
     await pool.query(
-      `UPDATE partner_opportunities SET payout_run_id = $1, payout_status = 'in_run' WHERE id = ANY($2::int[])`,
+      `UPDATE partner_opportunities SET ${c.run} = $1, ${c.status} = 'in_run' WHERE id = ANY($2::int[])`,
       [runId, eligible]
     );
-    logActivity('partner_payout_run', runId, 'created', `Draft payout run for ${periodLabel} created by ${actor} (${eligible.length} opportunities)`, actor);
+    logActivity('partner_payout_run', runId, 'created', `Draft ${kind} payout run for ${periodLabel} created by ${actor} (${eligible.length} opportunities)`, actor);
     res.json({ success: true, id: runId });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -5607,21 +5666,23 @@ app.put('/api/admin/partner-payouts/runs/:id', authenticateToken, async (req, re
     const totalAmount = req.body.totalAmount !== undefined ? parseFloat(req.body.totalAmount) : parseFloat(run.total_amount);
     if (isNaN(totalAmount) || totalAmount < 0) return res.status(400).json({ error: 'Total amount must be a positive number' });
 
+    // Le type vient du RUN, pas de la requete : on ne peut pas changer la nature d'un run existant.
+    const c = payoutCols(run.kind || 'conversion');
     if (Array.isArray(req.body.opportunityIds)) {
       const nextIds = req.body.opportunityIds.map((x) => parseInt(x, 10));
-      const current = (await pool.query(`SELECT id FROM partner_opportunities WHERE payout_run_id = $1`, [id])).rows.map((r) => r.id);
+      const current = (await pool.query(`SELECT id FROM partner_opportunities WHERE ${c.run} = $1`, [id])).rows.map((r) => r.id);
       const toRemove = current.filter((x) => !nextIds.includes(x));
       const toAdd = nextIds.filter((x) => !current.includes(x));
       if (toRemove.length) {
-        await pool.query(`UPDATE partner_opportunities SET payout_run_id = NULL, payout_status = 'eligible' WHERE id = ANY($1::int[])`, [toRemove]);
+        await pool.query(`UPDATE partner_opportunities SET ${c.run} = NULL, ${c.status} = 'eligible' WHERE id = ANY($1::int[])`, [toRemove]);
       }
       if (toAdd.length) {
         const addEligible = (await pool.query(
-          `SELECT id FROM partner_opportunities WHERE partner_id = $1 AND payout_status = 'eligible' AND id = ANY($2::int[])`,
+          `SELECT id FROM partner_opportunities WHERE partner_id = $1 AND ${c.status} = 'eligible' AND id = ANY($2::int[])`,
           [run.partner_id, toAdd]
         )).rows.map((r) => r.id);
         if (addEligible.length !== toAdd.length) return res.status(409).json({ error: 'One or more added opportunities are not eligible' });
-        await pool.query(`UPDATE partner_opportunities SET payout_run_id = $1, payout_status = 'in_run' WHERE id = ANY($2::int[])`, [id, addEligible]);
+        await pool.query(`UPDATE partner_opportunities SET ${c.run} = $1, ${c.status} = 'in_run' WHERE id = ANY($2::int[])`, [id, addEligible]);
       }
     }
 
@@ -5638,14 +5699,22 @@ app.delete('/api/admin/partner-payouts/runs/:id', authenticateToken, async (req,
   if (!(await requirePerm(req, res, 'partners:manage'))) return;
   const id = parseInt(req.params.id, 10);
   try {
-    const run = (await pool.query(`SELECT status FROM partner_payout_runs WHERE id = $1`, [id])).rows[0];
+    const run = (await pool.query(`SELECT status, kind FROM partner_payout_runs WHERE id = $1`, [id])).rows[0];
     if (!run) return res.status(404).json({ error: 'Run not found' });
     if (run.status !== 'draft') return res.status(409).json({ error: 'Only draft runs can be cancelled' });
-    const items = (await pool.query(`SELECT id FROM partner_opportunities WHERE payout_run_id = $1`, [id])).rows.map((r) => r.id);
-    await pool.query(`UPDATE partner_opportunities SET payout_run_id = NULL, payout_status = 'not_eligible' WHERE id = ANY($1::int[])`, [items]);
-    // Un seul passage groupe au lieu d'un aller-retour par ligne : les lignes viennent d'etre
-    // degelees, donc le recalcul general les rattrape toutes.
-    await recomputePartnerPayoutStatus();
+    const c = payoutCols(run.kind || 'conversion');
+    const items = (await pool.query(`SELECT id FROM partner_opportunities WHERE ${c.run} = $1`, [id])).rows.map((r) => r.id);
+    if (run.kind === 'initial') {
+      // Aucun recalcul pour l'initial : son droit est acquis a l'approbation, pas derive d'un etat
+      // Zoho. On le restitue donc directement au lieu de le remettre a zero et d'esperer un recalcul
+      // qui n'existe pas — ce qui aurait fait disparaitre un versement du.
+      await pool.query(`UPDATE partner_opportunities SET ${c.run} = NULL, ${c.status} = 'eligible' WHERE id = ANY($1::int[])`, [items]);
+    } else {
+      await pool.query(`UPDATE partner_opportunities SET ${c.run} = NULL, ${c.status} = 'not_eligible' WHERE id = ANY($1::int[])`, [items]);
+      // Un seul passage groupe au lieu d'un aller-retour par ligne : les lignes viennent d'etre
+      // degelees, donc le recalcul general les rattrape toutes.
+      await recomputePartnerPayoutStatus();
+    }
     await pool.query(`DELETE FROM partner_payout_runs WHERE id = $1`, [id]);
     res.json({ success: true });
   } catch (e) {
@@ -5663,9 +5732,10 @@ app.post('/api/admin/partner-payouts/runs/:id/finalize', authenticateToken, asyn
     if (!run) return res.status(404).json({ error: 'Run not found' });
     if (run.status !== 'draft') return res.status(409).json({ error: 'This run was already finalized' });
     const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+    const c = payoutCols(run.kind || 'conversion');
     await pool.query(`UPDATE partner_payout_runs SET status = 'finalized', finalized_by = $2, finalized_at = CURRENT_TIMESTAMP WHERE id = $1`, [id, actor]);
-    await pool.query(`UPDATE partner_opportunities SET payout_status = 'paid' WHERE payout_run_id = $1`, [id]);
-    logActivity('partner_payout_run', id, 'finalized', `Payout run for ${run.period_label} finalized by ${actor} ($${run.total_amount})`, actor);
+    await pool.query(`UPDATE partner_opportunities SET ${c.status} = 'paid' WHERE ${c.run} = $1`, [id]);
+    logActivity('partner_payout_run', id, 'finalized', `${run.kind || 'conversion'} payout run for ${run.period_label} finalized by ${actor} ($${run.total_amount})`, actor);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
