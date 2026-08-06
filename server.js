@@ -4970,6 +4970,155 @@ app.post('/api/admin/partner-migration', authenticateToken, async (req, res) => 
   }
 });
 
+// ============================================================================
+// GESTION DES USAGERS PARTENAIRES — regles partagees par les DEUX surfaces
+// ============================================================================
+// L'admin interne (perm `partners:manage`, tous les partenaires) et le portail (un administrateur
+// partenaire, son seul effectif) appliquent les MEMES regles. Ecrites une seule fois : deux copies
+// divergeraient, et il s'agit de verrouiller ou non l'acces de quelqu'un.
+//
+// `scopePartnerId` non nul = demandeur administrateur partenaire. Une cible hors de son partenaire
+// repond **404 et non 403** : un 403 confirmerait qu'un compte existe ailleurs.
+//
+// DEUX cles etrangeres pointent sur partner_users : `partner_opportunities.submitted_by` et
+// `partner_invoices.uploaded_by`, aucune en cascade. Les compter AVANT de tenter la suppression
+// evite une erreur de contrainte illisible pour l'operateur.
+async function loadPartnerUserTarget(id, scopePartnerId) {
+  const u = (await pool.query(
+    `SELECT pu.*, p.name AS partner_name FROM partner_users pu
+       JOIN partners p ON p.id = pu.partner_id WHERE pu.id = $1`, [id]
+  )).rows[0];
+  if (!u) return { error: { code: 404, body: { error: 'User not found' } } };
+  if (scopePartnerId && u.partner_id !== scopePartnerId) {
+    return { error: { code: 404, body: { error: 'User not found' } } };
+  }
+  const refs = (await pool.query(
+    `SELECT (SELECT COUNT(*) FROM partner_opportunities WHERE submitted_by = $1)::int AS opportunities,
+            (SELECT COUNT(*) FROM partner_invoices      WHERE uploaded_by  = $1)::int AS invoices`, [id]
+  )).rows[0];
+  // Administrateurs ACTIFS restants si cette cible disparaissait ou etait desactivee. Sert a
+  // interdire le verrouillage complet d'un partenaire : un partenaire sans administrateur ne peut
+  // plus inviter personne et n'a aucun moyen de se debloquer seul.
+  const others = (await pool.query(
+    `SELECT COUNT(*)::int AS n FROM partner_users
+      WHERE partner_id = $1 AND role = 'admin' AND status <> 'disabled' AND id <> $2`,
+    [u.partner_id, id]
+  )).rows[0].n;
+  return { user: u, refs, otherActiveAdmins: others };
+}
+
+// Re-activation : on NE remet pas 'active' aveuglement — un compte sans mot de passe ni 2FA ne
+// pourrait pas se connecter et afficherait un statut mensonger. Le statut est donc DEDUIT de ce que
+// le compte possede reellement.
+function partnerUserStatusOnEnable(u) {
+  if (u.password_hash && u.totp_enabled) return 'active';
+  if (u.invite_token_hash && u.invite_expires_at && new Date(u.invite_expires_at) > new Date()) return 'invited';
+  return 'imported';
+}
+
+// role et/ou statut. `actorSelfId` non nul (portail) interdit d'agir sur soi-meme : se desactiver
+// soi-meme, c'est se fermer la porte sans pouvoir la rouvrir.
+async function applyPartnerUserUpdate({ id, scopePartnerId, actorSelfId, role, status, actor }) {
+  const t = await loadPartnerUserTarget(id, scopePartnerId);
+  if (t.error) return t.error;
+  const { user, otherActiveAdmins } = t;
+  if (actorSelfId && actorSelfId === id) return { code: 409, body: { error: 'cannot_target_self' } };
+
+  const nextRole = role === undefined ? user.role : (role === 'admin' ? 'admin' : 'standard');
+  let nextStatus = user.status;
+  if (status !== undefined) {
+    if (status !== 'active' && status !== 'disabled') {
+      return { code: 400, body: { error: "status must be 'active' or 'disabled'" } };
+    }
+    nextStatus = status === 'disabled' ? 'disabled' : partnerUserStatusOnEnable(user);
+  }
+  // Le dernier administrateur actif ne peut etre ni retrograde ni desactive.
+  const wasActiveAdmin = user.role === 'admin' && user.status !== 'disabled';
+  const staysActiveAdmin = nextRole === 'admin' && nextStatus !== 'disabled';
+  if (wasActiveAdmin && !staysActiveAdmin && otherActiveAdmins === 0) {
+    return { code: 409, body: { error: 'last_admin', partnerName: user.partner_name } };
+  }
+
+  await pool.query(
+    `UPDATE partner_users SET role = $2, status = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+    [id, nextRole, nextStatus]
+  );
+  logActivity('partner_user', user.email, 'updated',
+    `${user.email} (${user.partner_name}) → role ${nextRole}, status ${nextStatus}, by ${actor}`, actor);
+  return { code: 200, body: { success: true, role: nextRole, status: nextStatus } };
+}
+
+// Suppression : refusee des qu'il reste une trace rattachee. Decision de David — on annonce le
+// decompte et on propose la desactivation, plutot que de detacher l'historique. Detacher rendrait
+// ces opportunites invisibles a tous les usagers standards, qui ne voient que leurs propres
+// soumissions.
+async function applyPartnerUserDelete({ id, scopePartnerId, actorSelfId, actor }) {
+  const t = await loadPartnerUserTarget(id, scopePartnerId);
+  if (t.error) return t.error;
+  const { user, refs, otherActiveAdmins } = t;
+  if (actorSelfId && actorSelfId === id) return { code: 409, body: { error: 'cannot_target_self' } };
+  if (user.role === 'admin' && user.status !== 'disabled' && otherActiveAdmins === 0) {
+    return { code: 409, body: { error: 'last_admin', partnerName: user.partner_name } };
+  }
+  if (refs.opportunities > 0 || refs.invoices > 0) {
+    return { code: 409, body: { error: 'user_has_history', counts: refs, email: user.email } };
+  }
+  await pool.query(`DELETE FROM partner_users WHERE id = $1`, [id]);
+  logActivity('partner_user', user.email, 'deleted',
+    `${user.email} (${user.partner_name}) deleted by ${actor}`, actor);
+  return { code: 200, body: { success: true } };
+}
+
+// --- Surface 1 : admin interne, tous les partenaires ---
+app.put('/api/admin/partner-users/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const r = await applyPartnerUserUpdate({
+      id: parseInt(req.params.id, 10), scopePartnerId: null, actorSelfId: null,
+      role: req.body.role, status: req.body.status,
+      actor: req.user.realAdminEmail || req.user.email || 'unknown',
+    });
+    res.status(r.code).json(r.body);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/admin/partner-users/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const r = await applyPartnerUserDelete({
+      id: parseInt(req.params.id, 10), scopePartnerId: null, actorSelfId: null,
+      actor: req.user.realAdminEmail || req.user.email || 'unknown',
+    });
+    res.status(r.code).json(r.body);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- Surface 2 : portail, un administrateur partenaire sur SON effectif ---
+// Le perimetre vient du JETON (`req.partnerUser.partnerId`), jamais du corps de la requete :
+// c'est ce qui empeche un administrateur de viser l'effectif d'un autre partenaire.
+app.put('/api/partner-portal/team/:id', authenticatePartnerToken, async (req, res) => {
+  if (req.partnerUser.role !== 'admin') return res.status(403).json({ error: 'Partner Admin only' });
+  try {
+    const r = await applyPartnerUserUpdate({
+      id: parseInt(req.params.id, 10), scopePartnerId: req.partnerUser.partnerId,
+      actorSelfId: req.partnerUser.id, role: req.body.role, status: req.body.status,
+      actor: req.partnerUser.email,
+    });
+    res.status(r.code).json(r.body);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/partner-portal/team/:id', authenticatePartnerToken, async (req, res) => {
+  if (req.partnerUser.role !== 'admin') return res.status(403).json({ error: 'Partner Admin only' });
+  try {
+    const r = await applyPartnerUserDelete({
+      id: parseInt(req.params.id, 10), scopePartnerId: req.partnerUser.partnerId,
+      actorSelfId: req.partnerUser.id, actor: req.partnerUser.email,
+    });
+    res.status(r.code).json(r.body);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/admin/partner-invites — suivi des invitations envoyees au portail.
 //
 // Trois dates, trois faits distincts : envoyee, lien ouvert, compte active. On ne
