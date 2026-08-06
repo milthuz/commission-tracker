@@ -1565,6 +1565,10 @@ async function initializeDatabase() {
     // plus l'eligibilite. Il n'existe aucun lien automatique entre un Lead Zoho et un client
     // facture Sales Hub, c'est justement ce qui a fait abandonner cette condition.
     await pool.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS payout_rate DECIMAL(10,2)`);
+    // Versement INITIAL : du au partenaire pour le lead lui-meme, meme si l'affaire ne se conclut
+    // pas. Montant distinct de `payout_rate` (qui recompense la conversion) et configurable par
+    // partenaire — les conditions ne se negocient pas au meme tarif d'un partenaire a l'autre.
+    await pool.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS initial_payout_rate DECIMAL(10,2)`);
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS linked_customer_name VARCHAR(255)`);
     // Etat du Deal Zoho, RETENU en base (2026-08-05). L'eligibilite au versement se lit desormais
     // dans `crm_deposit_date` — voir PARTNER_PAYOUT_ELIGIBLE_SQL. Il faut le stocker, et pas
@@ -4564,6 +4568,7 @@ app.get('/api/admin/partners', authenticateToken, async (req, res) => {
       `SELECT p.id, p.name, p.active, p.created_at, (p.logo_data IS NOT NULL) AS has_logo,
               p.lead_source, p.billing_contact_name, p.billing_contact_email, p.billing_contact_phone,
               p.business_contact_name, p.business_contact_email, p.business_contact_phone, p.payout_rate,
+              p.initial_payout_rate,
               COUNT(pu.id) AS user_count
          FROM partners p LEFT JOIN partner_users pu ON pu.partner_id = p.id
         GROUP BY p.id ORDER BY p.name`
@@ -4575,6 +4580,7 @@ app.get('/api/admin/partners', authenticateToken, async (req, res) => {
       billingContactName: r.billing_contact_name, billingContactEmail: r.billing_contact_email, billingContactPhone: r.billing_contact_phone,
       businessContactName: r.business_contact_name, businessContactEmail: r.business_contact_email, businessContactPhone: r.business_contact_phone,
       payoutRate: r.payout_rate !== null ? parseFloat(r.payout_rate) : null,
+      initialPayoutRate: r.initial_payout_rate !== null ? parseFloat(r.initial_payout_rate) : null,
     })) });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -4621,14 +4627,20 @@ app.put('/api/admin/partners/:id', authenticateToken, async (req, res) => {
     if (payoutRate !== null && (isNaN(payoutRate) || payoutRate < 0)) {
       return res.status(400).json({ error: 'Payout rate must be a positive number' });
     }
+    const initialPayoutRate = req.body.initialPayoutRate !== undefined
+      ? (req.body.initialPayoutRate === '' || req.body.initialPayoutRate === null ? null : parseFloat(req.body.initialPayoutRate))
+      : current.initial_payout_rate;
+    if (initialPayoutRate !== null && (isNaN(initialPayoutRate) || initialPayoutRate < 0)) {
+      return res.status(400).json({ error: 'Initial payout rate must be a positive number' });
+    }
     await pool.query(
       `UPDATE partners SET name = $2, active = $3, lead_source = $4,
               billing_contact_name = $5, billing_contact_email = $6, billing_contact_phone = $7,
               business_contact_name = $8, business_contact_email = $9, business_contact_phone = $10,
-              payout_rate = $11, updated_at = CURRENT_TIMESTAMP
+              payout_rate = $11, initial_payout_rate = $12, updated_at = CURRENT_TIMESTAMP
        WHERE id = $1`,
       [id, name, active, leadSource, billingContactName, billingContactEmail, billingContactPhone,
-       businessContactName, businessContactEmail, businessContactPhone, payoutRate]
+       businessContactName, businessContactEmail, businessContactPhone, payoutRate, initialPayoutRate]
     );
     res.json({ success: true });
   } catch (e) {
