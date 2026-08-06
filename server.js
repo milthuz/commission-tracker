@@ -5950,13 +5950,30 @@ app.get('/api/admin/partner-payouts/pending', authenticateToken, async (req, res
   if (!(await requirePerm(req, res, 'partners:manage'))) return;
   try {
     // Un seul type de versement depuis le 2026-08-06 : le second cycle a ete abandonne.
+    //
+    // La JUSTIFICATION de chaque ligne remonte avec elle : quelle facture payee la rend due, et
+    // quand. « 14 opportunites, 2800 $ » ne se verifie pas ; « cette ligne est due parce que la
+    // facture INV-071753 a ete payee le 2 juillet » se verifie. Un LATERAL plutot qu'une requete
+    // par ligne — la base est joignable par un proxy public, chaque aller-retour coute.
+    //
+    // On prend la PREMIERE facture payee (par date) : c'est elle qui a rendu l'affaire due. La plus
+    // recente donnerait une date qui bouge a chaque nouvelle facture du meme client.
     const rows = (await pool.query(
-      `SELECT o.id, o.business_name, o.linked_customer_name, o.created_at,
-              p.id AS partner_id, p.name AS partner_name, p.payout_rate AS rate
+      `SELECT o.id, o.business_name, o.linked_customer_name, o.created_at, o.payout_external_ref,
+              p.id AS partner_id, p.name AS partner_name, p.payout_rate AS rate,
+              inv.invoice_number, inv.paid_date
          FROM partner_opportunities o
          JOIN partners p ON p.id = o.partner_id
+         LEFT JOIN LATERAL (
+           SELECT i.invoice_number, i.paid_date
+             FROM invoices i
+            WHERE i.customer_name = o.linked_customer_name
+              AND i.status = 'paid' AND i.paid_date IS NOT NULL
+            ORDER BY i.paid_date ASC, i.invoice_number ASC
+            LIMIT 1
+         ) inv ON true
         WHERE o.payout_status = 'eligible'
-        ORDER BY p.name, o.created_at`
+        ORDER BY p.name, inv.paid_date ASC NULLS LAST, o.created_at`
     )).rows;
     const byPartner = new Map();
     for (const r of rows) {
@@ -5968,7 +5985,12 @@ app.get('/api/admin/partner-payouts/pending', authenticateToken, async (req, res
         });
       }
       byPartner.get(r.partner_id).opportunities.push({
-        id: r.id, businessName: r.business_name, linkedCustomerName: r.linked_customer_name, createdAt: r.created_at,
+        id: r.id, businessName: r.business_name, linkedCustomerName: r.linked_customer_name,
+        createdAt: r.created_at,
+        // Ce qui rend cette ligne due, et ce qui l'a deja reglee le cas echeant.
+        invoiceNumber: r.invoice_number || null,
+        invoicePaidDate: r.paid_date || null,
+        externalRef: r.payout_external_ref || null,
       });
     }
     const groups = [...byPartner.values()].map((g) => ({
