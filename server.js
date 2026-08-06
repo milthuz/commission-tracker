@@ -1588,6 +1588,10 @@ async function initializeDatabase() {
     // reellement soumise dans Sales Hub d'une ligne reprise de l'ancien outil.
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS payout_excluded BOOLEAN NOT NULL DEFAULT false`);
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS migration_source VARCHAR(50)`);
+    // Reference du versement REGLE HORS Sales Hub (numero de facture Moneris, ex. FTIN020952).
+    // Sans elle, un dossier marque « paye » sans run de versement n'a aucune trace de ce qui l'a
+    // regle : on ne pourrait ni le justifier ni le retrouver.
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS payout_external_ref VARCHAR(60)`);
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS payout_status VARCHAR(20) NOT NULL DEFAULT 'not_eligible'`);
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS payout_run_id INTEGER`);
     // DEUXIEME cycle de versement (2026-08-06) : l'initial, du pour le lead lui-meme meme si
@@ -5195,6 +5199,128 @@ app.post('/api/admin/partner-users/invite', authenticateToken, async (req, res) 
     res.json(report);
   } catch (e) {
     res.status(500).json({ error: e.message, report });
+  }
+});
+
+// POST /api/admin/partner-payouts/import-history — reprend l'historique des versements deja regles.
+//
+// La liste de David (« Cluster x Moneris _ Lead referral Payout ») porte deux sections : ce qui est
+// PAYE, et ce qui est ferme+installe mais encore DU. Elle est la source de verite pour le passe :
+// la regle actuelle ne s'applique qu'aux affaires a venir.
+//
+// ⚠️ La cle de rattachement est le NUMERO DE FACTURE, pas le nom d'entreprise. Mesure faite sur le
+// fichier : le nom ne retrouve que 58 lignes sur 98 (« Restaurant Djambala » contre « RESTAURANT
+// DJAMBALA INC. »), la facture est presente sur 100 %. D'ou la resolution en trois temps ci-dessous,
+// qui doit tourner ICI : la table des factures n'existe qu'en production.
+//
+// `dryRun` vaut VRAI par defaut, tout se joue dans une transaction annulee en simulation, et
+// l'operation est idempotente : on ECRIT DES ETATS ABSOLUS, donc rejouer ne double rien.
+app.post('/api/admin/partner-payouts/import-history', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:migrate'))) return;
+  const body = req.body || {};
+  const dryRun = body.dryRun !== false;
+  const partnerName = String(body.partner || '').trim();
+  const items = Array.isArray(body.items) ? body.items : [];
+  if (!partnerName) return res.status(400).json({ error: 'partner is required' });
+  if (!items.length) return res.status(400).json({ error: 'items required' });
+  if (items.length > 2000) return res.status(400).json({ error: 'Payload too large' });
+
+  const report = {
+    dryRun, partner: partnerName,
+    markedPaid: 0, markedDue: 0, unchanged: 0,
+    unresolvedInvoice: [], notMatched: [], ambiguous: [], wouldNotBeEligible: [],
+  };
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const partner = (await client.query(`SELECT id FROM partners WHERE name = $1`, [partnerName])).rows[0];
+    if (!partner) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Partner not found: ' + partnerName }); }
+
+    for (const it of items) {
+      const invoiceNumber = String(it?.invoice || '').trim().toUpperCase();
+      const account = String(it?.account || '').trim();
+      if (!invoiceNumber) { report.notMatched.push({ account, why: 'aucun numero de facture' }); continue; }
+
+      // 1) facture -> client facture
+      const inv = (await client.query(
+        `SELECT customer_name, status, paid_date FROM invoices WHERE UPPER(invoice_number) = $1`, [invoiceNumber]
+      )).rows[0];
+      if (!inv || !inv.customer_name) {
+        report.unresolvedInvoice.push({ invoice: invoiceNumber, account });
+        continue;
+      }
+
+      // 2) client -> opportunite, en trois tentatives de la plus sure a la moins sure. On s'arrete
+      // a la premiere qui donne UN SEUL resultat ; plusieurs resultats = on ne choisit pas.
+      let opp = null, ambigu = false;
+      for (const q of [
+        [`SELECT id, payout_status, payout_excluded, payout_external_ref, linked_customer_name
+            FROM partner_opportunities WHERE partner_id = $1 AND linked_customer_name = $2`, [partner.id, inv.customer_name]],
+        [`SELECT id, payout_status, payout_excluded, payout_external_ref, linked_customer_name
+            FROM partner_opportunities WHERE partner_id = $1 AND LOWER(business_name) = LOWER($2)`, [partner.id, inv.customer_name]],
+        [`SELECT id, payout_status, payout_excluded, payout_external_ref, linked_customer_name
+            FROM partner_opportunities WHERE partner_id = $1 AND LOWER(business_name) = LOWER($2)`, [partner.id, account]],
+      ]) {
+        const r = await client.query(q[0], q[1]);
+        if (r.rows.length === 1) { opp = r.rows[0]; break; }
+        if (r.rows.length > 1) { ambigu = true; break; }
+      }
+      if (ambigu) { report.ambiguous.push({ invoice: invoiceNumber, account, customer: inv.customer_name }); continue; }
+      if (!opp) { report.notMatched.push({ invoice: invoiceNumber, account, customer: inv.customer_name }); continue; }
+
+      // 3) etat cible. Deux cas seulement, et on ecrit des valeurs ABSOLUES pour rester idempotent.
+      if (it.paid === true) {
+        // Regle hors Sales Hub : gele en 'paid' sans run, avec la reference qui le justifie.
+        const already = opp.payout_status === 'paid' && opp.payout_external_ref === (it.externalRef || null)
+          && opp.linked_customer_name === inv.customer_name;
+        if (already) { report.unchanged++; continue; }
+        await client.query(
+          `UPDATE partner_opportunities
+              SET payout_status = 'paid', payout_run_id = NULL, payout_external_ref = $2,
+                  linked_customer_name = $3
+            WHERE id = $1`,
+          [opp.id, it.externalRef || null, inv.customer_name]
+        );
+        report.markedPaid++;
+      } else {
+        // Du : David l'affirme, donc on l'ouvre nommement — c'est plus fort que le calcul. On note
+        // quand la regle actuelle ne l'aurait PAS trouve eligible : c'est une information, pas un
+        // veto, mais il doit la voir.
+        if (!(inv.status === 'paid' && inv.paid_date)) {
+          report.wouldNotBeEligible.push({ invoice: invoiceNumber, account, invoiceStatus: inv.status });
+        }
+        const already = opp.payout_status === 'eligible' && opp.payout_excluded === false
+          && opp.linked_customer_name === inv.customer_name;
+        if (already) { report.unchanged++; continue; }
+        await client.query(
+          `UPDATE partner_opportunities
+              SET payout_status = 'eligible', payout_excluded = false, linked_customer_name = $2
+            WHERE id = $1`,
+          [opp.id, inv.customer_name]
+        );
+        report.markedDue++;
+      }
+    }
+
+    if (dryRun) await client.query('ROLLBACK');
+    else {
+      await client.query('COMMIT');
+      logActivity('partner', partnerName, 'payout_history_imported',
+        `${report.markedPaid} payout(s) marked settled and ${report.markedDue} marked due, by ${req.user.realAdminEmail || req.user.email}`,
+        req.user.realAdminEmail || req.user.email);
+    }
+    // Comptes exacts conserves, listes tronquees pour l'affichage : « rien a signaler » et « on ne
+    // t'a pas tout dit » ne doivent pas se ressembler.
+    for (const k of ['unresolvedInvoice', 'notMatched', 'ambiguous', 'wouldNotBeEligible']) {
+      report[k + 'Count'] = report[k].length;
+      report[k] = report[k].slice(0, 25);
+    }
+    res.json(report);
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    res.status(500).json({ error: e.message, report });
+  } finally {
+    client.release();
   }
 });
 
