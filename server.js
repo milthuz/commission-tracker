@@ -1609,6 +1609,29 @@ async function initializeDatabase() {
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_partner_data_imports_at ON partner_data_imports(imported_at DESC)`);
 
+    // Correction UNIQUE (2026-08-06) : la migration a rempli `crm_owner_name` avec la colonne
+    // « Sales Rep » de l'export, qui contient des representants MONERIS (Cecile Chen, Nandini
+    // Roy...) et non le representant Cluster. Mesure faite sur l'export : zero adresse Cluster dans
+    // cette colonne. On vide donc ces valeurs fausses ; le travail horaire les remplacera par le
+    // vrai proprietaire du Deal Zoho.
+    //
+    // Le drapeau est indispensable : sans lui, chaque redemarrage effacerait ce que le travail
+    // horaire vient de retablir.
+    const ownerFixKey = 'partner_owner_name_reset_2026_08';
+    const alreadyFixed = (await pool.query(`SELECT 1 FROM sync_state WHERE key = $1`, [ownerFixKey])).rowCount > 0;
+    if (!alreadyFixed) {
+      const cleared = await pool.query(
+        `UPDATE partner_opportunities SET crm_owner_name = NULL
+          WHERE migration_source IS NOT NULL AND crm_owner_name IS NOT NULL`
+      );
+      await pool.query(
+        `INSERT INTO sync_state (key, value, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP)
+         ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = CURRENT_TIMESTAMP`,
+        [ownerFixKey, String(cleared.rowCount)]
+      );
+      console.log(`🧹 [partner-owner] ${cleared.rowCount} representant(s) Cluster errone(s) efface(s) sur les dossiers repris`);
+    }
+
     // Reference du versement REGLE HORS Sales Hub (numero de facture Moneris, ex. FTIN020952).
     // Sans elle, un dossier marque « paye » sans run de versement n'a aucune trace de ce qui l'a
     // regle : on ne pourrait ni le justifier ni le retrouver.
@@ -4000,6 +4023,9 @@ async function resolvePartnerDeal(crmToken, businessName, knownDealId) {
       leadStage: null, leadConverted: true, dealId,
       dealStage: deal.Stage || null,
       depositDate: deal.Deposit_Information_Received || null,
+      // Le proprietaire du Deal dans Zoho EST le representant Cluster. C'est la seule source
+      // fiable : l'export de l'ancien portail ne portait que des representants Moneris.
+      ownerName: deal.Owner?.name || null,
     };
   };
 
@@ -4028,6 +4054,7 @@ async function resolvePartnerDeal(crmToken, businessName, knownDealId) {
       leadStage: null, leadConverted: true, dealId: deal.id,
       dealStage: deal.Stage || null,
       depositDate: deal.Deposit_Information_Received || null,
+      ownerName: deal.Owner?.name || null,
       lookup: null,
     };
   } catch {
@@ -5836,14 +5863,19 @@ async function syncPartnerDealState() {
           SET crm_deal_id      = COALESCE($2::varchar, crm_deal_id),
               crm_deal_stage   = $3::varchar,
               crm_deposit_date = $4::date,
-              crm_deal_lookup  = $5::varchar
+              crm_deal_lookup  = $5::varchar,
+              -- Le representant Cluster : on ne l'ECRASE pas par null quand Zoho ne le donne pas,
+              -- sinon une lecture partielle effacerait une attribution connue.
+              crm_owner_name   = COALESCE($6::varchar, crm_owner_name)
         WHERE id = $1
           AND (crm_deal_stage   IS DISTINCT FROM $3::varchar
             OR crm_deposit_date IS DISTINCT FROM $4::date
             OR crm_deal_lookup  IS DISTINCT FROM $5::varchar
+            OR ($6::varchar IS NOT NULL AND crm_owner_name IS DISTINCT FROM $6::varchar)
             OR (crm_deal_id IS NULL AND $2::varchar IS NOT NULL))
         RETURNING id`,
-      [r.id, state.dealId || null, state.dealStage || null, state.depositDate || null, state.lookup || null]
+      [r.id, state.dealId || null, state.dealStage || null, state.depositDate || null, state.lookup || null,
+       state.ownerName || null]
     );
     if (up.rows.length) {
       changed++;
