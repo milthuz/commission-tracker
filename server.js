@@ -4108,7 +4108,14 @@ async function getCrmLeadStage(leadId, businessName, knownDealId) {
         }
       }
     }
-    return { leadStage: lead.Lead_Status || null, leadConverted: converted, dealId, dealStage, depositDate, ownerName };
+    // Repli sur le proprietaire du LEAD. Le Deal est plus precis — il dit qui a MENE la vente —
+    // mais il n'existe pas tant que rien n'est converti, et c'etait la moitie des dossiers repris.
+    // Le proprietaire du Lead repond alors a la meme question : a QUI la piste a ete confiee.
+    // Le Deal garde la priorite quand les deux existent.
+    return {
+      leadStage: lead.Lead_Status || null, leadConverted: converted, dealId, dealStage, depositDate,
+      ownerName: ownerName || lead.Owner?.name || null,
+    };
   } catch {
     return null;
   }
@@ -5906,7 +5913,11 @@ async function syncPartnerDealState() {
 //
 // Il n'ecrit QUE le representant et l'identifiant du Deal. Ni l'etape ni la date de depot : ces
 // deux-la commandent l'argent, et une reprise d'affichage n'a rien a y faire.
-const PARTNER_OWNER_BACKFILL_KEY = 'partner_owner_backfill_cursor_2026_08';
+// Le SUFFIXE porte le numero de tour. La premiere traversee ne lisait que le proprietaire du
+// Deal et laissait vides les dossiers non convertis ; son curseur est deja passe dessus. Changer
+// de cle relance une traversee propre, qui ne reexamine QUE les lignes encore vides (le filtre
+// `crm_owner_name IS NULL` s'en charge) — pas les 674.
+const PARTNER_OWNER_BACKFILL_KEY = 'partner_owner_backfill_cursor_2026_08_t2';
 const PARTNER_OWNER_BACKFILL_BATCH = 200;
 async function backfillPartnerDealOwners() {
   const cur = (await pool.query(
