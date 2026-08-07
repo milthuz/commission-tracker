@@ -4089,7 +4089,7 @@ async function getCrmLeadStage(leadId, businessName, knownDealId) {
     // deliberé de leur cote et ca vaut ici aussi — un deal qui franchit l'etape puis avance
     // n'y est plus, mais il a bel et bien ete vendu. Se fier au Stage ferait disparaitre la
     // vente au premier mouvement dans Zoho.
-    let dealStage = null, depositDate = null, dealId = null;
+    let dealStage = null, depositDate = null, dealId = null, ownerName = null;
     if (converted) {
       dealId = lead.$converted_detail?.deal || lead.$converted_detail?.deal_id || null;
       if (dealId) {
@@ -4101,10 +4101,14 @@ async function getCrmLeadStage(leadId, businessName, knownDealId) {
         if (deal) {
           dealStage = deal.Stage || null;
           depositDate = deal.Deposit_Information_Received || null;
+          // TROISIEME endroit ou l'on lit un Deal, et le plus emprunte : un Lead converti reste
+          // LISIBLE dans Zoho, donc on passe ici et non par resolvePartnerDeal. L'avoir oublie
+          // laissait la colonne « representant Cluster » vide sur presque tous les dossiers.
+          ownerName = deal.Owner?.name || null;
         }
       }
     }
-    return { leadStage: lead.Lead_Status || null, leadConverted: converted, dealId, dealStage, depositDate };
+    return { leadStage: lead.Lead_Status || null, leadConverted: converted, dealId, dealStage, depositDate, ownerName };
   } catch {
     return null;
   }
@@ -4143,9 +4147,11 @@ app.get('/api/partner-portal/opportunities', authenticatePartnerToken, async (re
       pool.query(
         `UPDATE partner_opportunities
             SET crm_deal_id = COALESCE($2::varchar, crm_deal_id), crm_deal_stage = $3::varchar,
-                crm_deposit_date = $4::date, crm_deal_lookup = $5::varchar
+                crm_deposit_date = $4::date, crm_deal_lookup = $5::varchar,
+                crm_owner_name = COALESCE($6::varchar, crm_owner_name)
           WHERE id = $1`,
-        [r.id, s.dealId || null, s.dealStage || null, s.depositDate || null, s.lookup || null]
+        [r.id, s.dealId || null, s.dealStage || null, s.depositDate || null, s.lookup || null,
+         s.ownerName || null]
       ).catch((e) => console.warn('[partner-crm] etat du Deal non retenu', r.id, e.message));
     });
     res.json({ opportunities: rows.map((r, i) => ({
@@ -5886,6 +5892,80 @@ async function syncPartnerDealState() {
   }
   if (changed) console.log(`🤝 [partner-deals] ${changed} opportunite(s) mise(s) a jour depuis Zoho`);
   await recomputePartnerPayoutStatus();
+}
+
+// Reprise UNIQUE du representant Cluster sur les dossiers migres de l'ancien portail.
+//
+// POURQUOI un travail a part. syncPartnerDealState ecarte deliberement les dossiers repris
+// (`NOT payout_excluded`) : sans cela ils couteraient 674 appels Zoho PAR HEURE pour une
+// eligibilite qu'ils ne peuvent de toute facon jamais obtenir. Cette exclusion est juste — mais
+// elle a une consequence qui m'avait echappe : RIEN ne remplira jamais leur representant Cluster.
+// D'ou ce passage-ci, qui n'est pas une surveillance mais une TRAVERSEE : il avance par tranches
+// derriere un curseur, ne revient jamais en arriere, et s'eteint definitivement une fois le
+// dernier dossier examine. Cout total : un seul balayage, pas une charge recurrente.
+//
+// Il n'ecrit QUE le representant et l'identifiant du Deal. Ni l'etape ni la date de depot : ces
+// deux-la commandent l'argent, et une reprise d'affichage n'a rien a y faire.
+const PARTNER_OWNER_BACKFILL_KEY = 'partner_owner_backfill_cursor_2026_08';
+const PARTNER_OWNER_BACKFILL_BATCH = 200;
+async function backfillPartnerDealOwners() {
+  const cur = (await pool.query(
+    `SELECT value FROM sync_state WHERE key = $1`, [PARTNER_OWNER_BACKFILL_KEY]
+  )).rows[0]?.value;
+  if (cur === 'done') return;   // traversee terminee : plus jamais un seul appel Zoho
+  const mark = (v) => pool.query(
+    `INSERT INTO sync_state (key, value, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP)
+       ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = CURRENT_TIMESTAMP`,
+    [PARTNER_OWNER_BACKFILL_KEY, String(v)]
+  );
+
+  const rows = (await pool.query(
+    `SELECT id, business_name, crm_lead_id, crm_deal_id
+       FROM partner_opportunities
+      WHERE migration_source IS NOT NULL AND crm_owner_name IS NULL AND id > $1
+      ORDER BY id LIMIT $2`,
+    [parseInt(cur || '0', 10) || 0, PARTNER_OWNER_BACKFILL_BATCH]
+  )).rows;
+  if (!rows.length) {
+    await mark('done');
+    console.log('✅ [partner-owner] reprise du representant Cluster terminee');
+    return;
+  }
+
+  let filled = 0, reached = 0;
+  for (const r of rows) {
+    let state = null;
+    if (r.crm_lead_id) {
+      state = await getCrmLeadStage(r.crm_lead_id, r.business_name, r.crm_deal_id);
+    } else if (r.crm_deal_id) {
+      // 17 dossiers repris n'ont qu'un Deal, jamais de Lead : on lit le Deal directement.
+      const tok = await ensureValidCrmToken();
+      state = await resolvePartnerDeal(tok, r.business_name, r.crm_deal_id);
+    }
+    if (state) reached++;
+    if (!state?.ownerName) continue;
+    await pool.query(
+      // `AND crm_owner_name IS NULL` : on ne PIETINE jamais une valeur qu'un autre chemin
+      // (portail, travail horaire) aurait inscrite entre-temps.
+      `UPDATE partner_opportunities
+          SET crm_owner_name = $2::varchar,
+              crm_deal_id    = COALESCE(crm_deal_id, $3::varchar)
+        WHERE id = $1 AND crm_owner_name IS NULL`,
+      [r.id, state.ownerName, state.dealId || null]
+    );
+    filled++;
+  }
+
+  // Zoho muet sur TOUTE la tranche = panne, pas une absence de donnee. On n'avance pas le
+  // curseur : sinon une coupure de dix minutes ferait sauter 200 dossiers pour de bon.
+  if (!reached) {
+    console.warn('⚠️ [partner-owner] Zoho muet sur toute la tranche — curseur NON avance');
+    return;
+  }
+  // Le curseur avance en revanche sur les lignes que Zoho a bien lues sans y trouver de
+  // proprietaire : les reinterroger a chaque passage ne changerait rien, indefiniment.
+  await mark(rows[rows.length - 1].id);
+  console.log(`🔎 [partner-owner] ${rows.length} dossier(s) examine(s), ${filled} representant(s) Cluster retrouve(s)`);
 }
 
 // GET /api/admin/partner-opportunities/customer-search?q= — autocompletion sur les clients
@@ -9520,7 +9600,11 @@ function startAutoSync() {
   // Zoho. Premier passage 4 min apres le demarrage, decale des autres travaux.
   setTimeout(() => {
     const run = () => syncPartnerDealState()
-      .catch((e) => console.warn('[partner-deals] passage planifie echoue:', e.message));
+      .catch((e) => console.warn('[partner-deals] passage planifie echoue:', e.message))
+      // Enchaine APRES, jamais en parallele : les deux interrogent Zoho en sequence, et rien
+      // ne presse — cette traversee s'eteint d'elle-meme au bout de quelques passages.
+      .then(() => backfillPartnerDealOwners())
+      .catch((e) => console.warn('[partner-owner] reprise echouee:', e.message));
     run();
     setInterval(run, 60 * 60 * 1000);
   }, 4 * 60 * 1000);
