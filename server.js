@@ -4012,6 +4012,32 @@ function mapOpportunityRow(r) {
 // ⚠️ Ambiguite : la recherche par nom peut ramener plusieurs deals homonymes. On n'en choisit
 // alors AUCUN. Cette colonne finira par declencher des versements — afficher l'etape du
 // mauvais deal serait pire que n'afficher rien, parce que personne ne saurait que c'est faux.
+// Dernier recours pour retrouver le representant Cluster : le proprietaire du COMPTE Zoho.
+//
+// Un lead peut etre converti en COMPTE sans qu'aucun deal soit cree. Le lead sort alors du
+// module Leads (204) et il n'existe pas de deal a lire : les deux sources habituelles sont
+// muettes, alors que Zoho sait parfaitement a qui ce marchand appartient.
+//
+// ⚠️ Egalite STRICTE sur le nom, et un seul resultat accepte. Mesure faite avant d'ecrire ceci :
+// une recherche par debut de nom ramene jusqu'a 200 homonymes (« Restaurant… », « The… »), et
+// designer le representant d'un AUTRE marchand serait pire que de laisser la case vide.
+//
+// Affichage uniquement : ce nom ne conditionne aucun versement.
+async function findAccountOwnerName(crmToken, businessName) {
+  const name = String(businessName || '').trim();
+  if (!name) return null;
+  try {
+    const r = await axios.get(
+      `https://www.zohoapis.com/crm/v2/Accounts/search?criteria=(Account_Name:equals:${encodeURIComponent(name)})`,
+      { headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true }
+    );
+    const found = r.status === 200 ? (r.data?.data || []) : [];
+    return found.length === 1 ? (found[0].Owner?.name || null) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function resolvePartnerDeal(crmToken, businessName, knownDealId) {
   const readDeal = async (dealId) => {
     const d = await axios.get(`https://www.zohoapis.com/crm/v2/Deals/${dealId}`, {
@@ -4036,9 +4062,12 @@ async function resolvePartnerDeal(crmToken, businessName, knownDealId) {
   // n'arrive pas a mettre la main sur le Deal. `lookup` dit POURQUOI on a echoue — depuis que
   // l'eligibilite au versement depend de la date de depot, un echec silencieux ici vaut un
   // partenaire non paye sans explication.
-  const unresolved = (lookup) => ({
+  // `lookup` dit pourquoi aucun deal n'a ete retenu ; le proprietaire du compte, lui, peut
+  // quand meme etre connu — les deux informations sont independantes.
+  const unresolved = async (lookup) => ({
     leadStage: null, leadConverted: true, dealId: null,
     dealStage: null, depositDate: null, lookup,
+    ownerName: await findAccountOwnerName(crmToken, name),
   });
   try {
     const sr = await axios.get(
@@ -4048,7 +4077,7 @@ async function resolvePartnerDeal(crmToken, businessName, knownDealId) {
     const found = sr.status === 200 ? (sr.data?.data || []) : [];
     // 0 = pas encore de deal ; >1 = homonymes, on n'en choisit AUCUN (voir l'avertissement plus
     // haut : verser sur le mauvais deal serait pire que ne rien verser).
-    if (found.length !== 1) return unresolved(found.length > 1 ? 'ambiguous' : 'not_found');
+    if (found.length !== 1) return await unresolved(found.length > 1 ? 'ambiguous' : 'not_found');
     const deal = found[0];
     return {
       leadStage: null, leadConverted: true, dealId: deal.id,
@@ -5917,7 +5946,7 @@ async function syncPartnerDealState() {
 // Deal et laissait vides les dossiers non convertis ; son curseur est deja passe dessus. Changer
 // de cle relance une traversee propre, qui ne reexamine QUE les lignes encore vides (le filtre
 // `crm_owner_name IS NULL` s'en charge) — pas les 674.
-const PARTNER_OWNER_BACKFILL_KEY = 'partner_owner_backfill_cursor_2026_08_t2';
+const PARTNER_OWNER_BACKFILL_KEY = 'partner_owner_backfill_cursor_2026_08_t3';
 const PARTNER_OWNER_BACKFILL_BATCH = 200;
 async function backfillPartnerDealOwners() {
   const cur = (await pool.query(
