@@ -3224,13 +3224,15 @@ function mailChrome(inner, preheaderRaw, brand, lang, home) {
               <td style="padding-right:12px;vertical-align:middle">
                 ${brand === 'cluster'
                   ? `<img src="${base}/cluster-logo-email.png" width="128" height="29" alt="Cluster" style="display:block;border:0">`
-                  : `<img src="${base}/saleshub-icon-192.png" width="36" height="36" alt="Sales Hub" style="display:block;border:0;border-radius:9px">`}
+                  : `<img src="${base}/saleshub-glyph-on-dark-128.png" width="32" height="40" alt="Sales Hub" style="display:block;border:0">`}
               </td>
               <td style="vertical-align:middle">
                 ${brand === 'cluster'
                   ? `<span style="display:block;color:#8a99af;font-size:12px;letter-spacing:.2px">Portail partenaire &middot; Partner Portal</span>`
-                  : `<span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-.3px">Sales&nbsp;Hub</span><span style="color:#f97316;font-size:22px;font-weight:700">.</span>`
-                    + `<span style="display:block;color:#8a99af;font-size:12px;margin-top:2px;letter-spacing:.2px">by Cluster Systems</span>`}
+                  : `<span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-.3px">Sales&nbsp;Hub</span>`
+                    + `<span style="display:block;color:#8a99af;font-size:12px;margin-top:3px;letter-spacing:.2px">`
+                      + `${isFrLocale(lang) ? 'par' : 'by'} <span style="color:#ffffff;font-weight:700">cluster</span> <span style="color:#F58345">&bull;</span>`
+                    + `</span>`}
               </td>
             </tr></table>
           </td></tr>
@@ -23142,6 +23144,7 @@ function payrollI18n(lang) {
   const en = String(lang || '').toLowerCase().startsWith('en');
   return en ? {
     emailSubject: 'Commissions payable', emailFooter: 'Detailed pay stubs attached (PDF). Gross amounts, before taxes and deductions.',
+    by: 'by',
     payStubTitle: 'PAY STUB', rep: 'REP', period: 'PERIOD', status: 'STATUS', paid: 'Paid', pending: 'Pending approval',
     commissions: 'COMMISSIONS', invoice: 'INVOICE', customer: 'CUSTOMER', amount: 'AMOUNT', subtotalCommissions: 'Commissions subtotal',
     bonus: 'BONUSES', type: 'TYPE', detail: 'DETAIL', subtotalBonus: 'Bonus subtotal',
@@ -23150,6 +23153,7 @@ function payrollI18n(lang) {
     blSignup: 'Signup bonus', blMonthly: 'Monthly bonus', blProcessing: 'Processing bonus', blAdjustment: 'Adjustment',
   } : {
     emailSubject: 'Commissions à verser', emailFooter: 'Bulletins détaillés en pièce jointe (PDF). Montants bruts, avant impôts et retenues.',
+    by: 'par',
     payStubTitle: 'BULLETIN DE PAIE', rep: 'VENDEUR', period: 'PÉRIODE', status: 'STATUT', paid: 'Payé', pending: "En attente d'approbation",
     commissions: 'COMMISSIONS', invoice: 'FACTURE', customer: 'CLIENT', amount: 'MONTANT', subtotalCommissions: 'Sous-total commissions',
     bonus: 'BONUS', type: 'TYPE', detail: 'DÉTAIL', subtotalBonus: 'Sous-total bonus',
@@ -23160,6 +23164,51 @@ function payrollI18n(lang) {
 }
 
 // Build a single combined PDF (one rep per page) with pdfkit. Returns a Buffer.
+// Le glyphe Sales Hub, dessine en VECTORIEL plutot qu'insere comme image.
+//
+// L'ancienne version posait `saleshub-mark-192.png` — la TUILE noire, celle du favicon — sur le
+// bandeau bleu nuit des rapports. Une tuile sombre sur un fond sombre ne se lit pas : elle fait
+// une tache. Le kit de marque le dit explicitement : sur une surface deja foncee on pose le
+// glyphe NU, jamais la tuile (voir SalesHubLogo.tsx, variantes 'glyph'/'horizontal'/'lockup').
+//
+// Vectoriel plutot que PNG : net a l'impression quelle que soit la taille, et plus aucun fichier
+// a embarquer avec le serveur. Le trace est celui du SVG de l'application, viewBox « 17 14 32 40 ».
+// Renvoie la largeur occupee, pour que l'appelant pose le texte a cote sans deviner.
+function drawSalesHubGlyph(doc, x, y, hauteur) {
+  const e = hauteur / 40;                    // 40 = hauteur du viewBox
+  doc.save();
+  doc.translate(x, y).scale(e).translate(-17, -14);
+  doc.path('M42 24 C42 18 24 18 24 26 C24 32.5 42 32 42 40 C42 48 24 48 23 41')
+     .lineWidth(6).lineCap('round').strokeColor('#FFFFFF').stroke();
+  doc.circle(42, 24, 4.5).fillColor('#F58345').fill();
+  doc.restore();
+  return 32 * e;                             // 32 = largeur du viewBox
+}
+
+// Le VERROUILLAGE de marque complet : glyphe + « Sales Hub » + « par cluster ● ».
+//
+// Le bandeau affichait « by Cluster Systems », qui n'est pas la signature de la marque. Celle-ci
+// est composee de trois encres sur une meme ligne — « par » en gris, « cluster » en blanc gras,
+// puis le point orange (voir SalesHubLogo.tsx, variante 'lockup').
+//
+// Les largeurs sont MESUREES (`widthOfString`) plutot que devinees : trois morceaux poses a des
+// decalages fixes se desaligneraient des que le mot change de langue — « par » et « by » n'ont
+// pas la meme largeur.
+function drawSalesHubLockup(doc, x, y, T) {
+  const gW = drawSalesHubGlyph(doc, x, y + 2, 32);
+  const tx = x + gW + 12;
+  doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(21).text('Sales Hub', tx, y + 2, { lineBreak: false });
+
+  const by = (T && T.by ? T.by : 'by') + ' ';
+  doc.fontSize(9);
+  const wBy = doc.font('Helvetica').widthOfString(by);
+  const wCluster = doc.font('Helvetica-Bold').widthOfString('cluster');
+  const ly = y + 30;
+  doc.fillColor('#8a99af').font('Helvetica').text(by, tx, ly, { lineBreak: false });
+  doc.fillColor('#ffffff').font('Helvetica-Bold').text('cluster', tx + wBy, ly, { lineBreak: false });
+  doc.circle(tx + wBy + wCluster + 5.5, ly + 3.4, 2.3).fillColor('#F58345').fill();
+}
+
 function buildPayrollPdf(periodLabel, reps, lang) {
   const T = payrollI18n(lang);
   return new Promise((resolve, reject) => {
@@ -23173,14 +23222,10 @@ function buildPayrollPdf(periodLabel, reps, lang) {
       const L = 40, R = 572, W = R - L, AMT_X = R - 96;     // content area + amount column
       const C = { dark: '#1c2434', orange: '#f2682c', gray: '#475569', light: '#94a3b8', zebra: '#fafbfd', line: '#e8edf3' };
       const ensure = (h) => { if (doc.y + h > 748) doc.addPage(); };
-      const brandMark = require('path').join(__dirname, 'assets', 'brand', 'saleshub-mark-192.png');
-
       const header = (r) => {
         doc.rect(0, 0, 612, 6).fill(C.orange);
         doc.rect(0, 6, 612, 74).fill(C.dark);
-        try { doc.image(brandMark, L, 20, { width: 34, height: 34 }); } catch (_e) { /* optional */ }
-        doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(21).text('Sales Hub', L + 44, 24);
-        doc.fillColor('#8a99af').font('Helvetica').fontSize(9).text('by Cluster Systems', L + 44, 50);
+        drawSalesHubLockup(doc, L, 22, T);
         doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text(T.payStubTitle, L, 26, { width: W, align: 'right', characterSpacing: 1.5 });
         doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(17).text(periodLabel, L, 42, { width: W, align: 'right' });
         // meta row
@@ -23298,15 +23343,11 @@ function buildProcessingBonusPdf(periodLabel, reps, lang) {
       const L = 40, R = 572, W = R - L, AMT_X = R - 96;
       const C = { dark: '#1c2434', orange: '#f2682c', gray: '#475569', light: '#94a3b8', zebra: '#fafbfd', line: '#e8edf3' };
       const ensure = (h) => { if (doc.y + h > 748) doc.addPage(); };
-      const brandMark = require('path').join(__dirname, 'assets', 'brand', 'saleshub-mark-192.png');
-
       reps.forEach((r, idx) => {
         if (idx > 0) doc.addPage();
         doc.rect(0, 0, 612, 6).fill(C.orange);
         doc.rect(0, 6, 612, 74).fill(C.dark);
-        try { doc.image(brandMark, L, 20, { width: 34, height: 34 }); } catch (_e) { /* optional */ }
-        doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(21).text('Sales Hub', L + 44, 24);
-        doc.fillColor('#8a99af').font('Helvetica').fontSize(9).text('by Cluster Systems', L + 44, 50);
+        drawSalesHubLockup(doc, L, 22, T);
         doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text(T.docTitle, L, 26, { width: W, align: 'right', characterSpacing: 1.5 });
         doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(17).text(periodLabel, L, 42, { width: W, align: 'right' });
         const my = 96;
