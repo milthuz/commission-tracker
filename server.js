@@ -18036,7 +18036,8 @@ app.post('/api/invoices/:invoiceNumber/email', authenticateToken, async (req, re
     });
   } catch (e) {
     console.error('Invoice email error:', e.message);
-    res.status(500).json({ error: 'Failed to send invoice email', details: e.message });
+    console.error('[invoice-email] echec de l envoi:', e.stack || e.message);
+    res.status(500).json({ error: `Failed to send invoice email: ${e.message}`, details: e.message });
   }
 });
 
@@ -23533,7 +23534,11 @@ app.post('/api/commissions/payroll/send', authenticateToken, async (req, res) =>
     );
     res.json({ sent: true, recipients: recipients.length, reps: reps.length, grandTotal: grand });
   } catch (e) {
-    res.status(500).json({ error: 'Failed to send payroll', details: e.message });
+    // Le motif part MAINTENANT dans les deux directions : le journal du serveur (avec la pile,
+    // pour retrouver la ligne fautive) et le message rendu a l'admin. L'ancienne version ne
+    // faisait ni l'un ni l'autre : `details` n'etait affiche nulle part et rien n'etait journalise.
+    console.error('[payroll-send] echec de l envoi:', e.stack || e.message);
+    res.status(500).json({ error: `Failed to send payroll: ${e.message}`, details: e.message });
   }
 });
 
@@ -23642,7 +23647,8 @@ app.post('/api/commissions/processing-bonus/send', authenticateToken, async (req
     );
     res.json({ sent: true, recipients: recipients.length, reps: reps.length, grandTotal: grand });
   } catch (e) {
-    res.status(500).json({ error: 'Failed to send processing bonus', details: e.message });
+    console.error('[bonus-send] echec de l envoi:', e.stack || e.message);
+    res.status(500).json({ error: `Failed to send processing bonus: ${e.message}`, details: e.message });
   }
 });
 
