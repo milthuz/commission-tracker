@@ -3348,6 +3348,14 @@ const signPartnerJwt = (pu) => jwt.sign(
   { email: pu.email, name: pu.display_name || pu.email, partnerId: pu.partner_id, partnerUserId: pu.id, role: pu.role, userType: 'partner' },
   JWT_SECRET, { expiresIn: '7d' }
 );
+// Un partenaire desactive n'a plus d'acces : ni connexion, ni activation d'invitation, ni
+// reinitialisation. Interroge a chaque fois plutot que mis en cache — fermer un partenaire doit
+// agir immediatement, et ces chemins-la sont rares (quelques appels par jour, pas par requete).
+async function partnerIsActive(partnerId) {
+  const r = await pool.query(`SELECT active FROM partners WHERE id = $1`, [partnerId]);
+  return !!r.rows[0]?.active;
+}
+
 const authenticatePartnerToken = async (req, res, next) => {
   const token = req.headers['authorization']?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token provided' });
@@ -3357,11 +3365,21 @@ const authenticatePartnerToken = async (req, res, next) => {
     // Never trust the JWT's role/partnerId alone — re-resolve the live row every request (same
     // reasoning as isAdmin/isDemo re-resolution in authenticateToken) so a disabled partner user
     // or a role change takes effect immediately, not just on next login.
+    // Le partenaire est joint ICI plutot que lu a part : cette requete part deja a chaque
+    // requete, et la base est derriere un proxy public (voir la note sur les allers-retours).
+    // Un JOIN ne coute rien, un second SELECT couterait un aller-retour par appel.
     const pu = (await pool.query(
-      `SELECT id, partner_id, email, display_name, role, status, totp_enabled FROM partner_users WHERE id = $1`,
+      `SELECT pu.id, pu.partner_id, pu.email, pu.display_name, pu.role, pu.status, pu.totp_enabled,
+              p.active AS partner_active
+         FROM partner_users pu JOIN partners p ON p.id = pu.partner_id
+        WHERE pu.id = $1`,
       [claims.partnerUserId]
     )).rows[0];
     if (!pu || pu.status !== 'active') return res.status(401).json({ error: 'Invalid token' });
+    // Desactiver un partenaire prend effet TOUT DE SUITE. Ne verrouiller que la connexion
+    // laisserait vivre les jetons deja emis pendant 7 jours — une semaine d'acces apres la
+    // fermeture du compte, ce qui n'est pas ce qu'un interrupteur promet.
+    if (!pu.partner_active) return res.status(403).json({ error: 'partner_inactive' });
     req.partnerUser = { id: pu.id, partnerId: pu.partner_id, email: pu.email, name: pu.display_name || pu.email, role: pu.role, totpEnabled: pu.totp_enabled };
     next();
   } catch {
@@ -3876,6 +3894,10 @@ app.post('/api/partner-auth/invite/verify-2fa', async (req, res) => {
     if (!authenticator.check(String(req.body.code || ''), pu.totp_secret)) {
       return res.status(401).json({ error: 'Invalid code' });
     }
+    // Une invitation partie AVANT la desactivation ne doit pas ouvrir un compte apres.
+    if (!(await partnerIsActive(pu.partner_id))) {
+      return res.status(403).json({ error: 'partner_inactive' });
+    }
     await pool.query(
       `UPDATE partner_users SET totp_enabled = true, status = 'active', activated_at = NOW(), invite_token_hash = NULL,
               invite_expires_at = NULL, last_login_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
@@ -3902,6 +3924,11 @@ app.post('/api/partner-auth/login', async (req, res) => {
     if (pu.status !== 'active' || !pu.totp_enabled) {
       return res.status(403).json({ error: 'Account setup incomplete — use your invitation link' });
     }
+    // Message DISTINCT de « identifiants invalides » : le compte est bon, c'est l'organisation
+    // qui est fermee. Envoyer quelqu'un chercher un mot de passe correct serait cruel et inutile.
+    if (!(await partnerIsActive(pu.partner_id))) {
+      return res.status(403).json({ error: 'partner_inactive' });
+    }
     if (await checkTrustedDevice(pu.email, 'partner', req.body.deviceToken)) {
       await pool.query(`UPDATE partner_users SET last_login_at = CURRENT_TIMESTAMP WHERE id = $1`, [pu.id]);
       logActivity('partner_user', pu.email, 'login', `${pu.display_name || pu.email} logged in to the Partner Portal (trusted device)`, pu.email);
@@ -3923,6 +3950,11 @@ app.post('/api/partner-auth/login/verify-2fa', async (req, res) => {
     if (!authenticator.check(String(req.body.code || ''), pu.totp_secret)) {
       return res.status(401).json({ error: 'Invalid code' });
     }
+    // C'est cette etape qui EMET le jeton : la verifier aussi, sinon le partenaire pourrait
+    // etre desactive entre le mot de passe et le code a six chiffres.
+    if (!(await partnerIsActive(pu.partner_id))) {
+      return res.status(403).json({ error: 'partner_inactive' });
+    }
     await pool.query(`UPDATE partner_users SET last_login_at = CURRENT_TIMESTAMP WHERE id = $1`, [pu.id]);
     logActivity('partner_user', pu.email, 'login', `${pu.display_name || pu.email} logged in to the Partner Portal`, pu.email);
     const deviceToken = req.body.rememberDevice ? await trustDevice(pu.email, 'partner') : undefined;
@@ -3936,8 +3968,13 @@ app.post('/api/partner-auth/forgot-password', async (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
   if (rateLimited(`pforgot:${req.ip}`)) return res.status(429).json({ error: 'Too many attempts — try again later' });
   try {
+    // `p.active` dans la requete : un partenaire ferme ne reçoit plus de lien. Le silence est
+    // deliberement le meme que pour une adresse inconnue — la reponse ne doit pas reveler
+    // quels comptes existent.
     const pu = (await pool.query(
-      `SELECT id, display_name, locale FROM partner_users WHERE email = $1 AND status = 'active'`, [email]
+      `SELECT pu.id, pu.display_name, pu.locale
+         FROM partner_users pu JOIN partners p ON p.id = pu.partner_id
+        WHERE pu.email = $1 AND pu.status = 'active' AND p.active`, [email]
     )).rows[0];
     if (pu) {
       const raw = newRawToken();
