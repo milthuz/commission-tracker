@@ -3439,7 +3439,7 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // sampleEmail(), dans TEMPLATE_TYPES de EmailPreview.tsx, et dans les libellés i18n.
 // Les quatre `pass_*` sont les courriels du programme La Passe ; ils sont les seuls de la
 // liste à partir d'une adresse et d'une enveloppe qui ne sont pas celles de Sales Hub.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit'];
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -3461,6 +3461,22 @@ function sampleEmail(type, lang) {
     }[key] || {};
     const built = passEmailPreview(key, m, { firstName: passFirstName(m), ...vars });
     return built || { subject: `(${type})`, html: `<p>${fr ? 'Gabarit inconnu' : 'Unknown template'}</p>` };
+  }
+
+  // Les courriels du PORTAIL PARTENAIRE passent par leur vrai texte (PARTNER_EMAIL_COPY) et
+  // leur vraie enveloppe (marque « cluster », domaine partenaire) — meme raison que pour La
+  // Passe : un apercu recopie a cote finit toujours par montrer autre chose que ce qui part.
+  // Ce sont les seuls courriels de la liste qui ne portent NI la marque NI le domaine Sales Hub.
+  if (type === 'partner_invite' || type === 'partner_reset') {
+    const locale = isFrLocale(lang) ? 'fr' : 'en';
+    const c = partnerCopy(type === 'partner_invite' ? 'invite' : 'reset', locale);
+    const base = PARTNER_WEB_BASE(locale);
+    const url = type === 'partner_invite'
+      ? `${base}/partner-portal/accept-invite?token=SAMPLE`
+      : `${base}/partner-portal/reset-password?token=SAMPLE`;
+    // `intro` est une fonction pour l'invitation (nom + partenaire), une chaine pour le reset.
+    const intro = typeof c.intro === 'function' ? c.intro('Shanna Da Silva', 'Moneris') : c.intro;
+    return { subject: c.subject, html: mailShell(c.title, intro, c.cta, url, locale, 'cluster') };
   }
 
   switch (type) {
