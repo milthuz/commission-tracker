@@ -2325,6 +2325,42 @@ const PARTNER_EMAIL_COPY = {
       cta: 'Activate my account',
     },
   },
+  // Invitation d'un compte REPRIS d'un ancien portail. Choisie automatiquement quand le compte
+  // est encore au statut « imported » — voir partnerInviteMail.
+  inviteMigration: {
+    fr: {
+      subject: 'Votre accès au Portail partenaire Cluster — vos dossiers ont suivi',
+      title: 'Votre portail partenaire a changé d’adresse',
+      intro: (name, partner, dossiers, contact) =>
+        `${name ? name + ', ' : ''}votre accès au Portail partenaire Cluster est prêt.<br><br>`
+        + `<b>Vos dossiers ont suivi.</b> `
+        + (dossiers
+            ? `Les ${dossiers} opportunités de ${partner || 'votre organisation'} et leur suivi sont déjà dans le nouveau portail`
+            : `Vos opportunités et leur suivi sont déjà dans le nouveau portail`)
+        + ` : vous n’avez rien à ressaisir.<br><br>`
+        + `<b>L’ancien portail est remplacé.</b> Il ne sera plus mis à jour — c’est désormais ici que tout se passe.<br><br>`
+        + (contact
+            ? `Une question, un blocage ? Écrivez directement à <a href="mailto:${contact}" style="color:#3c50e0">${contact}</a>.`
+            : ''),
+      cta: 'Activer mon compte',
+    },
+    en: {
+      subject: 'Your Cluster Partner Portal access — your records came with you',
+      title: 'Your partner portal has moved',
+      intro: (name, partner, dossiers, contact) =>
+        `${name ? name + ', ' : ''}your access to the Cluster Partner Portal is ready.<br><br>`
+        + `<b>Your records came with you.</b> `
+        + (dossiers
+            ? `${partner || 'Your organization'}’s ${dossiers} opportunities and their history are already in the new portal`
+            : `Your opportunities and their history are already in the new portal`)
+        + ` — nothing to re-enter.<br><br>`
+        + `<b>The old portal is retired.</b> It will no longer be updated — everything happens here from now on.<br><br>`
+        + (contact
+            ? `Questions, or stuck? Write directly to <a href="mailto:${contact}" style="color:#3c50e0">${contact}</a>.`
+            : ''),
+      cta: 'Activate my account',
+    },
+  },
   reset: {
     fr: {
       subject: 'Réinitialisation du mot de passe — Cluster',
@@ -2341,6 +2377,26 @@ const PARTNER_EMAIL_COPY = {
   },
 };
 const partnerCopy = (kind, lang) => PARTNER_EMAIL_COPY[kind][isFrLocale(lang) ? 'fr' : 'en'];
+
+// Construit l'invitation partenaire, dans la version qui convient.
+//
+// `reprise` n'est pas un reglage d'interface : il vient du statut du compte AVANT l'envoi. Un
+// compte « imported » a ete cree par une reprise de portail et n'a jamais ete invite — lui dire
+// « un compte vous a ete prepare » nierait les dossiers qu'il possede deja. Un compte cree a la
+// main recoit la version normale. Les trois chemins d'invitation passent par ici, pour qu'ils ne
+// puissent pas divergent l'un de l'autre.
+function partnerInviteMail({ locale, name, partnerName, reprise, dossiers, contact, url }) {
+  const c = partnerCopy(reprise ? 'inviteMigration' : 'invite', locale);
+  const intro = reprise ? c.intro(name, partnerName, dossiers, contact) : c.intro(name, partnerName);
+  return { subject: c.subject, html: mailShell(c.title, intro, c.cta, url, locale, 'cluster') };
+}
+
+// Combien de dossiers ce partenaire retrouvera-t-il en se connectant ? Sert uniquement au texte
+// de l'invitation de reprise — « vos 674 opportunités » rassure la ou « vos dossiers » reste vague.
+async function partnerRecordCount(partnerId) {
+  const r = await pool.query(`SELECT COUNT(*)::int n FROM partner_opportunities WHERE partner_id = $1`, [partnerId]);
+  return r.rows[0]?.n || 0;
+}
 
 // Origines autorisées à ENCADRER nos réponses (aperçus PDF affichés en iframe)
 // ET à faire des requêtes cross-origin. Une seule liste : deux listes qui
@@ -3459,7 +3515,7 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // sampleEmail(), dans TEMPLATE_TYPES de EmailPreview.tsx, et dans les libellés i18n.
 // Les quatre `pass_*` sont les courriels du programme La Passe ; ils sont les seuls de la
 // liste à partir d'une adresse et d'une enveloppe qui ne sont pas celles de Sales Hub.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset'];
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -3487,6 +3543,16 @@ function sampleEmail(type, lang) {
   // leur vraie enveloppe (marque « cluster », domaine partenaire) — meme raison que pour La
   // Passe : un apercu recopie a cote finit toujours par montrer autre chose que ce qui part.
   // Ce sont les seuls courriels de la liste qui ne portent NI la marque NI le domaine Sales Hub.
+  if (type === 'partner_invite_migration') {
+    const locale = isFrLocale(lang) ? 'fr' : 'en';
+    // Chiffres d'exemple choisis pour ressembler au cas reel : Moneris et ses 674 dossiers.
+    return partnerInviteMail({
+      locale, name: 'Shanna Da Silva', partnerName: 'Moneris', reprise: true,
+      dossiers: 674, contact: 'david@clustersystems.com',
+      url: `${PARTNER_WEB_BASE(locale)}/partner-portal/accept-invite?token=SAMPLE`,
+    });
+  }
+
   if (type === 'partner_invite' || type === 'partner_reset') {
     const locale = isFrLocale(lang) ? 'fr' : 'en';
     const c = partnerCopy(type === 'partner_invite' ? 'invite' : 'reset', locale);
@@ -4507,18 +4573,16 @@ app.post('/api/partner-portal/team/invite', authenticatePartnerToken, async (req
       [req.partnerUser.partnerId, email, name || null, role, sha256hex(raw), expires, req.partnerUser.email, locale]
     );
     const inviteUrl = `${PARTNER_WEB_BASE(locale)}/partner-portal/accept-invite?token=${raw}`;
-    const mail = await sendMail(
-      email,
-      partnerCopy('invite', locale).subject,
-      mailShell(
-        partnerCopy('invite', locale).title,
-        partnerCopy('invite', locale).intro(name, partnerName),
-        partnerCopy('invite', locale).cta,
-        inviteUrl,
-        locale,
-        'cluster'
-      )
-    );
+    // Les collegues qu'un administrateur Moneris invitera depuis son portail sont eux AUSSI des
+    // comptes repris : ils doivent lire la meme chose que lui. Le contact est l'administrateur
+    // qui invite — c'est lui que son collegue connait, pas nous.
+    const reprise = existing?.status === 'imported';
+    const courriel = partnerInviteMail({
+      locale, name, partnerName, reprise,
+      dossiers: reprise ? await partnerRecordCount(req.partnerUser.partnerId) : 0,
+      contact: req.partnerUser.email || null, url: inviteUrl,
+    });
+    const mail = await sendMail(email, courriel.subject, courriel.html);
     logActivity('partner_user', email, 'invited', `${email}${name ? ` (${name})` : ''} invited by ${req.partnerUser.email}`, req.partnerUser.email);
     res.json({ success: true, inviteUrl, emailSent: mail.sent, emailError: mail.sent ? null : mail.reason });
   } catch (e) {
@@ -5336,6 +5400,9 @@ app.post('/api/admin/partner-users/invite', authenticateToken, async (req, res) 
         WHERE pu.id = ANY($1::int[])`, [ids]
     )).rows;
 
+    // Le nombre de dossiers est le meme pour tout un lot : une seule requete, pas une par usager
+    // (la base est derriere un proxy public — voir la note sur les allers-retours).
+    const dossiersParPartenaire = new Map();
     for (const u of rows) {
       // Un compte ACTIF a deja son acces : lui renvoyer une invitation reinitialiserait son
       // mot de passe et sa 2FA. On refuse, en le disant.
@@ -5355,16 +5422,20 @@ app.post('/api/admin/partner-users/invite', authenticateToken, async (req, res) 
           [u.id, sha256hex(raw), expires, actor]
         );
         const inviteUrl = `${PARTNER_WEB_BASE(locale)}/partner-portal/accept-invite?token=${raw}`;
-        const mail = await sendMail(
-          u.email,
-          partnerCopy('invite', locale).subject,
-          mailShell(
-            partnerCopy('invite', locale).title,
-            partnerCopy('invite', locale).intro(u.display_name, u.partner_name),
-            partnerCopy('invite', locale).cta,
-            inviteUrl, locale, 'cluster'
-          )
-        );
+        // ⚠️ `u.status` est le statut d'AVANT la mise a jour ci-dessus, qui vient de le passer a
+        // « invited ». C'est precisement ce qu'il faut : « imported » = compte repris d'un ancien
+        // portail. Le relire apres l'ecriture donnerait toujours « invited », donc jamais la
+        // version reprise.
+        const reprise = u.status === 'imported';
+        if (reprise && !dossiersParPartenaire.has(u.partner_id)) {
+          dossiersParPartenaire.set(u.partner_id, await partnerRecordCount(u.partner_id));
+        }
+        const courriel = partnerInviteMail({
+          locale, name: u.display_name, partnerName: u.partner_name, reprise,
+          dossiers: reprise ? dossiersParPartenaire.get(u.partner_id) : 0,
+          contact: actor.includes('@') ? actor : null, url: inviteUrl,
+        });
+        const mail = await sendMail(u.email, courriel.subject, courriel.html);
         if (mail.sent) {
           report.sent.push({ email: u.email });
           logActivity('partner_user', u.email, 'invited',
@@ -5660,18 +5731,15 @@ app.post('/api/admin/partners/:id/invite-admin', authenticateToken, async (req, 
       [partnerId, email, name || null, sha256hex(raw), expires, actor, locale]
     );
     const inviteUrl = `${PARTNER_WEB_BASE(locale)}/partner-portal/accept-invite?token=${raw}`;
-    const mail = await sendMail(
-      email,
-      partnerCopy('invite', locale).subject,
-      mailShell(
-        partnerCopy('invite', locale).title,
-        partnerCopy('invite', locale).intro(name, partnerName),
-        partnerCopy('invite', locale).cta,
-        inviteUrl,
-        locale,
-        'cluster'
-      )
-    );
+    // Ce point d'acces CREE normalement un compte, mais son upsert peut retomber sur une ligne
+    // reprise (`ON CONFLICT (email) DO UPDATE`) : on regarde donc le statut d'avant.
+    const reprise = existing?.status === 'imported';
+    const courriel = partnerInviteMail({
+      locale, name, partnerName, reprise,
+      dossiers: reprise ? await partnerRecordCount(partnerId) : 0,
+      contact: actor.includes('@') ? actor : null, url: inviteUrl,
+    });
+    const mail = await sendMail(email, courriel.subject, courriel.html);
     logActivity('partner_user', email, 'invited', `${email}${name ? ` (${name})` : ''} invited as Partner Admin for ${partner.name} by ${actor}`, actor);
     res.json({ success: true, inviteUrl, emailSent: mail.sent, emailError: mail.sent ? null : mail.reason });
   } catch (e) {
