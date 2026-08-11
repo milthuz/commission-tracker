@@ -6730,6 +6730,150 @@ async function toolCrmGetRecord(scope, { module, recordId }) {
   return { record: crmRecordSummary(mod, rec), notes };
 }
 
+// Resolve the caller's own Zoho CRM user id, so a record they create is OWNED
+// by them. This is not a nicety: scopeFilter matches on Owner.name, so a lead
+// created under the shared admin token would be INVISIBLE to the rep who just
+// asked for it. Cached briefly — the user list changes on the order of months.
+let _crmUsersCache = { at: 0, users: [] };
+async function crmActiveUsers() {
+  if (Date.now() - _crmUsersCache.at < 10 * 60 * 1000) return _crmUsersCache.users;
+  const token = await ensureValidCrmToken();
+  const r = await axios.get('https://www.zohoapis.com/crm/v2/users?type=ActiveUsers', {
+    headers: { Authorization: `Zoho-oauthtoken ${token}` }, validateStatus: () => true, timeout: 20000,
+  });
+  const users = r.status === 200 ? (r.data?.users || []) : [];
+  _crmUsersCache = { at: Date.now(), users };
+  return users;
+}
+
+async function resolveCrmOwnerId(scope) {
+  const users = await crmActiveUsers();
+  const byEmail = String(scope.email || '').trim().toLowerCase();
+  const byName = String(scope.repName || '').trim().toLowerCase();
+  const hit = users.find(u => (u.email && String(u.email).trim().toLowerCase() === byEmail))
+           || users.find(u => String(u.full_name || '').trim().toLowerCase() === byName);
+  return hit ? hit.id : null;
+}
+
+// Owner for a record Sofia is about to create. Refuses rather than creating an
+// orphan the requester cannot see afterwards; admins are exempt because they
+// see everything regardless.
+async function ownerForNewRecord(scope) {
+  const id = await resolveCrmOwnerId(scope);
+  if (id) return { ok: true, ownerId: id };
+  if (scope.canSeeAll) return { ok: true, ownerId: null };   // let Zoho default
+  return {
+    ok: false,
+    error: 'I could not find a Zoho CRM user account matching you, so anything I created would be filed under someone else and you would not be able to see it. Ask an administrator to confirm your CRM account, or have them create the record.',
+  };
+}
+
+// The Stage picklist is configured per org, so a guessed value gets rejected.
+// Fetch the real values and hand them back on mismatch — the tool loop lets the
+// model correct itself in the same turn instead of failing at the user.
+let _dealStageCache = { at: 0, stages: [] };
+async function crmDealStages() {
+  if (Date.now() - _dealStageCache.at < 30 * 60 * 1000 && _dealStageCache.stages.length) return _dealStageCache.stages;
+  const token = await ensureValidCrmToken();
+  const r = await axios.get('https://www.zohoapis.com/crm/v2/settings/fields', {
+    params: { module: 'Deals' },
+    headers: { Authorization: `Zoho-oauthtoken ${token}` }, validateStatus: () => true, timeout: 20000,
+  });
+  const stageField = r.status === 200
+    ? (r.data?.fields || []).find(f => f.api_name === 'Stage')
+    : null;
+  const stages = (stageField?.pick_list_values || []).map(v => v.display_value || v.actual_value).filter(Boolean);
+  if (stages.length) _dealStageCache = { at: Date.now(), stages };
+  return stages;
+}
+
+async function toolCrmCreateLead(scope, i) {
+  const company = String(i.company || '').trim();
+  if (!company) return { error: 'A lead needs a company/business name.' };
+
+  // Duplicate check FIRST, reusing the partner-portal detector. Creating a
+  // second Lead for a merchant that already exists is the expensive mistake
+  // here — it splits history and can misattribute a future deal.
+  const dup = await checkCrmDuplicate({
+    businessName: company, contactEmail: i.email, contactPhone: i.phone,
+  });
+  if (dup.matches?.length && !i.createAnyway) {
+    return {
+      duplicate: true,
+      existing: dup.matches.slice(0, 5).map(m => ({
+        module: m.module, matchedOn: m.matchedOn, company: m.company, id: m.id,
+      })),
+      note: 'Zoho already has record(s) matching this. Tell the user what exists and ask whether to add a note to it instead, or to create a new lead anyway (pass createAnyway=true only if they explicitly confirm a duplicate is wanted).',
+    };
+  }
+
+  const owner = await ownerForNewRecord(scope);
+  if (!owner.ok) return { error: owner.error };
+
+  const fields = {
+    Company: company.slice(0, 200),
+    // Zoho requires Last_Name on Leads; the partner flow makes the same fallback.
+    Last_Name: String(i.lastName || '').trim() || company.slice(0, 80),
+    Country: 'Canada',
+    Lead_Status: 'NEW',
+    Lead_Contact_Method: 'Sales Hub — Sofia',
+    Description: [
+      String(i.notes || '').trim(),
+      `Created by ${scope.actorLabel} via Sofia (Sales Hub).`,
+    ].filter(Boolean).join('\n\n').slice(0, 32000),
+  };
+  if (i.firstName) fields.First_Name = String(i.firstName).slice(0, 80);
+  if (i.email) fields.Email = String(i.email).slice(0, 120);
+  if (i.phone) fields.Phone = String(i.phone).slice(0, 40);
+  if (i.leadSource) fields.Lead_Source = String(i.leadSource).slice(0, 80);
+  if (owner.ownerId) fields.Owner = { id: owner.ownerId };
+
+  const r = await crmPost('/Leads', { data: [fields] });
+  return r.ok
+    ? { ok: true, leadId: r.id, company, owner: scope.repName || 'you' }
+    : { error: `Zoho refused the lead: ${r.error}` };
+}
+
+async function toolCrmCreateDeal(scope, i) {
+  const name = String(i.dealName || '').trim();
+  if (!name) return { error: 'A deal needs a name.' };
+  const closing = String(i.closingDate || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(closing)) return { error: 'closingDate is required, format YYYY-MM-DD.' };
+
+  const stages = await crmDealStages();
+  const wanted = String(i.stage || '').trim();
+  if (stages.length) {
+    const match = stages.find(s => s.toLowerCase() === wanted.toLowerCase());
+    if (!match) {
+      return { error: `"${wanted || '(none)'}" is not a valid stage in this Zoho org.`, validStages: stages };
+    }
+    i.stage = match; // use Zoho's exact casing
+  }
+
+  const owner = await ownerForNewRecord(scope);
+  if (!owner.ok) return { error: owner.error };
+
+  const fields = {
+    Deal_Name: name.slice(0, 200),
+    Stage: i.stage,
+    Closing_Date: closing,
+    Description: [
+      String(i.notes || '').trim(),
+      `Created by ${scope.actorLabel} via Sofia (Sales Hub).`,
+    ].filter(Boolean).join('\n\n').slice(0, 32000),
+  };
+  if (i.amount != null && !Number.isNaN(Number(i.amount))) fields.Amount = Number(i.amount);
+  // Linking to an existing Account needs its id — the model gets one from
+  // crm_find_record rather than typing a name Zoho would silently not match.
+  if (i.accountId) fields.Account_Name = { id: String(i.accountId) };
+  if (owner.ownerId) fields.Owner = { id: owner.ownerId };
+
+  const r = await crmPost('/Deals', { data: [fields] });
+  return r.ok
+    ? { ok: true, dealId: r.id, dealName: name, stage: i.stage, closingDate: closing, owner: scope.repName || 'you' }
+    : { error: `Zoho refused the deal: ${r.error}` };
+}
+
 async function toolCrmAddNote(scope, { module, recordId, title, content }) {
   const mod = SOFIA_MODULES[module] ? module : 'Deals';
   const body = String(content || '').trim();
@@ -7084,6 +7228,46 @@ const SOFIA_TOOLS = [
     handler: toolCrmExport,
   },
   {
+    name: 'crm_create_lead',
+    perm: 'assistant:crm_write',
+    write: true,
+    description: 'Create a new Lead in Zoho CRM. Checks for existing matching records first and reports them instead of creating a duplicate — only pass createAnyway=true if the user explicitly confirms they want a duplicate. The lead is filed under the requesting user.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        company: { type: 'string', description: 'Business / restaurant name. Required.' },
+        lastName: { type: 'string', description: "Contact's last name. Defaults to the company name if unknown." },
+        firstName: { type: 'string' },
+        email: { type: 'string' },
+        phone: { type: 'string' },
+        leadSource: { type: 'string', description: 'How the lead came in, if the user said.' },
+        notes: { type: 'string', description: "Context in the user's own words, written to the Description." },
+        createAnyway: { type: 'boolean', description: 'Only after the user confirms a duplicate is intended.' },
+      },
+      required: ['company'],
+    },
+    handler: toolCrmCreateLead,
+  },
+  {
+    name: 'crm_create_deal',
+    perm: 'assistant:crm_write',
+    write: true,
+    description: 'Create a new Deal in Zoho CRM. Stage must be one of the org\'s configured values — if you are unsure, attempt it and the error will list the valid stages. Link it to an existing account by passing accountId from crm_find_record. The deal is filed under the requesting user.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        dealName: { type: 'string', description: 'Required.' },
+        stage: { type: 'string', description: "Must match the org's Stage picklist." },
+        closingDate: { type: 'string', description: 'Required, YYYY-MM-DD. Resolve relative dates yourself.' },
+        amount: { type: 'number' },
+        accountId: { type: 'string', description: 'Account id from crm_find_record, to link the deal to a merchant.' },
+        notes: { type: 'string' },
+      },
+      required: ['dealName', 'stage', 'closingDate'],
+    },
+    handler: toolCrmCreateDeal,
+  },
+  {
     name: 'crm_add_note',
     perm: 'assistant:crm_write',
     write: true,
@@ -7144,6 +7328,8 @@ async function sofiaCrmEnabled() {
 }
 
 const SOFIA_AUDITED = {
+  crm_create_lead:       { event: 'sofia_lead',     label: 'Sofia created a CRM lead' },
+  crm_create_deal:       { event: 'sofia_deal',     label: 'Sofia created a CRM deal' },
   crm_add_note:          { event: 'sofia_note',     label: 'Sofia added a CRM note' },
   crm_schedule_followup: { event: 'sofia_followup', label: 'Sofia scheduled a CRM follow-up' },
   crm_export:            { event: 'sofia_export',   label: 'Sofia generated an export' },
@@ -7483,17 +7669,53 @@ async function runSofiaTool(tools, scope, call) {
 // what will ACTUALLY be sent to Zoho, not a paraphrase of it.
 function describePendingAction(call) {
   const i = call.input || {};
+  // `details` is a generic [labelKey, value] list so a new write tool needs no
+  // frontend change to render a readable confirmation card.
+  const row = (k, v) => (v == null || v === '' ? null : [k, String(v)]);
+
   if (call.name === 'crm_add_note') {
-    return { kind: 'note', module: i.module, title: i.title || null, content: String(i.content || '') };
+    return {
+      kind: 'note',
+      details: [row('title', i.title), row('module', i.module)].filter(Boolean),
+      content: String(i.content || ''),
+    };
   }
   if (call.name === 'crm_schedule_followup') {
     return {
       kind: String(i.type).toLowerCase() === 'call' ? 'call' : 'task',
-      module: i.module, subject: i.subject || null,
-      when: [i.dueDate, i.time].filter(Boolean).join(' '),
+      details: [
+        row('subject', i.subject),
+        row('when', [i.dueDate, i.time].filter(Boolean).join(' ')),
+        row('module', i.module),
+      ].filter(Boolean),
     };
   }
-  return { kind: call.name };
+  if (call.name === 'crm_create_lead') {
+    return {
+      kind: 'lead',
+      details: [
+        row('company', i.company),
+        row('contact', [i.firstName, i.lastName].filter(Boolean).join(' ')),
+        row('email', i.email),
+        row('phone', i.phone),
+        row('source', i.leadSource),
+      ].filter(Boolean),
+      content: String(i.notes || ''),
+    };
+  }
+  if (call.name === 'crm_create_deal') {
+    return {
+      kind: 'deal',
+      details: [
+        row('dealName', i.dealName),
+        row('stage', i.stage),
+        row('when', i.closingDate),
+        row('amount', i.amount == null ? null : `$${Number(i.amount).toLocaleString('en-CA')}`),
+      ].filter(Boolean),
+      content: String(i.notes || ''),
+    };
+  }
+  return { kind: call.name, details: [] };
 }
 
 // Read-tool trail, so the UI can show what Sofia looked at to get its answer.
