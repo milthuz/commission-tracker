@@ -2310,6 +2310,13 @@ const isFrLocale = (lang) => String(lang || 'fr').toLowerCase().startsWith('fr')
 // d'un partenaire avec Cluster : elle merite d'etre ecrite dans sa langue, pas dans les
 // deux. La langue est choisie par la personne qui invite et conservee sur le compte
 // (partner_users.locale), donc la reinitialisation de mot de passe la retrouve seule.
+// A qui un partenaire ecrit quand il a une question sur son acces.
+//
+// DELIBEREMENT une adresse fixe et non celle de la personne qui clique sur « Inviter » : le
+// courriel invite quelqu'un a poser ses questions a un interlocuteur qui saura repondre, pas a
+// celui qui a lance l'envoi ce jour-la. Une seule ligne a changer si l'interlocuteur change.
+const PARTNER_SUPPORT_EMAIL = 'gabriella.daly@clustersystems.com';
+
 const PARTNER_EMAIL_COPY = {
   invite: {
     fr: {
@@ -3556,7 +3563,7 @@ function sampleEmail(type, lang) {
     // Chiffres d'exemple choisis pour ressembler au cas reel : Moneris et ses 674 dossiers.
     return partnerInviteMail({
       locale, name: 'Shanna Da Silva', partnerName: 'Moneris', reprise: true,
-      dossiers: 674, contact: 'david@clustersystems.com',
+      dossiers: 674, contact: PARTNER_SUPPORT_EMAIL,
       url: `${PARTNER_WEB_BASE(locale)}/partner-portal/accept-invite?token=SAMPLE`,
     });
   }
@@ -4588,7 +4595,7 @@ app.post('/api/partner-portal/team/invite', authenticatePartnerToken, async (req
     const courriel = partnerInviteMail({
       locale, name, partnerName, reprise,
       dossiers: reprise ? await partnerRecordCount(req.partnerUser.partnerId) : 0,
-      contact: req.partnerUser.email || null, url: inviteUrl,
+      contact: PARTNER_SUPPORT_EMAIL, url: inviteUrl,
     });
     const mail = await sendMail(email, courriel.subject, courriel.html);
     logActivity('partner_user', email, 'invited', `${email}${name ? ` (${name})` : ''} invited by ${req.partnerUser.email}`, req.partnerUser.email);
@@ -4802,13 +4809,26 @@ app.get('/api/admin/partners', authenticateToken, async (req, res) => {
               p.lead_source, p.billing_contact_name, p.billing_contact_email, p.billing_contact_phone,
               p.business_contact_name, p.business_contact_email, p.business_contact_phone, p.payout_rate,
               p.initial_payout_rate,
-              COUNT(pu.id) AS user_count
+              COUNT(pu.id) AS user_count,
+              -- Avancement des invitations, agrege ici pour eviter un appel par partenaire.
+              -- Le compte des envoyees inclut les comptes deja actives : sinon le total
+              -- diminuerait a mesure que les gens s'activent, ce qui se lit comme une
+              -- regression alors que c'est un succes.
+              -- (Pas de guillemets obliques dans ce commentaire : il vit dans un litteral JS.)
+              COUNT(pu.id) FILTER (WHERE pu.invited_at IS NOT NULL) AS invited_count,
+              COUNT(pu.id) FILTER (WHERE pu.invite_opened_at IS NOT NULL) AS opened_count,
+              COUNT(pu.id) FILTER (WHERE pu.activated_at IS NOT NULL) AS activated_count,
+              MAX(pu.invited_at) AS last_invited_at
          FROM partners p LEFT JOIN partner_users pu ON pu.partner_id = p.id
         GROUP BY p.id ORDER BY p.name`
     )).rows;
     res.json({ partners: rows.map((r) => ({
       id: r.id, name: r.name, active: r.active, createdAt: r.created_at,
       hasLogo: r.has_logo, userCount: parseInt(r.user_count, 10),
+      invitedCount: parseInt(r.invited_count, 10),
+      openedCount: parseInt(r.opened_count, 10),
+      activatedCount: parseInt(r.activated_count, 10),
+      lastInvitedAt: r.last_invited_at,
       leadSource: r.lead_source,
       billingContactName: r.billing_contact_name, billingContactEmail: r.billing_contact_email, billingContactPhone: r.billing_contact_phone,
       businessContactName: r.business_contact_name, businessContactEmail: r.business_contact_email, businessContactPhone: r.business_contact_phone,
@@ -5441,7 +5461,7 @@ app.post('/api/admin/partner-users/invite', authenticateToken, async (req, res) 
         const courriel = partnerInviteMail({
           locale, name: u.display_name, partnerName: u.partner_name, reprise,
           dossiers: reprise ? dossiersParPartenaire.get(u.partner_id) : 0,
-          contact: actor.includes('@') ? actor : null, url: inviteUrl,
+          contact: PARTNER_SUPPORT_EMAIL, url: inviteUrl,
         });
         const mail = await sendMail(u.email, courriel.subject, courriel.html);
         if (mail.sent) {
@@ -5745,7 +5765,7 @@ app.post('/api/admin/partners/:id/invite-admin', authenticateToken, async (req, 
     const courriel = partnerInviteMail({
       locale, name, partnerName, reprise,
       dossiers: reprise ? await partnerRecordCount(partnerId) : 0,
-      contact: actor.includes('@') ? actor : null, url: inviteUrl,
+      contact: PARTNER_SUPPORT_EMAIL, url: inviteUrl,
     });
     const mail = await sendMail(email, courriel.subject, courriel.html);
     logActivity('partner_user', email, 'invited', `${email}${name ? ` (${name})` : ''} invited as Partner Admin for ${partner.name} by ${actor}`, actor);
