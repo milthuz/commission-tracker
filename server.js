@@ -440,6 +440,10 @@ async function initializeDatabase() {
     // et il méritait mieux qu'un message écrit deux fois. 'fr' par défaut — marché
     // principal, et c'est ce que recevaient les partenaires existants.
     await pool.query(`ALTER TABLE partner_users ADD COLUMN IF NOT EXISTS locale VARCHAR(5) DEFAULT 'fr'`);
+    // D'ou vient ce compte. Marque DURABLE, contrairement au statut « imported » qui disparait
+    // des la premiere invitation : c'est elle qui choisit la version du courriel, y compris sur
+    // une relance des semaines plus tard.
+    await pool.query(`ALTER TABLE partner_users ADD COLUMN IF NOT EXISTS migration_source VARCHAR(50)`);
     // Deal issu de la conversion du Lead. Retenu parce que la resolution passe par une
     // RECHERCHE par nom, couteuse et ambigue : une fois trouve, on n'y revient plus.
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_deal_id VARCHAR(50)`);
@@ -1617,6 +1621,22 @@ async function initializeDatabase() {
     //
     // Le drapeau est indispensable : sans lui, chaque redemarrage effacerait ce que le travail
     // horaire vient de retablir.
+    // Remplissage UNIQUE : les comptes repris avant l'existence de la colonne. Le drapeau est
+    // indispensable — sans lui, un futur import creant des comptes « imported » se verrait
+    // etiqueter de la mauvaise reprise au prochain redemarrage.
+    const migMarkKey = 'partner_users_migration_source_2026_08';
+    if (!(await pool.query(`SELECT 1 FROM sync_state WHERE key = $1`, [migMarkKey])).rowCount) {
+      const marques = await pool.query(
+        `UPDATE partner_users SET migration_source = 'zoho-creator-2026-08-05'
+          WHERE status = 'imported' AND migration_source IS NULL`);
+      await pool.query(
+        `INSERT INTO sync_state (key, value, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP)
+         ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = CURRENT_TIMESTAMP`,
+        [migMarkKey, String(marques.rowCount)]
+      );
+      console.log(`🏷️ [partner-users] ${marques.rowCount} compte(s) marque(s) comme repris d'un ancien portail`);
+    }
+
     const ownerFixKey = 'partner_owner_name_reset_2026_08';
     const alreadyFixed = (await pool.query(`SELECT 1 FROM sync_state WHERE key = $1`, [ownerFixKey])).rowCount > 0;
     if (!alreadyFixed) {
@@ -4557,7 +4577,7 @@ app.post('/api/partner-portal/team/invite', authenticatePartnerToken, async (req
     // token for a row that still belongs to B, and redeeming it yields an active session scoped
     // to B. Reject any email that already belongs to another company outright.
     const existing = (await pool.query(
-      `SELECT id, status, partner_id FROM partner_users WHERE email = $1`, [email]
+      `SELECT id, status, partner_id, migration_source FROM partner_users WHERE email = $1`, [email]
     )).rows[0];
     if (existing && existing.partner_id !== req.partnerUser.partnerId) {
       return res.status(409).json({ error: 'That email is already registered on the Partner Portal' });
@@ -4591,7 +4611,7 @@ app.post('/api/partner-portal/team/invite', authenticatePartnerToken, async (req
     // Les collegues qu'un administrateur Moneris invitera depuis son portail sont eux AUSSI des
     // comptes repris : ils doivent lire la meme chose que lui. Le contact est l'administrateur
     // qui invite — c'est lui que son collegue connait, pas nous.
-    const reprise = existing?.status === 'imported';
+    const reprise = !!existing?.migration_source;
     const courriel = partnerInviteMail({
       locale, name, partnerName, reprise,
       dossiers: reprise ? await partnerRecordCount(req.partnerUser.partnerId) : 0,
@@ -5138,11 +5158,14 @@ app.post('/api/admin/partner-migration', authenticateToken, async (req, res) => 
       // echouer Postgres avec « could not determine data type of parameter » — il ne peut pas
       // deviner le type de quelque chose qui ne sert nulle part. Les numeros partent donc a $2
       // sans trou. (Defaut trouve en repetition, il rendait le premier appel reel impossible.)
-      const vals = uRows.map((_, k) => `($1,$${k * 4 + 2},$${k * 4 + 3},$${k * 4 + 4},'imported',$${k * 4 + 5})`).join(',');
-      const params = [partnerId];
+      // `$2` porte la source, commune a tout l'import — d'ou les parametres des lignes qui
+      // commencent a $3. Une erreur d'arithmetique ici donne « could not determine data type of
+      // parameter », deja rencontre deux fois sur ce fichier.
+      const vals = uRows.map((_, k) => `($1,$${k * 4 + 3},$${k * 4 + 4},$${k * 4 + 5},'imported',$${k * 4 + 6},$2)`).join(',');
+      const params = [partnerId, source];
       for (const r of uRows) params.push(...r);
       const ins = await client.query(
-        `INSERT INTO partner_users (partner_id, email, display_name, role, status, locale)
+        `INSERT INTO partner_users (partner_id, email, display_name, role, status, locale, migration_source)
          VALUES ${vals} ON CONFLICT (email) DO NOTHING RETURNING email`,
         params
       );
@@ -5423,7 +5446,8 @@ app.post('/api/admin/partner-users/invite', authenticateToken, async (req, res) 
   const report = { sent: [], skipped: [], failed: [] };
   try {
     const rows = (await pool.query(
-      `SELECT pu.id, pu.email, pu.display_name, pu.role, pu.status, pu.locale, p.id AS partner_id, p.name AS partner_name
+      `SELECT pu.id, pu.email, pu.display_name, pu.role, pu.status, pu.locale, pu.migration_source,
+              p.id AS partner_id, p.name AS partner_name
          FROM partner_users pu JOIN partners p ON p.id = pu.partner_id
         WHERE pu.id = ANY($1::int[])`, [ids]
     )).rows;
@@ -5450,11 +5474,10 @@ app.post('/api/admin/partner-users/invite', authenticateToken, async (req, res) 
           [u.id, sha256hex(raw), expires, actor]
         );
         const inviteUrl = `${PARTNER_WEB_BASE(locale)}/partner-portal/accept-invite?token=${raw}`;
-        // ⚠️ `u.status` est le statut d'AVANT la mise a jour ci-dessus, qui vient de le passer a
-        // « invited ». C'est precisement ce qu'il faut : « imported » = compte repris d'un ancien
-        // portail. Le relire apres l'ecriture donnerait toujours « invited », donc jamais la
-        // version reprise.
-        const reprise = u.status === 'imported';
+        // La MARQUE, pas le statut : le statut « imported » disparait des la premiere invitation,
+        // si bien qu'une relance deux semaines plus tard repartait avec le texte standard apres
+        // avoir annonce « vos dossiers ont suivi ».
+        const reprise = !!u.migration_source;
         if (reprise && !dossiersParPartenaire.has(u.partner_id)) {
           dossiersParPartenaire.set(u.partner_id, await partnerRecordCount(u.partner_id));
         }
@@ -5739,7 +5762,7 @@ app.post('/api/admin/partners/:id/invite-admin', authenticateToken, async (req, 
   try {
     const partner = (await pool.query(`SELECT name FROM partners WHERE id = $1`, [partnerId])).rows[0];
     if (!partner) return res.status(404).json({ error: 'Partner not found' });
-    const existing = (await pool.query(`SELECT id, status FROM partner_users WHERE email = $1`, [email])).rows[0];
+    const existing = (await pool.query(`SELECT id, status, migration_source FROM partner_users WHERE email = $1`, [email])).rows[0];
     if (existing && existing.status === 'active') return res.status(409).json({ error: 'User already active' });
     const raw = newRawToken();
     const expires = new Date(Date.now() + 7 * 24 * 3600 * 1000);
@@ -5761,7 +5784,7 @@ app.post('/api/admin/partners/:id/invite-admin', authenticateToken, async (req, 
     const inviteUrl = `${PARTNER_WEB_BASE(locale)}/partner-portal/accept-invite?token=${raw}`;
     // Ce point d'acces CREE normalement un compte, mais son upsert peut retomber sur une ligne
     // reprise (`ON CONFLICT (email) DO UPDATE`) : on regarde donc le statut d'avant.
-    const reprise = existing?.status === 'imported';
+    const reprise = !!existing?.migration_source;
     const courriel = partnerInviteMail({
       locale, name, partnerName, reprise,
       dossiers: reprise ? await partnerRecordCount(partnerId) : 0,
