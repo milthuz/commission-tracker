@@ -2329,36 +2329,44 @@ const PARTNER_EMAIL_COPY = {
   // est encore au statut « imported » — voir partnerInviteMail.
   inviteMigration: {
     fr: {
-      subject: 'Votre accès au Portail partenaire Cluster — vos dossiers ont suivi',
-      title: 'Votre portail partenaire a changé d’adresse',
+      subject: 'Votre portail partenaire fait peau neuve',
+      title: 'Un nouveau portail — et vos dossiers déjà dedans',
       intro: (name, partner, dossiers, contact) =>
-        `${name ? name + ', ' : ''}votre accès au Portail partenaire Cluster est prêt.<br><br>`
+        `${name ? name + ', ' : ''}nous avons repensé le Portail partenaire Cluster de fond en comble : `
+        + `plus clair, plus rapide, et pensé pour vous faire gagner du temps sur chaque recommandation.<br><br>`
         + `<b>Vos dossiers ont suivi.</b> `
         + (dossiers
-            ? `Les ${dossiers} opportunités de ${partner || 'votre organisation'} et leur suivi sont déjà dans le nouveau portail`
-            : `Vos opportunités et leur suivi sont déjà dans le nouveau portail`)
-        + ` : vous n’avez rien à ressaisir.<br><br>`
-        + `<b>L’ancien portail est remplacé.</b> Il ne sera plus mis à jour — c’est désormais ici que tout se passe.<br><br>`
+            ? `Les ${dossiers} opportunités de ${partner || 'votre organisation'} et tout leur suivi y sont déjà`
+            : `Vos opportunités et tout leur suivi y sont déjà`)
+        + ` : rien à ressaisir, vous reprenez exactement là où vous étiez.<br><br>`
+        + `<b>Et ce n’est qu’un début.</b> D’autres outils suivront pour vous donner une vue encore plus `
+        + `précise de vos recommandations et de vos versements.<br><br>`
+        + `L’ancien portail est remplacé : c’est désormais ici que tout se passe.<br><br>`
         + (contact
-            ? `Une question, un blocage ? Écrivez directement à <a href="mailto:${contact}" style="color:#3c50e0">${contact}</a>.`
+            ? `Une question ? Écrivez directement à <a href="mailto:${contact}" style="color:#3c50e0">${contact}</a>, `
+              + `qui vous répondra personnellement.`
             : ''),
-      cta: 'Activer mon compte',
+      cta: 'Activer mon accès',
     },
     en: {
-      subject: 'Your Cluster Partner Portal access — your records came with you',
-      title: 'Your partner portal has moved',
+      subject: 'Your partner portal has a brand-new look',
+      title: 'A new portal — with your records already in it',
       intro: (name, partner, dossiers, contact) =>
-        `${name ? name + ', ' : ''}your access to the Cluster Partner Portal is ready.<br><br>`
+        `${name ? name + ', ' : ''}we’ve rebuilt the Cluster Partner Portal from the ground up: `
+        + `clearer, faster, and designed to save you time on every referral.<br><br>`
         + `<b>Your records came with you.</b> `
         + (dossiers
-            ? `${partner || 'Your organization'}’s ${dossiers} opportunities and their history are already in the new portal`
-            : `Your opportunities and their history are already in the new portal`)
-        + ` — nothing to re-enter.<br><br>`
-        + `<b>The old portal is retired.</b> It will no longer be updated — everything happens here from now on.<br><br>`
+            ? `${partner || 'Your organization'}’s ${dossiers} opportunities and their full history are already there`
+            : `Your opportunities and their full history are already there`)
+        + ` — nothing to re-enter, you pick up exactly where you left off.<br><br>`
+        + `<b>And this is only the beginning.</b> More tools are on the way, to give you an even sharper `
+        + `view of your referrals and your payouts.<br><br>`
+        + `The old portal is retired — everything happens here from now on.<br><br>`
         + (contact
-            ? `Questions, or stuck? Write directly to <a href="mailto:${contact}" style="color:#3c50e0">${contact}</a>.`
+            ? `Questions? Write directly to <a href="mailto:${contact}" style="color:#3c50e0">${contact}</a>, `
+              + `who will get back to you personally.`
             : ''),
-      cta: 'Activate my account',
+      cta: 'Activate my access',
     },
   },
   reset: {
