@@ -7162,17 +7162,10 @@ function crmUtcOffset() {
 async function toolCrmPipelineStats(scope, { module }) {
   const mod = module === 'Leads' ? 'Leads' : 'Deals';
   const spec = SOFIA_MODULES[mod];
-  const rows = [];
-  // Cap at 5 pages (1000 records). A rep's book is far smaller; an admin asking
-  // for org-wide stats gets a truthful "partial" flag rather than a 30s hang.
-  let truncated = false;
-  for (let page = 1; page <= 5; page++) {
-    const { data, info } = await crmGet(`/${mod}`, { fields: spec.fields.join(','), per_page: 200, page });
-    rows.push(...data);
-    if (!info?.more_records) break;
-    if (page === 5) truncated = true;
-  }
-  const mine = scopeFilter(rows, scope);
+  // Capped at 5 pages (1000 records) by the shared helper. A rep's book is far
+  // smaller; an admin asking for org-wide stats gets a truthful "partial" flag
+  // rather than a 30s hang.
+  const { rows: mine, truncated } = await crmScopedRecords(scope, mod, spec.fields);
   const byStage = {};
   let amount = 0;
   const stageField = mod === 'Deals' ? 'Stage' : 'Lead_Status';
@@ -7190,6 +7183,100 @@ async function toolCrmPipelineStats(scope, { module }) {
     byStage,
     ...(mod === 'Deals' ? { totalAmount: Math.round(amount) } : {}),
     ...(truncated ? { partial: 'Only the first 1000 records were scanned.' } : {}),
+  };
+}
+
+// Page through a module and keep only what this caller may see. Shared by the
+// stats and listing tools so they can never disagree about scope.
+async function crmScopedRecords(scope, mod, fields, maxPages = 5) {
+  const rows = [];
+  let truncated = false;
+  for (let page = 1; page <= maxPages; page++) {
+    const { data, info } = await crmGet(`/${mod}`, { fields: fields.join(','), per_page: 200, page });
+    rows.push(...data);
+    if (!info?.more_records) break;
+    if (page === maxPages) truncated = true;
+  }
+  return { rows: scopeFilter(rows, scope), truncated };
+}
+
+// LIST the caller's own records — the thing that was missing. Without it Sofia
+// could only answer questions about a merchant the user could already name,
+// which makes "who should I call first?" unanswerable: you cannot rank a set
+// you cannot enumerate.
+async function toolCrmListMyRecords(scope, i) {
+  const r0 = await resolveModule(i.module || 'Deals');
+  const blocked = moduleGuard(r0, scope);
+  if (blocked) return blocked;
+  const mod = r0.module;
+
+  // Always ask Zoho for the fields we sort and filter on, on top of the
+  // module's own summary fields — otherwise sorting silently no-ops.
+  const spec = r0.spec;
+  const wanted = [...new Set([
+    ...(spec.fields || []), spec.nameField, 'Owner', 'Modified_Time',
+    'Stage', 'Lead_Status', 'Status', 'Closing_Date', 'Due_Date', 'Amount', 'Call_Start_Time',
+  ])].filter(Boolean);
+
+  const { rows, truncated } = await crmScopedRecords(scope, mod, wanted);
+
+  // --- filters, all optional -------------------------------------------
+  let out = rows;
+  const statusOf = (r) => r.Stage || r.Lead_Status || r.Status || null;
+
+  if (i.status) {
+    const want = String(i.status).trim().toLowerCase();
+    out = out.filter(r => String(statusOf(r) || '').toLowerCase() === want);
+  }
+  // "open" means: not one of Zoho's terminal states. Kept as a name check
+  // rather than a picklist lookup so it works on custom modules too.
+  if (i.openOnly) {
+    out = out.filter(r => !/closed|won|lost|completed|junk|converted/i.test(String(statusOf(r) || '')));
+  }
+  if (i.contains) {
+    // Free-text scan across the fields we actually pulled — this is the
+    // "search inside my records" case, which Zoho's /search cannot express
+    // when there is no single keyword to search the whole org for.
+    const needle = String(i.contains).trim().toLowerCase();
+    out = out.filter(r => wanted.some(f => {
+      const v = r[f];
+      const s = v == null ? '' : typeof v === 'object' ? (v.name || '') : String(v);
+      return s.toLowerCase().includes(needle);
+    }));
+  }
+  const dateOf = (r) => r.Due_Date || r.Closing_Date || r.Call_Start_Time || null;
+  if (i.dueBefore) out = out.filter(r => dateOf(r) && String(dateOf(r)).slice(0, 10) <= i.dueBefore);
+  if (i.dueAfter)  out = out.filter(r => dateOf(r) && String(dateOf(r)).slice(0, 10) >= i.dueAfter);
+  if (i.modifiedSince) out = out.filter(r => r.Modified_Time && String(r.Modified_Time).slice(0, 10) >= i.modifiedSince);
+
+  // --- sort -------------------------------------------------------------
+  const key = {
+    date:     (r) => String(dateOf(r) || '9999'),
+    modified: (r) => String(r.Modified_Time || ''),
+    amount:   (r) => Number(r.Amount || 0),
+    name:     (r) => String(r[spec.nameField] || '').toLowerCase(),
+  }[i.sortBy || 'date'] || ((r) => String(dateOf(r) || '9999'));
+  const dir = i.sortDesc ? -1 : 1;
+  out.sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0) * dir);
+
+  const limit = Math.min(Math.max(parseInt(i.limit) || 25, 1), 100);
+  const shown = out.slice(0, limit);
+
+  return {
+    module: mod,
+    scope: scope.level === 'all' ? 'all reps'
+         : scope.level === 'team' ? `your team (${scope.teamNames.join(', ')})`
+         : `${scope.repName || 'you'} only`,
+    matched: out.length,
+    returned: shown.length,
+    records: shown.map(r => ({
+      ...crmRecordSummary(mod, r, spec),
+      status: statusOf(r),
+      date: dateOf(r),
+      lastActivity: r.Modified_Time || null,
+    })),
+    ...(out.length > shown.length ? { note: `${out.length - shown.length} more matched — raise limit or narrow the filters.` } : {}),
+    ...(truncated ? { partial: 'Only the first 1000 records of this module were scanned.' } : {}),
   };
 }
 
@@ -7240,6 +7327,13 @@ const SOFIA_EXPORT_SOURCES = {
   search: async (scope, a) => {
     const found = await toolCrmFindRecord(scope, { query: a.query, module: a.module });
     return { sheet: a.module || 'Records', rows: found.matches || [] };
+  },
+  // The user's own records, same filters as crm_list_my_records — so "export my
+  // open deals" is one call rather than a search the user has to phrase.
+  records: async (scope, a) => {
+    const r = await toolCrmListMyRecords(scope, { ...a, limit: 100 });
+    if (r.error) throw new Error(r.error);
+    return { sheet: r.module || 'Records', rows: r.records || [] };
   },
   report: async (scope, a) => {
     const r = await toolCrmRunReport(scope, { reportId: a.reportId });
@@ -7386,6 +7480,28 @@ const SOFIA_TOOLS = [
     handler: toolCrmGetRecord,
   },
   {
+    name: 'crm_list_my_records',
+    perm: 'assistant:crm_read',
+    write: false,
+    description: "List the user's own records in a module — deals, leads, and also their Tasks and Calls. This is how you answer questions about a SET rather than one named record: what's open, what's overdue, who to call first, what changed recently, or searching inside their records with `contains`. Sort and filter, then rank in your answer using the dates and last activity returned. Prefer this over crm_find_record whenever the user has not named a specific merchant.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        module: { type: 'string', description: "CRM module api_name. Deals, Leads, Tasks, Calls, or any custom module. Defaults to Deals." },
+        openOnly: { type: 'boolean', description: 'Exclude closed/won/lost/completed/junk records.' },
+        status: { type: 'string', description: 'Exact stage or status to filter on.' },
+        contains: { type: 'string', description: 'Free-text: keep only records where some field contains this.' },
+        dueBefore: { type: 'string', description: 'YYYY-MM-DD — due/closing/call date on or before.' },
+        dueAfter: { type: 'string', description: 'YYYY-MM-DD — due/closing/call date on or after.' },
+        modifiedSince: { type: 'string', description: 'YYYY-MM-DD — only records touched since then.' },
+        sortBy: { type: 'string', enum: ['date', 'modified', 'amount', 'name'], description: "Default 'date' (due/closing/call date)." },
+        sortDesc: { type: 'boolean' },
+        limit: { type: 'number', description: 'Default 25, max 100.' },
+      },
+    },
+    handler: toolCrmListMyRecords,
+  },
+  {
     name: 'crm_pipeline_stats',
     perm: 'assistant:crm_read',
     write: false,
@@ -7424,7 +7540,10 @@ const SOFIA_TOOLS = [
     input_schema: {
       type: 'object',
       properties: {
-        source: { type: 'string', enum: ['pipeline', 'search', 'report'], description: "'pipeline' for stage counts, 'search' for matching records, 'report' for a saved Zoho report." },
+        source: { type: 'string', enum: ['records', 'pipeline', 'search', 'report'], description: "'records' for the user's own records with the same filters as crm_list_my_records (the usual choice), 'pipeline' for stage counts, 'search' for keyword matches, 'report' for a saved Zoho report." },
+        openOnly: { type: 'boolean', description: "With source='records': exclude closed/won/lost records." },
+        status: { type: 'string', description: "With source='records': filter to one stage/status." },
+        contains: { type: 'string', description: "With source='records': free-text filter." },
         format: { type: 'string', enum: ['xlsx', 'pdf'], description: "File format. Default xlsx. Use pdf when the user asks for a PDF or something to print or email." },
         module: { type: 'string', description: 'CRM module api_name. Use crm_list_modules if unsure.' },
         query: { type: 'string', description: "Search text, when source='search'." },
@@ -8011,6 +8130,10 @@ function signPendingAction(payload) {
 
 const SOFIA_CRM_GUIDANCE_BASE = `
 ZOHO CRM TOOLS — you can act in the company's Zoho CRM on this user's behalf.
+- TWO ways in, and picking the wrong one makes you claim you cannot do things you can:
+  • The user named a specific merchant → crm_find_record, then crm_get_record.
+  • The user asked about a SET — "my open deals", "what should I do today", "who should I call first", "anything stale", "search my leads for X" → crm_list_my_records. It enumerates and filters their own records (Deals, Leads, and their Tasks and Calls), and its "contains" argument searches inside them.
+- You CAN therefore answer prioritisation questions. Pull the set, then rank it yourself in your reply using the dates and lastActivity returned, and say what you ranked on. Never tell the user you are unable to list or rank their work — that is what crm_list_my_records is for.
 - Always locate a record with crm_find_record before reading, noting or scheduling. Never invent a recordId.
 - The tools already restrict results to what this user may see. If a search returns nothing, say so plainly; do not guess that a merchant does not exist.
 - For notes: write what the user actually told you, in their words. Do not embellish, invent outcomes, or add facts they did not state. Your signature is added automatically — do not write one.
