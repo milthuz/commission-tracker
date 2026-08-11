@@ -151,6 +151,10 @@ const PERMISSION_CATALOG = [
   // Its own key: this one leaves the building. Everything else Sofia does is
   // internal and correctable; a sent email is neither.
   { key: 'assistant:crm_email',        label: 'Sofia can send emails to customers from a CRM record',            category: 'Assistant' },
+  // Master switch for Sales Hub's own data. Each Sales Hub tool ALSO requires
+  // the permission of the screen it reads (report:view_own, proposals:send…),
+  // so this grants "Sofia may reach my Sales Hub data", never extra access.
+  { key: 'assistant:hub',              label: "Sofia can read the user's own Sales Hub data (commission, pay stub, points)", category: 'Assistant' },
   { key: 'assistant:governance',       label: 'Turn Sofia\'s CRM access on/off and review what she did',        category: 'Assistant' },
 ];
 
@@ -6645,6 +6649,83 @@ async function sofiaCrmScope(req) {
         : base;
     })(),
     impersonatedBy: req.user.impersonating ? (req.user.realAdminEmail || null) : null,
+    // The caller's own bearer token, so Sales Hub tools can call our own
+    // endpoints AS THEM (see hubGet). Never log this.
+    authHeader: req.headers.authorization || null,
+  };
+}
+
+// --- Sales Hub's own data --------------------------------------------------
+// Sofia reads Sales Hub through our OWN HTTP endpoints, using the caller's
+// bearer token, rather than querying Postgres directly. That is a deliberate
+// trade of a little latency for a lot of safety: every endpoint already
+// enforces requirePerm, rep-vs-team scoping, disabled report years, and the
+// demo-mode scrambler that wraps res.json. Reimplementing any of that beside it
+// would mean two versions of the rules, and the copy Sofia uses would be the one
+// nobody remembers to update.
+async function hubGet(scope, path, params) {
+  if (!scope.authHeader) return { error: 'not_authenticated' };
+  const port = process.env.PORT || 3000;
+  const r = await axios.get(`http://127.0.0.1:${port}${path}`, {
+    params,
+    headers: { Authorization: scope.authHeader },
+    validateStatus: () => true,
+    timeout: 20000,
+  });
+  if (r.status === 403) return { error: 'You do not have access to that in Sales Hub.' };
+  if (r.status === 404) return { error: 'Nothing found for that period.' };
+  if (r.status !== 200) return { error: `Sales Hub returned HTTP ${r.status}.` };
+  return { data: r.data };
+}
+
+// Rep-facing reads. Each declares the Sales Hub permission its own screen
+// requires, so Sofia can never reach data the user could not open themselves.
+const HUB_VIEWS = {
+  my_commission: {
+    perm: 'report:view_own',
+    path: '/api/commissions/report',
+    params: (i) => ({ year: i.year, month: i.month }),
+    describe: 'Your commission report for a year (and optionally one month): what was earned, approved and paid.',
+  },
+  my_paystub: {
+    perm: 'report:view_paystub',
+    path: '/api/commissions/pay-stub',
+    params: (i) => ({ year: i.year, month: i.month }),
+    describe: 'Your pay stub for a month: invoices, bonuses, adjustments and the total.',
+  },
+  my_points: {
+    perm: 'tracker:view_own',
+    path: '/api/crm/points',
+    params: (i) => ({ year: i.year, month: i.month }),
+    describe: 'Your sales points and quota progress for a month.',
+  },
+  my_processing: {
+    perm: 'report:view_own',
+    path: '/api/commissions/my-processing',
+    params: () => ({}),
+    describe: 'Your payment-processing revenue: merchants and commission paid.',
+  },
+};
+
+async function toolHubRead(scope, i) {
+  const view = HUB_VIEWS[i.view];
+  if (!view) return { error: `view must be one of: ${Object.keys(HUB_VIEWS).join(', ')}` };
+  const r = await hubGet(scope, view.path, view.params(i || {}));
+  if (r.error) return { error: r.error };
+  return { view: i.view, data: r.data };
+}
+
+// Proposals: Sofia gets the rep to the point of sending, and stops there.
+// A proposal is a document that reaches a customer; the last click stays human,
+// and the Proposals screen already does the page selection and email editing
+// far better than a chat panel could.
+async function toolHubListEstimates(scope) {
+  const r = await hubGet(scope, '/api/proposals/estimates', {});
+  if (r.error) return { error: r.error };
+  const list = Array.isArray(r.data) ? r.data : (r.data?.estimates || []);
+  return {
+    estimates: list.slice(0, 25),
+    note: 'To build the proposal, the user opens Sales Hub → Proposals and picks this estimate. You cannot send it for them.',
   };
 }
 
@@ -7952,6 +8033,32 @@ const SOFIA_TOOLS = [
     handler: toolCrmListFields,
   },
   {
+    name: 'hub_read',
+    perm: 'assistant:hub',
+    write: false,
+    // Named views rather than a free path: the model must not be able to point
+    // this at an arbitrary endpoint of our own API.
+    description: "Read the user's OWN Sales Hub data. Views: my_commission (commission report for a year/month), my_paystub (a month's pay stub), my_points (sales points and quota progress), my_processing (payment-processing revenue). Report the figures EXACTLY as returned — see the money rule in your instructions.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        view: { type: 'string', enum: Object.keys(HUB_VIEWS) },
+        year: { type: 'string', description: 'YYYY. Defaults to the current year.' },
+        month: { type: 'string', description: 'MM or YYYY-MM, when the view takes a month.' },
+      },
+      required: ['view'],
+    },
+    handler: toolHubRead,
+  },
+  {
+    name: 'hub_list_estimates',
+    perm: 'proposals:send',
+    write: false,
+    description: "List the Zoho Books estimates this user can turn into a client proposal. Use when they ask about building or sending a proposal. You can surface the estimates and help them decide, but the proposal itself is built and sent by the user in Sales Hub → Proposals — tell them to go there, and do not claim to have sent anything.",
+    input_schema: { type: 'object', properties: {} },
+    handler: toolHubListEstimates,
+  },
+  {
     name: 'crm_send_email',
     perm: 'assistant:crm_email',
     write: true,
@@ -8298,10 +8405,24 @@ RULES:
 // read records, and a flat "you cannot see the user's data" makes her refuse
 // work she is now able to do. Commission/invoice figures stay off-limits either
 // way — those live in Postgres and she has no tool for them.
-function assistantDataRule(hasCrmTools) {
-  return hasCrmTools
-    ? '- You cannot see Sales Hub\'s own figures (commissions, invoices, pay stubs) — never invent those; point the user to the right screen. You CAN look up Zoho CRM records using your tools, and you should use them rather than telling the user to go to Zoho.'
-    : '- You CANNOT see the user\'s data (numbers, invoices, commissions, CRM records). Never invent figures. For data questions, tell the user where in the app to look.';
+function assistantDataRule(tools) {
+  const has = (p) => tools.some(t => t.name.startsWith(p));
+  const crm = has('crm_'), hub = has('hub_');
+  if (!crm && !hub) {
+    return '- You CANNOT see the user\'s data (numbers, invoices, commissions, CRM records). Never invent figures. For data questions, tell the user where in the app to look.';
+  }
+  const lines = [];
+  if (crm) lines.push('- You CAN look up Zoho CRM records with your tools, and you should use them rather than telling the user to go to Zoho.');
+  if (hub) {
+    lines.push('- You CAN read this user\'s own Sales Hub data (commission report, pay stub, points) with hub_read.');
+    // The money rule. Commission figures are what people are paid on: a number
+    // Sofia derives and gets wrong is not a wrong answer, it is a wrong
+    // paycheque expectation. So she quotes, she does not compute.
+    lines.push('- MONEY RULE, absolute: report money figures EXACTLY as the tool returned them. Do NOT add, subtract, average, project, convert or otherwise derive any amount — not even a subtotal, not even to be helpful. If the number the user wants is not already present in a tool result, say it is not shown and name the screen where they can see it. Quote, never compute.');
+  } else {
+    lines.push('- You cannot see Sales Hub\'s own figures (commissions, invoices, pay stubs) — never invent those; point the user to the right screen.');
+  }
+  return lines.join('\n');
 }
 
 // Appended ONLY for administrators — regular users must not be walked through admin features.
@@ -8386,8 +8507,11 @@ app.post('/api/assistant/chat', authenticateToken, async (req, res) => {
       ...(updates ? [{ type: 'text', text: updates }] : []),
       { type: 'text', text: `Current user: ${req.user.name || req.user.email || 'unknown'}${isAdmin ? ' (administrator)' : ' (regular user, not an administrator)'}.` },
       { type: 'text', text: `The user's app language is set to ${uiLang}. Reply in ${uiLang} unless the user clearly writes in another language.` },
-      { type: 'text', text: assistantDataRule(tools.length > 0) },
-      { type: 'text', text: tools.length ? sofiaCrmToolGuidance(scope) : SOFIA_NO_CRM_TOOLS },
+      { type: 'text', text: assistantDataRule(tools) },
+      // CRM guidance only when CRM tools are actually granted — someone with
+      // only Sales Hub access must not be told they can search Zoho.
+      { type: 'text', text: tools.some(t => t.name.startsWith('crm_')) ? sofiaCrmToolGuidance(scope) : SOFIA_NO_CRM_TOOLS },
+      ...(tools.some(t => t.name.startsWith('hub_')) ? [{ type: 'text', text: SOFIA_HUB_GUIDANCE }] : []),
     ];
 
     const convo = [...history];
@@ -8631,6 +8755,14 @@ DESCRIBING WHAT YOU CAN DO: when someone asks what you can do, what's new, or ho
 // ask) instead of a flat no that reads like the feature does not exist.
 const SOFIA_NO_CRM_TOOLS = `
 ZOHO CRM: Sales Hub can connect you to Zoho CRM through me — looking up deals and leads, adding notes, scheduling follow-ups, creating records and building exports. It is NOT enabled on this account. If the user asks me to do anything in the CRM, say plainly that I can do it once an administrator grants their role the Sofia CRM permissions, and point them to their administrator. Do not imply the capability does not exist, and never guess at CRM data.
+`;
+
+const SOFIA_HUB_GUIDANCE = `
+SALES HUB DATA — you can read this user's own commission, pay stub, points and processing revenue with hub_read.
+- These are the figures this person is PAID on. Getting one wrong is not a wrong answer, it is a wrong expectation about their paycheque. Quote what the tool returned, verbatim. Never derive an amount.
+- The tools only ever return this user's own data. If they ask about someone else's pay, say that is not something you can look up for them.
+- A month with no data is a real answer ("nothing recorded for July yet"), not a reason to estimate.
+- PROPOSALS: you can list the estimates a user could turn into a proposal, to help them find the right one. You CANNOT build or send the proposal — that happens in Sales Hub → Proposals, where they choose pages and edit the email. Send them there; never imply a proposal went out.
 `;
 
 function sofiaCrmToolGuidance(scope) {
