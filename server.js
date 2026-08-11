@@ -7050,9 +7050,16 @@ async function crmBlueprintOf(mod, recordId) {
   } catch { return null; }
 }
 
-// Which field does the Blueprint drive? Almost always the stage/status field;
-// derived rather than hardcoded so custom modules work too.
-function blueprintStageField(mod) {
+// Which field does the Blueprint actually drive?
+//
+// Zoho tells us, in process_info.field_name — so ASK, do not guess. Guessing
+// "Stage" works only for a default Deals blueprint; an org whose process runs on
+// a custom field would sail straight past the guard, and the whole point of the
+// guard is that a bypass is invisible. The module-based names stay as a fallback
+// for when process_info is absent.
+function blueprintStageField(mod, bp) {
+  const named = bp?.process_info?.field_name || bp?.process_info?.field_label;
+  if (named) return String(named);
   return mod === 'Leads' ? 'Lead_Status' : mod === 'Deals' ? 'Stage' : 'Status';
 }
 
@@ -7167,10 +7174,15 @@ async function toolCrmUpdateRecord(scope, i) {
   // succeed while skipping the required fields and automation the Blueprint
   // enforces — and a process bypassed silently is worse than one that failed
   // loudly, because nobody goes looking for it.
-  const stageField = blueprintStageField(mod);
-  if (Object.keys(payload).some(k => k.toLowerCase() === stageField.toLowerCase())) {
-    const bp = await crmBlueprintOf(mod, i.recordId);
-    if (bp) {
+  // The order is deliberate: fetch the Blueprint FIRST, then see whether the
+  // update touches the field it drives. The reverse order (guess the field, then
+  // look) is what let a custom-field process slip through — and a bypass nobody
+  // notices is the failure mode this guard exists for. One extra call on a write
+  // that is already several is a fair price.
+  const bp = await crmBlueprintOf(mod, i.recordId);
+  if (bp) {
+    const stageField = blueprintStageField(mod, bp);
+    if (Object.keys(payload).some(k => k.toLowerCase() === stageField.toLowerCase())) {
       return {
         error: `${mod} records here follow a Blueprint, so ${stageField} cannot be set directly — it has to go through a transition, which may require extra fields.`,
         currentState: bp.process_info?.field_value || null,
