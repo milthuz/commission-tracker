@@ -69,7 +69,8 @@ const PERMISSION_CATALOG = [
   { key: 'report:adjustments',         label: 'Manage commission adjustments & reconciliation suggestions', category: 'Commission Report' },
   { key: 'report:quota_review',        label: 'Review quota-gated (forfeited) commissions',  category: 'Commission Report' },
   { key: 'pass:manage',                label: 'Configure The Pass (merchant referral program)', category: 'The Pass' },
-  { key: 'pass:referrals',             label: 'Track The Pass referrals and apply credits',     category: 'The Pass' },
+  { key: 'pass:referrals',             label: 'Track The Pass referrals and mark them live',    category: 'The Pass' },
+  { key: 'pass:credit_approve',        label: 'Confirm the final credit amount and notify accounting (money)', category: 'The Pass' },
 
   // Dashboard
   { key: 'dashboard:view_admin',       label: 'View the Admin dashboard (company finance + action items)', category: 'Dashboard' },
@@ -465,6 +466,10 @@ async function initializeDatabase() {
     // Deal issu de la conversion du Lead. Retenu parce que la resolution passe par une
     // RECHERCHE par nom, couteuse et ambigue : une fois trouve, on n'y revient plus.
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_deal_id VARCHAR(50)`);
+    // Le palier donne un PLAFOND, pas un montant : a la mise en service on ignore encore
+    // quels services la reference prendra (Cluster seul ou avec Cluster Pay), donc le
+    // montant exact ne peut pas etre calcule. Il est confirme a la main a l'etape de credit.
+    await pool.query(`ALTER TABLE pass_referrals ADD COLUMN IF NOT EXISTS credit_max NUMERIC(10,2)`);
     // Suivi des invitations. `invite_opened_at` est pose quand le LIEN est ouvert, pas
     // quand le courriel l'est : un pixel de suivi se fait bloquer par la moitie des
     // clients de messagerie, alors qu'un clic sur le lien est un fait cote serveur.
@@ -19400,7 +19405,8 @@ app.patch('/api/admin/pass/referrals/:id/status', authenticateToken, async (req,
       updated = (await client.query(
         `UPDATE pass_referrals
             SET status = 'live', live_at = NOW(), tier_at_live = $2,
-                credit_amount = GREATEST($3::numeric, COALESCE(credit_amount, 0))
+                credit_amount = GREATEST($3::numeric, COALESCE(credit_amount, 0)),
+                credit_max    = GREATEST($3::numeric, COALESCE(credit_amount, 0))
           WHERE id = $1 RETURNING *`,
         [r.id, tier.level, tier.credit]
       )).rows[0];
@@ -19459,7 +19465,9 @@ app.patch('/api/admin/pass/referrals/:id/status', authenticateToken, async (req,
 // enregistre le certificat : le programme peut ouvrir sans ce scope, et le jour où il sera
 // accordé, c'est ici qu'il se branche.
 app.post('/api/admin/pass/referrals/:id/credit', authenticateToken, async (req, res) => {
-  if (!(await requirePerm(req, res, 'pass:referrals'))) return;
+  // Permission DISTINCTE de pass:referrals : confirmer un montant engage l'argent, ce n'est
+  // pas le meme pouvoir que suivre les dossiers au quotidien.
+  if (!(await requirePerm(req, res, 'pass:credit_approve'))) return;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -19471,14 +19479,33 @@ app.post('/api/admin/pass/referrals/:id/credit', authenticateToken, async (req, 
     }
     const m = (await client.query(`SELECT * FROM pass_members WHERE id = $1`, [r.member_id])).rows[0];
     const config = await getPassConfig();
-    const amount = Number(r.credit_amount) || 0;
+    // Le montant est CONFIRME ici, pas calcule : le palier n'a donne qu'un plafond, et on
+    // ne sait qu'a ce moment quels services la reference a pris.
+    //
+    // Borne cote SERVEUR, jamais seulement dans le champ de saisie — c'est un montant qui
+    // part en comptabilite. Sans corps de requete, on retombe sur le plafond : l'ancien
+    // comportement reste donc valable pour tout appel qui ne precise rien.
+    const ceiling = Number(r.credit_max ?? r.credit_amount) || 0;
+    const asked = req.body?.amount === undefined || req.body?.amount === null
+      ? ceiling
+      : Number(req.body.amount);
+    if (!Number.isFinite(asked) || asked <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'amount_invalid' });
+    }
+    if (asked > ceiling) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'amount_above_ceiling', ceiling });
+    }
+    const amount = asked;
     // Certificat lisible au téléphone : le montant y est visible, donc une erreur de
     // dossier se voit avant l'appel à la comptabilité, pas après.
     const code = `CLSTR-${Math.round(amount)}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
     const updated = (await client.query(
-      `UPDATE pass_referrals SET status = 'credit_applied', credit_applied_at = NOW(), certificate_code = $2
+      `UPDATE pass_referrals SET status = 'credit_applied', credit_applied_at = NOW(),
+              certificate_code = $2, credit_amount = $3
         WHERE id = $1 RETURNING *`,
-      [r.id, code]
+      [r.id, code, amount]
     )).rows[0];
     await client.query('COMMIT');
 
