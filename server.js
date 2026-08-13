@@ -19387,13 +19387,29 @@ app.patch('/api/admin/pass/referrals/:id/status', authenticateToken, async (req,
         `UPDATE pass_members SET lifetime_live_referrals = $2, tier_level = $3, updated_at = NOW() WHERE id = $1`,
         [m.id, after, newTier.level]
       );
+      // 🛡️ PLANCHER (decision de David 2026-08-12) : le montant affiche au membre AU MOMENT
+      // DE SA SOUMISSION lui est garanti. `credit_amount` porte deja cette valeur — elle y a
+      // ete ecrite a l'insertion — et cette mise a jour l'ecrasait.
+      //
+      // GREATEST, et non un simple remplacement par le montant de soumission : les deux
+      // variables bougent en sens INVERSE. Le palier du membre peut MONTER entre la
+      // soumission et la mise en service (l'echelle a vie ne redescend jamais), et ce gain
+      // lui revient. C'est le MONTANT CONFIGURE d'un palier qui peut baisser — un admin peut
+      // l'editer — et c'est contre cela seul qu'on protege. Figer betement la soumission
+      // priverait de sa montee un membre qui a franchi un seuil entre-temps.
       updated = (await client.query(
-        `UPDATE pass_referrals SET status = 'live', live_at = NOW(), tier_at_live = $2, credit_amount = $3
+        `UPDATE pass_referrals
+            SET status = 'live', live_at = NOW(), tier_at_live = $2,
+                credit_amount = GREATEST($3::numeric, COALESCE(credit_amount, 0))
           WHERE id = $1 RETURNING *`,
         [r.id, tier.level, tier.credit]
       )).rows[0];
+      // Tout ce qui suit annonce un MONTANT : il doit venir de la ligne ecrite, pas du
+      // calcul. Sans ca, le journal et le courriel promettraient le montant courant alors
+      // que le plancher a paye davantage.
+      const paidCredit = Number(updated.credit_amount);
       await logActivity('pass_referral', String(r.id), 'live',
-        `${r.ref_code} en service — crédit ${tier.credit} ${config.currency} au palier ${tier.level} pour ${m.email}`,
+        `${r.ref_code} en service — crédit ${paidCredit} ${config.currency} au palier ${tier.level} pour ${m.email}`,
         req.user.email || 'admin',
         { metadata: { memberId: m.id, lifetimeBefore: before, lifetimeAfter: after, tierAtSubmission: r.tier_at_submission, tierAtLive: tier.level, creditFloorAtSubmission: r.credit_amount === null ? null : Number(r.credit_amount), creditAmount: tier.credit } });
 
@@ -19403,7 +19419,7 @@ app.patch('/api/admin/pass/referrals/:id/status', authenticateToken, async (req,
       mails.push(['live', m, {
         firstName: passFirstName(m),
         restaurant: r.restaurant_name,
-        amount: passMoney(tier.credit, m.locale),
+        amount: passMoney(paidCredit, m.locale),
       }]);
       // Le palier a-t-il changé grâce à CETTE mise en service ? Comparé sur les paliers
       // calculés avant et après, jamais déduit d'un compteur : c'est le seul moment où
