@@ -19134,6 +19134,12 @@ function passReferralPublic(r) {
     tierAtSubmission: r.tier_at_submission,
     tierAtLive: r.tier_at_live,
     creditAmount: r.credit_amount === null ? null : Number(r.credit_amount),
+    // Le plafond du palier : l'ecran de confirmation en a besoin pour borner la saisie et
+    // pour dire a quoi on a droit. Retombe sur le montant quand la colonne est vide (dossiers
+    // passes en service avant l'ajout de credit_max).
+    creditMax: r.credit_max === null || r.credit_max === undefined
+      ? (r.credit_amount === null ? null : Number(r.credit_amount))
+      : Number(r.credit_max),
     currency: r.currency,
     certificateCode: r.certificate_code || null,
     hardwareDiscount: r.hardware_discount === null ? null : Number(r.hardware_discount),
