@@ -22,6 +22,31 @@ const { authenticator } = require('otplib');
 const nodemailer = require('nodemailer');
 const QRCode = require('qrcode');
 const Anthropic = require('@anthropic-ai/sdk');
+// Depuis quand une SUCCURSALE compte comme une vente distincte.
+//
+// Avant cette date, un marchand vaut une unite quelle que soit sa structure — c'est ainsi que les
+// paies de juin et juillet 2026 ont ete calculees, et une periode payee ne se rouvre pas.
+// Decision de David le 2026-08-13.
+const ZENTACT_PER_STORE_FROM = '2026-08-01';
+
+// Combien d'unites (points, bonis de signature) vaut un marchand ?
+//
+// ⚠️ On compte les balanceAccountId DISTINCTS du tableau `stores`, PAS le champ
+// `balance_account_id` de premier niveau : celui-ci est celui du PREMIER magasin, si bien qu'un
+// marchand a trois succursales n'en montrerait qu'une. Verifie sur « Pile Ou Glace ».
+//
+// GREATEST(..., 1) : un marchand sans magasin renseigne vaut quand meme une unite. Sans ce
+// plancher, une structure incomplete cote Zentact effacerait silencieusement une vente.
+//
+// Une succursale FERMEE reste comptee : le point a ete gagne a l'ouverture (decision de David).
+// C'est automatique ici, puisqu'on lit `stores` sans filtrer sur un statut de magasin.
+const zentactUnits = (alias = 'zentact_merchants') => `GREATEST(CASE
+      WHEN ${alias}.activated_at >= DATE '${ZENTACT_PER_STORE_FROM}'
+      THEN (SELECT COUNT(DISTINCT e->>'balanceAccountId')
+              FROM jsonb_array_elements(COALESCE(${alias}.stores, '[]'::jsonb)) e
+             WHERE e->>'balanceAccountId' IS NOT NULL)
+      ELSE 1 END, 1)`;
+
 const { ZohoCRMService, MONTHLY_QUOTA, MONTHLY_BONUS_TIERS, ANNUAL_BONUS_TIERS, PLAN_START_DATE } = require('./services/zohoCRMService');
 const { ZentactService } = require('./services/zentactService');
 const { ZohoBillingService } = require('./services/zohoBillingService');
@@ -9359,6 +9384,7 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
       });
     }
 
+    // (voir zentactUnits plus haut : une unite par compte de solde depuis le 1er aout 2026)
     // Merge Zentact activations for the same month
     const zentactResult = await pool.query(`
       SELECT merchant_account_id, business_name, sales_rep_name, sales_rep_email,
@@ -9486,9 +9512,9 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     // Annual Zentact points from PLAN_START_DATE
     const annualZentactResult = await pool.query(`
       SELECT sales_rep_name,
-             SUM(points)  AS zentact_points,
-             COUNT(*)     AS activations,
-             SUM(bonus_amount) AS zentact_bonus
+             SUM(points * ${zentactUnits()})       AS zentact_points,
+             SUM(${zentactUnits()})                AS activations,
+             SUM(bonus_amount * ${zentactUnits()}) AS zentact_bonus
       FROM zentact_merchants
       WHERE activated_at >= $1 AND status = 'ACTIVE'
       GROUP BY sales_rep_name
@@ -9687,9 +9713,9 @@ app.get('/api/crm/points/annual', authenticateToken, async (req, res) => {
     // Zentact activations grouped by month for this rep & year
     const zentactResult = await pool.query(`
       SELECT EXTRACT(MONTH FROM activated_at) AS month,
-             SUM(points)       AS zentact_points,
-             COUNT(*)          AS activations,
-             SUM(bonus_amount) AS zentact_bonus
+             SUM(points * ${zentactUnits()})       AS zentact_points,
+             SUM(${zentactUnits()})                AS activations,
+             SUM(bonus_amount * ${zentactUnits()}) AS zentact_bonus
       FROM zentact_merchants
       WHERE EXTRACT(YEAR FROM activated_at) = $1
         AND LOWER(sales_rep_name) = LOWER($2)
@@ -9735,7 +9761,9 @@ app.get('/api/crm/points/annual', authenticateToken, async (req, res) => {
         [PLAN_START_DATE, repName]
       ),
       pool.query(
-        `SELECT COALESCE(SUM(points), 0) AS pts, COALESCE(COUNT(*), 0) AS acts, COALESCE(SUM(bonus_amount), 0) AS bonus
+        `SELECT COALESCE(SUM(points * ${zentactUnits()}), 0) AS pts,
+                COALESCE(SUM(${zentactUnits()}), 0) AS acts,
+                COALESCE(SUM(bonus_amount * ${zentactUnits()}), 0) AS bonus
          FROM zentact_merchants
          WHERE activated_at >= $1 AND LOWER(sales_rep_name) = LOWER($2) AND status = 'ACTIVE'`,
         [PLAN_START_DATE, repName]
@@ -25437,11 +25465,37 @@ async function payrollDataForMonth(year, month) {
         [rep, orgId, periodStart, periodEnd])).rows;
       // Signup bonus is the REP'S CURRENT config, not the stored (never-customized) bonus_amount.
       const signupCfg = { enabled: sp.signup_bonus_enabled !== false, amount: sp.signup_bonus_amount == null ? 100 : parseFloat(sp.signup_bonus_amount) };
+      // UNE LIGNE PAR SUCCURSALE depuis le 1er aout 2026 (voir zentactUnits) — pas un montant
+      // double sur une seule ligne : deux « Pile Ou Glace / 100 $ » identiques se lisent comme
+      // une erreur de saisie, alors que « Pile Ou Glace — Pile_Ou_Glace_Ahuntsic » se verifie.
+      //
+      // LEFT JOIN LATERAL ... ON <condition> : quand la condition est fausse (activation
+      // anterieure a la bascule), la jointure rend UNE ligne a NULL — le comportement d'avant,
+      // a l'identique. Quand elle est vraie, une ligne par compte de solde distinct. Et si un
+      // marchand n'a aucun magasin renseigne, le LEFT garantit quand meme sa ligne : une
+      // structure incomplete cote Zentact ne doit pas faire disparaitre un boni.
       const signups = (await pool.query(
-        `SELECT business_name AS merchant_name FROM zentact_merchants
-         WHERE LOWER(sales_rep_name) = LOWER($1) AND status = 'ACTIVE' AND activated_at >= $2 AND activated_at < $3`,
+        `SELECT z.business_name AS merchant_name, succ.ref AS store_ref
+           FROM zentact_merchants z
+           LEFT JOIN LATERAL (
+             SELECT DISTINCT ON (e->>'balanceAccountId')
+                    e->>'balanceAccountId' AS ba, e->>'storeReferenceId' AS ref
+               FROM jsonb_array_elements(COALESCE(z.stores, '[]'::jsonb)) e
+              WHERE e->>'balanceAccountId' IS NOT NULL
+           ) succ ON z.activated_at >= DATE '${ZENTACT_PER_STORE_FROM}'
+          WHERE LOWER(z.sales_rep_name) = LOWER($1) AND z.status = 'ACTIVE'
+            AND z.activated_at >= $2 AND z.activated_at < $3
+          ORDER BY z.business_name, succ.ref`,
         [rep, periodStart, periodEnd])).rows;
-      bonuses = signups.map(b => ({ bonus_type: 'signup', merchant_name: b.merchant_name, amount: signupCfg.enabled ? signupCfg.amount : 0 }));
+      bonuses = signups.map(b => ({
+        bonus_type: 'signup',
+        // Le libelle ne porte la succursale que s'il y a matiere a distinguer : sur un marchand
+        // a une seule adresse, « Chez Cookla — Cafe_Cremerie » n'apprend rien et alourdit.
+        merchant_name: b.store_ref && signups.filter(x => x.merchant_name === b.merchant_name).length > 1
+          ? `${b.merchant_name} — ${b.store_ref}`
+          : b.merchant_name,
+        amount: signupCfg.enabled ? signupCfg.amount : 0,
+      }));
       if (platform) {
         const pts = ptsMap.get(`${rep}|${year}-${mm}`) || 0;
         const quota = sp.monthly_quota == null ? MONTHLY_QUOTA : parseInt(sp.monthly_quota);
