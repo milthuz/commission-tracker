@@ -3588,7 +3588,7 @@ function sampleEmail(type, lang) {
     const m = { email: 'julie@bistroducoin.ca', full_name: 'Julie Tremblay', business: 'Bistro du Coin', locale };
     const amt = (n) => passMoney(n, locale);
     const vars = {
-      received: { restaurant: 'Café Merlebleu', referenceId: 'CR-20423', hardware: amt(500), tier: 'Sous', amount: amt(750) },
+      received: { restaurant: 'Café Merlebleu', referenceId: 'CR-20423', tier: 'Sous', amount: amt(750) },
       live: { restaurant: 'Café Merlebleu', amount: amt(750) },
       tier_up: { restaurant: 'Café Merlebleu', nth: passOrdinal(4, locale), tier: 'Chef', amount: amt(1000) },
       credit: { restaurant: 'Café Merlebleu', amount: amt(750), certificateCode: 'CLSTR-750-4QX9' },
@@ -18703,7 +18703,6 @@ app.post('/api/pass/link/:slug/refer', async (req, res) => {
       firstName: passFirstName(member),
       restaurant: restaurantName,
       referenceId: code,
-      hardware: passMoney(config.hardwareDiscount, member.locale),
       tier: passTierLabel(tier),
       amount: passMoney(tier.credit, member.locale),
     });
@@ -18745,6 +18744,19 @@ app.post('/api/pass/link/:slug/click', async (req, res) => {
 // ces courriels, et une copie partagée mais utilisée d'un seul côté finit toujours par
 // diverger de celle qui sert vraiment. Les clés `pass.emails.*` du frontend restent la
 // référence du designer — à re-synchroniser à la main à chaque livraison.
+//
+// ⚠️ AUCUN de ces courriels ne peut annoncer un montant FERME avant la confirmation.
+// Depuis la refonte du crédit, le palier ne donne qu'un PLAFOND : le montant réel dépend
+// des services que la référence retient (Cluster seul, ou Cluster + Cluster Pay) et n'est
+// connu qu'à l'étape de confirmation manuelle. Seul `credit` — envoyé APRÈS cette
+// confirmation — porte un chiffre ferme ; les trois autres disent « jusqu'à ». Un courriel
+// est une trace écrite que le membre garde : y promettre 750 $ pour en verser 500 $ est
+// irrattrapable.
+//
+// 🚫 Le rabais matériel a été RETIRÉ du programme (12 août) : il ne s'adresse plus au
+// restaurant recommandé. Ne pas le réintroduire ici — l'ancienne phrase du courriel
+// `received` l'a survécu deux semaines et promettait un rabais que le programme n'offre
+// plus, alors que toutes les autres surfaces l'avaient déjà perdu.
 const PASS_EMAIL_COPY = {
   'fr-CA': {
     received: {
@@ -18753,18 +18765,18 @@ const PASS_EMAIL_COPY = {
       greeting: 'Bonjour {firstName},',
       paras: [
         'Merci de nous avoir passé {restaurant}. La recommandation est enregistrée sous la référence {referenceId}.',
-        "Un spécialiste les joindra dans les 2 jours ouvrables et gérera toute l'installation — y compris le rabais matériel de {hardware} qui accompagne votre recommandation.",
-        'Vous êtes actuellement {tier} : celle-ci vaut donc {amount} de crédit au compte dès leur mise en service.',
+        "Un spécialiste les joindra dans les 2 jours ouvrables et gérera toute l'installation.",
+        "Vous êtes actuellement {tier} : celle-ci peut vous valoir jusqu'à {amount} de crédit au compte. Nous confirmons le montant exact à leur mise en service, selon les services qu'ils retiennent.",
       ],
       cta: 'Suivre dans mon espace',
     },
     live: {
       subject: '{restaurant} est en service sur Cluster',
-      preview: "Votre recommandation vient d'entrer en service — crédit confirmé.",
+      preview: "Votre recommandation vient d'entrer en service — votre crédit s'en vient.",
       greeting: 'Bonjour {firstName},',
       paras: [
         '{restaurant} a terminé son installation et prend maintenant ses commandes sur Cluster.',
-        'Cela confirme {amount} de crédit au compte. Votre certificat arrivera par courriel dans un jour ouvrable.',
+        "Votre crédit pour cette recommandation peut atteindre {amount}. Nous confirmons le montant exact selon les services retenus, puis votre certificat suit par courriel.",
         "Merci d'avoir aidé un autre restaurateur à mieux s'outiller.",
       ],
       cta: 'Voir mon espace',
@@ -18775,11 +18787,11 @@ const PASS_EMAIL_COPY = {
       greeting: 'Bonjour {firstName},',
       paras: [
         '{restaurant} était votre {nth} recommandation à entrer en service — vous voilà à {tier}.',
-        'Désormais, chaque recommandation en service vous rapporte {amount} de crédit au compte.',
+        "Désormais, chaque recommandation en service peut vous rapporter jusqu'à {amount} de crédit au compte.",
       ],
       cta: 'Voir mon palier',
       banner: 'Nouveau palier atteint',
-      bannerSub: '{amount} de crédit pour chaque recommandation à partir de maintenant',
+      bannerSub: "Jusqu'à {amount} de crédit pour chaque recommandation à partir de maintenant",
     },
     credit: {
       subject: 'Votre crédit de {amount} est prêt',
@@ -18802,18 +18814,18 @@ const PASS_EMAIL_COPY = {
       greeting: 'Hi {firstName},',
       paras: [
         "Thanks for sending {restaurant} our way. It's logged under reference {referenceId}.",
-        'A specialist reaches out within 2 business days and runs the whole setup — including the {hardware} hardware discount that travels with your referral.',
-        "You're currently {tier}, so this one is worth {amount} in account credit the day they go live.",
+        'A specialist reaches out within 2 business days and runs the whole setup.',
+        "You're currently {tier}, so this one can be worth up to {amount} in account credit. We confirm the exact amount when they go live, based on the services they take.",
       ],
       cta: 'Track it in your hub',
     },
     live: {
       subject: '{restaurant} is live on Cluster',
-      preview: 'Your referral just went live — credit confirmed.',
+      preview: 'Your referral just went live — your credit is on the way.',
       greeting: 'Hi {firstName},',
       paras: [
         '{restaurant} finished setup and is now taking orders on Cluster.',
-        "That's {amount} in account credit confirmed. Your certificate arrives in a separate email within one business day.",
+        'Your credit for this referral can reach up to {amount}. We confirm the exact amount based on the services they took, then your certificate follows by email.',
         'Thanks for handing another operator a better setup.',
       ],
       cta: 'See your hub',
@@ -18824,11 +18836,11 @@ const PASS_EMAIL_COPY = {
       greeting: 'Hi {firstName},',
       paras: [
         '{restaurant} was your {nth} referral to go live — which puts you at {tier}.',
-        'From here, every referral that goes live earns you {amount} in account credit.',
+        'From here, every referral that goes live can earn you up to {amount} in account credit.',
       ],
       cta: 'View your tier',
       banner: 'New tier unlocked',
-      bannerSub: '{amount} credit for every referral from here on',
+      bannerSub: 'Up to {amount} credit for every referral from here on',
     },
     credit: {
       subject: 'Your {amount} Cluster credit is ready',
@@ -19246,7 +19258,6 @@ app.post('/api/pass/referrals', authenticatePassToken, async (req, res) => {
       firstName: passFirstName(req.passMember),
       restaurant: restaurantName,
       referenceId: code,
-      hardware: passMoney(config.hardwareDiscount, req.passMember.locale),
       tier: passTierLabel(tier),
       amount: passMoney(tier.credit, req.passMember.locale),
     });
