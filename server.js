@@ -18143,9 +18143,25 @@ app.put('/api/admin/pass/config', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'les seuils doivent être strictement croissants' });
     }
   }
-  const hardwareDiscount = num(body.hardwareDiscount);
-  if (!Number.isFinite(hardwareDiscount) || hardwareDiscount < 0) {
-    return res.status(400).json({ error: 'rabais matériel invalide' });
+  // Le rabais matériel n'est PLUS éditable depuis l'écran d'admin : la promesse a été
+  // retirée du programme le 12 août et le champ ne changeait plus rien de visible. La
+  // valeur reste EN CONFIGURATION pour un éventuel retour, donc une requête qui ne la
+  // mentionne pas conserve celle en place.
+  //
+  // ⚠️ Sans ce repli, retirer le champ de l'interface ferait répondre 400 à CHAQUE
+  // enregistrement — l'échelle et l'interrupteur d'ouverture avec lui. Un champ retiré
+  // d'un écran reste exigé par son endpoint jusqu'à ce qu'on l'y rende optionnel.
+  //
+  // Une valeur explicitement fournie est toujours validée : un appel qui la précise
+  // (script, futur écran) ne doit pas voir une saisie invalide retomber en silence sur
+  // l'ancienne.
+  const before = await getPassConfig();
+  let hardwareDiscount = Number(before.hardwareDiscount) || 0;
+  if (body.hardwareDiscount !== undefined && body.hardwareDiscount !== null && body.hardwareDiscount !== '') {
+    hardwareDiscount = num(body.hardwareDiscount);
+    if (!Number.isFinite(hardwareDiscount) || hardwareDiscount < 0) {
+      return res.status(400).json({ error: 'rabais matériel invalide' });
+    }
   }
 
   const next = {
@@ -18155,7 +18171,6 @@ app.put('/api/admin/pass/config', authenticateToken, async (req, res) => {
     tiers,
   };
   try {
-    const before = await getPassConfig();
     await pool.query(
       `INSERT INTO app_settings (key, value, updated_at) VALUES ('pass_config', $1::jsonb, NOW())
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
