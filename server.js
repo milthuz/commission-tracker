@@ -18378,7 +18378,19 @@ app.put('/api/admin/pass/config', authenticateToken, async (req, res) => {
 // ============================================================================
 // Version des conditions acceptées à l'adhésion. Elle est persistée sur le membre :
 // savoir QUE quelqu'un a consenti ne vaut rien si on ne sait plus à QUOI.
-const PASS_TERMS_VERSION = '2026-07';
+//
+// `2026-08` = la première version RÉELLEMENT ÉCRITE (page /pass/conditions).
+// ⚠️ Les membres inscrits avant le 2026-08-14 portent `2026-07`, une version qui n'a jamais
+// existé sous forme de document : à l'ouverture du programme, le lien « Conditions du
+// programme » menait encore aux conditions de Sales Hub. Rien ne peut réparer ça après coup —
+// c'est une question à porter au conseiller juridique, pas à corriger en base.
+//
+// Ces deux constantes sont exposées par `GET /api/pass/program` et AFFICHÉES sur la page des
+// conditions : la version que le document annonce est ainsi la même que celle enregistrée au
+// consentement, par construction. Deux valeurs à tenir à jour à la main finiraient par
+// diverger, et c'est justement la divergence qui rend un consentement inutilisable.
+const PASS_TERMS_VERSION = '2026-08';
+const PASS_TERMS_UPDATED = '2026-08-14';
 
 // Deux expéditeurs, un par langue — le programme porte deux noms.
 //
@@ -19167,6 +19179,10 @@ app.get('/api/pass/program', async (req, res) => {
       tiers: [...(c.tiers || [])].sort((a, b) => a.from - b.from)
         .map(t => ({ level: t.level, key: t.key, from: t.from, credit: t.credit,
                      productDiscountPct: t.productDiscountPct })),
+      // La page des conditions les affiche. Servies par l'API et non écrites dans la copie :
+      // c'est la même valeur qui est enregistrée au consentement du membre.
+      termsVersion: PASS_TERMS_VERSION,
+      termsUpdated: PASS_TERMS_UPDATED,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
