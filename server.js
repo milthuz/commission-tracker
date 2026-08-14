@@ -4715,6 +4715,52 @@ app.get('/api/partner-portal/team', authenticatePartnerToken, async (req, res) =
 });
 
 // POST /api/partner-portal/team/invite { email, name, role } — Admin-only, SH-31.
+// GET /api/partner-portal/team/join-code — l'administrateur partenaire voit SON code.
+//
+// Reserve aux administrateurs : un usager standard n'a personne a inviter, le code ne lui sert
+// a rien, et moins il circule mieux c'est.
+//
+// Le partenaire est toujours celui du JETON, jamais un identifiant du corps de la requete —
+// sinon un administrateur pourrait lire le code d'une autre organisation.
+app.get('/api/partner-portal/team/join-code', authenticatePartnerToken, async (req, res) => {
+  if (req.partnerUser.role !== 'admin') return res.status(403).json({ error: 'Partner Admin only' });
+  try {
+    const p = (await pool.query(
+      `SELECT join_code, join_enabled, join_email_domains FROM partners WHERE id = $1`,
+      [req.partnerUser.partnerId]
+    )).rows[0];
+    // Les domaines sont renvoyes en LECTURE : ils permettent a l'administrateur d'expliquer a un
+    // collegue pourquoi son adresse personnelle est refusee. Il ne peut pas les changer.
+    res.json({
+      joinCode: p?.join_enabled ? p.join_code : null,
+      joinEnabled: !!p?.join_enabled,
+      joinEmailDomains: p?.join_email_domains || null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/partner-portal/team/join-code — l'administrateur partenaire REMPLACE son code.
+//
+// C'est sa revocation a lui : si le code a trop circule en interne, il n'a pas a attendre
+// Cluster. Il ne peut PAS ouvrir ou fermer l'inscription, ni toucher aux domaines.
+app.post('/api/partner-portal/team/join-code', authenticatePartnerToken, async (req, res) => {
+  if (req.partnerUser.role !== 'admin') return res.status(403).json({ error: 'Partner Admin only' });
+  try {
+    const p = (await pool.query(`SELECT join_enabled FROM partners WHERE id = $1`,
+      [req.partnerUser.partnerId])).rows[0];
+    // Regenerer un code alors que l'inscription est fermee donnerait un code inutilisable, et
+    // laisserait croire qu'elle est ouverte.
+    if (!p?.join_enabled) return res.status(409).json({ error: 'signup_closed' });
+    const code = await rotatePartnerJoinCode(req.partnerUser.partnerId, req.partnerUser.email);
+    if (!code) return res.status(404).json({ error: 'Partner not found' });
+    res.json({ joinCode: code });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/api/partner-portal/team/invite', authenticatePartnerToken, async (req, res) => {
   if (req.partnerUser.role !== 'admin') return res.status(403).json({ error: 'Partner Admin only' });
   const email = String(req.body.email || '').trim().toLowerCase();
@@ -5094,27 +5140,36 @@ app.put('/api/admin/partners/:id', authenticateToken, async (req, res) => {
 // Le remplacement est le mecanisme de REVOCATION : un code diffuse trop largement se remplace,
 // et les comptes deja crees ne sont pas touches. C'est pour ca qu'il n'y a pas de « supprimer »
 // separe — fermer l'inscription se fait avec l'interrupteur.
+// Genere un code neuf pour un partenaire et le retient. Ecrit UNE fois : deux appelants
+// (Cluster et l'administrateur partenaire), et la boucle de collision merite d'exister a un
+// seul endroit.
+//
+// Boucle courte : la collision est quasi impossible (32^12) mais l'index unique la refuserait,
+// et echouer sur un tirage malchanceux serait absurde.
+async function rotatePartnerJoinCode(partnerId, actor) {
+  for (let essai = 0; essai < 5; essai++) {
+    try {
+      const r = await pool.query(
+        `UPDATE partners SET join_code = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING name, join_code`,
+        [partnerId, newJoinCode()]);
+      if (!r.rowCount) return null;
+      logActivity('partner', r.rows[0].name, 'join_code_rotated',
+        `Organization code regenerated for ${r.rows[0].name} by ${actor}`, actor);
+      return r.rows[0].join_code;
+    } catch (e) {
+      if (e.code !== '23505') throw e;
+    }
+  }
+  throw new Error('could not generate a unique code');
+}
+
 app.post('/api/admin/partners/:id/join-code', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'partners:manage'))) return;
   try {
-    const id = parseInt(req.params.id, 10);
-    // Boucle courte : la collision est quasi impossible (32^12) mais l'index unique la refuserait,
-    // et echouer sur un tirage malchanceux serait absurde.
-    for (let essai = 0; essai < 5; essai++) {
-      const code = newJoinCode();
-      try {
-        const r = await pool.query(
-          `UPDATE partners SET join_code = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING name, join_code`,
-          [id, code]);
-        if (!r.rowCount) return res.status(404).json({ error: 'Partner not found' });
-        logActivity('partner', r.rows[0].name, 'join_code_rotated',
-          `Organization code regenerated for ${r.rows[0].name}`, req.user.realAdminEmail || req.user.email);
-        return res.json({ joinCode: r.rows[0].join_code });
-      } catch (e) {
-        if (e.code !== '23505') throw e;
-      }
-    }
-    res.status(500).json({ error: 'could not generate a unique code' });
+    const code = await rotatePartnerJoinCode(parseInt(req.params.id, 10),
+      req.user.realAdminEmail || req.user.email);
+    if (!code) return res.status(404).json({ error: 'Partner not found' });
+    res.json({ joinCode: code });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
