@@ -164,6 +164,7 @@ const PERMISSION_CATALOG = [
   { key: 'partners:manage',            label: 'Manage partner companies and review submitted opportunities',   category: 'Partners' },
   { key: 'partners:delete',            label: 'Delete a partner company AND all its history (destructive)',     category: 'Partners' },
   { key: 'partners:migrate',           label: 'Bulk-import partners, portal users and opportunities (migration)', category: 'Partners' },
+  { key: 'partners:stats',             label: 'View partner portal usage statistics (adoption, logins, submissions)', category: 'Partners' },
 
   // Sofia (in-app assistant) — CRM tools. Split read/write on purpose: the write key is the
   // only thing standing between a chat message and a real record in Zoho, so it must be
@@ -5853,6 +5854,104 @@ app.post('/api/admin/partners/:id/invite-admin', authenticateToken, async (req, 
     logActivity('partner_user', email, 'invited', `${email}${name ? ` (${name})` : ''} invited as Partner Admin for ${partner.name} by ${actor}`, actor);
     res.json({ success: true, inviteUrl, emailSent: mail.sent, emailError: mail.sent ? null : mail.reason });
   } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/partner-stats — usage du portail partenaire.
+//
+// Tout en UN aller-retour : cinq resultats, mais la base est derriere un proxy public
+// (voir la note sur les allers-retours) et un ecran qui ferait cinq appels serait cinq fois
+// plus lent pour rien.
+//
+// ⚠️ Ce qu'on peut honnetement mesurer et ce qu'on ne peut pas. Les connexions, activations et
+// soumissions sont des faits cote serveur. Les pages consultees, le temps passe, les parcours :
+// RIEN n'est instrumente, et il ne faut pas laisser croire le contraire — l'ecran ne montre donc
+// que ce qui est reellement enregistre.
+app.get('/api/admin/partner-stats', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:stats'))) return;
+  try {
+    const [entonnoir, connexions, soumissions, dormants, actifs] = await Promise.all([
+      // Entonnoir d'adoption, par partenaire. `invite_opened_at` = le LIEN a ete ouvert ; ce
+      // n'est PAS « le courriel a ete lu », qui n'est pas mesure (decision assumee, un pixel de
+      // suivi ment une fois sur deux).
+      pool.query(
+        `SELECT p.id, p.name, p.active,
+                COUNT(pu.id)::int AS usagers,
+                COUNT(pu.id) FILTER (WHERE pu.invited_at IS NOT NULL)::int        AS invites,
+                COUNT(pu.id) FILTER (WHERE pu.invite_opened_at IS NOT NULL)::int  AS liens_ouverts,
+                COUNT(pu.id) FILTER (WHERE pu.activated_at IS NOT NULL)::int      AS actives,
+                COUNT(pu.id) FILTER (WHERE pu.last_login_at IS NOT NULL)::int     AS deja_connectes,
+                COUNT(pu.id) FILTER (WHERE pu.last_login_at > NOW() - INTERVAL '30 days')::int AS actifs_30j,
+                COUNT(pu.id) FILTER (WHERE pu.status = 'disabled')::int           AS desactives,
+                (SELECT COUNT(*)::int FROM partner_opportunities o WHERE o.partner_id = p.id) AS opportunites,
+                (SELECT COUNT(*)::int FROM partner_opportunities o
+                  WHERE o.partner_id = p.id AND o.created_at > NOW() - INTERVAL '30 days') AS opportunites_30j
+           FROM partners p LEFT JOIN partner_users pu ON pu.partner_id = p.id
+          GROUP BY p.id, p.name, p.active ORDER BY p.name`),
+
+      // Connexions par jour, 90 jours. Le journal porte le courriel : on rejoint pour nommer le
+      // partenaire. Un compte supprime depuis garde ses connexions mais perd son partenaire —
+      // d'ou le LEFT JOIN et le regroupement sur un libelle de repli.
+      pool.query(
+        `SELECT a.created_at::date AS jour, COALESCE(p.name, '—') AS partenaire, COUNT(*)::int AS n
+           FROM activity_log a
+           LEFT JOIN partner_users pu ON LOWER(pu.email) = LOWER(a.entity_id)
+           LEFT JOIN partners p ON p.id = pu.partner_id
+          WHERE a.entity_type = 'partner_user' AND a.event_type = 'login'
+            AND a.created_at > NOW() - INTERVAL '90 days'
+          GROUP BY 1, 2 ORDER BY 1`),
+
+      // Soumissions par mois, 12 mois.
+      pool.query(
+        `SELECT to_char(o.created_at, 'YYYY-MM') AS mois, p.name AS partenaire, COUNT(*)::int AS n
+           FROM partner_opportunities o JOIN partners p ON p.id = o.partner_id
+          WHERE o.created_at > NOW() - INTERVAL '12 months'
+          GROUP BY 1, 2 ORDER BY 1`),
+
+      // Comptes actives qui ne reviennent pas. C'est le signal le plus actionnable de l'ecran :
+      // quelqu'un a franchi mot de passe ET 2FA, puis a cesse — ce n'est pas un probleme d'acces,
+      // c'est que le portail ne lui sert pas.
+      pool.query(
+        `SELECT pu.email, pu.display_name, p.name AS partenaire, pu.role,
+                pu.activated_at, pu.last_login_at
+           FROM partner_users pu JOIN partners p ON p.id = pu.partner_id
+          WHERE pu.activated_at IS NOT NULL
+            AND (pu.last_login_at IS NULL OR pu.last_login_at < NOW() - INTERVAL '30 days')
+          ORDER BY pu.last_login_at NULLS FIRST, pu.activated_at LIMIT 50`),
+
+      // Les usagers qui font vivre le portail : connexions et soumissions.
+      pool.query(
+        `SELECT pu.email, pu.display_name, p.name AS partenaire, pu.last_login_at,
+                (SELECT COUNT(*)::int FROM activity_log a
+                  WHERE a.entity_type = 'partner_user' AND a.event_type = 'login'
+                    AND LOWER(a.entity_id) = LOWER(pu.email)) AS connexions,
+                (SELECT COUNT(*)::int FROM partner_opportunities o WHERE o.submitted_by = pu.id) AS soumissions
+           FROM partner_users pu JOIN partners p ON p.id = pu.partner_id
+          WHERE pu.last_login_at IS NOT NULL
+          ORDER BY pu.last_login_at DESC LIMIT 25`),
+    ]);
+
+    res.json({
+      funnel: entonnoir.rows.map((r) => ({
+        partnerId: r.id, partner: r.name, active: r.active,
+        users: r.usagers, invited: r.invites, opened: r.liens_ouverts,
+        activated: r.actives, everLoggedIn: r.deja_connectes, active30d: r.actifs_30j,
+        disabled: r.desactives, opportunities: r.opportunites, opportunities30d: r.opportunites_30j,
+      })),
+      logins: connexions.rows.map((r) => ({ day: r.jour, partner: r.partenaire, count: r.n })),
+      submissions: soumissions.rows.map((r) => ({ month: r.mois, partner: r.partenaire, count: r.n })),
+      dormant: dormants.rows.map((r) => ({
+        email: r.email, name: r.display_name, partner: r.partenaire, role: r.role,
+        activatedAt: r.activated_at, lastLoginAt: r.last_login_at,
+      })),
+      topUsers: actifs.rows.map((r) => ({
+        email: r.email, name: r.display_name, partner: r.partenaire,
+        lastLoginAt: r.last_login_at, logins: r.connexions, submissions: r.soumissions,
+      })),
+    });
+  } catch (e) {
+    console.error('[partner-stats] echec:', e.stack || e.message);
     res.status(500).json({ error: e.message });
   }
 });
