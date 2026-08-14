@@ -6805,8 +6805,12 @@ async function sofiaCrmScope(req) {
 // nobody remembers to update.
 async function hubGet(scope, path, params) {
   if (!scope.authHeader) return { error: 'not_authenticated' };
-  const port = process.env.PORT || 3000;
-  const r = await axios.get(`http://127.0.0.1:${port}${path}`, {
+  // Reuse the PORT constant the server actually listens on, rather than
+  // repeating the fallback: this said 3000 while app.listen used 5000, so with
+  // PORT unset (any local run) every Sales Hub tool called a dead port. Two
+  // copies of the same number is one too many. Read at call time, which is
+  // always after startup.
+  const r = await axios.get(`http://127.0.0.1:${PORT}${path}`, {
     params,
     headers: { Authorization: scope.authHeader },
     validateStatus: () => true,
@@ -7154,7 +7158,10 @@ async function toolCrmSendEmail(scope, i) {
       from: { user_name: me.full_name || scope.repName || 'Cluster', email: me.email },
       to: [{ user_name: crmRecordSummary(mod, rec, r0.spec).name, email: to }],
       subject: subject.slice(0, 250),
-      content: body.slice(0, 100000),
+      // Sent as HTML, so a plain-text body would arrive as one run-on paragraph
+      // with every line break swallowed — which is exactly what a dictated
+      // follow-up looks like. Convert breaks when the body carries no markup.
+      content: (/<[a-z][\s\S]*>/i.test(body) ? body : body.replace(/\n/g, '<br>')).slice(0, 100000),
       mail_format: 'html',
     }] },
     { headers: { Authorization: `Zoho-oauthtoken ${token}`, 'Content-Type': 'application/json' },
