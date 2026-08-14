@@ -2385,6 +2385,15 @@ const isFrLocale = (lang) => String(lang || 'fr').toLowerCase().startsWith('fr')
 // celui qui a lance l'envoi ce jour-la. Une seule ligne a changer si l'interlocuteur change.
 const PARTNER_SUPPORT_EMAIL = 'gabriella.daly@clustersystems.com';
 
+// Duree de vie d'un lien d'invitation partenaire. 30 jours, pas 7 (demande de David le
+// 2026-08-13, apres l'envoi des 177 invitations Moneris) : sept jours ne couvrent pas des
+// vacances ni une semaine chargee, et un lien expire se solde souvent par un compte jamais
+// active plutot que par une relance.
+//
+// ⚠️ Ne s'applique PAS aux invitations des employes Cluster (`/api/admin/local-users/invite`),
+// qui restent a 7 jours : autre population, autre risque.
+const PARTNER_INVITE_TTL_DAYS = 30;
+
 const PARTNER_EMAIL_COPY = {
   invite: {
     fr: {
@@ -3538,6 +3547,8 @@ app.post('/api/admin/local-users/invite', authenticateToken, async (req, res) =>
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'Invalid email' });
   try {
     const raw = newRawToken();
+    // Employes Cluster : 7 jours, deliberement plus court que les 30 jours des partenaires.
+    // Autre population, autre risque — ils activent dans la journee.
     const expires = new Date(Date.now() + 7 * 24 * 3600 * 1000);
     const actor = req.user.realAdminEmail || req.user.email || 'unknown';
     const existing = (await pool.query(`SELECT id, status FROM local_users WHERE email = $1`, [email])).rows[0];
@@ -4632,7 +4643,7 @@ app.post('/api/partner-portal/team/invite', authenticatePartnerToken, async (req
     }
     if (existing && existing.status === 'active') return res.status(409).json({ error: 'User already active' });
     const raw = newRawToken();
-    const expires = new Date(Date.now() + 7 * 24 * 3600 * 1000);
+    const expires = new Date(Date.now() + PARTNER_INVITE_TTL_DAYS * 24 * 3600 * 1000);
     // Langue du courriel d'invitation, choisie par la personne qui invite. Conservee sur
     // le compte : la reinitialisation de mot de passe, plus tard, n'a personne a qui la
     // demander.
@@ -5510,7 +5521,7 @@ app.post('/api/admin/partner-users/invite', authenticateToken, async (req, res) 
       if (u.status === 'disabled') { report.skipped.push({ email: u.email, why: 'disabled' }); continue; }
       try {
         const raw = newRawToken();
-        const expires = new Date(Date.now() + 7 * 24 * 3600 * 1000);
+        const expires = new Date(Date.now() + PARTNER_INVITE_TTL_DAYS * 24 * 3600 * 1000);
         const locale = isFrLocale(u.locale) ? 'fr' : 'en';
         await pool.query(
           // NI le role NI la langue ne sont touches : ils appartiennent au compte, pas a l'envoi.
@@ -5813,7 +5824,7 @@ app.post('/api/admin/partners/:id/invite-admin', authenticateToken, async (req, 
     const existing = (await pool.query(`SELECT id, status, migration_source FROM partner_users WHERE email = $1`, [email])).rows[0];
     if (existing && existing.status === 'active') return res.status(409).json({ error: 'User already active' });
     const raw = newRawToken();
-    const expires = new Date(Date.now() + 7 * 24 * 3600 * 1000);
+    const expires = new Date(Date.now() + PARTNER_INVITE_TTL_DAYS * 24 * 3600 * 1000);
     const actor = req.user.realAdminEmail || req.user.email || 'unknown';
     // Langue du courriel d'invitation, choisie par la personne qui invite. Conservee sur
     // le compte : la reinitialisation de mot de passe, plus tard, n'a personne a qui la
