@@ -489,6 +489,13 @@ async function initializeDatabase() {
     // des la premiere invitation : c'est elle qui choisit la version du courriel, y compris sur
     // une relance des semaines plus tard.
     await pool.query(`ALTER TABLE partner_users ADD COLUMN IF NOT EXISTS migration_source VARCHAR(50)`);
+    // Inscription libre par code d'organisation (2026-08-14). Le code est un secret PARTAGE,
+    // du meme genre qu'un mot de passe de reseau sans fil : stocke en clair parce qu'un admin
+    // doit pouvoir le lire pour le communiquer, et rendu inoffensif par le domaine impose.
+    await pool.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS join_code VARCHAR(32)`);
+    await pool.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS join_email_domains VARCHAR(255)`);
+    await pool.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS join_enabled BOOLEAN DEFAULT false`);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_partners_join_code ON partners(UPPER(join_code)) WHERE join_code IS NOT NULL`);
     // Deal issu de la conversion du Lead. Retenu parce que la resolution passe par une
     // RECHERCHE par nom, couteuse et ambigue : une fois trouve, on n'y revient plus.
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_deal_id VARCHAR(50)`);
@@ -2395,6 +2402,30 @@ const PARTNER_SUPPORT_EMAIL = 'gabriella.daly@clustersystems.com';
 // qui restent a 7 jours : autre population, autre risque.
 const PARTNER_INVITE_TTL_DAYS = 30;
 
+// Code d'organisation : alphabet SANS caracteres ambigus (ni I, ni O, ni 0, ni 1). Ce code est
+// lu au telephone, recopie a la main, colle dans un message — chaque confusion possible est un
+// appel au soutien. Groupe par 4 pour la meme raison.
+const JOIN_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function newJoinCode() {
+  const c = require('crypto');
+  const tirer = () => Array.from({ length: 4 }, () => JOIN_ALPHABET[c.randomInt(JOIN_ALPHABET.length)]).join('');
+  return `${tirer()}-${tirer()}-${tirer()}`;
+}
+
+// Le courriel appartient-il a un domaine autorise par ce partenaire ?
+//
+// ⚠️ ECHOUE FERME : sans domaine configure, aucune inscription n'est possible. David a choisi le
+// domaine impose ; un partenaire mal configure doit bloquer, pas ouvrir grand.
+function emailDomainAllowed(email, domainesConfigures) {
+  const domaines = String(domainesConfigures || '')
+    .split(/[,;\s]+/).map((d) => d.trim().toLowerCase().replace(/^@/, '')).filter(Boolean);
+  if (!domaines.length) return false;
+  const d = String(email || '').toLowerCase().split('@')[1] || '';
+  // Sous-domaines acceptes (`ca.moneris.com` pour `moneris.com`), mais jamais un suffixe qui
+  // ressemble : `notmoneris.com` ne doit pas passer pour `moneris.com`.
+  return domaines.some((ok) => d === ok || d.endsWith('.' + ok));
+}
+
 const PARTNER_EMAIL_COPY = {
   invite: {
     fr: {
@@ -4020,6 +4051,66 @@ app.get('/api/partner-auth/invite-info', async (req, res) => {
   }
 });
 
+// POST /api/partner-auth/signup { code, email, name, password } — inscription libre.
+//
+// Remplace l'invitation nominative quand un partenaire a des dizaines de personnes : on lui
+// donne UN code, il le diffuse en interne. Le parcours rejoint ensuite exactement celui d'une
+// invitation — mot de passe puis double authentification — donc rien n'est affaibli a l'entree.
+app.post('/api/partner-auth/signup', async (req, res) => {
+  const code = String(req.body.code || '').trim().toUpperCase();
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const name = String(req.body.name || '').trim();
+  const password = String(req.body.password || '');
+  // Deux compteurs : par IP contre un balayage large, par CODE contre l'essai methodique d'un
+  // seul partenaire. Le second est le vrai garde-fou — un code fait 12 caracteres.
+  if (rateLimited(`psignup:${req.ip}`, 10) || rateLimited(`psignupcode:${code}`, 20)) {
+    return res.status(429).json({ error: 'Too many attempts — try again later' });
+  }
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'invalid_email' });
+  if (password.length < 8) return res.status(400).json({ error: 'password_too_short' });
+  if (!name) return res.status(400).json({ error: 'name_required' });
+  try {
+    const p = (await pool.query(
+      `SELECT id, name, active, join_enabled, join_email_domains
+         FROM partners WHERE UPPER(join_code) = $1`, [code]
+    )).rows[0];
+    // Meme reponse pour « code inconnu » et « inscription fermee » : distinguer les deux
+    // apprendrait a un inconnu qu'un code est valide, ce qui est precisement ce qu'il cherche.
+    if (!p || !p.active || !p.join_enabled) return res.status(404).json({ error: 'invalid_code' });
+    if (!emailDomainAllowed(email, p.join_email_domains)) {
+      return res.status(403).json({ error: 'email_domain_not_allowed' });
+    }
+
+    const existant = (await pool.query(`SELECT id, status FROM partner_users WHERE email = $1`, [email])).rows[0];
+    // La personne a prouve qu'elle connait le code de son organisation : lui dire que son compte
+    // existe deja est une aide, pas une fuite.
+    if (existant) return res.status(409).json({ error: 'account_exists' });
+
+    // Cree DIRECTEMENT avec mot de passe et secret 2FA, puis on rejoint le parcours d'activation
+    // existant (`/invite/verify-2fa`), qui basculera le statut a « active ». Un second parcours
+    // parallele finirait par diverger de celui-ci.
+    const secret = authenticator.generateSecret();
+    await pool.query(
+      `INSERT INTO partner_users (partner_id, email, display_name, role, status, password_hash,
+                                  totp_secret, locale, created_at)
+       VALUES ($1, $2, $3, 'standard', 'invited', $4, $5, $6, CURRENT_TIMESTAMP)`,
+      [p.id, email, name, await bcrypt.hash(password, 10), secret, isFrLocale(req.body.locale) ? 'fr' : 'en']
+    );
+    logActivity('partner_user', email, 'self_signup',
+      `${name} (${email}) joined ${p.name} with the organization code`, email);
+
+    const otpauth = authenticator.keyuri(email, PARTNER_TOTP_ISSUER, secret);
+    const qrDataUrl = await QRCode.toDataURL(otpauth, { margin: 1, width: 220 });
+    res.json({ success: true, partnerName: p.name, qrDataUrl, secret,
+               setupToken: signMfaJwt(email, 'partner-2fa-setup') });
+  } catch (e) {
+    // Course entre deux inscriptions simultanees sur la meme adresse : l'unicite tranche.
+    if (e.code === '23505') return res.status(409).json({ error: 'account_exists' });
+    console.error('[partner-signup] echec:', e.stack || e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/api/partner-auth/invite/accept', async (req, res) => {
   const raw = String(req.body.token || '');
   const password = String(req.body.password || '');
@@ -4888,7 +4979,7 @@ app.get('/api/admin/partners', authenticateToken, async (req, res) => {
       `SELECT p.id, p.name, p.active, p.created_at, (p.logo_data IS NOT NULL) AS has_logo,
               p.lead_source, p.billing_contact_name, p.billing_contact_email, p.billing_contact_phone,
               p.business_contact_name, p.business_contact_email, p.business_contact_phone, p.payout_rate,
-              p.initial_payout_rate,
+              p.initial_payout_rate, p.join_code, p.join_email_domains, p.join_enabled,
               COUNT(pu.id) AS user_count,
               -- Avancement des invitations, agrege ici pour eviter un appel par partenaire.
               -- Le compte des envoyees inclut les comptes deja actives : sinon le total
@@ -4914,6 +5005,7 @@ app.get('/api/admin/partners', authenticateToken, async (req, res) => {
       businessContactName: r.business_contact_name, businessContactEmail: r.business_contact_email, businessContactPhone: r.business_contact_phone,
       payoutRate: r.payout_rate !== null ? parseFloat(r.payout_rate) : null,
       initialPayoutRate: r.initial_payout_rate !== null ? parseFloat(r.initial_payout_rate) : null,
+      joinCode: r.join_code, joinEmailDomains: r.join_email_domains, joinEnabled: !!r.join_enabled,
     })) });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -4967,13 +5059,18 @@ app.put('/api/admin/partners/:id', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Initial payout rate must be a positive number' });
     }
     await pool.query(
-      `UPDATE partners SET name = $2, active = $3, lead_source = $4,
+      `UPDATE partners SET name = $2, active = $3, lead_source = $4, join_enabled = $13,
+              join_email_domains = $14,
               billing_contact_name = $5, billing_contact_email = $6, billing_contact_phone = $7,
               business_contact_name = $8, business_contact_email = $9, business_contact_phone = $10,
               payout_rate = $11, initial_payout_rate = $12, updated_at = CURRENT_TIMESTAMP
        WHERE id = $1`,
       [id, name, active, leadSource, billingContactName, billingContactEmail, billingContactPhone,
-       businessContactName, businessContactEmail, businessContactPhone, payoutRate, initialPayoutRate]
+       businessContactName, businessContactEmail, businessContactPhone, payoutRate, initialPayoutRate,
+       // ⚠️ Ouvrir l'inscription SANS domaine configure est refuse plus bas cote serveur
+       // (emailDomainAllowed echoue ferme) — mais on evite meme d'enregistrer cet etat.
+       req.body.joinEnabled === true && String(req.body.joinEmailDomains || '').trim() !== '',
+       req.body.joinEmailDomains !== undefined ? String(req.body.joinEmailDomains).trim() || null : current.join_email_domains]
     );
     res.json({ success: true });
   } catch (e) {
@@ -4992,6 +5089,37 @@ app.put('/api/admin/partners/:id', authenticateToken, async (req, res) => {
 //
 // La LECTURE reste l'endpoint public existant : un logo de co-marquage doit s'afficher dans
 // un <img src> ordinaire, qui ne peut pas porter d'en-tete d'autorisation.
+// POST /api/admin/partners/:id/join-code — genere (ou remplace) le code d'organisation.
+//
+// Le remplacement est le mecanisme de REVOCATION : un code diffuse trop largement se remplace,
+// et les comptes deja crees ne sont pas touches. C'est pour ca qu'il n'y a pas de « supprimer »
+// separe — fermer l'inscription se fait avec l'interrupteur.
+app.post('/api/admin/partners/:id/join-code', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const id = parseInt(req.params.id, 10);
+    // Boucle courte : la collision est quasi impossible (32^12) mais l'index unique la refuserait,
+    // et echouer sur un tirage malchanceux serait absurde.
+    for (let essai = 0; essai < 5; essai++) {
+      const code = newJoinCode();
+      try {
+        const r = await pool.query(
+          `UPDATE partners SET join_code = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING name, join_code`,
+          [id, code]);
+        if (!r.rowCount) return res.status(404).json({ error: 'Partner not found' });
+        logActivity('partner', r.rows[0].name, 'join_code_rotated',
+          `Organization code regenerated for ${r.rows[0].name}`, req.user.realAdminEmail || req.user.email);
+        return res.json({ joinCode: r.rows[0].join_code });
+      } catch (e) {
+        if (e.code !== '23505') throw e;
+      }
+    }
+    res.status(500).json({ error: 'could not generate a unique code' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/api/admin/partners/:id/logo', authenticateToken, uploadPartnerLogo.single('file'), async (req, res) => {
   if (!(await requirePerm(req, res, 'partners:manage'))) return;
   const file = req.file;
