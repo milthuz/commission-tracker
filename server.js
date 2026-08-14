@@ -18119,10 +18119,19 @@ const PASS_CONFIG_DEFAULTS = {
   countries: ['CA'],          // Canada seulement — règle d'éligibilité, pas juste de la copie
   hardwareDiscount: 500,      // ce que le restaurant RECOMMANDÉ obtient
   // `from` = mises en service à vie déjà atteintes. Le premier palier commence à 0.
+  //
+  // `productDiscountPct` = l'avantage « X % de rabais sur les produits Cluster, en crédit
+  // Cluster » des paliers 2 et 3. Il vivait en DUR dans la copie de la page programme
+  // (`pass.landing.perks{2,3}`), donc invisible à la configuration : le modifier demandait
+  // un déploiement. C'est un montant, et la règle 4 du brief veut que les montants soient
+  // de la configuration — comme `credit`.
+  //
+  // ⚠️ C'est un TAUX ANNONCÉ, pas un mécanisme : rien ne l'applique automatiquement. Le
+  // rabais est accordé à la main, comme le crédit, via une note de crédit Zoho.
   tiers: [
-    { level: 1, from: 0, credit: 500,  key: 'commis' },
-    { level: 2, from: 1, credit: 750,  key: 'sous'   },
-    { level: 3, from: 3, credit: 1000, key: 'chef'   },
+    { level: 1, from: 0, credit: 500,  key: 'commis', productDiscountPct: 0  },
+    { level: 2, from: 1, credit: 750,  key: 'sous',   productDiscountPct: 5  },
+    { level: 3, from: 3, credit: 1000, key: 'chef',   productDiscountPct: 10 },
   ],
 };
 
@@ -18135,6 +18144,30 @@ function passTierFor(config, lifetimeLive) {
     .reduce((best, t) => (n >= t.from ? t : best), config.tiers[0]);
 }
 
+/**
+ * Complète un palier ENREGISTRÉ avec les champs ajoutés après coup.
+ *
+ * La fusion de `getPassConfig()` est superficielle : elle protège les champs de premier
+ * niveau, mais `tiers` est un TABLEAU, remplacé en bloc. Un champ ajouté à l'intérieur d'un
+ * palier est donc absent de toute configuration enregistrée avant lui — et ici cet oubli
+ * ferait DISPARAÎTRE l'avantage « X % » de la page programme jusqu'au prochain
+ * enregistrement, sans que personne ne l'ait demandé.
+ *
+ * Le repli se fait par `level` (à défaut par `key`) sur le palier correspondant des défauts.
+ *
+ * ⚠️ On teste la PRÉSENCE, pas la véracité : un 0 délibérément enregistré (« ce palier
+ * n'accorde aucun rabais ») doit rester 0, alors qu'un `|| défaut` le remplacerait.
+ */
+function passTierWithDefaults(t) {
+  const d = PASS_CONFIG_DEFAULTS.tiers.find(x => x.level === t.level) ||
+            PASS_CONFIG_DEFAULTS.tiers.find(x => x.key === t.key);
+  const absent = t.productDiscountPct === undefined || t.productDiscountPct === null || t.productDiscountPct === '';
+  return {
+    ...t,
+    productDiscountPct: absent ? (d ? d.productDiscountPct : 0) : (Number(t.productDiscountPct) || 0),
+  };
+}
+
 async function getPassConfig() {
   try {
     const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'pass_config'`);
@@ -18143,7 +18176,9 @@ async function getPassConfig() {
     // Fusion superficielle avec les valeurs par défaut : un réglage sauvegardé
     // avant l'ajout d'un champ ne doit pas faire disparaître ce champ.
     return { ...PASS_CONFIG_DEFAULTS, ...v,
-             tiers: Array.isArray(v.tiers) && v.tiers.length ? v.tiers : PASS_CONFIG_DEFAULTS.tiers };
+             tiers: Array.isArray(v.tiers) && v.tiers.length
+               ? v.tiers.map(passTierWithDefaults)
+               : PASS_CONFIG_DEFAULTS.tiers };
   } catch { return { ...PASS_CONFIG_DEFAULTS }; }
 }
 
@@ -18161,16 +18196,28 @@ app.put('/api/admin/pass/config', authenticateToken, async (req, res) => {
   const body = req.body || {};
   const num = (x) => (Number.isFinite(Number(x)) ? Number(x) : NaN);
 
+  // ⚠️ Cette projection est une LISTE BLANCHE : tout champ absent d'ici est supprimé du
+  // palier à l'enregistrement. Un champ ajouté aux paliers doit donc y être ajouté aussi,
+  // sinon il survit à la lecture et disparaît au premier « Enregistrer ».
   const tiers = Array.isArray(body.tiers) ? body.tiers.map((t, i) => ({
     level: i + 1,
     from: num(t.from),
     credit: num(t.credit),
     key: String(t.key || `tier${i + 1}`).trim().slice(0, 40),
+    // Un palier peut n'accorder aucun rabais — c'est le cas du palier 1 — donc un champ
+    // vide vaut 0 et non une erreur de saisie.
+    productDiscountPct: (t.productDiscountPct === undefined || t.productDiscountPct === null || t.productDiscountPct === '')
+      ? 0 : num(t.productDiscountPct),
   })) : null;
 
   if (!tiers || tiers.length === 0) return res.status(400).json({ error: 'tiers required' });
   if (tiers.some(t => !Number.isFinite(t.from) || t.from < 0 || !Number.isFinite(t.credit) || t.credit <= 0)) {
     return res.status(400).json({ error: 'chaque palier exige un seuil >= 0 et un crédit > 0' });
+  }
+  // Borné à 100 : au-delà, on rembourserait plus que le prix. Le 0 reste permis — c'est la
+  // valeur du palier 1, qui n'accorde pas ce rabais.
+  if (tiers.some(t => !Number.isFinite(t.productDiscountPct) || t.productDiscountPct < 0 || t.productDiscountPct > 100)) {
+    return res.status(400).json({ error: 'le rabais produits doit être un pourcentage entre 0 et 100' });
   }
   // Le premier palier DOIT partir de 0, sinon un membre sans recommandation
   // n'est dans aucun palier et l'espace membre n'a rien à afficher.
@@ -18376,8 +18423,8 @@ function passMemberPublic(m, config) {
     locale: m.locale,
     joinedAt: m.created_at,
     lifetimeLiveReferrals: lifetime,
-    tier: { level: tier.level, key: tier.key, credit: tier.credit },
-    nextTier: next ? { level: next.level, key: next.key, credit: next.credit, referralsAway: next.from - lifetime } : null,
+    tier: { level: tier.level, key: tier.key, credit: tier.credit, productDiscountPct: tier.productDiscountPct },
+    nextTier: next ? { level: next.level, key: next.key, credit: next.credit, productDiscountPct: next.productDiscountPct, referralsAway: next.from - lifetime } : null,
     hardwareDiscount: config.hardwareDiscount,
     currency: config.currency,
   };
@@ -19019,7 +19066,8 @@ app.get('/api/pass/program', async (req, res) => {
       countries: c.countries,
       hardwareDiscount: c.hardwareDiscount,
       tiers: [...(c.tiers || [])].sort((a, b) => a.from - b.from)
-        .map(t => ({ level: t.level, key: t.key, from: t.from, credit: t.credit })),
+        .map(t => ({ level: t.level, key: t.key, from: t.from, credit: t.credit,
+                     productDiscountPct: t.productDiscountPct })),
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
