@@ -2485,6 +2485,34 @@ const PARTNER_EMAIL_COPY = {
       cta: 'Activate my access',
     },
   },
+  // RAPPEL d'activation. Sobre par conception — voir l'en-tete de ce fichier de correctif :
+  // le gabarit d'annonce est parti dans « Promotions » chez Outlook.
+  inviteReminder: {
+    fr: {
+      subject: 'Votre accès au Portail partenaire Cluster',
+      title: 'Votre accès n’est pas encore activé',
+      intro: (name, partner, url, echeance) =>
+        `${name ? 'Bonjour ' + name + ',' : 'Bonjour,'}<br><br>`
+        + `Votre compte du Portail partenaire Cluster${partner ? ` pour ${partner}` : ''} est prêt, `
+        + `mais il n’a pas encore été activé.<br><br>`
+        + `Pour l’activer, ouvrez ce lien : <a href="${url}" style="color:#3c50e0">${url}</a>`
+        + (echeance ? `<br><br>Le lien reste valide jusqu’au ${echeance}.` : '')
+        + `<br><br>Si vous n’avez pas besoin de cet accès, ignorez ce message.`,
+      cta: '',
+    },
+    en: {
+      subject: 'Your Cluster Partner Portal access',
+      title: 'Your access is not active yet',
+      intro: (name, partner, url, echeance) =>
+        `${name ? 'Hello ' + name + ',' : 'Hello,'}<br><br>`
+        + `Your Cluster Partner Portal account${partner ? ` for ${partner}` : ''} is ready, `
+        + `but it has not been activated yet.<br><br>`
+        + `To activate it, open this link: <a href="${url}" style="color:#3c50e0">${url}</a>`
+        + (echeance ? `<br><br>The link stays valid until ${echeance}.` : '')
+        + `<br><br>If you do not need this access, you can ignore this message.`,
+      cta: '',
+    },
+  },
   reset: {
     fr: {
       subject: 'Réinitialisation du mot de passe — Cluster',
@@ -2509,10 +2537,17 @@ const partnerCopy = (kind, lang) => PARTNER_EMAIL_COPY[kind][isFrLocale(lang) ? 
 // « un compte vous a ete prepare » nierait les dossiers qu'il possede deja. Un compte cree a la
 // main recoit la version normale. Les trois chemins d'invitation passent par ici, pour qu'ils ne
 // puissent pas divergent l'un de l'autre.
-function partnerInviteMail({ locale, name, partnerName, reprise, dossiers, contact, url }) {
-  const c = partnerCopy(reprise ? 'inviteMigration' : 'invite', locale);
-  const intro = reprise ? c.intro(name, partnerName, dossiers, contact) : c.intro(name, partnerName);
-  return { subject: c.subject, html: mailShell(c.title, intro, c.cta, url, locale, 'cluster') };
+function partnerInviteMail({ locale, name, partnerName, reprise, dossiers, contact, url,
+                             rappel, echeance }) {
+  // Le RAPPEL prime sur tout : quelqu'un qui n'a pas active n'a pas besoin qu'on lui re-annonce
+  // un nouveau portail, il a besoin de son lien. Et c'est ce gabarit-la qui doit rester sobre.
+  const c = partnerCopy(rappel ? 'inviteReminder' : (reprise ? 'inviteMigration' : 'invite'), locale);
+  const intro = rappel ? c.intro(name, partnerName, url, echeance)
+    : reprise ? c.intro(name, partnerName, dossiers, contact)
+    : c.intro(name, partnerName);
+  // `cta` vide → mailShell n'affiche NI bouton NI la ligne « si le bouton ne fonctionne pas ».
+  // C'est voulu : un gros bouton colore est un marqueur d'infolettre.
+  return { subject: c.subject, html: mailShell(c.title, intro, c.cta, c.cta ? url : null, locale, 'cluster') };
 }
 
 // Combien de dossiers ce partenaire retrouvera-t-il en se connectant ? Sert uniquement au texte
@@ -3641,7 +3676,7 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // sampleEmail(), dans TEMPLATE_TYPES de EmailPreview.tsx, et dans les libellés i18n.
 // Les quatre `pass_*` sont les courriels du programme La Passe ; ils sont les seuls de la
 // liste à partir d'une adresse et d'une enveloppe qui ne sont pas celles de Sales Hub.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration'];
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -3669,6 +3704,15 @@ function sampleEmail(type, lang) {
   // leur vraie enveloppe (marque « cluster », domaine partenaire) — meme raison que pour La
   // Passe : un apercu recopie a cote finit toujours par montrer autre chose que ce qui part.
   // Ce sont les seuls courriels de la liste qui ne portent NI la marque NI le domaine Sales Hub.
+  if (type === 'partner_reminder') {
+    const locale = isFrLocale(lang) ? 'fr' : 'en';
+    return partnerInviteMail({
+      locale, name: 'Shanna Da Silva', partnerName: 'Moneris', rappel: true,
+      echeance: locale === 'fr' ? '11 septembre 2026' : 'September 11, 2026',
+      url: `${PARTNER_WEB_BASE(locale)}/partner-portal/accept-invite?token=SAMPLE`,
+    });
+  }
+
   if (type === 'partner_invite_migration') {
     const locale = isFrLocale(lang) ? 'fr' : 'en';
     // Chiffres d'exemple choisis pour ressembler au cas reel : Moneris et ses 674 dossiers.
@@ -5686,7 +5730,12 @@ app.post('/api/admin/partner-users/invite', authenticateToken, async (req, res) 
     return res.status(400).json({ error: 'batch_too_large', max: PARTNER_INVITE_BATCH_MAX });
   }
   const actor = req.user.realAdminEmail || req.user.email || 'unknown';
-  const report = { sent: [], skipped: [], failed: [] };
+  // Mode RAPPEL : meme mecanique, autre texte. ⚠️ Le jeton precedent est REMPLACE — il est
+  // stocke hache, donc impossible a remettre dans un courriel. Le lien de la premiere
+  // invitation cesse donc de fonctionner, ce que le rappel rend sans consequence puisqu'il
+  // porte le nouveau.
+  const rappel = req.body.reminder === true;
+  const report = { sent: [], skipped: [], failed: [], reminder: rappel };
   try {
     const rows = (await pool.query(
       `SELECT pu.id, pu.email, pu.display_name, pu.role, pu.status, pu.locale, pu.migration_source,
@@ -5728,12 +5777,15 @@ app.post('/api/admin/partner-users/invite', authenticateToken, async (req, res) 
           locale, name: u.display_name, partnerName: u.partner_name, reprise,
           dossiers: reprise ? dossiersParPartenaire.get(u.partner_id) : 0,
           contact: PARTNER_SUPPORT_EMAIL, url: inviteUrl,
+          rappel,
+          echeance: expires.toLocaleDateString(locale === 'fr' ? 'fr-CA' : 'en-CA',
+            { year: 'numeric', month: 'long', day: 'numeric' }),
         });
         const mail = await sendMail(u.email, courriel.subject, courriel.html);
         if (mail.sent) {
           report.sent.push({ email: u.email });
-          logActivity('partner_user', u.email, 'invited',
-            `${u.email} invited to the ${u.partner_name} portal by ${actor}`, actor);
+          logActivity('partner_user', u.email, rappel ? 'reminded' : 'invited',
+            `${u.email} ${rappel ? 'reminded about' : 'invited to'} the ${u.partner_name} portal by ${actor}`, actor);
         } else {
           // Le jeton reste valide : l'envoi a echoue, pas l'invitation. Un nouvel essai plus tard
           // fonctionnera, et le compte n'est pas coince dans un etat intermediaire.
