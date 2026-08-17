@@ -6133,10 +6133,23 @@ app.post('/api/admin/partners/:id/invite-admin', authenticateToken, async (req, 
 // soumissions sont des faits cote serveur. Les pages consultees, le temps passe, les parcours :
 // RIEN n'est instrumente, et il ne faut pas laisser croire le contraire — l'ecran ne montre donc
 // que ce qui est reellement enregistre.
+// L'etat d'une opportunite, ecrit UNE SEULE fois. Il est deduit de l'etape du Deal dans Zoho, et
+// trois requetes s'en servent : si la definition diverge entre elles, l'ecran s'auto-contredit.
+//
+// Regle de prefixe plutot que liste fermee : Zoho peut ajouter « Closed <quelque chose> » sans
+// nous prevenir, et un nouvel etat ferme tomberait sinon dans « en cours », ou il gonflerait le
+// pipeline en silence. `Non Qualified` et `Previously Claimed Account` sont termines sans porter
+// le prefixe — d'ou la liste, qui ne couvre que ces exceptions constatees.
+const ETAPE_GAGNE = `o.crm_deal_stage = 'Closed Won'`;
+const ETAPE_PERDU = `(o.crm_deal_stage LIKE 'Closed %' AND o.crm_deal_stage <> 'Closed Won'
+                      OR o.crm_deal_stage IN ('Non Qualified', 'Previously Claimed Account'))`;
+const ETAPE_EN_COURS = `(o.crm_deal_stage IS NOT NULL AND NOT ${ETAPE_GAGNE} AND NOT ${ETAPE_PERDU})`;
+
 app.get('/api/admin/partner-stats', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'partners:stats'))) return;
   try {
-    const [entonnoir, connexions, soumissions, dormants, actifs] = await Promise.all([
+    const [entonnoir, connexions, soumissions, dormants, actifs,
+           pipeline, parMois, parEtape] = await Promise.all([
       // Entonnoir d'adoption, par partenaire. `invite_opened_at` = le LIEN a ete ouvert ; ce
       // n'est PAS « le courriel a ete lu », qui n'est pas mesure (decision assumee, un pixel de
       // suivi ment une fois sur deux).
@@ -6195,6 +6208,53 @@ app.get('/api/admin/partner-stats', authenticateToken, async (req, res) => {
            FROM partner_users pu JOIN partners p ON p.id = pu.partner_id
           WHERE pu.last_login_at IS NOT NULL
           ORDER BY pu.last_login_at DESC LIMIT 25`),
+
+      // --- Le PIPELINE d'affaires, par partenaire. Un tableau et pas un graphique compare : il
+      // n'y a qu'un partenaire aujourd'hui, un histogramme a une barre ne dit rien, alors qu'un
+      // tableau reste lisible a une ligne et monte a N sans etre redessine.
+      //
+      // ⚠️ « gagne » et « versement declenche » sont DEUX choses, a 4x d'ecart dans les donnees
+      // (94 contre 21) : le premier est l'etape du Deal, le second est la date de depot Zoho qui
+      // commande le paiement du partenaire. Les melanger donnerait un taux de conversion faux.
+      // `sans_etape` est expose expres : 43 % des dossiers n'ont pas d'etape lue, les masquer
+      // ferait mentir tous les pourcentages.
+      pool.query(
+        `SELECT p.id, p.name,
+                COUNT(o.id)::int                                              AS soumis,
+                COUNT(o.id) FILTER (WHERE o.created_at > NOW() - INTERVAL '30 days')::int AS soumis_30j,
+                COUNT(o.crm_lead_id)::int                                     AS avec_lead,
+                COUNT(o.crm_deal_id)::int                                     AS avec_deal,
+                COUNT(o.id) FILTER (WHERE ${ETAPE_EN_COURS})::int             AS en_cours,
+                COUNT(o.id) FILTER (WHERE ${ETAPE_GAGNE})::int                AS gagnes,
+                COUNT(o.id) FILTER (WHERE ${ETAPE_PERDU})::int                AS perdus,
+                COUNT(o.id) FILTER (WHERE o.crm_deal_stage IS NULL)::int      AS sans_etape,
+                COUNT(o.crm_deposit_date)::int                                AS depots,
+                COUNT(o.id) FILTER (WHERE o.payout_status = 'paid')::int      AS verses
+           FROM partners p LEFT JOIN partner_opportunities o ON o.partner_id = p.id
+          GROUP BY p.id, p.name ORDER BY soumis DESC, p.name`),
+
+      // Volume mensuel, 24 mois. Vue par COHORTE : « gagnes » compte les dossiers soumis CE
+      // mois-la et gagnes depuis, pas les deals gagnes pendant le mois. C'est ce qui repond a
+      // « est-ce que ce que ce partenaire nous envoie se transforme », plutot qu'a « combien
+      // a-t-on signe en mars ».
+      pool.query(
+        `SELECT to_char(o.created_at, 'YYYY-MM') AS mois,
+                COUNT(*)::int                                     AS soumis,
+                COUNT(*) FILTER (WHERE ${ETAPE_GAGNE})::int       AS gagnes,
+                COUNT(*) FILTER (WHERE ${ETAPE_PERDU})::int       AS perdus,
+                COUNT(*) FILTER (WHERE ${ETAPE_EN_COURS})::int    AS en_cours
+           FROM partner_opportunities o
+          WHERE o.created_at > NOW() - INTERVAL '24 months'
+          GROUP BY 1 ORDER BY 1`),
+
+      // Le pipeline OUVERT, etape par etape — la reponse a « ce qui est en cours ». Les etats
+      // termines sont exclus : les melanger noierait les 101 dossiers vivants sous 284 dossiers
+      // clos.
+      pool.query(
+        `SELECT o.crm_deal_stage AS etape, COUNT(*)::int AS n
+           FROM partner_opportunities o
+          WHERE ${ETAPE_EN_COURS}
+          GROUP BY 1 ORDER BY 2 DESC`),
     ]);
 
     res.json({
@@ -6214,6 +6274,17 @@ app.get('/api/admin/partner-stats', authenticateToken, async (req, res) => {
         email: r.email, name: r.display_name, partner: r.partenaire,
         lastLoginAt: r.last_login_at, logins: r.connexions, submissions: r.soumissions,
       })),
+      pipeline: pipeline.rows.map((r) => ({
+        partnerId: r.id, partner: r.name,
+        submitted: r.soumis, submitted30d: r.soumis_30j,
+        withLead: r.avec_lead, withDeal: r.avec_deal,
+        open: r.en_cours, won: r.gagnes, lost: r.perdus, noStage: r.sans_etape,
+        deposits: r.depots, paid: r.verses,
+      })),
+      byMonth: parMois.rows.map((r) => ({
+        month: r.mois, submitted: r.soumis, won: r.gagnes, lost: r.perdus, open: r.en_cours,
+      })),
+      byStage: parEtape.rows.map((r) => ({ stage: r.etape, count: r.n })),
     });
   } catch (e) {
     console.error('[partner-stats] echec:', e.stack || e.message);
