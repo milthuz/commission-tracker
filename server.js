@@ -6312,6 +6312,13 @@ app.put('/api/admin/partner-opportunities/:id', authenticateToken, async (req, r
       // the partner can see who owns their deal without a second Zoho lookup.
       full.crm_owner_id = String(req.body.crmOwnerId || '').trim() || null;
       const ownerName = String(req.body.crmOwnerName || '').trim() || null;
+      // Qui approuve — pour la note attachee au Lead. Zoho estampille « Cree par » avec le
+      // proprietaire du jeton CRM partage quoi qu'on fasse, donc c'est la seule facon de faire
+      // apparaitre l'approbateur reel dans le CRM.
+      // Le NOM n'est repris que hors usurpation d'identite : pendant une usurpation
+      // `req.user.name` est celui de la personne visitee, alors que `actor` reste bien l'admin.
+      full.approver_email = actor;
+      full.approver_name = req.user.realAdminEmail ? null : (req.user.name || null);
       const result = await createCrmLead(full);
       await pool.query(
         `UPDATE partner_opportunities SET crm_lead_id = $2, crm_lead_error = $3, crm_owner_name = $4 WHERE id = $1`,
@@ -15677,6 +15684,12 @@ async function createCrmLead(o) {
   // SH-30 follow-up — the partner manager's chosen rep to own this Lead in Zoho CRM.
   if (o.crm_owner_id) fields.Owner = { id: o.crm_owner_id };
   const repName = [o.rep_first_name, o.rep_last_name].filter(Boolean).join(' ');
+  // ⚠️ Description : Zoho la JETTE EN SILENCE. Ni la mise en page « POS » ni la « PAY » ne
+  // contiennent ce champ (verifie le 2026-08-17 sur /settings/layouts), et Zoho ignore sans
+  // broncher tout champ absent de la mise en page — creation renvoyee en succes, contenu perdu.
+  // Le Lead #2706 avait donc une Description vide alors que le code en envoyait quatre lignes.
+  // On continue de l'envoyer (gratuit, et ca repartira tout seul si quelqu'un ajoute le champ a
+  // la mise en page), mais la note ci-dessous est desormais le porteur REEL de ces informations.
   fields.Description = o.description || [
     `Referred by partner: ${o.partner_name}`,
     o.submitted_by_email ? `Submitted by: ${o.submitted_by_email}` : null,
@@ -15694,20 +15707,45 @@ async function createCrmLead(o) {
     const result = r.data?.data?.[0];
     if (r.status >= 200 && r.status < 300 && result?.status === 'success') {
       const leadId = result.details?.id || null;
-      // La note du partenaire va dans la liste liee « Notes » du Lead — c'est la que les
-      // representants la cherchent, et non dans la Description. Ce n'est pas un champ de la
-      // fiche mais un enregistrement a part, d'ou ce SECOND appel, apres la creation.
+      // La note va dans la liste liee « Notes » du Lead — c'est la que les representants la
+      // cherchent. Ce n'est pas un champ de la fiche mais un enregistrement a part, d'ou ce
+      // SECOND appel, apres la creation.
       //
-      // Volontairement tolerant : si l'appel echoue (jeton, limite de debit), le Lead reste
-      // cree et la note demeure dans la Description, ou elle continue d'etre ecrite. Perdre
-      // une note serait pire que la voir en double.
-      if (leadId && o.notes) {
+      // Elle porte maintenant TOUT le contexte de la reference, pas seulement le commentaire du
+      // partenaire : la Description qui le portait jusqu'ici n'arrive jamais (voir plus haut).
+      // Elle est donc ecrite meme quand le partenaire n'a rien commente — sans elle, le Lead ne
+      // dirait plus d'ou il vient.
+      //
+      // ⚠️ « Cree par » restera le proprietaire du jeton CRM partage (une seule ligne de
+      // `user_tokens` sert a toute l'application), PAS l'approbateur. Zoho ne laisse pas fixer
+      // l'auteur d'une note a la creation. D'ou la premiere ligne, qui nomme explicitement qui a
+      // approuve : c'est la seule attribution que Zoho nous laisse ecrire.
+      const approbateur = o.approver_name && o.approver_email
+        ? `${o.approver_name} (${o.approver_email})`
+        : (o.approver_email || o.approver_name || null);
+      const corps = [
+        approbateur ? `Approuvé dans Sales Hub par ${approbateur}.` : null,
+        '',
+        `Partenaire référent : ${o.partner_name}`,
+        o.submitted_by_email ? `Soumis par : ${o.submitted_by_email}` : null,
+        repName
+          ? `Représentant du partenaire : ${repName}${o.rep_phone ? ` — ${o.rep_phone}` : ''}${o.rep_email ? ` — ${o.rep_email}` : ''}`
+          : null,
+        o.notes ? `\nNote du partenaire :\n${o.notes}` : null,
+      ].filter((l) => l !== null).join('\n').trim();
+
+      if (leadId) {
         try {
           await axios.post(
             'https://www.zohoapis.com/crm/v2/Notes',
             { data: [{
-              Note_Title: 'Note du partenaire',
-              Note_Content: String(o.notes),
+              // Le nom de l'approbateur est dans le TITRE aussi : la liste liee « Notes » n'affiche
+              // que le titre et l'auteur, et l'auteur est le jeton partage. Sans ca il faut ouvrir
+              // la note pour savoir qui a approuve.
+              Note_Title: [`Référence partenaire — ${o.partner_name}`,
+                o.approver_name || o.approver_email ? `approuvée par ${o.approver_name || o.approver_email}` : null]
+                .filter(Boolean).join(' — ').slice(0, 250),
+              Note_Content: corps.slice(0, 32000),
               Parent_Id: { id: leadId },
               se_module: 'Leads',
             }] },
