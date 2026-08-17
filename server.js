@@ -9519,8 +9519,14 @@ app.get('/api/auth/zoho-crm', authenticateToken, (req, res) => {
   // Zoho voyait son autorisation enregistree sous le nom d'un tiers, et tout ce que
   // l'application ecrit ensuite dans Zoho portait ce nom. Signe et court, parce que ce jeton
   // voyage dans une URL et dans l'historique du navigateur.
+  // `back` : ou renvoyer apres le consentement. Liste blanche fermee, jamais l'entree brute —
+  // une URL de redirection qui se laisse dicter par la requete est une redirection ouverte.
+  // Utile parce que « Integrations » (/admin/sync) est reserve aux admins : un gestionnaire de
+  // partenaires qui connecte SON compte Zoho doit revenir sur une page qu'il a le droit de voir,
+  // sinon le retour le renvoie a l'accueil et il ne sait pas si ca a marche.
+  const back = req.query.back === 'partners' ? '/admin/partners' : '/admin/sync';
   const state = jwt.sign(
-    { email: req.user.realAdminEmail || req.user.email, k: 'crm-oauth' },
+    { email: req.user.realAdminEmail || req.user.email, k: 'crm-oauth', back },
     process.env.JWT_SECRET,
     { expiresIn: '15m' }
   );
@@ -9572,9 +9578,13 @@ app.get('/api/auth/crm-callback', async (req, res) => {
     // de retomber sur une supposition : ecrire l'autorisation de quelqu'un sous le nom d'un
     // autre est precisement le defaut qu'on corrige, et un flux refuse se relance en un clic.
     let adminEmail = null;
+    let back = '/admin/sync';
     try {
       const p = jwt.verify(String(req.query.state || ''), process.env.JWT_SECRET);
       if (p && p.k === 'crm-oauth' && p.email) adminEmail = String(p.email);
+      // Re-verifie la liste blanche a l'arrivee aussi : le `state` est signe, donc non falsifie,
+      // mais une valeur ecrite par une version future du code ne doit pas devenir une redirection.
+      if (p && (p.back === '/admin/partners' || p.back === '/admin/sync')) back = p.back;
     } catch (e) {
       console.warn('[crm-oauth] state invalide ou expire :', e.message);
     }
@@ -9591,7 +9601,7 @@ app.get('/api/auth/crm-callback', async (req, res) => {
     // Silencieux jusqu'ici : la personne voyait « connecte » et rien ne fonctionnait.
     if (!pose.rowCount) {
       console.error(`[crm-oauth] aucune ligne user_tokens pour ${adminEmail} — jeton non enregistre`);
-      return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/admin/sync?crm=compte_introuvable`);
+      return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}${back}?crm=compte_introuvable`);
     }
 
     // Reconnection succeeded — drop any 'disconnected' flag right away so the
@@ -9601,7 +9611,7 @@ app.get('/api/auth/crm-callback', async (req, res) => {
     console.log(`✅ CRM tokens stored for ${adminEmail}, expires at ${new Date(Date.now() + expires_in * 1000).toISOString()}`);
 
     // Redirect back to admin panel
-    const redirectUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/admin/sync?crm=connected`;
+    const redirectUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}${back}?crm=connected`;
     res.redirect(redirectUrl);
   } catch (error) {
     console.error('CRM OAuth callback error:', error.response?.data || error.message);
@@ -9610,6 +9620,26 @@ app.get('/api/auth/crm-callback', async (req, res) => {
 });
 
 // 3. Check CRM connection status
+// L'etat du compte Zoho DE LA PERSONNE QUI DEMANDE — a ne pas confondre avec /crm-status, qui
+// rend compte du compte systeme de l'application. Sert a savoir si les leads qu'elle approuve
+// porteront son nom dans Zoho ou celui du compte systeme. Aucune permission particuliere : on ne
+// renvoie que l'etat de son propre jeton, et connaitre l'etat de son propre compte n'expose rien.
+app.get('/api/auth/crm-status/me', authenticateToken, async (req, res) => {
+  try {
+    const moi = req.user.realAdminEmail || req.user.email;
+    const row = (await pool.query(
+      `SELECT crm_refresh_token IS NOT NULL AS connecte, crm_expires_at
+         FROM user_tokens WHERE LOWER(email) = LOWER($1)`, [moi])).rows[0];
+    res.json({
+      email: moi,
+      connected: !!row?.connecte,
+      expired: row?.crm_expires_at ? Date.now() > parseInt(row.crm_expires_at) : null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/auth/crm-status', authenticateToken, async (req, res) => {
   try {
     // On rend compte du compte EPINGLE — celui sous lequel l'application ecrit reellement. Lire
