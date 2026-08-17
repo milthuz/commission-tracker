@@ -456,6 +456,13 @@ function chunk(arr, size) {
   return out;
 }
 
+// Le compte Zoho sous lequel l'application ecrit par defaut. Declare ICI, et pas a cote des
+// fonctions qui s'en servent (~12 000 lignes plus bas) : `initializeDatabase()` est appelee
+// avant que le module ait fini de s'evaluer, donc une declaration plus bas serait en zone morte
+// temporelle. Ca tiendrait par accident — le premier `await` laisse le module se terminer — mais
+// c'est exactement le genre de dependance invisible qui casse au premier remaniement.
+const CRM_SYSTEM_KEY = 'crm_system_account';
+
 // Initialize database tables
 async function initializeDatabase() {
   try {
@@ -1691,6 +1698,29 @@ async function initializeDatabase() {
         [migMarkKey, String(marques.rowCount)]
       );
       console.log(`🏷️ [partner-users] ${marques.rowCount} compte(s) marque(s) comme repris d'un ancien portail`);
+    }
+
+    // Epinglage UNIQUE du compte Zoho « systeme » sur son detenteur ACTUEL — celui que l'ancien
+    // classement « le plus recemment mis a jour » designe aujourd'hui. Le but est justement que
+    // rien ne change maintenant : c'est PLUS TARD, quand une deuxieme personne connectera son
+    // compte Zoho, que ce classement aurait bascule les ecritures de toute l'application vers
+    // elle. On fige l'etat present avant d'ouvrir cette porte.
+    // Le drapeau est indispensable : sans lui, chaque redemarrage re-epinglerait sur le plus
+    // recent et l'epinglage ne servirait a rien.
+    if (!(await pool.query(`SELECT 1 FROM sync_state WHERE key = $1`, [CRM_SYSTEM_KEY])).rowCount) {
+      const actuel = (await pool.query(
+        `SELECT email FROM user_tokens WHERE crm_refresh_token IS NOT NULL
+          ORDER BY updated_at DESC LIMIT 1`)).rows[0]?.email || null;
+      if (actuel) {
+        await pool.query(
+          `INSERT INTO sync_state (key, value, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP)
+           ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = CURRENT_TIMESTAMP`,
+          [CRM_SYSTEM_KEY, actuel]
+        );
+        console.log(`📌 [crm] compte Zoho systeme epingle sur ${actuel}`);
+      } else {
+        console.log('📌 [crm] aucun jeton Zoho connecte : epinglage reporte au prochain demarrage');
+      }
     }
 
     const ownerFixKey = 'partner_owner_name_reset_2026_08';
@@ -9482,7 +9512,18 @@ app.post('/api/auth/refresh-photo', authenticateToken, async (req, res) => {
 
 // 1. Initiate CRM OAuth
 app.get('/api/auth/zoho-crm', authenticateToken, (req, res) => {
-  const state = Math.random().toString(36).substring(7);
+  // Le `state` porte l'identite de qui clique, SIGNEE. Le callback ci-dessous est un simple
+  // retour de navigateur : il n'est pas authentifie et n'a aucun moyen de savoir qui a lance le
+  // flux. Il le DEVINAIT — « l'admin le plus recemment actif » — et ecrivait l'autorisation sur
+  // la ligne de cette personne-la. Consequence : quelqu'un d'autre qui connectait son compte
+  // Zoho voyait son autorisation enregistree sous le nom d'un tiers, et tout ce que
+  // l'application ecrit ensuite dans Zoho portait ce nom. Signe et court, parce que ce jeton
+  // voyage dans une URL et dans l'historique du navigateur.
+  const state = jwt.sign(
+    { email: req.user.realAdminEmail || req.user.email, k: 'crm-oauth' },
+    process.env.JWT_SECRET,
+    { expiresIn: '15m' }
+  );
 
   const authUrl = `${ZOHO_CONFIG.accounts_url}/oauth/v2/auth?` +
     // send_mail is NOT covered by modules.ALL — it is its own scope, added
@@ -9526,24 +9567,32 @@ app.get('/api/auth/crm-callback', async (req, res) => {
 
     const { access_token, refresh_token, expires_in } = tokenResponse.data;
 
-    // Store CRM tokens. Attach to the most recently-active admin user
-    // (the one who just clicked 'Connect CRM').
-    // Updating only ONE row (by email) avoids race conditions / overwrites
-    // when there are multiple admins.
-    const adminEmailRes = await pool.query(
-      `SELECT email FROM user_tokens WHERE is_admin = true
-       ORDER BY updated_at DESC LIMIT 1`
-    );
-    const adminEmail = adminEmailRes.rows[0]?.email;
-    if (!adminEmail) {
-      return res.status(500).json({ error: 'No admin user found to attach CRM token to' });
+    // L'autorisation va sur la ligne de CELUI QUI A CLIQUE, lu dans le `state` signe a l'aller.
+    // On ne devine plus. Si le `state` manque, a expire ou ne verifie pas, on REFUSE plutot que
+    // de retomber sur une supposition : ecrire l'autorisation de quelqu'un sous le nom d'un
+    // autre est precisement le defaut qu'on corrige, et un flux refuse se relance en un clic.
+    let adminEmail = null;
+    try {
+      const p = jwt.verify(String(req.query.state || ''), process.env.JWT_SECRET);
+      if (p && p.k === 'crm-oauth' && p.email) adminEmail = String(p.email);
+    } catch (e) {
+      console.warn('[crm-oauth] state invalide ou expire :', e.message);
     }
-    await pool.query(
+    if (!adminEmail) {
+      return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/admin/sync?crm=state_invalide`);
+    }
+    const pose = await pool.query(
       `UPDATE user_tokens
        SET crm_access_token = $1, crm_refresh_token = $2, crm_expires_at = $3, updated_at = CURRENT_TIMESTAMP
-       WHERE email = $4`,
+       WHERE LOWER(email) = LOWER($4)`,
       [access_token, refresh_token, Date.now() + (expires_in * 1000), adminEmail]
     );
+    // Zero ligne touchee = l'autorisation Zoho vient d'etre echangee et n'est stockee NULLE PART.
+    // Silencieux jusqu'ici : la personne voyait « connecte » et rien ne fonctionnait.
+    if (!pose.rowCount) {
+      console.error(`[crm-oauth] aucune ligne user_tokens pour ${adminEmail} — jeton non enregistre`);
+      return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/admin/sync?crm=compte_introuvable`);
+    }
 
     // Reconnection succeeded — drop any 'disconnected' flag right away so the
     // banner clears instead of waiting on the next token refresh.
@@ -9563,13 +9612,21 @@ app.get('/api/auth/crm-callback', async (req, res) => {
 // 3. Check CRM connection status
 app.get('/api/auth/crm-status', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(
-      'SELECT crm_access_token, crm_expires_at FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
-    );
+    // On rend compte du compte EPINGLE — celui sous lequel l'application ecrit reellement. Lire
+    // « le dernier admin mis a jour » repondait a une autre question, et depuis que quelqu'un
+    // d'autre peut connecter son propre compte Zoho, les deux reponses peuvent diverger.
+    const epingle = await crmSystemAccount();
+    const result = epingle
+      ? await pool.query(
+          `SELECT email, crm_access_token, crm_expires_at FROM user_tokens
+            WHERE LOWER(email) = LOWER($1)`, [epingle])
+      : await pool.query(
+          `SELECT email, crm_access_token, crm_expires_at FROM user_tokens
+            WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1`);
     const row = result.rows[0];
     const connected = !!(row?.crm_access_token);
     const expired = row?.crm_expires_at ? Date.now() > parseInt(row.crm_expires_at) : true;
-    res.json({ connected, expired });
+    res.json({ connected, expired, account: row?.email || null });
   } catch (error) {
     res.status(500).json({ error: 'Failed to check CRM status' });
   }
@@ -12741,12 +12798,64 @@ async function ensureValidToken(email) {
 // CRM TOKEN HELPER - Get and auto-refresh CRM access token
 // ============================================================================
 
+// Le compte Zoho « systeme » : celui sous lequel l'application ecrit quand personne de precis
+// n'est en cause (synchros, webhooks, Sofia).
+//
+// ⚠️ Il est EPINGLE dans sync_state, et ce n'est pas un detail. Le choix etait auparavant « la
+// ligne user_tokens la plus recemment mise a jour », un classement qui bouge TOUT SEUL : chaque
+// rafraichissement de jeton ecrit `updated_at`. Le jour ou une deuxieme personne connecte son
+// compte Zoho, elle heritait donc, sans que personne l'ait demande, de TOUTES les ecritures de
+// l'application — Sofia comprise, dont le filtre de portee suppose un compte connu.
+// L'epinglage est seme au demarrage avec le detenteur ACTUEL : rien ne change aujourd'hui.
+async function crmSystemAccount() {
+  const r = await pool.query(`SELECT value FROM sync_state WHERE key = $1`, [CRM_SYSTEM_KEY]);
+  return r.rows[0]?.value || null;
+}
+
+// Le jeton de QUELQU'UN EN PARTICULIER, avec repli sur le compte systeme.
+// Sert quand l'ecriture doit porter le nom de la personne qui l'a declenchee : Zoho estampille
+// « Cree par » avec le proprietaire du jeton, et rien dans l'API ne permet de le corriger apres
+// coup. Renvoie aussi sous quel compte on a fini par ecrire, pour pouvoir le dire.
+async function crmTokenForActor(email) {
+  const cible = String(email || '').trim().toLowerCase();
+  if (cible) {
+    const r = await pool.query(
+      `SELECT email, crm_access_token, crm_refresh_token, crm_expires_at
+         FROM user_tokens WHERE LOWER(email) = $1 AND crm_refresh_token IS NOT NULL`, [cible]);
+    if (r.rows.length) {
+      try {
+        return { token: await crmTokenFromRow(r.rows[0]), actingAs: r.rows[0].email };
+      } catch (e) {
+        // Jeton personnel mort (revoque, consentement retire) : on n'ARRETE PAS l'approbation
+        // pour autant. On retombe sur le compte systeme, et l'attribution reste lisible dans le
+        // corps de la note, qui nomme l'approbateur quoi qu'il arrive.
+        console.warn(`[crm] jeton personnel inutilisable pour ${cible}, repli sur le compte systeme :`, e.message);
+      }
+    }
+  }
+  const t = await ensureValidCrmToken();
+  return { token: t, actingAs: (await crmSystemAccount()) || null };
+}
+
 async function ensureValidCrmToken() {
-  const result = await pool.query(
-    `SELECT email, crm_access_token, crm_refresh_token, crm_expires_at
-     FROM user_tokens WHERE crm_refresh_token IS NOT NULL
-     ORDER BY updated_at DESC LIMIT 1`
-  );
+  // 1. le compte epingle, s'il a bien un jeton exploitable
+  const epingle = await crmSystemAccount();
+  let result = epingle
+    ? await pool.query(
+        `SELECT email, crm_access_token, crm_refresh_token, crm_expires_at
+           FROM user_tokens WHERE LOWER(email) = LOWER($1) AND crm_refresh_token IS NOT NULL`,
+        [epingle])
+    : { rows: [] };
+
+  // 2. sinon l'ancien comportement, inchange — il reste le filet quand l'epinglage pointe vers
+  //    un compte deconnecte depuis, ou avant que le semis du demarrage ait tourne.
+  if (!result.rows.length) {
+    result = await pool.query(
+      `SELECT email, crm_access_token, crm_refresh_token, crm_expires_at
+       FROM user_tokens WHERE crm_refresh_token IS NOT NULL
+       ORDER BY updated_at DESC LIMIT 1`
+    );
+  }
 
   if (!result.rows.length) {
     // Try fallback: any admin with crm_access_token (legacy rows without refresh_token)
@@ -12761,7 +12870,13 @@ async function ensureValidCrmToken() {
     result.rows[0] = fallback.rows[0];
   }
 
-  let row = result.rows[0];
+  return crmTokenFromRow(result.rows[0]);
+}
+
+// Rafraichit au besoin et rend un jeton d'acces valide pour CETTE ligne. Extrait tel quel de
+// `ensureValidCrmToken` pour que le chemin « jeton de quelqu'un en particulier » suive exactement
+// la meme logique de rafraichissement et de gestion d'echec — une seule version a maintenir.
+async function crmTokenFromRow(row) {
   const expiresAt = row.crm_expires_at ? parseInt(row.crm_expires_at) : null;
 
   // Proactive refresh: refresh if expiring within 10 min (was 5) for safety margin
@@ -15698,7 +15813,16 @@ async function createCrmLead(o) {
   ].filter(Boolean).join('\n');
 
   try {
-    const crmToken = await ensureValidCrmToken();
+    // Le jeton de L'APPROBATEUR quand il en a un, sinon le compte systeme. C'est le seul levier
+    // qui existe sur « Cree par » : Zoho l'estampille avec le proprietaire du jeton et l'API ne
+    // permet ni de le fixer a la creation ni de le corriger apres. Tant que la personne n'a pas
+    // connecte son compte Zoho, on retombe sur le compte systeme — le Lead est cree quand meme,
+    // et la note nomme l'approbateur dans son corps.
+    const { token: crmToken, actingAs } = await crmTokenForActor(o.approver_email);
+    if (actingAs && o.approver_email
+        && String(actingAs).toLowerCase() !== String(o.approver_email).toLowerCase()) {
+      console.log(`[partner-crm] ecriture Zoho sous ${actingAs} (approbateur ${o.approver_email} sans compte Zoho connecte)`);
+    }
     const r = await axios.post(
       'https://www.zohoapis.com/crm/v2/Leads',
       { data: [fields] },
