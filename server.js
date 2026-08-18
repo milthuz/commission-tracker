@@ -12040,6 +12040,15 @@ async function autoSyncInvoices() {
     // Default Jan 1, 2026. Saves ~50K legacy invoices from being re-pulled.
     const dateStart = process.env.INVOICES_SYNC_FROM_DATE || '2026-01-01';
 
+    // Set to false the moment ANY paginated fetch below comes back short. A single failed
+    // page (rate limit, 5xx) used to just `break` and return a PARTIAL list with no error —
+    // and a partial list handed to the deletion reconcile marks live invoices as deleted with
+    // commission = 0. On 2026-08-18 17:29 that zeroed 19 446 invoices (43% of the table) for
+    // 65 minutes, until the next sync restored them: reps watched commissions, points and
+    // whole clients vanish and come back. An incomplete fetch now disables reconciliation for
+    // this run — the upserts still happen (they only ever add/update, never remove).
+    let fetchComplete = true;
+
     // Helper: paginated fetch by status with date_start filter
     async function fetchAllByStatus(status) {
       const all = [];
@@ -12059,6 +12068,7 @@ async function autoSyncInvoices() {
         });
         if (r.status !== 200) {
           console.warn(`⚠️ [AUTO-SYNC] ${status} page ${page} returned ${r.status}:`, JSON.stringify(r.data).slice(0, 200));
+          fetchComplete = false;   // list is truncated → no deletion reconcile this run
           break;
         }
         const rows = r.data?.invoices || [];
@@ -12146,18 +12156,40 @@ async function autoSyncInvoices() {
     // ------------------------------------------------------------------
     const liveInvoiceNumbers = allInvoices.map(i => i.invoice_number).filter(Boolean);
     let deletedCount = 0;
-    // Safety: count how many invoices we *expect* to have for this period.
-    // If Zoho returned <50% of that, something is wrong (rate limit, partial
-    // failure, etc.) — skip reconciliation rather than nuke real data.
-    const expected = (await pool.query(
-      `SELECT COUNT(*)::int AS c FROM invoices
+    // Safety: compare what Zoho returned against what we hold, PER STATUS.
+    // The old check was a single 50% threshold on the combined count, and it waved through
+    // the 2026-08-18 incident: 24 200 of 43 645 paid invoices came back (55%), so the sweep
+    // "safely" deleted 19 446 live rows. Two changes: the tolerance is now 5% instead of 50%,
+    // and it is applied per status — a collapse confined to one status can no longer hide
+    // behind the healthy volume of the other three.
+    // Caveat worth knowing: `expected` counts only non-deleted rows, so a run that wrongly
+    // deletes rows also shrinks the next run's baseline. `fetchComplete` is the real defence
+    // against that ratchet — this ratio is the second line, not the first.
+    const RECONCILE_TOLERANCE = 0.95;
+    const fetchedByStatus = {
+      paid:           paidInvoices.length,
+      overdue:        overdueInvoices.length,
+      partially_paid: partialInvoices.length,
+      void:           voidInvoices.length,
+    };
+    const expectedByStatus = Object.fromEntries((await pool.query(
+      `SELECT status, COUNT(*)::int AS c FROM invoices
        WHERE organization_id = $1 AND date >= $2::date
-         AND status IN ('paid', 'overdue', 'partially_paid', 'void')`,
+         AND status IN ('paid', 'overdue', 'partially_paid', 'void')
+       GROUP BY status`,
       [process.env.ZOHO_ORG_ID, dateStart]
-    )).rows[0]?.c || 0;
-    const safe = expected === 0 || liveInvoiceNumbers.length >= Math.floor(expected * 0.5);
-    if (!safe) {
-      console.warn(`⚠️ [AUTO-SYNC] Skipping deletion reconcile — Zoho returned ${liveInvoiceNumbers.length} but DB has ${expected}. Possible partial fetch.`);
+    )).rows.map(r => [r.status, r.c]));
+
+    const shortfalls = Object.entries(fetchedByStatus)
+      .map(([status, got]) => ({ status, got, want: expectedByStatus[status] || 0 }))
+      .filter(({ got, want }) => want > 0 && got < Math.floor(want * RECONCILE_TOLERANCE));
+
+    const safe = fetchComplete && shortfalls.length === 0;
+    if (!fetchComplete) {
+      console.warn('⚠️ [AUTO-SYNC] Skipping deletion reconcile — a page fetch failed, so the invoice list is incomplete. Live invoices would have been marked deleted.');
+    } else if (shortfalls.length > 0) {
+      const detail = shortfalls.map(s => `${s.status}: got ${s.got}, expected ~${s.want}`).join('; ');
+      console.warn(`⚠️ [AUTO-SYNC] Skipping deletion reconcile — Zoho came back short (${detail}). Possible partial fetch.`);
     }
     if (safe && liveInvoiceNumbers.length > 0) {
       const deletedRes = await pool.query(
@@ -12182,7 +12214,10 @@ async function autoSyncInvoices() {
        VALUES ($1, 'success', $2, $3)`,
       [syncedCount, process.env.ZOHO_ORG_ID,
        `Synced ${paidInvoices.length} paid + ${overdueInvoices.length} overdue + ${partialInvoices.length} partial + ${voidInvoices.length} void` +
-       (deletedCount > 0 ? `, marked ${deletedCount} as deleted` : '')]
+       (deletedCount > 0 ? `, marked ${deletedCount} as deleted` : '') +
+       // Recorded so a skipped reconcile is visible in the log rather than looking like a
+       // clean run — the 2026-08-18 investigation had to infer the partial fetch from counts.
+       (safe ? '' : `, SKIPPED deletion reconcile (${fetchComplete ? 'short fetch' : 'failed page'})`)]
     );
 
     console.log(`✅ [AUTO-SYNC] Successfully synced ${syncedCount} invoices, ${deletedCount} deleted at ${new Date().toISOString()}`);
@@ -24136,16 +24171,27 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
       custStart = new Date(`${targetYear}-${String(month).padStart(2, '0')}-01`);
       custEnd = new Date(custStart); custEnd.setMonth(custEnd.getMonth() + 1); custEndOp = '<';
     }
+    // The cap used to be 50 with no total alongside it, so a rep with a long tail simply did
+    // not see their smaller clients and had no way to tell: Sophie Falardeau had 183 qualifying
+    // clients in 2025, and "GR NORDIQUE" sat at rank 124 — reported as missing data, when it was
+    // really silent truncation. Returning the full count lets the UI say so out loud.
+    const CUSTOMER_LIMIT = 500;
     const customerResult = await pool.query(`
-      SELECT COALESCE(customer_name, 'Unknown') AS customer_name,
-             COUNT(*) AS invoices,
-             COALESCE(SUM(total), 0) AS revenue,
-             COALESCE(SUM(commission), 0) AS commission
-      FROM invoices
-      WHERE salesperson_name = $1 AND organization_id = $2
-        AND ${dateCol} >= $3 AND ${dateCol} ${custEndOp} $4
-        AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
-      GROUP BY customer_name ORDER BY commission DESC LIMIT 50
+      WITH per_customer AS (
+        SELECT COALESCE(customer_name, 'Unknown') AS customer_name,
+               COUNT(*) AS invoices,
+               COALESCE(SUM(total), 0) AS revenue,
+               COALESCE(SUM(commission), 0) AS commission
+        FROM invoices
+        WHERE salesperson_name = $1 AND organization_id = $2
+          AND ${dateCol} >= $3 AND ${dateCol} ${custEndOp} $4
+          AND commission > 0 AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
+        GROUP BY customer_name
+      )
+      SELECT *, COUNT(*) OVER ()::int AS total_customers
+      FROM per_customer
+      ORDER BY commission DESC
+      LIMIT ${CUSTOMER_LIMIT}
     `, [targetRep, process.env.ZOHO_ORG_ID, custStart, custEnd]);
 
     const currentMonthNum  = new Date().getMonth();  // 0-indexed
@@ -24170,6 +24216,9 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
         revenue:      parseFloat(r.revenue),
         commission:   parseFloat(r.commission),
       })),
+      // Total qualifying clients before the display cap — equal to customers.length unless
+      // the rep has more than CUSTOMER_LIMIT, in which case the UI must say what it hid.
+      customersTotal: customerResult.rows[0]?.total_customers ?? customerResult.rows.length,
       summary: {
         currentMonth: {
           commission: currentMonthData.commission,
