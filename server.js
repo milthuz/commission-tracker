@@ -8875,6 +8875,7 @@ THE APP'S SECTIONS (left sidebar):
 - Hardware Overview: the full Cluster hardware catalog (POS terminals, printers, payment devices, displays, networking, peripherals) — searchable, filterable by Kaizen(V2)/V1 compatibility and lifecycle status, with a compare tool (up to 4 side by side) and one-click SKU copy.
 - Services & Pricing Guide: Cluster's pricing reference (SaaS, Rental, Menu Build, Installation, Support, Online Ordering, Shipping, On-Site/XPERIO) with a monthly/yearly toggle and a built-in quote builder that totals recurring vs one-time costs.
 - Proposals: build and send a branded sales proposal (cover + company deck + optional Zoho Books estimate) to a client, with open/click tracking.
+- Partners: the referral-partner program (Moneris and others). Partner staff submit merchant leads through their own portal; a Cluster partner manager reviews each one in the Opportunity Queue, and approving it creates a real Lead in Zoho CRM assigned to a chosen Cluster rep. Sub-tabs: Opportunity Queue (review/approve/reject), Manage Partners, Users, Payouts, Data import, and Statistics. Statistics has two halves — the deal PIPELINE (volume submitted, what is still open, won vs lost, win rate over decided records, and per-partner conversion) and portal USAGE (invitations, activations, logins, dormant accounts). A partner payout is triggered by the deposit date on the Zoho deal, not by a paid invoice.
 - What each user sees depends on their permissions — some sections may not be visible to everyone.
 
 THE COMMISSION MODEL:
