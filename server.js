@@ -50,6 +50,7 @@ const zentactUnits = (alias = 'zentact_merchants') => `GREATEST(CASE
 const { ZohoCRMService, MONTHLY_QUOTA, MONTHLY_BONUS_TIERS, ANNUAL_BONUS_TIERS, PLAN_START_DATE } = require('./services/zohoCRMService');
 const { ZentactService } = require('./services/zentactService');
 const { ZohoBillingService } = require('./services/zohoBillingService');
+const { investigateReport } = require('./services/reportInvestigator');
 
 dotenv.config();
 
@@ -116,6 +117,7 @@ const PERMISSION_CATALOG = [
   { key: 'admin:releases',             label: 'Push new app releases',                       category: 'Admin Panel' },
   { key: 'admin:impersonate',          label: 'Use impersonation mode',                      category: 'Admin Panel' },
   { key: 'admin:data_health',          label: 'View the "Needs attention" data-health page', category: 'Admin Panel' },
+  { key: 'reports:investigate',        label: 'Re-run the automatic diagnosis on a rep report', category: 'Admin Panel' },
   { key: 'admin:notifications',        label: 'Configure notification recipients & email templates', category: 'Admin Panel' },
   { key: 'admin:demo_mode',            label: 'Toggle demo mode on user accounts',            category: 'Admin Panel' },
   { key: 'admin:audit_dashboard',      label: 'View who is connected + connection-time stats', category: 'Admin Panel' },
@@ -2213,6 +2215,22 @@ async function initializeDatabase() {
         status                VARCHAR(20) NOT NULL DEFAULT 'linked',
         linked_by             VARCHAR(255),
         linked_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // Automatic diagnosis of a rep's "missing commission / missing points" report, so an
+    // admin opens the page with the answer already there instead of running the same eight
+    // queries by hand. One row per report, replaced on re-investigation. Read-only work:
+    // nothing here ever changes a commission — it only explains one.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_report_investigations (
+        report_id     INTEGER PRIMARY KEY REFERENCES user_reports(id) ON DELETE CASCADE,
+        verdict       VARCHAR(40) NOT NULL,
+        evidence      JSONB NOT NULL DEFAULT '{}'::jsonb,
+        ai_note       TEXT,
+        reply_index   INTEGER,
+        likely_resolved BOOLEAN NOT NULL DEFAULT false,
+        investigated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
 
@@ -18666,8 +18684,13 @@ async function computeDataHealth() {
     // 6. Open user-submitted reports (missing commission / missing points) — full list so
     //    the page can show + resolve them inline.
     pool.query(`
-      SELECT id, report_type, reporter_email, reporter_name, reference, period, message, created_at
-      FROM user_reports WHERE status = 'open' ORDER BY created_at DESC LIMIT 100`),
+      SELECT r.id, r.report_type, r.reporter_email, r.reporter_name, r.reference, r.period,
+             r.message, r.created_at,
+             i.verdict, i.evidence, i.ai_note, i.reply_index, i.likely_resolved,
+             i.investigated_at
+      FROM user_reports r
+      LEFT JOIN user_report_investigations i ON i.report_id = r.id
+      WHERE r.status = 'open' ORDER BY r.created_at DESC LIMIT 100`),
     // 7. The actual unassigned-invoice rows (so the page can list them, not just count).
     pool.query(`
       SELECT invoice_number, customer_name, commission::float AS commission, date::date AS date
@@ -25103,6 +25126,45 @@ app.post('/api/feedback/feature-request', authenticateToken, async (req, res) =>
 // Shared handler: a rep flags a missing commission OR missing points. Persists the report
 // to user_reports (so it shows in the admin "À corriger" page) AND emails all admins.
 // reportType: 'missing_commission' | 'missing_points'.
+// Diagnose one report and store the finding (one row per report, replaced on re-run).
+// Layer 2 is handed the Anthropic client only when a key is configured — with none, the
+// deterministic layer 1 still runs and the page simply shows no AI note.
+async function runReportInvestigation(report) {
+  const out = await investigateReport(pool, report, {
+    orgId: process.env.ZOHO_ORG_ID,
+    anthropic: getAnthropic(),
+  });
+  await pool.query(
+    `INSERT INTO user_report_investigations
+       (report_id, verdict, evidence, ai_note, reply_index, likely_resolved, investigated_at)
+     VALUES ($1, $2, $3::jsonb, $4, $5, $6, CURRENT_TIMESTAMP)
+     ON CONFLICT (report_id) DO UPDATE SET
+       verdict         = EXCLUDED.verdict,
+       evidence        = EXCLUDED.evidence,
+       ai_note         = EXCLUDED.ai_note,
+       reply_index     = EXCLUDED.reply_index,
+       likely_resolved = EXCLUDED.likely_resolved,
+       investigated_at = CURRENT_TIMESTAMP`,
+    [report.id, out.verdict, JSON.stringify(out.evidence), out.aiNote, out.replyIndex, out.likelyResolved]
+  );
+  _dataHealthCache = { at: 0, data: null };
+  return out;
+}
+
+// POST /api/admin/user-reports/:id/investigate — re-run the diagnosis on demand (data
+// changes after a report is filed; Sophie's answer only appeared once the deal synced).
+app.post('/api/admin/user-reports/:id/investigate', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'reports:investigate'))) return;
+  try {
+    const r = (await pool.query(
+      `SELECT id, report_type, reporter_email, reporter_name, reference, period, message, created_at
+         FROM user_reports WHERE id = $1`, [req.params.id]
+    )).rows[0];
+    if (!r) return res.status(404).json({ error: 'Report not found' });
+    res.json({ success: true, investigation: await runReportInvestigation(r) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 async function handleUserReport(reportType, req, res) {
   const isPoints = reportType === 'missing_points';
   const { email, name: jwtName } = req.user;
@@ -25114,12 +25176,17 @@ async function handleUserReport(reportType, req, res) {
     const tok = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
     const repName = tok.rows[0]?.display_name || jwtName || email || 'Unknown rep';
     // Persist so admins see it in the data-health page.
-    await pool.query(
+    const saved = (await pool.query(
       `INSERT INTO user_reports (report_type, reporter_email, reporter_name, reference, period, message)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, report_type, reporter_email, reporter_name, reference, period, message, created_at`,
       [reportType, email || null, repName, reference || null, period || null, message]
-    );
+    )).rows[0];
     _dataHealthCache = { at: 0, data: null }; // bust the 60s cache so the badge updates now
+    // Diagnose immediately, in the background: the rep's answer is waiting on the page by
+    // the time an admin opens it. Fire-and-forget on purpose — the reporter must never wait
+    // on (or be failed by) the diagnosis, so errors are swallowed after logging.
+    runReportInvestigation(saved).catch(e => console.warn('[REPORT] auto-investigation failed:', e.message));
     // Email ONLY the configured recipient list. If none is set, the report lives in the
     // "À corriger" dashboard only — no email is sent (per admin's choice).
     const recipients = [...new Set(await getReportRecipients())];
