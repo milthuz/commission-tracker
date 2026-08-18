@@ -148,7 +148,24 @@ async function investigatePoints(pool, report, rep, ref) {
     if (deal.sold_date && report.created_at && new Date(deal.sold_date) >= new Date(new Date(report.created_at).toDateString())) {
       return { verdict: 'points_arrived_since', evidence: ev };
     }
-    if (deal.points > 0) return { verdict: 'points_present', evidence: ev };
+    if (deal.points > 0) {
+      // A rep often asks about one half of a sale ("Cluster payments + point for POS"), so
+      // report the Zentact side too rather than stopping at the deal. Amy's real case: the
+      // deal was hers since July, but the activation she was actually asking about only
+      // landed three days AFTER she filed — evidence that answers the question she asked.
+      const also = await findMerchant(pool, ref);
+      if (also) {
+        ev.zentact_merchant = also.business_name;
+        ev.zentact_status = also.status;
+        ev.zentact_activated_at = also.activated_at;
+        ev.zentact_rep = also.sales_rep_name;
+        if (also.activated_at && report.created_at
+            && new Date(also.activated_at) >= new Date(new Date(report.created_at).toDateString())) {
+          return { verdict: 'points_arrived_since', evidence: ev };
+        }
+      }
+      return { verdict: 'points_present', evidence: ev };
+    }
   }
 
   const m = await findMerchant(pool, ref);
