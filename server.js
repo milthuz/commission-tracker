@@ -18641,7 +18641,7 @@ app.get('/api/resellers/pos-activations', authenticateToken, async (req, res) =>
 // ============================================================================
 let _dataHealthCache = { at: 0, data: null };
 async function computeDataHealth() {
-  const [resAct, unInv, zenMerch, repsNoRole, unEmails, openReports, unInvList] = await Promise.all([
+  const [resAct, unInv, zenMerch, repsNoRole, unEmails, openReports, unInvList, staleMerch] = await Promise.all([
     // 1. Reseller POS activations resolving to "(unassigned)" — no managed match, no name, no email.
     pool.query(`
       SELECT COUNT(*)::int AS count
@@ -18695,6 +18695,33 @@ async function computeDataHealth() {
       SELECT invoice_number, customer_name, commission::float AS commission, date::date AS date
       FROM invoices WHERE salesperson_name = 'Unassigned' AND commission > 0 AND date >= '2026-01-01'
       ORDER BY commission DESC LIMIT 100`),
+    // 8. Merchants Zentact still flags ACTIVE that are not actually processing. Found the hard
+    //    way on 2026-08-18: "Chez Toune" showed two ACTIVE accounts whose last revenue was
+    //    September 2025 — the business had closed and reopened under a new deal, and nobody
+    //    could see it. Two shapes, both worth a call: never earned a cent (activation likely
+    //    never completed on the merchant's side), or earned then went quiet (closed, or churned
+    //    to another processor). They also dilute the "revenue per active merchant" run-rate.
+    //    Manual entries are excluded — they exist precisely because there is no Zentact feed.
+    //    The 3-month grace period keeps a genuinely new activation from being flagged early.
+    pool.query(`
+      WITH last_rev AS (
+        SELECT m.merchant_account_id, m.business_name, m.sales_rep_name, m.activated_at::date AS activated_at,
+               MAX(r.year * 100 + r.month) AS last_period
+        FROM zentact_merchants m
+        LEFT JOIN zentact_merchant_revenue r ON r.merchant_account_id = m.merchant_account_id
+        WHERE m.status = 'ACTIVE' AND m.is_manual = false
+          AND m.activated_at IS NOT NULL
+          AND m.activated_at < (CURRENT_DATE - INTERVAL '3 months')
+        GROUP BY 1, 2, 3, 4
+      )
+      SELECT merchant_account_id, business_name, COALESCE(sales_rep_name, '') AS sales_rep_name,
+             activated_at, last_period,
+             (last_period IS NULL) AS never_earned
+      FROM last_rev
+      WHERE last_period IS NULL
+         OR last_period < (EXTRACT(YEAR FROM CURRENT_DATE - INTERVAL '3 months')::int * 100
+                           + EXTRACT(MONTH FROM CURRENT_DATE - INTERVAL '3 months')::int)
+      ORDER BY never_earned DESC, activated_at`),
   ]);
   const issues = {
     unassignedResellerActivations: resAct.rows[0].count,
@@ -18703,10 +18730,15 @@ async function computeDataHealth() {
     repsNoRole: { count: repsNoRole.rows[0].count, names: repsNoRole.rows[0].names },
     unmappedResellerEmails: unEmails.rows[0].count,
     userReports: { count: openReports.rows.length, items: openReports.rows },
+    staleActiveMerchants: {
+      count: staleMerch.rows.length,
+      neverEarned: staleMerch.rows.filter(r => r.never_earned).length,
+      items: staleMerch.rows,
+    },
   };
   const totalIssues = issues.unassignedResellerActivations + issues.unassignedInvoices.count
     + issues.unassignedZentactMerchants + issues.repsNoRole.count + issues.unmappedResellerEmails
-    + issues.userReports.count;
+    + issues.userReports.count + issues.staleActiveMerchants.count;
   return { totalIssues, issues, generatedAt: new Date().toISOString() };
 }
 // GET /api/admin/data-health — the "À corriger" aggregate (?fresh=1 bypasses the 60s cache).
