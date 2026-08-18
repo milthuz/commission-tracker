@@ -18686,8 +18686,7 @@ async function computeDataHealth() {
     pool.query(`
       SELECT r.id, r.report_type, r.reporter_email, r.reporter_name, r.reference, r.period,
              r.message, r.created_at,
-             i.verdict, i.evidence, i.ai_note, i.reply_index, i.likely_resolved,
-             i.investigated_at
+             i.verdict, i.evidence, i.ai_note, i.likely_resolved, i.investigated_at
       FROM user_reports r
       LEFT JOIN user_report_investigations i ON i.report_id = r.id
       WHERE r.status = 'open' ORDER BY r.created_at DESC LIMIT 100`),
@@ -25129,23 +25128,45 @@ app.post('/api/feedback/feature-request', authenticateToken, async (req, res) =>
 // Diagnose one report and store the finding (one row per report, replaced on re-run).
 // Layer 2 is handed the Anthropic client only when a key is configured — with none, the
 // deterministic layer 1 still runs and the page simply shows no AI note.
+// Resolve an estimate NUMBER (EST-017147) to its customer, live from Zoho Books — we keep
+// no estimates locally. Lets the investigator treat an estimate as a starting point: the
+// deal and the activation are filed under the CUSTOMER, never under the number a rep quotes.
+// Returns null on any failure, so the diagnosis degrades to "it's an estimate" instead of erroring.
+async function lookupEstimateByNumber(number) {
+  try {
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    const r = await axios.get(`${apiDomain}/books/v3/estimates`, {
+      params: { organization_id: process.env.ZOHO_ORG_ID, estimate_number: number, per_page: 5 },
+      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
+    });
+    if (r.status !== 200) return null;
+    const list = r.data?.estimates || [];
+    const e = list.find(x => String(x.estimate_number).toLowerCase() === String(number).toLowerCase()) || list[0];
+    if (!e) return null;
+    return {
+      number: e.estimate_number, customerName: e.customer_name, status: e.status,
+      date: e.date, total: e.total, salesperson: e.salesperson_name || '',
+    };
+  } catch { return null; }
+}
+
 async function runReportInvestigation(report) {
   const out = await investigateReport(pool, report, {
     orgId: process.env.ZOHO_ORG_ID,
     anthropic: getAnthropic(),
+    lookupEstimate: lookupEstimateByNumber,
   });
   await pool.query(
     `INSERT INTO user_report_investigations
-       (report_id, verdict, evidence, ai_note, reply_index, likely_resolved, investigated_at)
-     VALUES ($1, $2, $3::jsonb, $4, $5, $6, CURRENT_TIMESTAMP)
+       (report_id, verdict, evidence, ai_note, likely_resolved, investigated_at)
+     VALUES ($1, $2, $3::jsonb, $4, $5, CURRENT_TIMESTAMP)
      ON CONFLICT (report_id) DO UPDATE SET
        verdict         = EXCLUDED.verdict,
        evidence        = EXCLUDED.evidence,
        ai_note         = EXCLUDED.ai_note,
-       reply_index     = EXCLUDED.reply_index,
        likely_resolved = EXCLUDED.likely_resolved,
        investigated_at = CURRENT_TIMESTAMP`,
-    [report.id, out.verdict, JSON.stringify(out.evidence), out.aiNote, out.replyIndex, out.likelyResolved]
+    [report.id, out.verdict, JSON.stringify(out.evidence), out.aiNote, out.likelyResolved]
   );
   _dataHealthCache = { at: 0, data: null };
   return out;

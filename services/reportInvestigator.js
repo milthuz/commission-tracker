@@ -4,8 +4,8 @@
 //
 // Layer 1 is deterministic: a closed decision tree over invoices, zentact_merchants
 // and crm_sold_deals. It returns one verdict from VERDICTS plus the evidence it used,
-// so an admin can CHECK the answer instead of trusting it. Every verdict maps to one
-// of the Data Health quick replies, which is what pre-fills the resolve note.
+// so an admin can CHECK the answer instead of trusting it. The UI keys its quick replies
+// on the verdict, so the resolve note starts from the answer that fits THAT case.
 //
 // Layer 2 only runs when layer 1 says `inconclusive`: Claude reads the evidence layer 1
 // already gathered plus the rep's free text (things like "point for WF" that no query
@@ -13,33 +13,37 @@
 // its output is a suggestion for a human, never an action.
 // ============================================================================
 
-// Every verdict layer 1 can return. `reply` names the i18n quick-reply that fits, so the
-// UI can pre-fill the resolve note; null means "no canned answer applies, read the note".
+// Every verdict layer 1 can return. The UI keys its quick replies on the verdict itself
+// (dataHealth.reports.verdictReplies.<verdict>), so nothing here needs to name one.
+// `resolved` is the triage signal: true = we believe nothing is actually missing.
 const VERDICTS = {
   // ---- shared
-  not_found:             { reply: null,  resolved: false },
-  inconclusive:          { reply: null,  resolved: false },
+  not_found:             { resolved: false },
+  inconclusive:          { resolved: false },
+  // Estimate resolved to a customer, but nothing has followed it yet — no deal, no
+  // activation, no invoice. The honest answer to "where is my point": not sold yet.
+  estimate_no_sale_yet:  { resolved: false },
   // ---- points
-  points_present:        { reply: null,  resolved: true  },
-  points_arrived_since:  { reply: null,  resolved: true  },
-  deal_wrong_rep:        { reply: 0,     resolved: false },
-  merchant_wrong_rep:    { reply: 0,     resolved: false },
-  merchant_trade_name:   { reply: 2,     resolved: true  },
-  merchant_not_active:   { reply: 4,     resolved: false },
-  per_store_unit_owed:   { reply: 1,     resolved: false },
+  points_present:        { resolved: true  },
+  points_arrived_since:  { resolved: true  },
+  deal_wrong_rep:        { resolved: false },
+  merchant_wrong_rep:    { resolved: false },
+  merchant_trade_name:   { resolved: true  },
+  merchant_not_active:   { resolved: false },
+  per_store_unit_owed:   { resolved: false },
   // ---- commission
-  commission_present:    { reply: null,  resolved: true  },
-  reference_is_estimate: { reply: null,  resolved: false },
-  invoice_not_found:     { reply: null,  resolved: false },
-  invoice_wrong_rep:     { reply: null,  resolved: false },
-  invoice_void:          { reply: null,  resolved: false },
-  invoice_frozen:        { reply: 0,     resolved: false },
-  invoice_renewal:       { reply: 1,     resolved: true  },
-  awaiting_first_saas:   { reply: 2,     resolved: true  },
-  invoice_not_paid:      { reply: 3,     resolved: true  },
-  pre_platform_sale:     { reply: 4,     resolved: true  },
-  quota_gate:            { reply: null,  resolved: true  },
-  rep_inactive:          { reply: null,  resolved: false },
+  commission_present:    { resolved: true  },
+  reference_is_estimate: { resolved: false },
+  invoice_not_found:     { resolved: false },
+  invoice_wrong_rep:     { resolved: false },
+  invoice_void:          { resolved: false },
+  invoice_frozen:        { resolved: false },
+  invoice_renewal:       { resolved: true  },
+  awaiting_first_saas:   { resolved: true  },
+  invoice_not_paid:      { resolved: true  },
+  pre_platform_sale:     { resolved: true  },
+  quota_gate:            { resolved: true  },
+  rep_inactive:          { resolved: false },
 };
 
 // The per-location rule ("une succursale = une vente") only applies from this date on;
@@ -274,7 +278,7 @@ async function askClaude(anthropic, report, rep, layer1) {
 
 /**
  * Investigate one user report. Never writes to business tables — it only reads.
- * @returns {{verdict:string, evidence:object, aiNote:string|null, replyIndex:number|null, likelyResolved:boolean}}
+ * @returns {{verdict:string, evidence:object, aiNote:string|null, likelyResolved:boolean}}
  */
 async function investigateReport(pool, report, opts = {}) {
   const rep = report.reporter_name || report.reporter_email || '';
@@ -288,10 +292,34 @@ async function investigateReport(pool, report, opts = {}) {
     if (!refs.length) {
       result = { verdict: 'inconclusive', evidence: { why: 'no reference on the report and none found in the message' } };
     }
+    const runPath = (ref) => report.report_type === 'missing_points'
+      ? investigatePoints(pool, report, rep, ref)
+      : investigateCommission(pool, report, rep, orgId, ref);
+
     for (const ref of refs) {
-      const attempt = report.report_type === 'missing_points'
-        ? await investigatePoints(pool, report, rep, ref)
-        : await investigateCommission(pool, report, rep, orgId, ref);
+      let attempt = await runPath(ref);
+
+      // An estimate is a starting point, not a dead end. We keep no estimates locally, so
+      // resolve the number against Zoho Books, take the customer off it, and run the same
+      // tree again on that name — the deal or the activation is filed under the customer,
+      // never under the estimate number the rep quotes.
+      if (attempt.verdict === 'reference_is_estimate' && opts.lookupEstimate) {
+        const est = await opts.lookupEstimate(ref);
+        if (est && est.customerName) {
+          const chained = await runPath(est.customerName);
+          const evidence = {
+            ...chained.evidence,
+            via_estimate: est.number,
+            estimate_customer: est.customerName,
+            estimate_status: est.status,
+            estimate_date: est.date,
+          };
+          attempt = isConclusive(chained.verdict)
+            ? { verdict: chained.verdict, evidence }
+            : { verdict: 'estimate_no_sale_yet', evidence };
+        }
+      }
+
       if (!result) result = attempt;
       if (isConclusive(attempt.verdict)) { result = attempt; break; }
     }
@@ -311,7 +339,6 @@ async function investigateReport(pool, report, opts = {}) {
     verdict: result.verdict,
     evidence: result.evidence || {},
     aiNote,
-    replyIndex: meta.reply,
     likelyResolved: meta.resolved,
   };
 }
