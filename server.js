@@ -83,6 +83,7 @@ const PERMISSION_CATALOG = [
   { key: 'tracker:view_all_details',   label: 'View all reps deals + merchants details',     category: 'Commission Tracker' },
   { key: 'tracker:assign_merchants',   label: 'Assign unassigned Zentact merchants to reps', category: 'Commission Tracker' },
   { key: 'tracker:manual_activation',  label: 'Add manual payment activations (when Zentact is unavailable)', category: 'Commission Tracker' },
+  { key: 'tracker:exclude_deal',       label: 'Exclude a deal from the Commission Tracker (and give it back)', category: 'Commission Tracker' },
 
   // Commission Report
   { key: 'report:view_own',            label: 'View own commission report',                  category: 'Commission Report' },
@@ -2141,6 +2142,22 @@ async function initializeDatabase() {
     // sold_date or groups by owner — and those fire on every dashboard load.
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_sold_deals_sold_date ON crm_sold_deals(sold_date)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_sold_deals_owner_date ON crm_sold_deals(owner_name, sold_date)`);
+
+    // Deals an admin has taken OUT of the Commission Tracker (duplicate, test, deal that
+    // should never have counted). Deliberately a SEPARATE table rather than a flag on
+    // crm_sold_deals: that table is upserted by the CRM sync and TRUNCATEd by the admin
+    // reset, either of which would silently wipe the exclusion and hand back points nobody
+    // meant to give. Keyed on deal_id so it survives both, and reversible by design —
+    // a hard DELETE would just be recreated by the next sync.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS excluded_deals (
+        deal_id     VARCHAR(255) PRIMARY KEY,
+        deal_name   VARCHAR(500),
+        reason      TEXT,
+        excluded_by VARCHAR(255),
+        excluded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
 
     // Zentact merchants — stores all merchant accounts pulled from Zentact API.
     // activated_at is stamped the first time we see status = ACTIVE (never overwritten).
@@ -9762,6 +9779,17 @@ app.get('/api/auth/crm-status', authenticateToken, async (req, res) => {
 // read every colleague's pipeline and every client's deal value. Nothing in the frontend calls
 // them (the only UI CRM call is /api/crm/deals/:dealId/source), so admin-gating breaks nothing.
 // Contrast /api/crm/points, which correctly scopes by canViewAll.
+// A deal an admin pulled out of the Commission Tracker must stop counting EVERYWHERE points
+// are credited — the deal list, annual and monthly per-rep totals, and the quota gate recalc
+// applies. One expression, reused at every site: copying it is how the five per-location
+// counters were about to drift on 2026-08-13, and the same trap applies here.
+// The outer reference MUST stay qualified. Written unqualified as `x.deal_id = deal_id`,
+// Postgres resolves the bare name against the INNERMOST table — excluded_deals, which also
+// has a deal_id — so the condition degrades to `x.deal_id = x.deal_id`, NOT EXISTS turns
+// false for every row, and one single exclusion wipes every deal from the tracker.
+const NOT_EXCLUDED_DEAL = (alias) =>
+  `NOT EXISTS (SELECT 1 FROM excluded_deals x WHERE x.deal_id = ${alias || 'crm_sold_deals'}.deal_id)`;
+
 app.get('/api/crm/deals', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin only' });
   try {
@@ -9854,7 +9882,7 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
              c.lead_source_group AS synced_source, c.lead_source_group_override AS source_override,
              c.points, c.sold_date
       FROM crm_sold_deals c
-      WHERE c.sold_date >= $1 AND c.sold_date <= $2
+      WHERE ${NOT_EXCLUDED_DEAL('c')} AND c.sold_date >= $1 AND c.sold_date <= $2
         AND (
           c.owner_name IN (SELECT name FROM salespeople WHERE is_active = true)
           OR c.owner_name IS NULL
@@ -10036,7 +10064,7 @@ app.get('/api/crm/points', authenticateToken, async (req, res) => {
     const annualResult = await pool.query(`
       SELECT owner_name, SUM(points) AS annual_points
       FROM crm_sold_deals
-      WHERE sold_date >= $1
+      WHERE ${NOT_EXCLUDED_DEAL('')} AND sold_date >= $1
       GROUP BY owner_name
     `, [PLAN_START_DATE]);
 
@@ -10241,7 +10269,7 @@ app.get('/api/crm/points/annual', authenticateToken, async (req, res) => {
       SELECT EXTRACT(MONTH FROM sold_date) AS month,
              SUM(points) AS crm_points
       FROM crm_sold_deals
-      WHERE EXTRACT(YEAR FROM sold_date) = $1
+      WHERE ${NOT_EXCLUDED_DEAL('')} AND EXTRACT(YEAR FROM sold_date) = $1
         AND LOWER(owner_name) = LOWER($2)
       GROUP BY EXTRACT(MONTH FROM sold_date)
     `, [year, repName]);
@@ -10293,7 +10321,7 @@ app.get('/api/crm/points/annual', authenticateToken, async (req, res) => {
     const [crmAnn, zentactAnn] = await Promise.all([
       pool.query(
         `SELECT COALESCE(SUM(points), 0) AS pts FROM crm_sold_deals
-         WHERE sold_date >= $1 AND LOWER(owner_name) = LOWER($2)`,
+         WHERE ${NOT_EXCLUDED_DEAL('')} AND sold_date >= $1 AND LOWER(owner_name) = LOWER($2)`,
         [PLAN_START_DATE, repName]
       ),
       pool.query(
@@ -11854,12 +11882,17 @@ app.get('/api/admin/deals-search', authenticateToken, async (req, res) => {
   if (q.length < 2) return res.status(400).json({ error: 'q must be at least 2 characters' });
   try {
     const rows = (await pool.query(
-      `SELECT deal_id, deal_name, account_name, owner_name,
-              COALESCE(lead_source_group_override, lead_source_group) AS lead_source_group,
-              points, sold_date::date AS sold_date
-       FROM crm_sold_deals
-       WHERE deal_name ILIKE '%'||$1||'%' OR account_name ILIKE '%'||$1||'%' OR owner_name ILIKE '%'||$1||'%'
-       ORDER BY sold_date DESC, deal_name LIMIT 50`,
+      // Deliberately NOT filtered by the exclusion: this screen is where an exclusion gets
+      // made and undone, so an excluded deal has to remain findable here.
+      `SELECT d.deal_id, d.deal_name, d.account_name, d.owner_name,
+              COALESCE(d.lead_source_group_override, d.lead_source_group) AS lead_source_group,
+              d.points, d.sold_date::date AS sold_date,
+              (x.deal_id IS NOT NULL) AS excluded, x.reason AS exclusion_reason,
+              x.excluded_by, x.excluded_at
+       FROM crm_sold_deals d
+       LEFT JOIN excluded_deals x ON x.deal_id = d.deal_id
+       WHERE d.deal_name ILIKE '%'||$1||'%' OR d.account_name ILIKE '%'||$1||'%' OR d.owner_name ILIKE '%'||$1||'%'
+       ORDER BY d.sold_date DESC, d.deal_name LIMIT 50`,
       [q]
     )).rows;
     res.json({ deals: rows });
@@ -11885,6 +11918,62 @@ app.patch('/api/crm/sold-deals-db/:dealId', authenticateToken, async (req, res) 
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+});
+
+// POST /api/crm/deals/:dealId/exclude — take a deal OUT of the Commission Tracker, or put it
+// back. Body: { excluded: bool, reason?: string }. Excluding does not delete anything: the deal
+// stays in crm_sold_deals (the CRM sync would recreate it anyway) and simply stops counting
+// toward points — annual, monthly, per-rep totals, and the quota gate that recalc applies.
+// Reversible on purpose: an exclusion is a judgement call, and judgement calls get revisited.
+app.post('/api/crm/deals/:dealId/exclude', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'tracker:exclude_deal'))) return;
+  const dealId = String(req.params.dealId || '').trim();
+  const excluded = req.body?.excluded !== false;   // default true; pass false to restore
+  const reason = (req.body?.reason || '').toString().trim().slice(0, 500) || null;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  try {
+    const deal = (await pool.query(
+      `SELECT deal_id, deal_name, owner_name, points FROM crm_sold_deals WHERE deal_id = $1`, [dealId]
+    )).rows[0];
+    if (!deal) return res.status(404).json({ error: 'Deal not found' });
+
+    if (excluded) {
+      await pool.query(
+        `INSERT INTO excluded_deals (deal_id, deal_name, reason, excluded_by)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (deal_id) DO UPDATE SET
+           deal_name = EXCLUDED.deal_name, reason = EXCLUDED.reason,
+           excluded_by = EXCLUDED.excluded_by, excluded_at = CURRENT_TIMESTAMP`,
+        [dealId, deal.deal_name, reason, actor]
+      );
+    } else {
+      await pool.query(`DELETE FROM excluded_deals WHERE deal_id = $1`, [dealId]);
+    }
+    logActivity('crm_deal', dealId,
+      excluded ? 'deal_excluded_from_tracker' : 'deal_restored_to_tracker',
+      `Deal "${deal.deal_name}" (${deal.owner_name || '—'}, ${deal.points} pt) `
+      + `${excluded ? 'excluded from' : 'restored to'} the Commission Tracker by ${actor}`
+      + (reason ? ` — ${reason}` : ''),
+      actor, { metadata: { points: deal.points, owner: deal.owner_name, reason } });
+    // Points feed the quota gate, so a stale cache would show the old total.
+    _dataHealthCache = { at: 0, data: null };
+    res.json({ success: true, dealId, excluded });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/crm/excluded-deals — the current exclusion list (admin review).
+app.get('/api/crm/excluded-deals', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'tracker:exclude_deal'))) return;
+  try {
+    const rows = (await pool.query(
+      `SELECT e.deal_id, e.deal_name, e.reason, e.excluded_by, e.excluded_at,
+              d.owner_name, d.points, d.sold_date::date AS sold_date
+         FROM excluded_deals e
+         LEFT JOIN crm_sold_deals d ON d.deal_id = e.deal_id
+        ORDER BY e.excluded_at DESC`
+    )).rows;
+    res.json({ deals: rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // GET /api/crm/debug — inspect raw deal data to diagnose missing fields / date issues
@@ -27452,7 +27541,7 @@ async function _computeMonthlyPointsByRep(fromDate) {
            COALESCE(lead_source_group_override, lead_source_group) AS g,
            points, COUNT(*)::int AS c
     FROM crm_sold_deals
-    WHERE sold_date >= $1 AND owner_name IS NOT NULL
+    WHERE ${NOT_EXCLUDED_DEAL('')} AND sold_date >= $1 AND owner_name IS NOT NULL
     GROUP BY 1, 2, 3, 4
   `, [fromDate])).rows) {
     const g = String(r.g || '');
