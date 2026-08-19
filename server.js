@@ -14484,12 +14484,20 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
              MAX(checked_at) AS last_checked
         FROM saas_subscription_insights
        WHERE subscription_number = ANY($1::text[])`, [numbers])).rows[0];
+    // The actual failure text, grouped. Storing per-row errors that nothing ever displays makes a
+    // scan that fails on every subscription indistinguishable from one that never ran.
+    const topErrors = (await pool.query(`
+      SELECT check_error AS error, COUNT(*)::int AS count
+        FROM saas_subscription_insights
+       WHERE check_error IS NOT NULL AND subscription_number = ANY($1::text[])
+       GROUP BY check_error ORDER BY count DESC LIMIT 3`, [numbers])).rows;
     res.json({
       total: numbers.length,
       verified: r.verified,
       errors: r.errors,
       active: r.recent > 0,
       lastCheckedAt: r.last_checked,
+      topErrors,
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
