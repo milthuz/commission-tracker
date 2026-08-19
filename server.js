@@ -2368,6 +2368,13 @@ async function initializeDatabase() {
     // window, price never moved" from "barely any invoice history existed to compare" (both would
     // otherwise look identical as last_price_change_at = NULL).
     await pool.query(`ALTER TABLE saas_subscription_insights ADD COLUMN IF NOT EXISTS price_points_checked INTEGER`);
+    // The BASE PLAN price, separated from addons. Zoho's subscription LIST response only carries
+    // the total (plan + addons), but an increase applies to the plan line ONLY — pushing a
+    // plan+addons figure as the new plan price would silently re-charge the addons on top of it.
+    // Only the per-subscription detail call exposes the split, so it's captured by the same
+    // nightly scan that already makes that call for tenure.
+    await pool.query(`ALTER TABLE saas_subscription_insights ADD COLUMN IF NOT EXISTS plan_monthly NUMERIC(12,2)`);
+    await pool.query(`ALTER TABLE saas_subscription_insights ADD COLUMN IF NOT EXISTS addons_monthly NUMERIC(12,2)`);
 
     // Historical churn dataset for the SaaS Increase risk-score calibration — one row per
     // CANCELLED subscription (a completed event), separate from saas_subscription_insights
@@ -14424,8 +14431,17 @@ app.get('/api/admin/saas-increase/subscriptions', authenticateToken, async (req,
     const insightsByNum = new Map(insightsRes.rows.map(r => [r.subscription_number, r]));
     rows = rows.map(s => {
       const i = insightsByNum.get(s.subscriptionNumber);
+      // An increase applies to the BASE PLAN line only. The list endpoint gives plan + addons,
+      // so `currentMonthly` becomes the scanned plan price whenever it's known; `baseVerified`
+      // tells the UI (and the push guard) whether that separation actually happened for this row.
+      const planMonthly = i?.plan_monthly != null ? Number(i.plan_monthly) : null;
+      const addonsMonthly = i?.addons_monthly != null ? Number(i.addons_monthly) : null;
       return {
         ...s,
+        totalMonthly: s.currentMonthly,
+        currentMonthly: planMonthly != null ? planMonthly : s.currentMonthly,
+        addonsMonthly,
+        baseVerified: planMonthly != null,
         activatedAt: i?.activated_at || null,
         lastPriceChangeAt: i?.last_price_change_at || null,
         lastPriceBefore: i?.last_price_before != null ? Number(i.last_price_before) : null,
@@ -14546,6 +14562,9 @@ function r2Money(n) { return Math.round((Number(n) || 0) * 100) / 100; }
 function saasIncreaseNewMonthly(current, type, value) {
   const c = Number(current) || 0;
   const v = Number(value) || 0;
+  // 'target' is an absolute price ("set everyone to $169"), not a delta — used to normalize
+  // legacy price drift within a plan. A 0 means "not set", so keep the current price.
+  if (type === 'target') return r2Money(v > 0 ? v : c);
   return r2Money(type === 'flat' ? c + v : c * (1 + v / 100));
 }
 function serializeSaasIncreaseItem(row) {
@@ -14658,7 +14677,7 @@ app.post('/api/admin/saas-increase/scenarios/:id/items', authenticateToken, asyn
     for (const it of items) {
       const subscriptionNumber = String(it.subscriptionNumber || '').trim();
       if (!subscriptionNumber) continue;
-      const increaseType = it.increaseType === 'flat' ? 'flat' : 'percent';
+      const increaseType = (it.increaseType === 'flat' || it.increaseType === 'target') ? it.increaseType : 'percent';
       const currentMonthly = r2Money(it.currentMonthly);
       const increaseValue = Number(it.increaseValue) || 0;
       byNumber.set(subscriptionNumber, [
@@ -15031,10 +15050,25 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
     const liveSubs = await getSaasIncreaseSubscriptions();
     const liveBySub = new Map(liveSubs.map(s => [s.subscriptionNumber, s]));
     const { accessToken, apiDomain } = await getAdminBooksAuth();
+    // Which subscriptions have had their plan price separated from their addons by the insights
+    // scan. Anything missing here cannot be pushed safely — see the per-item guard below.
+    const baseVerified = new Set((await pool.query(
+      `SELECT subscription_number FROM saas_subscription_insights WHERE plan_monthly IS NOT NULL`
+    )).rows.map(r => r.subscription_number));
 
     const results = [];
     for (const item of items) {
       const live = liveBySub.get(item.subscription_number);
+      // The value we push becomes the PLAN price. If the plan/addon split was never verified for
+      // this subscription, new_monthly may have been computed from plan + addons — pushing it
+      // would set the plan to that combined figure and the addons would be re-charged on top of
+      // it. Refuse rather than overcharge; the nightly insights scan fills this in.
+      if (!baseVerified.has(item.subscription_number)) {
+        const msg = 'Base plan price not verified yet (addons not separated) — refresh price history first';
+        await pool.query(`UPDATE saas_increase_items SET status = 'push_failed', push_error = $1 WHERE id = $2`, [msg, item.id]);
+        results.push({ itemId: item.id, ok: false, error: msg });
+        continue;
+      }
       if (!live || !live.subscriptionId) {
         const msg = 'Subscription no longer found in Zoho Billing';
         await pool.query(`UPDATE saas_increase_items SET status = 'push_failed', push_error = $1 WHERE id = $2`, [msg, item.id]);
@@ -15078,21 +15112,34 @@ const SAAS_INSIGHTS_RESCAN_AFTER_HOURS = 20;
 const SAAS_CHURN_RESCAN_AFTER_DAYS = 7;
 
 async function fetchSaasSubscriptionTenure(apiDomain, accessToken, orgId, subscriptionId) {
-  if (!subscriptionId) return { activatedAt: null, cancelledAt: null };
+  const empty = { activatedAt: null, cancelledAt: null, planMonthly: null, addonsMonthly: null };
+  if (!subscriptionId) return empty;
   const r = await axios.get(`${apiDomain}/billing/v1/subscriptions/${subscriptionId}`, {
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, 'X-com-zoho-subscriptions-organizationid': orgId },
     validateStatus: () => true,
   });
-  if (r.status !== 200) return { activatedAt: null, cancelledAt: null };
+  if (r.status !== 200) return empty;
   const sub = r.data?.subscription;
   const toDate = (raw) => {
     if (!raw) return null;
     const d = (typeof raw === 'number' || /^\d+$/.test(String(raw))) ? new Date(parseInt(raw) * 1000) : new Date(raw);
     return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
   };
+  // Plan vs addons. Only this detail endpoint exposes the split — the list endpoint returns just
+  // the combined amount, which is exactly why the tool was treating "plan + addons" as the base
+  // price to raise. `price * quantity` mirrors what Zoho shows on the subscription's own line
+  // items (e.g. $119 x 1 for the plan, then Online Ordering $29 and MEV-WEB $20 as addons).
+  const line = (p, q) => (Number(p) || 0) * (Number(q) || 1);
+  const planRaw = sub?.plan ? line(sub.plan.price, sub.plan.quantity) : null;
+  const addonsRaw = Array.isArray(sub?.addons)
+    ? sub.addons.reduce((sum, a) => sum + line(a.price, a.quantity), 0)
+    : null;
+  const perMonth = (v) => (v == null ? null : r2Money(subMonthlyAmount(v, sub?.interval, sub?.interval_unit)));
   return {
     activatedAt: toDate(sub?.activated_at || sub?.current_term_starts_at || sub?.start_date),
     cancelledAt: toDate(sub?.cancelled_at),
+    planMonthly: perMonth(planRaw),
+    addonsMonthly: perMonth(addonsRaw),
   };
 }
 
@@ -15186,14 +15233,15 @@ async function runSaasSubscriptionInsightsScan() {
     let ok = 0, failed = 0;
     for (const s of subs) {
       try {
-        const { activatedAt } = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
+        const { activatedAt, planMonthly, addonsMonthly } = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
         const { points, change } = await fetchSaasPriceChange(apiDomain, accessToken, booksOrgId, s.subscriptionId, s.customerId, planCodes, planNames);
         await pool.query(`
-          INSERT INTO saas_subscription_insights (subscription_number, activated_at, last_price_change_at, last_price_before, last_price_after, price_points_checked, checked_at, check_error)
-          VALUES ($1, $2, $3, $4, $5, $6, NOW(), NULL)
+          INSERT INTO saas_subscription_insights (subscription_number, activated_at, last_price_change_at, last_price_before, last_price_after, price_points_checked, plan_monthly, addons_monthly, checked_at, check_error)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NULL)
           ON CONFLICT (subscription_number) DO UPDATE SET
-            activated_at = $2, last_price_change_at = $3, last_price_before = $4, last_price_after = $5, price_points_checked = $6, checked_at = NOW(), check_error = NULL`,
-          [s.subscriptionNumber, activatedAt, change?.date || null, change?.before ?? null, change?.after ?? null, points]
+            activated_at = $2, last_price_change_at = $3, last_price_before = $4, last_price_after = $5, price_points_checked = $6,
+            plan_monthly = $7, addons_monthly = $8, checked_at = NOW(), check_error = NULL`,
+          [s.subscriptionNumber, activatedAt, change?.date || null, change?.before ?? null, change?.after ?? null, points, planMonthly, addonsMonthly]
         );
         ok++;
       } catch (e) {
