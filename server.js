@@ -14647,28 +14647,54 @@ app.post('/api/admin/saas-increase/scenarios/:id/items', authenticateToken, asyn
   try {
     const scenario = (await pool.query(`SELECT id FROM saas_increase_scenarios WHERE id = $1`, [req.params.id])).rows[0];
     if (!scenario) return res.status(404).json({ error: 'scenario not found' });
-    const saved = [];
+    // Normalize + dedupe first. A duplicate subscription_number inside one multi-row upsert makes
+    // Postgres abort the whole statement ("ON CONFLICT DO UPDATE command cannot affect row a
+    // second time"), so last-one-wins per subscription.
+    const byNumber = new Map();
     for (const it of items) {
       const subscriptionNumber = String(it.subscriptionNumber || '').trim();
       if (!subscriptionNumber) continue;
       const increaseType = it.increaseType === 'flat' ? 'flat' : 'percent';
       const currentMonthly = r2Money(it.currentMonthly);
       const increaseValue = Number(it.increaseValue) || 0;
-      const newMonthly = saasIncreaseNewMonthly(currentMonthly, increaseType, increaseValue);
-      const row = (await pool.query(`
+      byNumber.set(subscriptionNumber, [
+        req.params.id, String(it.orgId || ''), subscriptionNumber, it.customerId || null, it.customerName || null,
+        it.merchantAccountId || null, it.planCode || null, it.planName || null, currentMonthly, increaseType,
+        increaseValue, saasIncreaseNewMonthly(currentMonthly, increaseType, increaseValue),
+      ]);
+    }
+    const toSave = Array.from(byNumber.values());
+
+    // One round-trip per CHUNK rows instead of one per item. This DB is cross-cloud, so every
+    // round-trip carries real latency — saving a few thousand items one at a time ran for minutes
+    // and died on the gateway timeout, which the UI could only report as a generic failure. The
+    // segment-first UI makes thousand-item scenarios a two-click affair, so this is now the normal
+    // case, not an edge case. 12 params/row keeps each chunk far below Postgres's 65535 ceiling.
+    const CHUNK = 500;
+    const saved = [];
+    for (let i = 0; i < toSave.length; i += CHUNK) {
+      const chunk = toSave.slice(i, i + CHUNK);
+      const params = [];
+      const tuples = chunk.map((vals, n) => {
+        params.push(...vals);
+        const b = n * 12;
+        return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8},$${b + 9},$${b + 10},$${b + 11},$${b + 12})`;
+      });
+      // EXCLUDED.* rather than positional params in the DO UPDATE — with a multi-row VALUES list,
+      // $2/$4/... would pin every conflicting row to the FIRST row's values.
+      const inserted = await pool.query(`
         INSERT INTO saas_increase_items
           (scenario_id, org_id, subscription_number, customer_id, customer_name, merchant_account_id,
            plan_code, plan_name, current_monthly, increase_type, increase_value, new_monthly)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+        VALUES ${tuples.join(',')}
         ON CONFLICT (scenario_id, subscription_number) DO UPDATE SET
-          org_id = $2, customer_id = $4, customer_name = $5, merchant_account_id = $6,
-          plan_code = $7, plan_name = $8, current_monthly = $9, increase_type = $10,
-          increase_value = $11, new_monthly = $12, status = 'pending', push_error = NULL
-        RETURNING *`,
-        [req.params.id, String(it.orgId || ''), subscriptionNumber, it.customerId || null, it.customerName || null,
-         it.merchantAccountId || null, it.planCode || null, it.planName || null, currentMonthly, increaseType, increaseValue, newMonthly]
-      )).rows[0];
-      saved.push(serializeSaasIncreaseItem(row));
+          org_id = EXCLUDED.org_id, customer_id = EXCLUDED.customer_id, customer_name = EXCLUDED.customer_name,
+          merchant_account_id = EXCLUDED.merchant_account_id, plan_code = EXCLUDED.plan_code,
+          plan_name = EXCLUDED.plan_name, current_monthly = EXCLUDED.current_monthly,
+          increase_type = EXCLUDED.increase_type, increase_value = EXCLUDED.increase_value,
+          new_monthly = EXCLUDED.new_monthly, status = 'pending', push_error = NULL
+        RETURNING *`, params);
+      for (const row of inserted.rows) saved.push(serializeSaasIncreaseItem(row));
     }
     res.json({ items: saved });
   } catch (e) { res.status(500).json({ error: e.message }); }
