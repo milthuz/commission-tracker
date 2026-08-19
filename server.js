@@ -14642,8 +14642,11 @@ app.delete('/api/admin/saas-increase/scenarios/:id', authenticateToken, async (r
 // currentMonthly, increaseType, increaseValue }, ...] }. new_monthly is computed server-side.
 app.post('/api/admin/saas-increase/scenarios/:id/items', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
-  const items = Array.isArray(req.body?.items) ? req.body.items : [];
-  if (!items.length) return res.status(400).json({ error: 'items required' });
+  // An EMPTY list is meaningful here, not an error: it means every segment was cleared, and the
+  // delete below then empties the scenario (minus the pushed/notified rows it protects). Only a
+  // malformed body is rejected.
+  if (!Array.isArray(req.body?.items)) return res.status(400).json({ error: 'items array required' });
+  const items = req.body.items;
   const client = await pool.connect();
   try {
     const scenario = (await client.query(`SELECT id FROM saas_increase_scenarios WHERE id = $1`, [req.params.id])).rows[0];
