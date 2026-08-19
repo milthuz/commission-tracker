@@ -15230,7 +15230,7 @@ async function fetchSaasPriceChange(apiDomain, accessToken, orgId, subscriptionI
     // same-plan price change instead of being silently counted as one.
     const repPlanCode = saasLines.reduce((best, li) => {
       const amt = lineAmount(li);
-      return (!best || amt > best.amt) ? { amt, sku: (li.sku || li.item_code || '').toLowerCase().trim() || null } : best;
+      return (!best || amt > best.amt) ? { amt, sku: String(li.sku || li.item_code || '').toLowerCase().trim() || null } : best;
     }, null)?.sku || null;
     points.push({ date: full.date, amount: Math.round(saasAmount * 100) / 100, planCode: repPlanCode });
     await new Promise(r => setTimeout(r, 150));
@@ -15277,16 +15277,24 @@ async function runSaasSubscriptionInsightsScan() {
     for (const s of subs) {
       try {
         const { activatedAt, planMonthly, addonsMonthly } = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
-        const { points, change } = await fetchSaasPriceChange(apiDomain, accessToken, booksOrgId, s.subscriptionId, s.customerId, planCodes, planNames);
+        // The invoice-history walk is the fragile half (it parses arbitrary Books line items), and
+        // it must not take the plan/addon split down with it: that split is what gates pushing to
+        // Zoho, whereas price history is only informational. Failing it is recorded, not fatal.
+        let points = null, change = null, priceErr = null;
+        try {
+          ({ points, change } = await fetchSaasPriceChange(apiDomain, accessToken, booksOrgId, s.subscriptionId, s.customerId, planCodes, planNames));
+        } catch (e) {
+          priceErr = `price history: ${e.message}`;
+        }
         await pool.query(`
           INSERT INTO saas_subscription_insights (subscription_number, activated_at, last_price_change_at, last_price_before, last_price_after, price_points_checked, plan_monthly, addons_monthly, checked_at, check_error)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NULL)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), $9)
           ON CONFLICT (subscription_number) DO UPDATE SET
             activated_at = $2, last_price_change_at = $3, last_price_before = $4, last_price_after = $5, price_points_checked = $6,
-            plan_monthly = $7, addons_monthly = $8, checked_at = NOW(), check_error = NULL`,
-          [s.subscriptionNumber, activatedAt, change?.date || null, change?.before ?? null, change?.after ?? null, points, planMonthly, addonsMonthly]
+            plan_monthly = $7, addons_monthly = $8, checked_at = NOW(), check_error = $9`,
+          [s.subscriptionNumber, activatedAt, change?.date || null, change?.before ?? null, change?.after ?? null, points, planMonthly, addonsMonthly, priceErr]
         );
-        ok++;
+        if (priceErr) failed++; else ok++;
       } catch (e) {
         failed++;
         await pool.query(`
@@ -24059,7 +24067,7 @@ app.get('/api/invoices/enrich-preview/:invoiceNumber', authenticateToken, async 
         for (const det_inv of dets) {
           if (!det_inv) continue;
           const hasSaas = (det_inv.line_items || []).some(li => {
-            const sku = (li.sku || li.item_code || '').toLowerCase().trim();
+            const sku = String(li.sku || li.item_code || '').toLowerCase().trim();
             if (sku && planCodes.has(sku)) return true;
             const n = normalizeName(li.name);
             return !!(n && planNames.has(n));
