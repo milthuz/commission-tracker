@@ -14644,9 +14644,10 @@ app.post('/api/admin/saas-increase/scenarios/:id/items', authenticateToken, asyn
   if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
   const items = Array.isArray(req.body?.items) ? req.body.items : [];
   if (!items.length) return res.status(400).json({ error: 'items required' });
+  const client = await pool.connect();
   try {
-    const scenario = (await pool.query(`SELECT id FROM saas_increase_scenarios WHERE id = $1`, [req.params.id])).rows[0];
-    if (!scenario) return res.status(404).json({ error: 'scenario not found' });
+    const scenario = (await client.query(`SELECT id FROM saas_increase_scenarios WHERE id = $1`, [req.params.id])).rows[0];
+    if (!scenario) return res.status(404).json({ error: 'scenario not found' }); // finally releases
     // Normalize + dedupe first. A duplicate subscription_number inside one multi-row upsert makes
     // Postgres abort the whole statement ("ON CONFLICT DO UPDATE command cannot affect row a
     // second time"), so last-one-wins per subscription.
@@ -14672,6 +14673,7 @@ app.post('/api/admin/saas-increase/scenarios/:id/items', authenticateToken, asyn
     // case, not an edge case. 12 params/row keeps each chunk far below Postgres's 65535 ceiling.
     const CHUNK = 500;
     const saved = [];
+    await client.query('BEGIN');
     for (let i = 0; i < toSave.length; i += CHUNK) {
       const chunk = toSave.slice(i, i + CHUNK);
       const params = [];
@@ -14682,7 +14684,7 @@ app.post('/api/admin/saas-increase/scenarios/:id/items', authenticateToken, asyn
       });
       // EXCLUDED.* rather than positional params in the DO UPDATE — with a multi-row VALUES list,
       // $2/$4/... would pin every conflicting row to the FIRST row's values.
-      const inserted = await pool.query(`
+      const inserted = await client.query(`
         INSERT INTO saas_increase_items
           (scenario_id, org_id, subscription_number, customer_id, customer_name, merchant_account_id,
            plan_code, plan_name, current_monthly, increase_type, increase_value, new_monthly)
@@ -14696,8 +14698,33 @@ app.post('/api/admin/saas-increase/scenarios/:id/items', authenticateToken, asyn
         RETURNING *`, params);
       for (const row of inserted.rows) saved.push(serializeSaasIncreaseItem(row));
     }
-    res.json({ items: saved });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+
+    // Save reflects the WHOLE scenario, so anything no longer included has been removed by the
+    // user and must go — otherwise clearing a segment never persisted: the old increase stayed in
+    // the scenario, kept showing up in the notification panel and stayed pushable to Zoho.
+    // The frontend always sends every included subscription (it maps over the full list, not the
+    // filtered/tab view), so the complement really is "removed", not "not currently on screen".
+    //
+    // Two categories are deliberately NEVER deleted, because they record something that already
+    // happened in the real world and deleting them would destroy the audit trail: an item already
+    // PUSHED to Zoho (the customer's billing was actually changed) and one whose merchant
+    // notification was already SENT. A failed push is not protected — nothing happened.
+    const keep = toSave.map(v => v[2]);
+    const removed = await client.query(`
+      DELETE FROM saas_increase_items
+      WHERE scenario_id = $1
+        AND NOT (subscription_number = ANY($2::text[]))
+        AND status <> 'pushed'
+        AND notify_status <> 'sent'
+      RETURNING subscription_number`, [req.params.id, keep]);
+    await client.query('COMMIT');
+    res.json({ items: saved, removed: removed.rowCount });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch { /* connection may already be broken */ }
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
 });
 
 // DELETE /api/admin/saas-increase/scenarios/:id/items/:itemId — drop one row from a scenario
