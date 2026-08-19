@@ -14466,6 +14466,34 @@ app.post('/api/admin/saas-increase/insights/refresh', authenticateToken, async (
   res.json({ started: true });
 });
 
+// GET /api/admin/saas-increase/insights/status — progress of the price-history scan, so a run
+// that takes the better part of an hour isn't invisible outside the server logs.
+// Progress is derived from the DATA, not from an in-process flag: the scheduled scan runs on the
+// worker dyno while this request is served by the web one, so a boolean "running" here would read
+// false during a scheduled run. Rows written in the last couple of minutes are the reliable
+// cross-process signal that a scan is actively working.
+app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  try {
+    const subs = await getSaasIncreaseSubscriptions();
+    const numbers = subs.map(s => s.subscriptionNumber);
+    const r = (await pool.query(`
+      SELECT COUNT(*) FILTER (WHERE plan_monthly IS NOT NULL)::int AS verified,
+             COUNT(*) FILTER (WHERE check_error IS NOT NULL)::int AS errors,
+             COUNT(*) FILTER (WHERE checked_at > NOW() - INTERVAL '2 minutes')::int AS recent,
+             MAX(checked_at) AS last_checked
+        FROM saas_subscription_insights
+       WHERE subscription_number = ANY($1::text[])`, [numbers])).rows[0];
+    res.json({
+      total: numbers.length,
+      verified: r.verified,
+      errors: r.errors,
+      active: r.recent > 0,
+      lastCheckedAt: r.last_checked,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /api/admin/saas-increase/churn-history/refresh — fire-and-forget: kicks off the weekly
 // cancelled-subscription backfill on demand instead of waiting for the next scheduled run.
 app.post('/api/admin/saas-increase/churn-history/refresh', authenticateToken, async (req, res) => {
