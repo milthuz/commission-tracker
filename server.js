@@ -168,6 +168,7 @@ const PERMISSION_CATALOG = [
   { key: 'partners:delete',            label: 'Delete a partner company AND all its history (destructive)',     category: 'Partners' },
   { key: 'partners:migrate',           label: 'Bulk-import partners, portal users and opportunities (migration)', category: 'Partners' },
   { key: 'partners:stats',             label: 'View partner portal usage statistics (adoption, logins, submissions)', category: 'Partners' },
+  { key: 'partners:export_users',      label: 'Export the partner user list to Excel (emails and invitation dates)', category: 'Partners' },
 
   // Sofia (in-app assistant) — CRM tools. Split read/write on purpose: the write key is the
   // only thing standing between a chat message and a real record in Zoho, so it must be
@@ -6035,6 +6036,110 @@ app.get('/api/admin/partner-invites', authenticateToken, async (req, res) => {
       expiresAt: r.invite_expires_at, lastLoginAt: r.last_login_at,
     })) });
   } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/partner-invites/export — la liste des comptes INVITES, en Excel.
+//
+// Pourquoi cote serveur alors que l'ecran a deja les lignes en memoire : le garde du mode demo
+// bloque toute route GET dont le chemin contient « export » (voir DEMO_BLOCKED_GET_RE), un export
+// fabrique dans le navigateur y echapperait. Et .xlsx est le format que l'equipe utilise partout
+// ailleurs — cette liste part typiquement chez le partenaire.
+//
+// `invited_at IS NOT NULL` = on a envoye quelque chose a cette personne. ⚠️ Ce n'est PAS
+// forcement l'invitation INITIALE : un renvoi ecrase `invited_at` (et remet `invite_opened_at`
+// et `activated_at` a NULL). Rien en base ne distingue les deux envois. Au 2026-08-19 aucune
+// relance n'est partie, donc la date EST celle du premier envoi — mais le jour ou on relancera,
+// cette colonne changera de sens. L'en-tete le dit, plutot que de laisser croire le contraire.
+//
+// Filtres facultatifs, pour exporter exactement ce que l'ecran montre :
+//   ?partner=<nom exact>   un seul partenaire
+//   ?pending=1             seulement les comptes JAMAIS actives (la liste a relancer)
+//   ?q=<texte>             meme recherche que l'ecran (adresse ou nom)
+//   ?lang=en|fr            langue des en-tetes de colonnes
+app.get('/api/admin/partner-invites/export', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:export_users'))) return;
+  try {
+    const conditions = ['pu.invited_at IS NOT NULL'];
+    const params = [];
+    if (String(req.query.partner || '').trim()) {
+      params.push(String(req.query.partner).trim());
+      conditions.push(`p.name = $${params.length}`);
+    }
+    // « Jamais active » se lit sur activated_at et non sur le statut : un compte peut etre
+    // desactive APRES activation, il a bien recu et utilise son invitation.
+    if (req.query.pending === '1') conditions.push('pu.activated_at IS NULL');
+    // Meme semantique EXACTE que la recherche de l'ecran (adresse OU nom affiche, sous-chaine,
+    // insensible a la casse) : un export qui ne rend pas ce qui est a l'ecran est un piege.
+    // `strpos` plutot que ILIKE : l'entree est traitee comme une sous-chaine LITTERALE, donc un
+    // « % » ou un « _ » tape par l'usager se cherche lui-meme au lieu de devenir un joker.
+    if (String(req.query.q || '').trim()) {
+      params.push(String(req.query.q).trim().toLowerCase());
+      conditions.push(`(strpos(LOWER(pu.email), $${params.length}) > 0
+                        OR strpos(LOWER(COALESCE(pu.display_name, '')), $${params.length}) > 0)`);
+    }
+
+    const rows = (await pool.query(
+      `SELECT pu.email, pu.display_name, pu.role, pu.status, pu.locale, pu.invited_by,
+              pu.invited_at, pu.invite_opened_at, pu.activated_at, pu.last_login_at,
+              pu.migration_source, p.name AS partner_name
+         FROM partner_users pu JOIN partners p ON p.id = pu.partner_id
+        WHERE ${conditions.join(' AND ')}
+        ORDER BY p.name, pu.invited_at DESC NULLS LAST, LOWER(pu.email)`, params)).rows;
+
+    const en = String(req.query.lang || 'fr').toLowerCase().startsWith('en');
+    // Horaire de Montreal, écrit en clair dans l'en-tete : les horodatages sont en UTC en base,
+    // et un export date sans fuseau est une question qu'on se repose six mois plus tard.
+    const dt = (v) => {
+      if (!v) return '';
+      const s = new Date(v).toLocaleString('sv-SE', { timeZone: 'America/Toronto' });
+      return s.slice(0, 16); // « YYYY-MM-DD HH:MM »
+    };
+    const T = en
+      ? { email: 'Email', name: 'Name', partner: 'Partner', role: 'Role', lang: 'Language',
+          status: 'Status', invited: 'Invitation sent (Montreal time)', opened: 'Link opened',
+          activated: 'Account activated', last: 'Last sign-in', by: 'Invited by', src: 'Source',
+          migrated: 'migrated from the old portal', created: 'created in Sales Hub', sheet: 'Invited users' }
+      : { email: 'Courriel', name: 'Nom', partner: 'Partenaire', role: 'Rôle', lang: 'Langue',
+          status: 'Statut', invited: 'Invitation envoyée (heure de Montréal)', opened: 'Lien ouvert',
+          activated: 'Compte activé', last: 'Dernière connexion', by: 'Invité par', src: 'Origine',
+          migrated: 'reprise de l’ancien portail', created: 'créé dans Sales Hub', sheet: 'Comptes invités' };
+
+    const lignes = rows.map((r) => ({
+      [T.email]: r.email,
+      [T.name]: r.display_name || '',
+      [T.partner]: r.partner_name,
+      [T.role]: r.role,
+      [T.lang]: r.locale || '',
+      [T.status]: r.status,
+      [T.invited]: dt(r.invited_at),
+      [T.opened]: dt(r.invite_opened_at),
+      [T.activated]: dt(r.activated_at),
+      [T.last]: dt(r.last_login_at),
+      [T.by]: r.invited_by || '',
+      [T.src]: r.migration_source ? T.migrated : T.created,
+    }));
+
+    const wb = xlsx.utils.book_new();
+    // En-tetes explicites : sans `header`, json_to_sheet deduit les colonnes de la PREMIERE ligne
+    // et un export vide sortirait sans aucun en-tete.
+    const colonnes = [T.email, T.name, T.partner, T.role, T.lang, T.status,
+                      T.invited, T.opened, T.activated, T.last, T.by, T.src];
+    const ws = xlsx.utils.json_to_sheet(lignes, { header: colonnes });
+    ws['!cols'] = [{ wch: 34 }, { wch: 24 }, { wch: 16 }, { wch: 10 }, { wch: 8 }, { wch: 10 },
+                   { wch: 26 }, { wch: 17 }, { wch: 17 }, { wch: 17 }, { wch: 28 }, { wch: 26 }];
+    ws['!autofilter'] = { ref: xlsx.utils.encode_range({ s: { c: 0, r: 0 }, e: { c: colonnes.length - 1, r: Math.max(lignes.length, 1) } }) };
+    xlsx.utils.book_append_sheet(wb, ws, String(T.sheet).slice(0, 31));
+    const buf = xlsx.write(wb, { type: 'buffer', bookType: 'xlsx' });
+
+    const jour = new Date().toISOString().slice(0, 10);
+    const nom = `${en ? 'partner-invited-users' : 'partenaires-comptes-invites'}-${jour}.xlsx`;
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${nom}"`);
+    res.send(buf);
+  } catch (e) {
+    console.error('[partner-invites/export] echec:', e.stack || e.message);
     res.status(500).json({ error: e.message });
   }
 });
