@@ -9511,12 +9511,18 @@ function appstreamUserId(req) {
 async function getKaizenDemoSettings() {
   try {
     const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'kaizen_demo'`);
-    if (!r.rows[0]) return { enabled: true, message: '' };
+    if (!r.rows[0]) return { enabled: true, message: '', version: '' };
     // app_settings.value is JSONB — node-postgres already parses it into a JS object, so
     // JSON.parse()'ing it again throws (was silently caught below, always fail-open "enabled").
     const v = r.rows[0].value;
-    return { enabled: v.enabled !== false, message: (v.message || '').toString() };
-  } catch { return { enabled: true, message: '' }; }
+    return {
+      enabled: v.enabled !== false,
+      message: (v.message || '').toString(),
+      // POS build currently baked into the AppStream image — set by an admin when the image is
+      // rebuilt (AWS has no field that carries the POS's own version), shown on the demo page.
+      version: (v.version || '').toString(),
+    };
+  } catch { return { enabled: true, message: '', version: '' }; }
 }
 
 // GET /api/demo/kaizen-status — whether the demo is enabled + the maintenance message, so the
@@ -9529,15 +9535,19 @@ app.get('/api/demo/kaizen-status', authenticateToken, async (req, res) => {
 // PUT /api/admin/kaizen-demo-settings { enabled, message } — admin on/off switch (demo:kaizen_manage).
 app.put('/api/admin/kaizen-demo-settings', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'demo:kaizen_manage'))) return;
-  const enabled = req.body.enabled !== false;
-  const message = (req.body.message || '').toString().slice(0, 500);
+  // Merge over the stored settings: the toggle and the version field are edited from different
+  // places, so a partial payload must not wipe the key it didn't send.
+  const cur = await getKaizenDemoSettings();
+  const enabled = req.body.enabled === undefined ? cur.enabled : req.body.enabled !== false;
+  const message = req.body.message === undefined ? cur.message : (req.body.message || '').toString().slice(0, 500);
+  const version = req.body.version === undefined ? cur.version : (req.body.version || '').toString().trim().slice(0, 60);
   try {
     await pool.query(
       `INSERT INTO app_settings (key, value, updated_at) VALUES ('kaizen_demo', $1::jsonb, NOW())
        ON CONFLICT (key) DO UPDATE SET value = $1::jsonb, updated_at = NOW()`,
-      [JSON.stringify({ enabled, message })]
+      [JSON.stringify({ enabled, message, version })]
     );
-    res.json({ success: true, enabled, message });
+    res.json({ success: true, enabled, message, version });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -9601,6 +9611,19 @@ app.get('/api/demo/kaizen-capacity', authenticateToken, async (req, res) => {
 
     const f = (fleetsOut.Fleets || [])[0] || {};
     const cap = f.ComputeCapacityStatus || {};
+
+    // Which AppStream image the fleet actually runs (i.e. which POS build reps are streaming).
+    // The name comes free with DescribeFleets; its build date needs DescribeImages, which the
+    // IAM user may not be allowed — best-effort, never fails the panel.
+    let imageBuiltAt = null;
+    if (f.ImageName) {
+      try {
+        const { DescribeImagesCommand } = require('@aws-sdk/client-appstream');
+        const imgs = await client.send(new DescribeImagesCommand({ Names: [f.ImageName] }));
+        imageBuiltAt = (imgs.Images || [])[0]?.CreatedTime || null;
+      } catch (e) { console.warn('[DEMO] describeImages skipped:', e.name, e.message); }
+    }
+
     const sessions = (sessionsOut.Sessions || []).map((s) => {
       const mine = s.UserId === myUserId;
       return {
@@ -9619,6 +9642,8 @@ app.get('/api/demo/kaizen-capacity', authenticateToken, async (req, res) => {
         type: f.FleetType || null,            // ALWAYS_ON | ON_DEMAND
         maxUserDurationSec: f.MaxUserDurationInSeconds || null,
         idleDisconnectSec: f.IdleDisconnectTimeoutInSeconds || null,
+        imageName: f.ImageName || null,       // e.g. kaizen-POS-v2
+        imageBuiltAt,                         // null when DescribeImages isn't permitted
       },
       capacity: {
         desired: cap.Desired ?? null,         // instances the fleet is asked to run
@@ -14571,6 +14596,15 @@ app.post('/api/admin/saas-increase/insights/refresh', authenticateToken, async (
   res.json({ started: true });
 });
 
+// POST /api/admin/saas-increase/insights/refresh-base — the fast pass: base plan price + addons
+// only. This is the one that unblocks pushing, so it's what the page's button triggers; the full
+// price-history walk is left to the nightly job because it costs ~25 Zoho calls per subscription.
+app.post('/api/admin/saas-increase/insights/refresh-base', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  runSaasBasePriceScan().catch(e => console.error('[saas-base] manual run failed:', e.message));
+  res.json({ started: true });
+});
+
 // GET /api/admin/saas-increase/insights/status — progress of the price-history scan, so a run
 // that takes the better part of an hour isn't invisible outside the server logs.
 // Progress is derived from the DATA, not from an in-process flag: the scheduled scan runs on the
@@ -15242,6 +15276,12 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
 // classification already used by invoice enrichment (see PHASE 1b above).
 const SAAS_INSIGHTS_INVOICE_LOOKBACK = 24; // most recent N invoices per customer — bounds worst-case API cost
 const SAAS_INSIGHTS_DELAY_MS = 250; // per-subscription throttle, rate-limit friendly for an overnight job
+// The base-price pass makes ONE call per subscription instead of the price-history walk's ~25, so
+// it can afford a shorter throttle and still be far gentler overall.
+const SAAS_BASE_DELAY_MS = 120;
+// Zoho access tokens last about an hour; these scans run much longer than that, so the token is
+// re-fetched every N subscriptions (getAdminBooksAuth refreshes it only when actually expired).
+const SAAS_TOKEN_REFRESH_EVERY = 200;
 // Skip subscriptions checked more recently than this — without it, every run (nightly or manual)
 // rescans EVERY subscription from scratch, which at real-world scale (thousands of subscriptions,
 // each needing several Zoho calls) can take hours and burn through a large share of the org's daily
@@ -15252,6 +15292,59 @@ const SAAS_INSIGHTS_RESCAN_AFTER_HOURS = 20;
 // picking up) — a much longer skip-if-fresh window than the live-subscription scan above.
 const SAAS_CHURN_RESCAN_AFTER_DAYS = 7;
 
+// Fast pass: base plan price + addons ONLY, one Zoho call per subscription. This is what gates
+// pushing to Zoho, and it's ~25x cheaper than the full insights scan, whose expensive half is
+// walking each customer's invoice history purely to date the last price change. Separating them
+// takes "unblock the pushes" from hours down to minutes; price history stays on the nightly job.
+let saasBasePriceScanRunning = false;
+async function runSaasBasePriceScan() {
+  if (saasBasePriceScanRunning) { console.log('[saas-base] already running, skipping'); return; }
+  saasBasePriceScanRunning = true;
+  try {
+    let { accessToken, apiDomain } = await getAdminBooksAuth();
+    const allSubs = await getSaasIncreaseSubscriptions();
+    const doneRes = await pool.query(`SELECT subscription_number FROM saas_subscription_insights WHERE plan_monthly IS NOT NULL`);
+    const done = new Set(doneRes.rows.map(r => r.subscription_number));
+    const subs = allSubs.filter(s => !done.has(s.subscriptionNumber));
+    console.log(`[saas-base] ${subs.length} of ${allSubs.length} subscriptions still need a base price...`);
+    let ok = 0, failed = 0, i = 0;
+    for (const s of subs) {
+      if (i > 0 && i % SAAS_TOKEN_REFRESH_EVERY === 0) {
+        ({ accessToken, apiDomain } = await getAdminBooksAuth());
+        console.log(`[saas-base] ${i}/${subs.length} (${ok} ok, ${failed} failed) — token refreshed`);
+      }
+      i++;
+      try {
+        const { activatedAt, planMonthly, addonsMonthly } = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
+        if (planMonthly == null) throw new Error('Zoho returned no plan amount for this subscription');
+        await pool.query(`
+          INSERT INTO saas_subscription_insights (subscription_number, activated_at, plan_monthly, addons_monthly, checked_at, check_error)
+          VALUES ($1, $2, $3, $4, NOW(), NULL)
+          ON CONFLICT (subscription_number) DO UPDATE SET
+            activated_at = COALESCE($2, saas_subscription_insights.activated_at),
+            plan_monthly = $3, addons_monthly = $4, checked_at = NOW(), check_error = NULL`,
+          [s.subscriptionNumber, activatedAt, planMonthly, addonsMonthly]
+        );
+        ok++;
+      } catch (e) {
+        failed++;
+        await pool.query(`
+          INSERT INTO saas_subscription_insights (subscription_number, checked_at, check_error)
+          VALUES ($1, NOW(), $2)
+          ON CONFLICT (subscription_number) DO UPDATE SET checked_at = NOW(), check_error = $2`,
+          [s.subscriptionNumber, e.message]
+        ).catch(() => {});
+      }
+      await new Promise(r => setTimeout(r, SAAS_BASE_DELAY_MS));
+    }
+    console.log(`[saas-base] complete: ${ok} ok, ${failed} failed`);
+  } catch (e) {
+    console.error('[saas-base] scan failed:', e.message);
+  } finally {
+    saasBasePriceScanRunning = false;
+  }
+}
+
 async function fetchSaasSubscriptionTenure(apiDomain, accessToken, orgId, subscriptionId) {
   const empty = { activatedAt: null, cancelledAt: null, planMonthly: null, addonsMonthly: null };
   if (!subscriptionId) return empty;
@@ -15259,6 +15352,9 @@ async function fetchSaasSubscriptionTenure(apiDomain, accessToken, orgId, subscr
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, 'X-com-zoho-subscriptions-organizationid': orgId },
     validateStatus: () => true,
   });
+  // A dead token must NOT look like "this subscription has no data" — that silently wrote NULL
+  // plan prices for every remaining subscription once the hour-long token expired mid-scan.
+  if (r.status === 401) throw new Error('subscription detail HTTP 401 (Zoho token expired)');
   if (r.status !== 200) return empty;
   const sub = r.data?.subscription;
   const toDate = (raw) => {
@@ -15356,7 +15452,7 @@ async function runSaasSubscriptionInsightsScan() {
   if (saasInsightsScanRunning) { console.log('[saas-insights] scan already running, skipping'); return; }
   saasInsightsScanRunning = true;
   try {
-    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    let { accessToken, apiDomain } = await getAdminBooksAuth();
     const booksOrgId = process.env.ZOHO_ORG_ID;
     const plansRes = await pool.query('SELECT plan_code, name FROM zoho_plans');
     const planCodes = new Set(plansRes.rows.map(r => (r.plan_code || '').toLowerCase().trim()));
@@ -15378,8 +15474,14 @@ async function runSaasSubscriptionInsightsScan() {
     const freshNumbers = new Set(freshRes.rows.map(r => r.subscription_number));
     const subs = allSubs.filter(s => !freshNumbers.has(s.subscriptionNumber));
     console.log(`[saas-insights] scanning ${subs.length} of ${allSubs.length} subscriptions (${freshNumbers.size} skipped, checked within ${SAAS_INSIGHTS_RESCAN_AFTER_HOURS}h)...`);
-    let ok = 0, failed = 0;
+    let ok = 0, failed = 0, i = 0;
     for (const s of subs) {
+      // Same hour-long token expiry as the base scan — this loop runs far longer still.
+      if (i > 0 && i % SAAS_TOKEN_REFRESH_EVERY === 0) {
+        ({ accessToken, apiDomain } = await getAdminBooksAuth());
+        console.log(`[saas-insights] ${i}/${subs.length} (${ok} ok, ${failed} failed) — token refreshed`);
+      }
+      i++;
       try {
         const { activatedAt, planMonthly, addonsMonthly } = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
         // The invoice-history walk is the fragile half (it parses arbitrary Books line items), and
