@@ -2392,6 +2392,11 @@ async function initializeDatabase() {
     // nightly scan that already makes that call for tenure.
     await pool.query(`ALTER TABLE saas_subscription_insights ADD COLUMN IF NOT EXISTS plan_monthly NUMERIC(12,2)`);
     await pool.query(`ALTER TABLE saas_subscription_insights ADD COLUMN IF NOT EXISTS addons_monthly NUMERIC(12,2)`);
+    // The plan price EXACTLY as Zoho bills it, undivided. Normalising to monthly and converting
+    // back loses cents on annual plans ($799.95/yr round-trips to $799.92), and that is the number
+    // the customer reads on their invoice. Keeping the raw figure removes the conversion entirely
+    // from the push and from the merchant email.
+    await pool.query(`ALTER TABLE saas_subscription_insights ADD COLUMN IF NOT EXISTS plan_price_period NUMERIC(12,2)`);
     // One-time re-key on (org_id, subscription_number). Zoho subscription numbers are unique per
     // ORG, not globally, so a subscription_number-only primary key let two orgs' subscriptions
     // share one row — and one org's base plan price silently overwrite another's, which decides
@@ -14622,12 +14627,14 @@ app.get('/api/admin/saas-increase/subscriptions', authenticateToken, async (req,
       // tells the UI (and the push guard) whether that separation actually happened for this row.
       const planMonthly = i?.plan_monthly != null ? Number(i.plan_monthly) : null;
       const addonsMonthly = i?.addons_monthly != null ? Number(i.addons_monthly) : null;
+      const planPeriod = i?.plan_price_period != null ? Number(i.plan_price_period) : null;
       return {
         ...s,
         totalMonthly: s.currentMonthly,
         currentMonthly: planMonthly != null ? planMonthly : s.currentMonthly,
         addonsMonthly,
-        baseVerified: planMonthly != null,
+        planPeriod,
+        baseVerified: planMonthly != null && planPeriod != null,
         activatedAt: i?.activated_at || null,
         lastPriceChangeAt: i?.last_price_change_at || null,
         lastPriceBefore: i?.last_price_before != null ? Number(i.last_price_before) : null,
@@ -14838,6 +14845,16 @@ app.get('/api/admin/saas-increase/churn-history/calibration', authenticateToken,
 });
 
 function r2Money(n) { return Math.round((Number(n) || 0) * 100) / 100; }
+// Applies an increase directly to the amount Zoho bills per period. Working from the exact
+// per-period price means no monthly round-trip, so an annual plan lands on the cent instead of
+// drifting a few. 'flat' is per period by design: what you type is added to the amount displayed.
+function saasNewPeriodPrice(currentPeriod, type, value) {
+  const c = Number(currentPeriod) || 0;
+  const v = Number(value) || 0;
+  if (type === 'target') return r2Money(v > 0 ? v : c);
+  return r2Money(type === 'flat' ? c + v : c * (1 + v / 100));
+}
+
 function saasIncreaseNewMonthly(current, type, value) {
   const c = Number(current) || 0;
   const v = Number(value) || 0;
@@ -15097,15 +15114,15 @@ function saasBillingPeriodWords(interval, intervalUnit, lang) {
   return { adj: en ? 'subscription' : "d'abonnement", per: en ? 'per billing period' : 'par période de facturation' };
 }
 
-function saasIncreaseDraftCopy({ customerName, planName, currentMonthly, newMonthly, effectiveDate, interval, intervalUnit, lang }) {
+function saasIncreaseDraftCopy({ customerName, planName, currentMonthly, newMonthly, currentPeriod, newPeriod, effectiveDate, interval, intervalUnit, lang }) {
   const money = (n) => `$${Number(n || 0).toFixed(2)}`;
   const greeting = customerName ? ` ${customerName}` : '';
   const plan = planName || (lang === 'en' ? 'subscription' : 'abonnement');
   // Quote what the customer is actually billed. The tool reasons in monthly figures, but an annual
   // customer's invoice reads $799.95 once a year, not $66.66 twelve times — sending the monthly
   // equivalent would contradict the invoice that follows.
-  const curr = r2Money(subAmountFromMonthly(currentMonthly, interval, intervalUnit));
-  const next = r2Money(subAmountFromMonthly(newMonthly, interval, intervalUnit));
+  const curr = r2Money(currentPeriod != null ? currentPeriod : subAmountFromMonthly(currentMonthly, interval, intervalUnit));
+  const next = r2Money(newPeriod != null ? newPeriod : subAmountFromMonthly(newMonthly, interval, intervalUnit));
   const w = saasBillingPeriodWords(interval, intervalUnit, lang);
   const whenEn = effectiveDate ? `on ${formatSaasEffectiveDate(effectiveDate, 'en')}` : 'at your next renewal';
   const whenFr = effectiveDate ? `le ${formatSaasEffectiveDate(effectiveDate, 'fr')}` : 'à votre prochain renouvellement';
@@ -15122,14 +15139,14 @@ function saasIncreaseDraftCopy({ customerName, planName, currentMonthly, newMont
 function renderSaasTemplate(str, vars) {
   return String(str || '').replace(/\{\{(\w+)\}\}/g, (m, key) => (key in vars ? String(vars[key]) : m));
 }
-function saasTemplatePlaceholders({ customerName, planName, currentMonthly, newMonthly, effectiveDate, interval, intervalUnit, lang }) {
+function saasTemplatePlaceholders({ customerName, planName, currentMonthly, newMonthly, currentPeriod, newPeriod, effectiveDate, interval, intervalUnit, lang }) {
   const money = (n) => `$${Number(n || 0).toFixed(2)}`;
   // Per-BILLING-PERIOD amounts, not monthly: these go to a customer and must match the invoice
   // they will receive. {{currentMonthly}}/{{newMonthly}} are kept as aliases so templates written
   // before this don't break — their names are now a misnomer, which is why the correctly named
   // {{currentPrice}}/{{newPrice}} exist alongside them.
-  const curr = money(r2Money(subAmountFromMonthly(currentMonthly, interval, intervalUnit)));
-  const next = money(r2Money(subAmountFromMonthly(newMonthly, interval, intervalUnit)));
+  const curr = money(r2Money(currentPeriod != null ? currentPeriod : subAmountFromMonthly(currentMonthly, interval, intervalUnit)));
+  const next = money(r2Money(newPeriod != null ? newPeriod : subAmountFromMonthly(newMonthly, interval, intervalUnit)));
   const w = saasBillingPeriodWords(interval, intervalUnit, lang);
   return {
     customerName: customerName || '', planName: planName || '',
@@ -15218,20 +15235,29 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authentic
     // shift) — looked up fresh from the same cached subscriptions list the main table uses.
     const liveSubs = await getSaasIncreaseSubscriptions();
     const nextBillingBySub = new Map(liveSubs.map(s => [s.subscriptionNumber, s.nextBillingAt]));
+    const periodByKey = new Map((await pool.query(
+      `SELECT org_id, subscription_number, plan_price_period FROM saas_subscription_insights
+        WHERE plan_price_period IS NOT NULL`
+    )).rows.map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
     const results = [];
     for (const it of items) {
       const to = await resolveMerchantContactEmail(it.customer_id, it.customer_name);
       const effectiveDate = nextBillingBySub.get(it.subscription_number) || null;
       const liveSub = liveSubs.find(x => x.orgId === it.org_id && x.subscriptionNumber === it.subscription_number);
+      // Quote exactly what the push will write, from the same source — otherwise the email and the
+      // invoice could disagree by a few cents on annual plans.
+      const curPeriod = periodByKey.get(`${it.org_id}||${it.subscription_number}`) ?? null;
+      const nxtPeriod = curPeriod == null ? null : saasNewPeriodPrice(curPeriod, it.increase_type, it.increase_value);
       let subject, body;
       if (template) {
-        const vars = saasTemplatePlaceholders({ customerName: it.customer_name, planName: it.plan_name, currentMonthly: it.current_monthly, newMonthly: it.new_monthly, effectiveDate, interval: liveSub?.interval, intervalUnit: liveSub?.intervalUnit, lang });
+        const vars = saasTemplatePlaceholders({ customerName: it.customer_name, planName: it.plan_name, currentMonthly: it.current_monthly, newMonthly: it.new_monthly, currentPeriod: curPeriod, newPeriod: nxtPeriod, effectiveDate, interval: liveSub?.interval, intervalUnit: liveSub?.intervalUnit, lang });
         subject = renderSaasTemplate(lang === 'en' ? template.subject_en : template.subject_fr, vars);
         body = renderSaasTemplate(lang === 'en' ? template.body_en : template.body_fr, vars);
       } else {
         ({ subject, body } = saasIncreaseDraftCopy({
           customerName: it.customer_name, planName: it.plan_name,
-          currentMonthly: it.current_monthly, newMonthly: it.new_monthly, effectiveDate,
+          currentMonthly: it.current_monthly, newMonthly: it.new_monthly,
+          currentPeriod: curPeriod, newPeriod: nxtPeriod, effectiveDate,
           interval: liveSub?.interval, intervalUnit: liveSub?.intervalUnit, lang,
         }));
       }
@@ -15463,9 +15489,12 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
     const { accessToken, apiDomain } = await getAdminBooksAuth();
     // Which subscriptions have had their plan price separated from their addons by the insights
     // scan. Anything missing here cannot be pushed safely — see the per-item guard below.
-    const baseVerified = new Set((await pool.query(
-      `SELECT org_id, subscription_number FROM saas_subscription_insights WHERE plan_monthly IS NOT NULL`
-    )).rows.map(r => `${r.org_id}||${r.subscription_number}`));
+    // The exact price Zoho bills per period, keyed per org. Anything missing here cannot be
+    // pushed safely — see the per-item guard below.
+    const baseByKey = new Map((await pool.query(
+      `SELECT org_id, subscription_number, plan_price_period FROM saas_subscription_insights
+        WHERE plan_price_period IS NOT NULL`
+    )).rows.map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
 
     const results = [];
     for (const item of items) {
@@ -15474,7 +15503,8 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
       // this subscription, new_monthly may have been computed from plan + addons — pushing it
       // would set the plan to that combined figure and the addons would be re-charged on top of
       // it. Refuse rather than overcharge; the nightly insights scan fills this in.
-      if (!baseVerified.has(`${item.org_id}||${item.subscription_number}`)) {
+      const currentPeriod = baseByKey.get(`${item.org_id}||${item.subscription_number}`);
+      if (currentPeriod == null) {
         const msg = 'Base plan price not verified yet (addons not separated) — refresh price history first';
         await pool.query(`UPDATE saas_increase_items SET status = 'push_failed', push_error = $1 WHERE id = $2`, [msg, item.id]);
         results.push({ itemId: item.id, ok: false, error: msg });
@@ -15487,14 +15517,9 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
         continue;
       }
       const billing = new ZohoBillingService(accessToken, apiDomain, item.org_id);
-      // new_monthly is a MONTHLY figure; Zoho wants the amount per billing period.
-      if (!live.intervalUnit) {
-        const msg = 'Billing period unknown for this subscription — refusing to push';
-        await pool.query(`UPDATE saas_increase_items SET status = 'push_failed', push_error = $1 WHERE id = $2`, [msg, item.id]);
-        results.push({ itemId: item.id, ok: false, error: msg });
-        continue;
-      }
-      const pricePerPeriod = r2Money(subAmountFromMonthly(Number(item.new_monthly), live.interval, live.intervalUnit));
+      // Computed from the exact per-period price and the stored increase — never converted from
+      // a monthly figure, so nothing is lost to rounding.
+      const pricePerPeriod = saasNewPeriodPrice(currentPeriod, item.increase_type, item.increase_value);
       const r = await billing.scheduleSubscriptionPriceChange(live.subscriptionId, item.plan_code, pricePerPeriod);
       if (r.ok) {
         await pool.query(
@@ -15552,7 +15577,7 @@ async function runSaasBasePriceScan() {
   try {
     let { accessToken, apiDomain } = await getAdminBooksAuth();
     const allSubs = await getSaasIncreaseSubscriptions();
-    const doneRes = await pool.query(`SELECT org_id, subscription_number FROM saas_subscription_insights WHERE plan_monthly IS NOT NULL`);
+    const doneRes = await pool.query(`SELECT org_id, subscription_number FROM saas_subscription_insights WHERE plan_monthly IS NOT NULL AND plan_price_period IS NOT NULL`);
     const done = new Set(doneRes.rows.map(r => `${r.org_id}||${r.subscription_number}`));
     const subs = allSubs.filter(s => !done.has(`${s.orgId}||${s.subscriptionNumber}`));
     console.log(`[saas-base] ${subs.length} of ${allSubs.length} subscriptions still need a base price...`);
@@ -15575,15 +15600,15 @@ async function runSaasBasePriceScan() {
           ({ accessToken, apiDomain } = await getAdminBooksAuth());
           detail = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
         }
-        const { activatedAt, planMonthly, addonsMonthly } = detail;
+        const { activatedAt, planMonthly, addonsMonthly, planPeriod } = detail;
         if (planMonthly == null) throw new Error('Zoho returned no plan amount for this subscription');
         await pool.query(`
-          INSERT INTO saas_subscription_insights (org_id, subscription_number, activated_at, plan_monthly, addons_monthly, checked_at, check_error)
-          VALUES ($1, $2, $3, $4, $5, NOW(), NULL)
+          INSERT INTO saas_subscription_insights (org_id, subscription_number, activated_at, plan_monthly, addons_monthly, plan_price_period, checked_at, check_error)
+          VALUES ($1, $2, $3, $4, $5, $6, NOW(), NULL)
           ON CONFLICT (org_id, subscription_number) DO UPDATE SET
             activated_at = COALESCE($3, saas_subscription_insights.activated_at),
-            plan_monthly = $4, addons_monthly = $5, checked_at = NOW(), check_error = NULL`,
-          [s.orgId, s.subscriptionNumber, activatedAt, planMonthly, addonsMonthly]
+            plan_monthly = $4, addons_monthly = $5, plan_price_period = $6, checked_at = NOW(), check_error = NULL`,
+          [s.orgId, s.subscriptionNumber, activatedAt, planMonthly, addonsMonthly, planPeriod]
         );
         ok++;
       } catch (e) {
@@ -15638,6 +15663,7 @@ async function fetchSaasSubscriptionTenure(apiDomain, accessToken, orgId, subscr
     cancelledAt: toDate(sub?.cancelled_at),
     planMonthly: perMonth(planRaw),
     addonsMonthly: perMonth(addonsRaw),
+    planPeriod: planRaw == null ? null : r2Money(planRaw),
   };
 }
 
