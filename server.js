@@ -14324,6 +14324,11 @@ const SAAS_SCAN_LOCK = 'zoho_scan';
 // A scan that has not reported in for this long is presumed dead (deploy, crash, OOM) and its
 // lock is taken over. Must comfortably exceed the heartbeat interval below.
 const SAAS_SCAN_STALE_MINUTES = 5;
+// A lock whose heartbeat is younger than this belongs to a process that is demonstrably alive.
+// Deliberately far shorter than the takeover window: it answers "can this be stopped", not "is
+// this abandoned". Must exceed the slowest realistic gap between heartbeats.
+const SAAS_SCAN_ALIVE_SECONDS = 90;
+
 // How many subscriptions between heartbeats. Also how often a stop request is noticed, which is
 // what sets the interval: the price-history scan spends seconds per subscription (up to 24 invoice
 // calls each), so checking every 20 would leave the stop button looking dead for a minute and a
@@ -14834,9 +14839,17 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
        WHERE (org_id || '||' || subscription_number) = ANY($1::text[])`, [pairs])).rows[0];
     // The actual failure text, grouped. Storing per-row errors that nothing ever displays makes a
     // scan that fails on every subscription indistinguishable from one that never ran.
+    // Two different questions, two different windows. Taking a lock over uses the conservative
+    // 5-minute staleness so a slow scan is never robbed. But "is a scan alive RIGHT NOW", which
+    // decides whether to offer a Stop button, needs a much tighter test: a dyno killed mid-scan
+    // (a deploy, say) leaves its row behind, and for those 5 minutes the page would offer to stop
+    // a process that no longer exists — and then report "Stopping…" forever, because nothing is
+    // left to read the flag.
     const lock = (await pool.query(
-      `SELECT label, started_at, stop_requested FROM saas_scan_runs
-        WHERE name = $1 AND heartbeat_at > NOW() - INTERVAL '${SAAS_SCAN_STALE_MINUTES} minutes'`,
+      `SELECT label, started_at, stop_requested,
+              EXTRACT(EPOCH FROM (NOW() - heartbeat_at))::int AS beat_age
+         FROM saas_scan_runs
+        WHERE name = $1 AND heartbeat_at > NOW() - INTERVAL '${SAAS_SCAN_ALIVE_SECONDS} seconds'`,
       [SAAS_SCAN_LOCK]
     )).rows[0] || null;
     const topErrors = (await pool.query(`
@@ -14859,7 +14872,7 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
       lastScanError: saasBaseScanLastError,
       // Which scan actually holds the token, so the page can offer to stop THAT one by name
       // instead of inferring "something is running" from recently-written rows.
-      runningScan: lock ? { label: lock.label, startedAt: lock.started_at, stopRequested: lock.stop_requested } : null,
+      runningScan: lock ? { label: lock.label, startedAt: lock.started_at, stopRequested: lock.stop_requested, beatAge: lock.beat_age } : null,
       topErrors,
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
