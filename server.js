@@ -15320,7 +15320,16 @@ app.get('/api/admin/saas-increase/scenarios/:id/items/:itemId/scheduled', authen
       headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, 'X-com-zoho-subscriptions-organizationid': item.org_id },
       validateStatus: () => true, timeout: 20000,
     });
-    if (r.status !== 200) return res.status(502).json({ error: `Zoho HTTP ${r.status}`, raw: JSON.stringify(r.data).slice(0, 600) });
+    // Zoho answers "no scheduled changes" with HTTP 400 + code 107222, not an empty 200. That is
+    // the EXPECTED state after a cancellation, and the whole point of this endpoint is to confirm
+    // it — reporting it as an error made a successful cancellation look like a failure.
+    if (r.status !== 200) {
+      if (Number(r.data?.code) === 107222 || /doesn't have scheduled changes/i.test(String(r.data?.message || ''))) {
+        return res.json({ scheduled: false, price: null, planCode: null, effectiveAt: null,
+          expected: { price: Number(item.new_monthly), planCode: item.plan_code } });
+      }
+      return res.status(502).json({ error: `Zoho HTTP ${r.status}`, raw: JSON.stringify(r.data).slice(0, 600) });
+    }
 
     // Zoho's exact response shape for this endpoint isn't documented, so pull the fields from the
     // likely containers and always return `raw` — a parse that silently finds nothing would be
