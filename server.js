@@ -14681,9 +14681,13 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
       // Per-status count and MRR. When this tool's org total disagrees with Zoho's dashboard, the
       // gap is almost always one status bucket we include and Zoho doesn't (MRR_STATUSES was
       // reverse-engineered against ONE org), so the breakdown says which — instead of guessing.
-      const st = e.byStatus[sub.status] || { count: 0, mrr: 0 };
+      const st = e.byStatus[sub.status] || { count: 0, mrr: 0, numbers: [] };
       st.count++;
       st.mrr = Math.round((st.mrr + (sub.currentMonthly || 0)) * 100) / 100;
+      // Name the non-live ones. They are few by definition, and when a total disagrees with Zoho
+      // the difference has so far always sat in that handful — listing them turns "somewhere in
+      // 522 subscriptions" into a couple of records to open.
+      if (sub.status !== 'live' && st.numbers.length < 15) st.numbers.push(sub.subscriptionNumber);
       e.byStatus[sub.status] = st;
       byOrgMap.set(sub.orgId, e);
       if (!orgsByNumber.has(sub.subscriptionNumber)) orgsByNumber.set(sub.subscriptionNumber, new Set());
