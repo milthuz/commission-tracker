@@ -2297,6 +2297,22 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notify_error TEXT`);
     await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notified_by VARCHAR(255)`);
     await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notified_at TIMESTAMP`);
+    // Widen scenario-item uniqueness to include the org. Zoho subscription numbers are per-ORG,
+    // so (scenario_id, subscription_number) meant two different customers sharing a number could
+    // not both be in one scenario — the second silently overwrote the first, losing a real
+    // increase. Lossless: the old, narrower constraint guaranteed no existing row can conflict
+    // under the wider one, and org_id is already NOT NULL here.
+    const itemsUniq = (await pool.query(`
+      SELECT c.conname FROM pg_constraint c
+       WHERE c.conrelid = 'saas_increase_items'::regclass AND c.contype = 'u'
+         AND pg_get_constraintdef(c.oid) = 'UNIQUE (scenario_id, subscription_number)'`)).rows;
+    if (itemsUniq.length) {
+      console.log('[migration] widening saas_increase_items uniqueness to (scenario_id, org_id, subscription_number)');
+      for (const r of itemsUniq) {
+        await pool.query(`ALTER TABLE saas_increase_items DROP CONSTRAINT "${r.conname}"`);
+      }
+      await pool.query(`ALTER TABLE saas_increase_items ADD CONSTRAINT saas_increase_items_scenario_org_sub_key UNIQUE (scenario_id, org_id, subscription_number)`);
+    }
 
     // Confirmation PIN required before pushing a scenario's price increases into live Zoho
     // subscriptions (saas_increase:execute) — a Sales-Hub-native PIN rather than re-authenticating
@@ -14913,7 +14929,7 @@ app.post('/api/admin/saas-increase/scenarios/:id/items', authenticateToken, asyn
       const increaseType = (it.increaseType === 'flat' || it.increaseType === 'target') ? it.increaseType : 'percent';
       const currentMonthly = r2Money(it.currentMonthly);
       const increaseValue = Number(it.increaseValue) || 0;
-      byNumber.set(subscriptionNumber, [
+      byNumber.set(`${String(it.orgId || '')}||${subscriptionNumber}`, [
         req.params.id, String(it.orgId || ''), subscriptionNumber, it.customerId || null, it.customerName || null,
         it.merchantAccountId || null, it.planCode || null, it.planName || null, currentMonthly, increaseType,
         increaseValue, saasIncreaseNewMonthly(currentMonthly, increaseType, increaseValue),
@@ -14944,8 +14960,8 @@ app.post('/api/admin/saas-increase/scenarios/:id/items', authenticateToken, asyn
           (scenario_id, org_id, subscription_number, customer_id, customer_name, merchant_account_id,
            plan_code, plan_name, current_monthly, increase_type, increase_value, new_monthly)
         VALUES ${tuples.join(',')}
-        ON CONFLICT (scenario_id, subscription_number) DO UPDATE SET
-          org_id = EXCLUDED.org_id, customer_id = EXCLUDED.customer_id, customer_name = EXCLUDED.customer_name,
+        ON CONFLICT (scenario_id, org_id, subscription_number) DO UPDATE SET
+          customer_id = EXCLUDED.customer_id, customer_name = EXCLUDED.customer_name,
           merchant_account_id = EXCLUDED.merchant_account_id, plan_code = EXCLUDED.plan_code,
           plan_name = EXCLUDED.plan_name, current_monthly = EXCLUDED.current_monthly,
           increase_type = EXCLUDED.increase_type, increase_value = EXCLUDED.increase_value,
@@ -14964,11 +14980,13 @@ app.post('/api/admin/saas-increase/scenarios/:id/items', authenticateToken, asyn
     // happened in the real world and deleting them would destroy the audit trail: an item already
     // PUSHED to Zoho (the customer's billing was actually changed) and one whose merchant
     // notification was already SENT. A failed push is not protected — nothing happened.
-    const keep = toSave.map(v => v[2]);
+    // Compare org+number PAIRS: matching on the bare number would delete a different org's
+    // subscription that merely shares it.
+    const keep = toSave.map(v => `${v[1]}||${v[2]}`);
     const removed = await client.query(`
       DELETE FROM saas_increase_items
       WHERE scenario_id = $1
-        AND NOT (subscription_number = ANY($2::text[]))
+        AND NOT ((org_id || '||' || subscription_number) = ANY($2::text[]))
         AND status <> 'pushed'
         AND notify_status <> 'sent'
       RETURNING subscription_number`, [req.params.id, keep]);
