@@ -14324,8 +14324,11 @@ const SAAS_SCAN_LOCK = 'zoho_scan';
 // A scan that has not reported in for this long is presumed dead (deploy, crash, OOM) and its
 // lock is taken over. Must comfortably exceed the heartbeat interval below.
 const SAAS_SCAN_STALE_MINUTES = 5;
-// How many subscriptions between heartbeats. Also how often a stop request is noticed.
-const SAAS_SCAN_HEARTBEAT_EVERY = 20;
+// How many subscriptions between heartbeats. Also how often a stop request is noticed, which is
+// what sets the interval: the price-history scan spends seconds per subscription (up to 24 invoice
+// calls each), so checking every 20 would leave the stop button looking dead for a minute and a
+// half. One small indexed UPDATE every few seconds is nothing next to that scan's Zoho traffic.
+const SAAS_SCAN_HEARTBEAT_EVERY = 5;
 
 // Returns an owner token on success, null if another scan holds the lock.
 async function acquireSaasScanLock(label) {
