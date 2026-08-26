@@ -15083,16 +15083,36 @@ function formatSaasEffectiveDate(dateStr, lang) {
   if (isNaN(d.getTime())) return lang === 'en' ? 'your next renewal' : 'votre prochain renouvellement';
   return new Intl.DateTimeFormat(lang === 'en' ? 'en-US' : 'fr-CA', { year: 'numeric', month: 'long', day: 'numeric' }).format(d);
 }
-function saasIncreaseDraftCopy({ customerName, planName, currentMonthly, newMonthly, effectiveDate, lang }) {
+// How to name a billing period in customer-facing copy. Only the shapes actually billed on get
+// bespoke wording; anything else falls back to phrasing that stays true without inventing a
+// cadence.
+function saasBillingPeriodWords(interval, intervalUnit, lang) {
+  const iv = Math.max(1, parseInt(interval) || 1);
+  const u = String(intervalUnit || 'months').toLowerCase();
+  const en = lang === 'en';
+  if (u.startsWith('year') && iv === 1) return { adj: en ? 'annual' : 'annuel', per: en ? 'per year' : 'par année' };
+  if (u.startsWith('month') && iv === 1) return { adj: en ? 'monthly' : 'mensuel', per: en ? 'per month' : 'par mois' };
+  if (u.startsWith('month')) return { adj: en ? `${iv}-month` : `pour ${iv} mois`, per: en ? `every ${iv} months` : `aux ${iv} mois` };
+  if (u.startsWith('year')) return { adj: en ? `${iv}-year` : `pour ${iv} ans`, per: en ? `every ${iv} years` : `aux ${iv} ans` };
+  return { adj: en ? 'subscription' : "d'abonnement", per: en ? 'per billing period' : 'par période de facturation' };
+}
+
+function saasIncreaseDraftCopy({ customerName, planName, currentMonthly, newMonthly, effectiveDate, interval, intervalUnit, lang }) {
   const money = (n) => `$${Number(n || 0).toFixed(2)}`;
   const greeting = customerName ? ` ${customerName}` : '';
   const plan = planName || (lang === 'en' ? 'subscription' : 'abonnement');
+  // Quote what the customer is actually billed. The tool reasons in monthly figures, but an annual
+  // customer's invoice reads $799.95 once a year, not $66.66 twelve times — sending the monthly
+  // equivalent would contradict the invoice that follows.
+  const curr = r2Money(subAmountFromMonthly(currentMonthly, interval, intervalUnit));
+  const next = r2Money(subAmountFromMonthly(newMonthly, interval, intervalUnit));
+  const w = saasBillingPeriodWords(interval, intervalUnit, lang);
   const whenEn = effectiveDate ? `on ${formatSaasEffectiveDate(effectiveDate, 'en')}` : 'at your next renewal';
   const whenFr = effectiveDate ? `le ${formatSaasEffectiveDate(effectiveDate, 'fr')}` : 'à votre prochain renouvellement';
   const subject = lang === 'en' ? `An update to your ${plan} pricing` : `Une mise à jour du prix de votre ${plan}`;
   const body = lang === 'en'
-    ? `Hello${greeting},\n\nWe're writing to let you know that the monthly price of your ${plan} will change from ${money(currentMonthly)} to ${money(newMonthly)} per month, effective ${whenEn}.\n\nIf you have any questions about this change, just reply to this email — we're happy to help.\n\nThank you for being a Cluster Systems customer.\n\nBest regards,`
-    : `Bonjour${greeting},\n\nNous vous écrivons pour vous informer que le prix mensuel de votre ${plan} passera de ${money(currentMonthly)} à ${money(newMonthly)} par mois, ${whenFr}.\n\nPour toute question à ce sujet, répondez simplement à ce courriel — il nous fera plaisir de vous aider.\n\nMerci d'être client de Cluster Systems.\n\nCordialement,`;
+    ? `Hello${greeting},\n\nWe're writing to let you know that the ${w.adj} price of your ${plan} will change from ${money(curr)} to ${money(next)} ${w.per}, effective ${whenEn}.\n\nIf you have any questions about this change, just reply to this email — we're happy to help.\n\nThank you for being a Cluster Systems customer.\n\nBest regards,`
+    : `Bonjour${greeting},\n\nNous vous écrivons pour vous informer que le prix ${w.adj} de votre ${plan} passera de ${money(curr)} à ${money(next)} ${w.per}, ${whenFr}.\n\nPour toute question à ce sujet, répondez simplement à ce courriel — il nous fera plaisir de vous aider.\n\nMerci d'être client de Cluster Systems.\n\nCordialement,`;
   return { subject, body };
 }
 
@@ -15102,10 +15122,20 @@ function saasIncreaseDraftCopy({ customerName, planName, currentMonthly, newMont
 function renderSaasTemplate(str, vars) {
   return String(str || '').replace(/\{\{(\w+)\}\}/g, (m, key) => (key in vars ? String(vars[key]) : m));
 }
-function saasTemplatePlaceholders({ customerName, planName, currentMonthly, newMonthly, effectiveDate, lang }) {
+function saasTemplatePlaceholders({ customerName, planName, currentMonthly, newMonthly, effectiveDate, interval, intervalUnit, lang }) {
   const money = (n) => `$${Number(n || 0).toFixed(2)}`;
+  // Per-BILLING-PERIOD amounts, not monthly: these go to a customer and must match the invoice
+  // they will receive. {{currentMonthly}}/{{newMonthly}} are kept as aliases so templates written
+  // before this don't break — their names are now a misnomer, which is why the correctly named
+  // {{currentPrice}}/{{newPrice}} exist alongside them.
+  const curr = money(r2Money(subAmountFromMonthly(currentMonthly, interval, intervalUnit)));
+  const next = money(r2Money(subAmountFromMonthly(newMonthly, interval, intervalUnit)));
+  const w = saasBillingPeriodWords(interval, intervalUnit, lang);
   return {
-    customerName: customerName || '', planName: planName || '', currentMonthly: money(currentMonthly), newMonthly: money(newMonthly),
+    customerName: customerName || '', planName: planName || '',
+    currentPrice: curr, newPrice: next,
+    currentMonthly: curr, newMonthly: next,
+    billingPeriod: w.per, billingPeriodAdj: w.adj,
     effectiveDate: formatSaasEffectiveDate(effectiveDate, lang),
   };
 }
@@ -15192,15 +15222,17 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authentic
     for (const it of items) {
       const to = await resolveMerchantContactEmail(it.customer_id, it.customer_name);
       const effectiveDate = nextBillingBySub.get(it.subscription_number) || null;
+      const liveSub = liveSubs.find(x => x.orgId === it.org_id && x.subscriptionNumber === it.subscription_number);
       let subject, body;
       if (template) {
-        const vars = saasTemplatePlaceholders({ customerName: it.customer_name, planName: it.plan_name, currentMonthly: it.current_monthly, newMonthly: it.new_monthly, effectiveDate, lang });
+        const vars = saasTemplatePlaceholders({ customerName: it.customer_name, planName: it.plan_name, currentMonthly: it.current_monthly, newMonthly: it.new_monthly, effectiveDate, interval: liveSub?.interval, intervalUnit: liveSub?.intervalUnit, lang });
         subject = renderSaasTemplate(lang === 'en' ? template.subject_en : template.subject_fr, vars);
         body = renderSaasTemplate(lang === 'en' ? template.body_en : template.body_fr, vars);
       } else {
         ({ subject, body } = saasIncreaseDraftCopy({
           customerName: it.customer_name, planName: it.plan_name,
-          currentMonthly: it.current_monthly, newMonthly: it.new_monthly, effectiveDate, lang,
+          currentMonthly: it.current_monthly, newMonthly: it.new_monthly, effectiveDate,
+          interval: liveSub?.interval, intervalUnit: liveSub?.intervalUnit, lang,
         }));
       }
       const row = (await pool.query(
