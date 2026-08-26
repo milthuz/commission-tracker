@@ -14299,6 +14299,16 @@ const ZOHO_BILLING_ORG_IDS = (process.env.ZOHO_BILLING_ORG_IDS || '697704869,802
 // Display names for the per-org breakdown shown when a dashboard tile is clicked.
 const ZOHO_BILLING_ORG_NAMES = { '697704869': 'Cluster Canada', '802470810': 'Cluster USA', '905113716': 'Xperio POS' };
 
+// A base price counts as verified only when BOTH halves exist: the monthly figure (used to sum
+// MRR across cadences) and the per-period figure (what actually gets written to Zoho's plan.price).
+// The row badge and the push guard already test both; the progress counter tested only
+// plan_monthly, so it read "3462 / 3462 verified" while 736 rows still showed the unverified
+// badge. Anything that reports on base-price completeness must use THIS predicate.
+const SAAS_BASE_VERIFIED_SQL = 'plan_monthly IS NOT NULL AND plan_price_period IS NOT NULL';
+
+// How long to wait out a Zoho 429 before retrying the same subscription.
+const SAAS_RATE_LIMIT_BACKOFF_MS = 20000;
+
 // Normalize a subscription's recurring charge to a MONTHLY amount for MRR.
 function subMonthlyAmount(amount, interval, intervalUnit) {
   const a = Number(amount) || 0;
@@ -14694,7 +14704,7 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
     // cannot say which org a shared row belongs to, which is itself the argument for re-keying it.
     const verifiedSet = new Set((await pool.query(
       `SELECT org_id, subscription_number FROM saas_subscription_insights
-        WHERE plan_monthly IS NOT NULL AND (org_id || '||' || subscription_number) = ANY($1::text[])`, [pairs]
+        WHERE ${SAAS_BASE_VERIFIED_SQL} AND (org_id || '||' || subscription_number) = ANY($1::text[])`, [pairs]
     )).rows.map(r => `${r.org_id}||${r.subscription_number}`));
     const orgsByNumber = new Map();
     const byOrgMap = new Map();
@@ -14723,7 +14733,7 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
     // if it covered this one, so the counter could read 100% while a specific subscription still
     // had no base price — which is exactly how a missing row hid behind "3462 / 3462".
     const r = (await pool.query(`
-      SELECT COUNT(*) FILTER (WHERE plan_monthly IS NOT NULL)::int AS verified,
+      SELECT COUNT(*) FILTER (WHERE ${SAAS_BASE_VERIFIED_SQL})::int AS verified,
              COUNT(*) FILTER (WHERE check_error IS NOT NULL)::int AS errors,
              COUNT(*) FILTER (WHERE checked_at > NOW() - INTERVAL '2 minutes')::int AS recent,
              MAX(checked_at) AS last_checked
@@ -15596,8 +15606,14 @@ async function runSaasBasePriceScan() {
           // The Zoho token is SHARED: any other job refreshing it invalidates the one this loop is
           // holding, so periodic renewal alone can't prevent 401s. Re-fetch and retry this one
           // subscription before writing it off as a failure.
-          if (!/401/.test(e.message)) throw e;
-          ({ accessToken, apiDomain } = await getAdminBooksAuth());
+          // 429 is not a permanent failure, it is Zoho asking us to slow down — most likely
+          // because the price-history scan is running against the same account. Back off once
+          // rather than recording the subscription as having no plan price.
+          if (/HTTP 429/.test(e.message)) {
+            await new Promise(r => setTimeout(r, SAAS_RATE_LIMIT_BACKOFF_MS));
+          } else if (/401/.test(e.message)) {
+            ({ accessToken, apiDomain } = await getAdminBooksAuth());
+          } else throw e;
           detail = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
         }
         const { activatedAt, planMonthly, addonsMonthly, planPeriod } = detail;
@@ -15641,7 +15657,14 @@ async function fetchSaasSubscriptionTenure(apiDomain, accessToken, orgId, subscr
   // A dead token must NOT look like "this subscription has no data" — that silently wrote NULL
   // plan prices for every remaining subscription once the hour-long token expired mid-scan.
   if (r.status === 401) throw new Error('subscription detail HTTP 401 (Zoho token expired)');
-  if (r.status !== 200) return empty;
+  // Returning `empty` here made every transport failure — rate limiting above all, since two scans
+  // can hammer Zoho at once — surface as the single message "Zoho returned no plan amount", which
+  // is indistinguishable from a subscription that genuinely carries no plan line. 736 rows failed
+  // that way with no means of telling which cause applied. Report the status.
+  if (r.status !== 200) {
+    const detail = r.data?.message || r.data?.error || '';
+    throw new Error(`subscription detail HTTP ${r.status}${detail ? ` — ${detail}` : ''}`);
+  }
   const sub = r.data?.subscription;
   const toDate = (raw) => {
     if (!raw) return null;
