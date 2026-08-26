@@ -14661,7 +14661,6 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
     // Now that the table is keyed per org, the unit of work is an (org, number) PAIR — so the
     // total no longer collapses duplicated numbers and can actually reach 100%.
     const pairs = Array.from(new Set(subs.map(s => `${s.orgId}||${s.subscriptionNumber}`)));
-    const numbers = Array.from(new Set(subs.map(s => s.subscriptionNumber)));
     const duplicates = subs.length - pairs.length;
 
     // Per-organisation breakdown, plus which subscription numbers exist in MORE THAN ONE org.
@@ -14671,7 +14670,7 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
     // cannot say which org a shared row belongs to, which is itself the argument for re-keying it.
     const verifiedSet = new Set((await pool.query(
       `SELECT org_id, subscription_number FROM saas_subscription_insights
-        WHERE plan_monthly IS NOT NULL AND subscription_number = ANY($1::text[])`, [numbers]
+        WHERE plan_monthly IS NOT NULL AND (org_id || '||' || subscription_number) = ANY($1::text[])`, [pairs]
     )).rows.map(r => `${r.org_id}||${r.subscription_number}`));
     const orgsByNumber = new Map();
     const byOrgMap = new Map();
@@ -14685,20 +14684,23 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
     }
     const collisions = Array.from(orgsByNumber.entries()).filter(([, o]) => o.size > 1).map(([n]) => n);
     const byOrg = Array.from(byOrgMap.values()).sort((a, b) => a.orgName.localeCompare(b.orgName));
+    // Match org+number PAIRS. Matching bare numbers counted a row belonging to a DIFFERENT org as
+    // if it covered this one, so the counter could read 100% while a specific subscription still
+    // had no base price — which is exactly how a missing row hid behind "3462 / 3462".
     const r = (await pool.query(`
       SELECT COUNT(*) FILTER (WHERE plan_monthly IS NOT NULL)::int AS verified,
              COUNT(*) FILTER (WHERE check_error IS NOT NULL)::int AS errors,
              COUNT(*) FILTER (WHERE checked_at > NOW() - INTERVAL '2 minutes')::int AS recent,
              MAX(checked_at) AS last_checked
         FROM saas_subscription_insights
-       WHERE subscription_number = ANY($1::text[])`, [numbers])).rows[0];
+       WHERE (org_id || '||' || subscription_number) = ANY($1::text[])`, [pairs])).rows[0];
     // The actual failure text, grouped. Storing per-row errors that nothing ever displays makes a
     // scan that fails on every subscription indistinguishable from one that never ran.
     const topErrors = (await pool.query(`
       SELECT check_error AS error, COUNT(*)::int AS count
         FROM saas_subscription_insights
-       WHERE check_error IS NOT NULL AND subscription_number = ANY($1::text[])
-       GROUP BY check_error ORDER BY count DESC LIMIT 3`, [numbers])).rows;
+       WHERE check_error IS NOT NULL AND (org_id || '||' || subscription_number) = ANY($1::text[])
+       GROUP BY check_error ORDER BY count DESC LIMIT 3`, [pairs])).rows;
     res.json({
       total: pairs.length,
       duplicates,
