@@ -15058,7 +15058,11 @@ app.get('/api/admin/saas-increase/scenarios/:id/export', authenticateToken, asyn
 // (e.g. Zoho hasn't returned next_billing_at for this subscription).
 function formatSaasEffectiveDate(dateStr, lang) {
   if (!dateStr) return lang === 'en' ? 'your next renewal' : 'votre prochain renouvellement';
-  const d = new Date(dateStr);
+  // A calendar date must be built from its OWN parts. `new Date('2026-09-17')` is parsed as
+  // midnight UTC, which formats as September 16 anywhere west of Greenwich — so a merchant would
+  // be told their price changes a day before it actually does.
+  const ymd = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(dateStr));
+  const d = ymd ? new Date(Number(ymd[1]), Number(ymd[2]) - 1, Number(ymd[3])) : new Date(dateStr);
   if (isNaN(d.getTime())) return lang === 'en' ? 'your next renewal' : 'votre prochain renouvellement';
   return new Intl.DateTimeFormat(lang === 'en' ? 'en-US' : 'fr-CA', { year: 'numeric', month: 'long', day: 'numeric' }).format(d);
 }
