@@ -15779,7 +15779,10 @@ async function runSaasSubscriptionInsightsScan() {
       }
       i++;
       try {
-        const { activatedAt, planMonthly, addonsMonthly } = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
+        const { activatedAt, planMonthly, addonsMonthly, planPeriod } = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
+        // planPeriod comes free with this same detail call and is what gates pushing to Zoho.
+        // Discarding it meant a subscription this scan had already fully inspected still showed
+        // "incl. addons" until the separate base-price pass re-fetched the identical record.
         // The invoice-history walk is the fragile half (it parses arbitrary Books line items), and
         // it must not take the plan/addon split down with it: that split is what gates pushing to
         // Zoho, whereas price history is only informational. Failing it is recorded, not fatal.
@@ -15790,12 +15793,12 @@ async function runSaasSubscriptionInsightsScan() {
           priceErr = `price history: ${e.message}`;
         }
         await pool.query(`
-          INSERT INTO saas_subscription_insights (org_id, subscription_number, activated_at, last_price_change_at, last_price_before, last_price_after, price_points_checked, plan_monthly, addons_monthly, checked_at, check_error)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), $10)
+          INSERT INTO saas_subscription_insights (org_id, subscription_number, activated_at, last_price_change_at, last_price_before, last_price_after, price_points_checked, plan_monthly, addons_monthly, plan_price_period, checked_at, check_error)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), $11)
           ON CONFLICT (org_id, subscription_number) DO UPDATE SET
             activated_at = $3, last_price_change_at = $4, last_price_before = $5, last_price_after = $6, price_points_checked = $7,
-            plan_monthly = $8, addons_monthly = $9, checked_at = NOW(), check_error = $10`,
-          [s.orgId, s.subscriptionNumber, activatedAt, change?.date || null, change?.before ?? null, change?.after ?? null, points, planMonthly, addonsMonthly, priceErr]
+            plan_monthly = $8, addons_monthly = $9, plan_price_period = $10, checked_at = NOW(), check_error = $11`,
+          [s.orgId, s.subscriptionNumber, activatedAt, change?.date || null, change?.before ?? null, change?.after ?? null, points, planMonthly, addonsMonthly, planPeriod, priceErr]
         );
         if (priceErr) failed++; else ok++;
       } catch (e) {
