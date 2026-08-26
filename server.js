@@ -15341,6 +15341,46 @@ app.get('/api/admin/saas-increase/scenarios/:id/items/:itemId/scheduled', authen
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// DELETE /api/admin/saas-increase/scenarios/:id/items/:itemId/scheduled — cancel a pending price
+// change in Zoho. This is the undo for a push, and Zoho's UI offers no way to do it, so without
+// this a wrong price pushed across hundreds of subscriptions could only be corrected one by one
+// through the API by hand.
+//
+// Requires saas_increase:execute (it writes to Zoho) but deliberately NOT the confirmation PIN:
+// this is the emergency brake, and it moves billing back toward what the customer already pays.
+// Putting a second lock on the undo would be protecting the wrong direction.
+app.delete('/api/admin/saas-increase/scenarios/:id/items/:itemId/scheduled', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:execute'))) return;
+  try {
+    const item = (await pool.query(
+      `SELECT * FROM saas_increase_items WHERE id = $1 AND scenario_id = $2`,
+      [req.params.itemId, req.params.id]
+    )).rows[0];
+    if (!item) return res.status(404).json({ error: 'item not found' });
+
+    const live = (await getSaasIncreaseSubscriptions())
+      .find(x => x.orgId === item.org_id && x.subscriptionNumber === item.subscription_number);
+    if (!live?.subscriptionId) return res.status(404).json({ error: 'subscription not found in Zoho' });
+
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    const r = await axios.delete(`${apiDomain}/billing/v1/subscriptions/${live.subscriptionId}/scheduledchanges`, {
+      headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, 'X-com-zoho-subscriptions-organizationid': item.org_id },
+      validateStatus: () => true, timeout: 20000,
+    });
+    if (r.status !== 200) {
+      return res.status(502).json({ error: `Zoho HTTP ${r.status}`, raw: JSON.stringify(r.data).slice(0, 400) });
+    }
+    // Back to 'pending': the increase is still part of the scenario, it is simply no longer
+    // scheduled in Zoho. Leaving it 'pushed' would misreport reality and, worse, keep it under
+    // the audit-trail protection that refuses to delete pushed rows.
+    await pool.query(
+      `UPDATE saas_increase_items SET status = 'pending', push_error = NULL, pushed_at = NULL WHERE id = $1`,
+      [item.id]
+    );
+    res.json({ cancelled: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:execute'))) return;
   const itemIds = Array.isArray(req.body?.itemIds) ? req.body.itemIds.map(Number).filter(Boolean) : [];
