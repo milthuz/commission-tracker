@@ -2297,6 +2297,10 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notify_error TEXT`);
     await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notified_by VARCHAR(255)`);
     await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notified_at TIMESTAMP`);
+    // A deliberate "leave this one alone" for THIS scenario. Distinct from simply having no
+    // increase: an untouched subscription is unfinished work, a skipped one is a decision, and
+    // only the decision should let a segment drop out of the To-do list.
+    await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS skipped BOOLEAN NOT NULL DEFAULT FALSE`);
     // Widen scenario-item uniqueness to include the org. Zoho subscription numbers are per-ORG,
     // so (scenario_id, subscription_number) meant two different customers sharing a number could
     // not both be in one scenario — the second silently overwrote the first, losing a real
@@ -15002,6 +15006,7 @@ function serializeSaasIncreaseItem(row) {
     planCode: row.plan_code, planName: row.plan_name,
     currentMonthly: Number(row.current_monthly), increaseType: row.increase_type, increaseValue: Number(row.increase_value),
     newMonthly: Number(row.new_monthly), status: row.status, pushError: row.push_error,
+    skipped: row.skipped === true,
     pushedBy: row.pushed_by, pushedAt: row.pushed_at,
     notifyTo: row.notify_to, notifySubject: row.notify_subject, notifyBody: row.notify_body,
     notifyStatus: row.notify_status, notifyError: row.notify_error,
@@ -15108,10 +15113,11 @@ app.post('/api/admin/saas-increase/scenarios/:id/items', authenticateToken, asyn
       const increaseType = (it.increaseType === 'flat' || it.increaseType === 'target') ? it.increaseType : 'percent';
       const currentMonthly = r2Money(it.currentMonthly);
       const increaseValue = Number(it.increaseValue) || 0;
+      const skipped = it.skipped === true;
       byNumber.set(`${String(it.orgId || '')}||${subscriptionNumber}`, [
         req.params.id, String(it.orgId || ''), subscriptionNumber, it.customerId || null, it.customerName || null,
         it.merchantAccountId || null, it.planCode || null, it.planName || null, currentMonthly, increaseType,
-        increaseValue, saasIncreaseNewMonthly(currentMonthly, increaseType, increaseValue),
+        increaseValue, saasIncreaseNewMonthly(currentMonthly, increaseType, increaseValue), skipped,
       ]);
     }
     const toSave = Array.from(byNumber.values());
@@ -15120,7 +15126,7 @@ app.post('/api/admin/saas-increase/scenarios/:id/items', authenticateToken, asyn
     // round-trip carries real latency — saving a few thousand items one at a time ran for minutes
     // and died on the gateway timeout, which the UI could only report as a generic failure. The
     // segment-first UI makes thousand-item scenarios a two-click affair, so this is now the normal
-    // case, not an edge case. 12 params/row keeps each chunk far below Postgres's 65535 ceiling.
+    // case, not an edge case. 13 params/row keeps each chunk far below Postgres's 65535 ceiling.
     const CHUNK = 500;
     const saved = [];
     await client.query('BEGIN');
@@ -15129,22 +15135,22 @@ app.post('/api/admin/saas-increase/scenarios/:id/items', authenticateToken, asyn
       const params = [];
       const tuples = chunk.map((vals, n) => {
         params.push(...vals);
-        const b = n * 12;
-        return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8},$${b + 9},$${b + 10},$${b + 11},$${b + 12})`;
+        const b = n * 13;
+        return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8},$${b + 9},$${b + 10},$${b + 11},$${b + 12},$${b + 13})`;
       });
       // EXCLUDED.* rather than positional params in the DO UPDATE — with a multi-row VALUES list,
       // $2/$4/... would pin every conflicting row to the FIRST row's values.
       const inserted = await client.query(`
         INSERT INTO saas_increase_items
           (scenario_id, org_id, subscription_number, customer_id, customer_name, merchant_account_id,
-           plan_code, plan_name, current_monthly, increase_type, increase_value, new_monthly)
+           plan_code, plan_name, current_monthly, increase_type, increase_value, new_monthly, skipped)
         VALUES ${tuples.join(',')}
         ON CONFLICT (scenario_id, org_id, subscription_number) DO UPDATE SET
           customer_id = EXCLUDED.customer_id, customer_name = EXCLUDED.customer_name,
           merchant_account_id = EXCLUDED.merchant_account_id, plan_code = EXCLUDED.plan_code,
           plan_name = EXCLUDED.plan_name, current_monthly = EXCLUDED.current_monthly,
           increase_type = EXCLUDED.increase_type, increase_value = EXCLUDED.increase_value,
-          new_monthly = EXCLUDED.new_monthly, status = 'pending', push_error = NULL
+          new_monthly = EXCLUDED.new_monthly, skipped = EXCLUDED.skipped, status = 'pending', push_error = NULL
         RETURNING *`, params);
       for (const row of inserted.rows) saved.push(serializeSaasIncreaseItem(row));
     }
@@ -15360,7 +15366,10 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authentic
       ? (await pool.query(`SELECT * FROM saas_increase_email_templates WHERE id = $1`, [templateId])).rows[0]
       : null;
     const items = (await pool.query(
-      `SELECT * FROM saas_increase_items WHERE scenario_id = $1 AND id = ANY($2::int[])`,
+      // A skipped item is an explicit "do not touch this customer" for this scenario. Filtering
+      // it here, rather than trusting the caller's id list, means the decision holds even if a
+      // stale page or a hand-made request asks for it.
+      `SELECT * FROM saas_increase_items WHERE scenario_id = $1 AND id = ANY($2::int[]) AND skipped = FALSE`,
       [req.params.id, itemIds]
     )).rows;
     // Effective date isn't stored on the item (it's Zoho's own next-renewal date, which can
@@ -15610,7 +15619,10 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
   const actor = req.user.realAdminEmail || req.user.email || 'unknown';
   try {
     const items = (await pool.query(
-      `SELECT * FROM saas_increase_items WHERE scenario_id = $1 AND id = ANY($2::int[])`,
+      // A skipped item is an explicit "do not touch this customer" for this scenario. Filtering
+      // it here, rather than trusting the caller's id list, means the decision holds even if a
+      // stale page or a hand-made request asks for it.
+      `SELECT * FROM saas_increase_items WHERE scenario_id = $1 AND id = ANY($2::int[]) AND skipped = FALSE`,
       [req.params.id, itemIds]
     )).rows;
     // Live lookup for Zoho's real internal subscription_id — not persisted on the item (which
