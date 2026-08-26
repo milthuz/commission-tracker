@@ -15717,7 +15717,13 @@ async function runSaasBasePriceScan() {
   try {
     let { accessToken, apiDomain } = await getAdminBooksAuth();
     const allSubs = await getSaasIncreaseSubscriptions();
-    const doneRes = await pool.query(`SELECT org_id, subscription_number FROM saas_subscription_insights WHERE plan_monthly IS NOT NULL AND plan_price_period IS NOT NULL`);
+    // "Done" must test everything this scan WRITES, not just what gates a push. Leaving
+    // addons_price_period out would have made this run skip all 3462 rows that already had a plan
+    // price, so the column it was added to backfill would have stayed empty — the same mistake
+    // that once left the price-history column permanently blank. Any column added below belongs
+    // here too.
+    const doneRes = await pool.query(`SELECT org_id, subscription_number FROM saas_subscription_insights
+       WHERE plan_monthly IS NOT NULL AND plan_price_period IS NOT NULL AND addons_price_period IS NOT NULL`);
     const done = new Set(doneRes.rows.map(r => `${r.org_id}||${r.subscription_number}`));
     const subs = allSubs.filter(s => !done.has(`${s.orgId}||${s.subscriptionNumber}`));
     console.log(`[saas-base] ${subs.length} of ${allSubs.length} subscriptions still need a base price...`);
