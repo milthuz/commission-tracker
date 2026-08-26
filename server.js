@@ -14675,9 +14675,16 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
     const orgsByNumber = new Map();
     const byOrgMap = new Map();
     for (const sub of subs) {
-      const e = byOrgMap.get(sub.orgId) || { orgId: sub.orgId, orgName: sub.orgName, total: 0, verified: 0 };
+      const e = byOrgMap.get(sub.orgId) || { orgId: sub.orgId, orgName: sub.orgName, total: 0, verified: 0, byStatus: {} };
       e.total++;
       if (verifiedSet.has(`${sub.orgId}||${sub.subscriptionNumber}`)) e.verified++;
+      // Per-status count and MRR. When this tool's org total disagrees with Zoho's dashboard, the
+      // gap is almost always one status bucket we include and Zoho doesn't (MRR_STATUSES was
+      // reverse-engineered against ONE org), so the breakdown says which — instead of guessing.
+      const st = e.byStatus[sub.status] || { count: 0, mrr: 0 };
+      st.count++;
+      st.mrr = Math.round((st.mrr + (sub.currentMonthly || 0)) * 100) / 100;
+      e.byStatus[sub.status] = st;
       byOrgMap.set(sub.orgId, e);
       if (!orgsByNumber.has(sub.subscriptionNumber)) orgsByNumber.set(sub.subscriptionNumber, new Set());
       orgsByNumber.get(sub.subscriptionNumber).add(sub.orgId);
