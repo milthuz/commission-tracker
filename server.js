@@ -14615,7 +14615,12 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
   if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
   try {
     const subs = await getSaasIncreaseSubscriptions();
-    const numbers = subs.map(s => s.subscriptionNumber);
+    // Count DISTINCT subscription numbers, not list entries. saas_subscription_insights is keyed
+    // by subscription_number alone, so a number appearing more than once across the three billing
+    // orgs collapses to a single row — reporting the raw list length made a finished scan look
+    // permanently stuck (e.g. 3107 verified "of 3462" when only 3107 distinct numbers exist).
+    const numbers = Array.from(new Set(subs.map(s => s.subscriptionNumber)));
+    const duplicates = subs.length - numbers.length;
     const r = (await pool.query(`
       SELECT COUNT(*) FILTER (WHERE plan_monthly IS NOT NULL)::int AS verified,
              COUNT(*) FILTER (WHERE check_error IS NOT NULL)::int AS errors,
@@ -14632,6 +14637,7 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
        GROUP BY check_error ORDER BY count DESC LIMIT 3`, [numbers])).rows;
     res.json({
       total: numbers.length,
+      duplicates,
       verified: r.verified,
       errors: r.errors,
       active: r.recent > 0,
