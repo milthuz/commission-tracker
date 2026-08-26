@@ -14305,6 +14305,20 @@ function subMonthlyAmount(amount, interval, intervalUnit) {
   return a / iv; // months
 }
 
+// Exact inverse of subMonthlyAmount: converts a MONTHLY figure back into the amount charged per
+// billing period. Zoho's plan.price is per period, so an annual subscription must receive a yearly
+// amount — pushing the monthly figure would have cut a $799.95/year plan to $73.33/year while the
+// UI reported a 10% increase.
+function subAmountFromMonthly(monthly, interval, intervalUnit) {
+  const m = Number(monthly) || 0;
+  const iv = Math.max(1, parseInt(interval) || 1);
+  const unit = String(intervalUnit || 'months').toLowerCase();
+  if (unit.startsWith('year')) return m * iv * 12;
+  if (unit.startsWith('week')) return (m * iv * 12) / 52;
+  if (unit.startsWith('day'))  return (m * iv * 12) / 365;
+  return m * iv; // months
+}
+
 // List every subscription of a status for one billing org (paginated).
 async function fetchBillingSubs(apiDomain, accessToken, orgId, filterBy) {
   const base = (apiDomain || 'https://www.zohoapis.com').replace(/\/$/, '');
@@ -14575,6 +14589,9 @@ async function computeSaasIncreaseSubscriptions() {
         planName: s.plan_name || '',
         status: String(s.status || '').toLowerCase(),
         currentMonthly: Math.round(subMonthlyAmount(s.sub_total != null ? s.sub_total : s.amount, s.interval, s.interval_unit) * 100) / 100,
+        // Needed to convert a monthly figure back to what Zoho actually charges per period.
+        interval: s.interval,
+        intervalUnit: s.interval_unit,
         // When this subscription's next term/price change actually takes effect — used for the
         // merchant notification's {{effectiveDate}} placeholder, not just the price itself.
         nextBillingAt: toDate(s.next_billing_at || s.current_term_ends_at),
@@ -15438,7 +15455,15 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
         continue;
       }
       const billing = new ZohoBillingService(accessToken, apiDomain, item.org_id);
-      const r = await billing.scheduleSubscriptionPriceChange(live.subscriptionId, item.plan_code, Number(item.new_monthly));
+      // new_monthly is a MONTHLY figure; Zoho wants the amount per billing period.
+      if (!live.intervalUnit) {
+        const msg = 'Billing period unknown for this subscription — refusing to push';
+        await pool.query(`UPDATE saas_increase_items SET status = 'push_failed', push_error = $1 WHERE id = $2`, [msg, item.id]);
+        results.push({ itemId: item.id, ok: false, error: msg });
+        continue;
+      }
+      const pricePerPeriod = r2Money(subAmountFromMonthly(Number(item.new_monthly), live.interval, live.intervalUnit));
+      const r = await billing.scheduleSubscriptionPriceChange(live.subscriptionId, item.plan_code, pricePerPeriod);
       if (r.ok) {
         await pool.query(
           `UPDATE saas_increase_items SET status = 'pushed', push_error = NULL, pushed_by = $1, pushed_at = NOW() WHERE id = $2`,
