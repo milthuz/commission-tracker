@@ -2376,6 +2376,28 @@ async function initializeDatabase() {
     // nightly scan that already makes that call for tenure.
     await pool.query(`ALTER TABLE saas_subscription_insights ADD COLUMN IF NOT EXISTS plan_monthly NUMERIC(12,2)`);
     await pool.query(`ALTER TABLE saas_subscription_insights ADD COLUMN IF NOT EXISTS addons_monthly NUMERIC(12,2)`);
+    // One-time re-key on (org_id, subscription_number). Zoho subscription numbers are unique per
+    // ORG, not globally, so a subscription_number-only primary key let two orgs' subscriptions
+    // share one row — and one org's base plan price silently overwrite another's, which decides
+    // what gets pushed as a customer's new price.
+    //
+    // The table is emptied rather than backfilled: it is a derived cache (both scans recompute
+    // everything in it), and a row already shared by two orgs cannot be attributed to either
+    // after the fact. Guessing would keep exactly the corrupt rows this is meant to remove.
+    await pool.query(`ALTER TABLE saas_subscription_insights ADD COLUMN IF NOT EXISTS org_id VARCHAR(20)`);
+    const insightsPk = (await pool.query(`
+      SELECT a.attname AS col
+        FROM pg_index i
+        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+       WHERE i.indrelid = 'saas_subscription_insights'::regclass AND i.indisprimary`)).rows.map(r => r.col);
+    if (insightsPk.length === 1 && insightsPk[0] === 'subscription_number') {
+      console.log('[migration] re-keying saas_subscription_insights on (org_id, subscription_number) — table will be rebuilt by the next scan');
+      await pool.query(`DELETE FROM saas_subscription_insights`);
+      await pool.query(`ALTER TABLE saas_subscription_insights DROP CONSTRAINT IF EXISTS saas_subscription_insights_pkey`);
+      await pool.query(`ALTER TABLE saas_subscription_insights ALTER COLUMN org_id SET NOT NULL`);
+      await pool.query(`ALTER TABLE saas_subscription_insights ADD PRIMARY KEY (org_id, subscription_number)`);
+      console.log('[migration] done — run "Verify base prices" to repopulate');
+    }
 
     // Historical churn dataset for the SaaS Increase risk-score calibration — one row per
     // CANCELLED subscription (a completed event), separate from saas_subscription_insights
@@ -14558,9 +14580,10 @@ app.get('/api/admin/saas-increase/subscriptions', authenticateToken, async (req,
     // Attach the nightly-precomputed insights (tenure + last price change) — null until the
     // first background scan completes for a given subscription (see runSaasSubscriptionInsightsScan).
     const insightsRes = await pool.query(`SELECT * FROM saas_subscription_insights`);
-    const insightsByNum = new Map(insightsRes.rows.map(r => [r.subscription_number, r]));
+    // Keyed by org + number: the same subscription_number can exist in more than one billing org.
+    const insightsByNum = new Map(insightsRes.rows.map(r => [`${r.org_id}||${r.subscription_number}`, r]));
     rows = rows.map(s => {
-      const i = insightsByNum.get(s.subscriptionNumber);
+      const i = insightsByNum.get(`${s.orgId}||${s.subscriptionNumber}`);
       // An increase applies to the BASE PLAN line only. The list endpoint gives plan + addons,
       // so `currentMonthly` becomes the scanned plan price whenever it's known; `baseVerified`
       // tells the UI (and the push guard) whether that separation actually happened for this row.
@@ -14619,8 +14642,11 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
     // by subscription_number alone, so a number appearing more than once across the three billing
     // orgs collapses to a single row — reporting the raw list length made a finished scan look
     // permanently stuck (e.g. 3107 verified "of 3462" when only 3107 distinct numbers exist).
+    // Now that the table is keyed per org, the unit of work is an (org, number) PAIR — so the
+    // total no longer collapses duplicated numbers and can actually reach 100%.
+    const pairs = Array.from(new Set(subs.map(s => `${s.orgId}||${s.subscriptionNumber}`)));
     const numbers = Array.from(new Set(subs.map(s => s.subscriptionNumber)));
-    const duplicates = subs.length - numbers.length;
+    const duplicates = subs.length - pairs.length;
 
     // Per-organisation breakdown, plus which subscription numbers exist in MORE THAN ONE org.
     // Those are the collisions: saas_subscription_insights is keyed by subscription_number alone,
@@ -14628,15 +14654,15 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
     // per-org `verified` count is necessarily ambiguous for exactly those numbers — the table
     // cannot say which org a shared row belongs to, which is itself the argument for re-keying it.
     const verifiedSet = new Set((await pool.query(
-      `SELECT subscription_number FROM saas_subscription_insights
+      `SELECT org_id, subscription_number FROM saas_subscription_insights
         WHERE plan_monthly IS NOT NULL AND subscription_number = ANY($1::text[])`, [numbers]
-    )).rows.map(r => r.subscription_number));
+    )).rows.map(r => `${r.org_id}||${r.subscription_number}`));
     const orgsByNumber = new Map();
     const byOrgMap = new Map();
     for (const sub of subs) {
       const e = byOrgMap.get(sub.orgId) || { orgId: sub.orgId, orgName: sub.orgName, total: 0, verified: 0 };
       e.total++;
-      if (verifiedSet.has(sub.subscriptionNumber)) e.verified++;
+      if (verifiedSet.has(`${sub.orgId}||${sub.subscriptionNumber}`)) e.verified++;
       byOrgMap.set(sub.orgId, e);
       if (!orgsByNumber.has(sub.subscriptionNumber)) orgsByNumber.set(sub.subscriptionNumber, new Set());
       orgsByNumber.get(sub.subscriptionNumber).add(sub.orgId);
@@ -14658,7 +14684,7 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
        WHERE check_error IS NOT NULL AND subscription_number = ANY($1::text[])
        GROUP BY check_error ORDER BY count DESC LIMIT 3`, [numbers])).rows;
     res.json({
-      total: numbers.length,
+      total: pairs.length,
       duplicates,
       byOrg,
       crossOrgCollisions: collisions.length,
@@ -15260,8 +15286,8 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
     // Which subscriptions have had their plan price separated from their addons by the insights
     // scan. Anything missing here cannot be pushed safely — see the per-item guard below.
     const baseVerified = new Set((await pool.query(
-      `SELECT subscription_number FROM saas_subscription_insights WHERE plan_monthly IS NOT NULL`
-    )).rows.map(r => r.subscription_number));
+      `SELECT org_id, subscription_number FROM saas_subscription_insights WHERE plan_monthly IS NOT NULL`
+    )).rows.map(r => `${r.org_id}||${r.subscription_number}`));
 
     const results = [];
     for (const item of items) {
@@ -15270,7 +15296,7 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
       // this subscription, new_monthly may have been computed from plan + addons — pushing it
       // would set the plan to that combined figure and the addons would be re-charged on top of
       // it. Refuse rather than overcharge; the nightly insights scan fills this in.
-      if (!baseVerified.has(item.subscription_number)) {
+      if (!baseVerified.has(`${item.org_id}||${item.subscription_number}`)) {
         const msg = 'Base plan price not verified yet (addons not separated) — refresh price history first';
         await pool.query(`UPDATE saas_increase_items SET status = 'push_failed', push_error = $1 WHERE id = $2`, [msg, item.id]);
         results.push({ itemId: item.id, ok: false, error: msg });
@@ -15340,9 +15366,9 @@ async function runSaasBasePriceScan() {
   try {
     let { accessToken, apiDomain } = await getAdminBooksAuth();
     const allSubs = await getSaasIncreaseSubscriptions();
-    const doneRes = await pool.query(`SELECT subscription_number FROM saas_subscription_insights WHERE plan_monthly IS NOT NULL`);
-    const done = new Set(doneRes.rows.map(r => r.subscription_number));
-    const subs = allSubs.filter(s => !done.has(s.subscriptionNumber));
+    const doneRes = await pool.query(`SELECT org_id, subscription_number FROM saas_subscription_insights WHERE plan_monthly IS NOT NULL`);
+    const done = new Set(doneRes.rows.map(r => `${r.org_id}||${r.subscription_number}`));
+    const subs = allSubs.filter(s => !done.has(`${s.orgId}||${s.subscriptionNumber}`));
     console.log(`[saas-base] ${subs.length} of ${allSubs.length} subscriptions still need a base price...`);
     let ok = 0, failed = 0, i = 0;
     for (const s of subs) {
@@ -15366,21 +15392,21 @@ async function runSaasBasePriceScan() {
         const { activatedAt, planMonthly, addonsMonthly } = detail;
         if (planMonthly == null) throw new Error('Zoho returned no plan amount for this subscription');
         await pool.query(`
-          INSERT INTO saas_subscription_insights (subscription_number, activated_at, plan_monthly, addons_monthly, checked_at, check_error)
-          VALUES ($1, $2, $3, $4, NOW(), NULL)
-          ON CONFLICT (subscription_number) DO UPDATE SET
-            activated_at = COALESCE($2, saas_subscription_insights.activated_at),
-            plan_monthly = $3, addons_monthly = $4, checked_at = NOW(), check_error = NULL`,
-          [s.subscriptionNumber, activatedAt, planMonthly, addonsMonthly]
+          INSERT INTO saas_subscription_insights (org_id, subscription_number, activated_at, plan_monthly, addons_monthly, checked_at, check_error)
+          VALUES ($1, $2, $3, $4, $5, NOW(), NULL)
+          ON CONFLICT (org_id, subscription_number) DO UPDATE SET
+            activated_at = COALESCE($3, saas_subscription_insights.activated_at),
+            plan_monthly = $4, addons_monthly = $5, checked_at = NOW(), check_error = NULL`,
+          [s.orgId, s.subscriptionNumber, activatedAt, planMonthly, addonsMonthly]
         );
         ok++;
       } catch (e) {
         failed++;
         await pool.query(`
-          INSERT INTO saas_subscription_insights (subscription_number, checked_at, check_error)
-          VALUES ($1, NOW(), $2)
-          ON CONFLICT (subscription_number) DO UPDATE SET checked_at = NOW(), check_error = $2`,
-          [s.subscriptionNumber, e.message]
+          INSERT INTO saas_subscription_insights (org_id, subscription_number, checked_at, check_error)
+          VALUES ($1, $2, NOW(), $3)
+          ON CONFLICT (org_id, subscription_number) DO UPDATE SET checked_at = NOW(), check_error = $3`,
+          [s.orgId, s.subscriptionNumber, e.message]
         ).catch(() => {});
       }
       await new Promise(r => setTimeout(r, SAAS_BASE_DELAY_MS));
@@ -15516,12 +15542,12 @@ async function runSaasSubscriptionInsightsScan() {
     // split would never be filled in, leaving every push blocked. Any future column added here
     // needs the same treatment.
     const freshRes = await pool.query(
-      `SELECT subscription_number FROM saas_subscription_insights
+      `SELECT org_id, subscription_number FROM saas_subscription_insights
         WHERE checked_at > NOW() - INTERVAL '${SAAS_INSIGHTS_RESCAN_AFTER_HOURS} hours'
           AND plan_monthly IS NOT NULL`
     );
-    const freshNumbers = new Set(freshRes.rows.map(r => r.subscription_number));
-    const subs = allSubs.filter(s => !freshNumbers.has(s.subscriptionNumber));
+    const freshNumbers = new Set(freshRes.rows.map(r => `${r.org_id}||${r.subscription_number}`));
+    const subs = allSubs.filter(s => !freshNumbers.has(`${s.orgId}||${s.subscriptionNumber}`));
     console.log(`[saas-insights] scanning ${subs.length} of ${allSubs.length} subscriptions (${freshNumbers.size} skipped, checked within ${SAAS_INSIGHTS_RESCAN_AFTER_HOURS}h)...`);
     let ok = 0, failed = 0, i = 0;
     for (const s of subs) {
@@ -15543,21 +15569,21 @@ async function runSaasSubscriptionInsightsScan() {
           priceErr = `price history: ${e.message}`;
         }
         await pool.query(`
-          INSERT INTO saas_subscription_insights (subscription_number, activated_at, last_price_change_at, last_price_before, last_price_after, price_points_checked, plan_monthly, addons_monthly, checked_at, check_error)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), $9)
-          ON CONFLICT (subscription_number) DO UPDATE SET
-            activated_at = $2, last_price_change_at = $3, last_price_before = $4, last_price_after = $5, price_points_checked = $6,
-            plan_monthly = $7, addons_monthly = $8, checked_at = NOW(), check_error = $9`,
-          [s.subscriptionNumber, activatedAt, change?.date || null, change?.before ?? null, change?.after ?? null, points, planMonthly, addonsMonthly, priceErr]
+          INSERT INTO saas_subscription_insights (org_id, subscription_number, activated_at, last_price_change_at, last_price_before, last_price_after, price_points_checked, plan_monthly, addons_monthly, checked_at, check_error)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), $10)
+          ON CONFLICT (org_id, subscription_number) DO UPDATE SET
+            activated_at = $3, last_price_change_at = $4, last_price_before = $5, last_price_after = $6, price_points_checked = $7,
+            plan_monthly = $8, addons_monthly = $9, checked_at = NOW(), check_error = $10`,
+          [s.orgId, s.subscriptionNumber, activatedAt, change?.date || null, change?.before ?? null, change?.after ?? null, points, planMonthly, addonsMonthly, priceErr]
         );
         if (priceErr) failed++; else ok++;
       } catch (e) {
         failed++;
         await pool.query(`
-          INSERT INTO saas_subscription_insights (subscription_number, checked_at, check_error)
-          VALUES ($1, NOW(), $2)
-          ON CONFLICT (subscription_number) DO UPDATE SET checked_at = NOW(), check_error = $2`,
-          [s.subscriptionNumber, e.message]
+          INSERT INTO saas_subscription_insights (org_id, subscription_number, checked_at, check_error)
+          VALUES ($1, $2, NOW(), $3)
+          ON CONFLICT (org_id, subscription_number) DO UPDATE SET checked_at = NOW(), check_error = $3`,
+          [s.orgId, s.subscriptionNumber, e.message]
         ).catch(() => {});
       }
       await new Promise(r => setTimeout(r, SAAS_INSIGHTS_DELAY_MS));
