@@ -7,7 +7,8 @@
 // so an admin can CHECK the answer instead of trusting it. The UI keys its quick replies
 // on the verdict, so the resolve note starts from the answer that fits THAT case.
 //
-// Layer 2 only runs when layer 1 says `inconclusive`: Claude reads the evidence layer 1
+// Layer 2 runs when layer 1 cannot settle it — including when BOTH point sources check out
+// and the rep still reports a gap: Claude reads the evidence layer 1
 // already gathered plus the rep's free text (things like "point for WF" that no query
 // can resolve) and drafts a note. It is READ-ONLY — it never touches money tables, and
 // its output is a suggestion for a human, never an action.
@@ -31,6 +32,17 @@ const VERDICTS = {
   merchant_trade_name:   { resolved: true  },
   merchant_not_active:   { resolved: false },
   per_store_unit_owed:   { resolved: false },
+  // The deal side is absent while payments exist. Not automatically an error — plenty of
+  // sales are payments-only — but it is the half that used to go unexamined entirely.
+  deal_missing:          { resolved: false },
+  // The deal exists but carries no points (source group configured at 0, or synced that way).
+  deal_zero_points:      { resolved: false },
+  // A deal with points but no payment account behind it.
+  payments_missing:      { resolved: false },
+  // Both sides check out and the rep still reports a gap: the thing they are asking about is
+  // not something these tables express. Left NON-resolved on purpose — answering "all good"
+  // to someone reporting a problem is the one outcome that helps nobody.
+  both_sides_present:    { resolved: false },
   // ---- commission
   commission_present:    { resolved: true  },
   reference_is_estimate: { resolved: false },
@@ -140,66 +152,78 @@ async function investigatePoints(pool, report, rep, ref) {
     return { verdict: 'reference_is_estimate', evidence: { reference: ref, note: 'an estimate is not a sale yet; points follow the deal or the Zentact activation' } };
   }
 
-  const deal = await findDeal(pool, ref);
-  if (deal) {
-    const ev = { deal_name: deal.deal_name, owner: deal.owner_name, points: deal.points, sold_date: deal.sold_date };
-    if (!sameRep(deal.owner_name, rep)) return { verdict: 'deal_wrong_rep', evidence: ev };
-    // Landed after the report was filed → the rep flagged it before the deposit reached Zoho.
-    if (deal.sold_date && report.created_at && new Date(deal.sold_date) >= new Date(new Date(report.created_at).toDateString())) {
-      return { verdict: 'points_arrived_since', evidence: ev };
-    }
-    if (deal.points > 0) {
-      // A rep often asks about one half of a sale ("Cluster payments + point for POS"), so
-      // report the Zentact side too rather than stopping at the deal. Amy's real case: the
-      // deal was hers since July, but the activation she was actually asking about only
-      // landed three days AFTER she filed — evidence that answers the question she asked.
-      const also = await findMerchant(pool, ref);
-      if (also) {
-        ev.zentact_merchant = also.business_name;
-        ev.zentact_status = also.status;
-        ev.zentact_activated_at = also.activated_at;
-        ev.zentact_rep = also.sales_rep_name;
-        if (also.activated_at && report.created_at
-            && new Date(also.activated_at) >= new Date(new Date(report.created_at).toDateString())) {
-          return { verdict: 'points_arrived_since', evidence: ev };
-        }
-      }
-      return { verdict: 'points_present', evidence: ev };
-    }
+  // BOTH sides are looked up, every time. The first version stopped at whichever side it found
+  // first: a rep asking about a missing POS point got a confident "the points are there" based
+  // on the payments side, and the question of why the DEAL was absent was never asked. A sale
+  // can carry a CRM deal (POS) and a Zentact activation (payments), or payments alone — so the
+  // only honest diagnosis is one that states where each side stands.
+  const [deal, merch] = await Promise.all([findDeal(pool, ref), findMerchant(pool, ref)]);
+
+  const evidence = {
+    pos_deal_found: !!deal,
+    ...(deal ? {
+      deal_name: deal.deal_name, deal_owner: deal.owner_name,
+      deal_points: deal.points, deal_sold_date: deal.sold_date,
+    } : {}),
+    payments_found: !!merch,
+    ...(merch ? {
+      zentact_merchant: merch.business_name, zentact_rep: merch.sales_rep_name,
+      zentact_status: merch.status, zentact_activated_at: merch.activated_at,
+      zentact_points: merch.points, balance_accounts: merch.balance_accounts,
+    } : {}),
+  };
+  const out = (verdict, extra) => ({ verdict, evidence: { ...evidence, ...(extra || {}) } });
+
+  const dealMine  = deal  && sameRep(deal.owner_name, rep);
+  const merchMine = merch && sameRep(merch.sales_rep_name, rep);
+  const filedOn   = report.created_at ? new Date(new Date(report.created_at).toDateString()) : null;
+  const landedAfterReport = (d) => !!(d && filedOn && new Date(d) >= filedOn);
+
+  if (!deal && !merch) return out('not_found', { searched: ref });
+
+  // Attribution problems outrank everything: they are the only case where points exist but
+  // sit on someone else's row, and they need a fix rather than an explanation.
+  if (deal  && !dealMine)  return out('deal_wrong_rep');
+  if (merch && !merchMine) return out('merchant_wrong_rep');
+
+  // Either side landing after the report means the rep flagged it before the sync caught up.
+  if (landedAfterReport(deal && deal.sold_date) || landedAfterReport(merch && merch.activated_at)) {
+    return out('points_arrived_since');
   }
 
-  const m = await findMerchant(pool, ref);
-  if (m) {
-    const ev = {
-      merchant_account_id: m.merchant_account_id, business_name: m.business_name,
-      status: m.status, rep_on_record: m.sales_rep_name, activated_at: m.activated_at,
-      balance_accounts: m.balance_accounts, stores: m.store_names, points: m.points,
-    };
-    if (!sameRep(m.sales_rep_name, rep)) return { verdict: 'merchant_wrong_rep', evidence: ev };
-    if (m.status !== 'ACTIVE') return { verdict: 'merchant_not_active', evidence: ev };
+  // Now the deficiencies, deal side first — that is the half that used to go unexamined.
+  // A missing deal is NOT automatically an error: plenty of sales are payments-only. The
+  // verdict says what is absent and lets the admin decide whether it should have been there.
+  if (!deal && merchMine)     return out('deal_missing');
+  if (deal && deal.points === 0) return out('deal_zero_points');
+  if (dealMine && !merch)     return out('payments_missing');
+  if (merch && merch.status !== 'ACTIVE') return out('merchant_not_active');
 
-    // Extra balance accounts on a merchant activated before the cutoff: units the
-    // per-location rule would grant today but did not back then.
-    if (m.balance_accounts > 1 && m.activated_at && String(m.activated_at) < PER_STORE_RULE_START) {
-      const granted = (await pool.query(
-        `SELECT COUNT(*)::int AS c FROM zentact_merchants
-          WHERE is_manual = true AND sales_rep_name = $1
-            AND activated_at >= $2::date - INTERVAL '60 days'`,
-        [rep, m.activated_at]
-      )).rows[0].c;
-      return {
-        verdict: 'per_store_unit_owed',
-        evidence: { ...ev, extra_units: m.balance_accounts - 1, manual_units_already_granted: granted },
-      };
-    }
-    // Found, but under a name the rep would not have searched for.
-    if (loosePattern(ref) && !new RegExp(String(ref).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i').test(m.business_name || '')) {
-      return { verdict: 'merchant_trade_name', evidence: ev };
-    }
-    return { verdict: 'points_present', evidence: ev };
+  // Extra balance accounts on a merchant activated before the cutoff: units the per-location
+  // rule would grant today but did not back then.
+  if (merch && merch.balance_accounts > 1 && merch.activated_at
+      && String(merch.activated_at) < PER_STORE_RULE_START) {
+    const granted = (await pool.query(
+      `SELECT COUNT(*)::int AS c FROM zentact_merchants
+        WHERE is_manual = true AND sales_rep_name = $1
+          AND activated_at >= $2::date - INTERVAL '60 days'`,
+      [rep, merch.activated_at]
+    )).rows[0].c;
+    return out('per_store_unit_owed', {
+      extra_units: merch.balance_accounts - 1, manual_units_already_granted: granted,
+    });
   }
 
-  return { verdict: 'not_found', evidence: { searched: ref } };
+  // (No trade-name branch here on purpose: "payments exist under another name, no deal" is
+  // already covered by deal_missing above, and the actual Zentact name is in the evidence.
+  // merchant_trade_name stays in VERDICTS for rows diagnosed before this rewrite.)
+
+  // Both sides check out — and the rep still says something is missing. That is NOT a clean
+  // "nothing to see here": it means the thing they are asking about is not something these
+  // two tables can express (an abbreviation like "WF", a second location, a product line).
+  // Deliberately left non-conclusive so layer 2 reads their wording instead of the tree
+  // closing the case with false confidence.
+  return out('both_sides_present');
 }
 
 // ---------------------------------------------------------------------------
@@ -347,7 +371,7 @@ async function investigateReport(pool, report, opts = {}) {
   const meta = VERDICTS[result.verdict] || VERDICTS.inconclusive;
   let aiNote = null;
   // Layer 2 fires only where layer 1 gave up, so a normal report costs nothing.
-  if ((result.verdict === 'inconclusive' || result.verdict === 'not_found') && opts.anthropic) {
+  if (['inconclusive', 'not_found', 'both_sides_present'].includes(result.verdict) && opts.anthropic) {
     try { aiNote = await askClaude(opts.anthropic, report, rep, result); }
     catch (e) { aiNote = null; }
   }
