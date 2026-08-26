@@ -2397,6 +2397,22 @@ async function initializeDatabase() {
     // the customer reads on their invoice. Keeping the raw figure removes the conversion entirely
     // from the push and from the merchant email.
     await pool.query(`ALTER TABLE saas_subscription_insights ADD COLUMN IF NOT EXISTS plan_price_period NUMERIC(12,2)`);
+
+    // Cross-process lock for the two Zoho-heavy SaaS scans. The scheduled price-history scan runs
+    // on the WORKER dyno and the manual ones on WEB, so the in-process booleans they each kept
+    // could never see one another: both ran at once, sharing a single Zoho token whose refresh by
+    // one invalidated the other's, producing "HTTP 401 (Zoho token expired)" out of nowhere.
+    // heartbeat_at also makes the lock self-healing — a dyno killed mid-scan (every deploy did
+    // exactly that) would otherwise leave it held forever.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS saas_scan_runs (
+        name TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        label TEXT,
+        started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        stop_requested BOOLEAN NOT NULL DEFAULT FALSE
+      )`);
     // One-time re-key on (org_id, subscription_number). Zoho subscription numbers are unique per
     // ORG, not globally, so a subscription_number-only primary key let two orgs' subscriptions
     // share one row — and one org's base plan price silently overwrite another's, which decides
@@ -14299,6 +14315,63 @@ const ZOHO_BILLING_ORG_IDS = (process.env.ZOHO_BILLING_ORG_IDS || '697704869,802
 // Display names for the per-org breakdown shown when a dashboard tile is clicked.
 const ZOHO_BILLING_ORG_NAMES = { '697704869': 'Cluster Canada', '802470810': 'Cluster USA', '905113716': 'Xperio POS' };
 
+// ---------------------------------------------------------------------------------------------
+// Scan lock. Both SaaS scans hammer the same Zoho account with the same shared token, so only one
+// may run at a time — across dynos, not just within a process. The lock doubles as the stop
+// button: the running loop polls its own row and bails out when stop_requested flips.
+// ---------------------------------------------------------------------------------------------
+const SAAS_SCAN_LOCK = 'zoho_scan';
+// A scan that has not reported in for this long is presumed dead (deploy, crash, OOM) and its
+// lock is taken over. Must comfortably exceed the heartbeat interval below.
+const SAAS_SCAN_STALE_MINUTES = 5;
+// How many subscriptions between heartbeats. Also how often a stop request is noticed.
+const SAAS_SCAN_HEARTBEAT_EVERY = 20;
+
+// Returns an owner token on success, null if another scan holds the lock.
+async function acquireSaasScanLock(label) {
+  const owner = `${label}:${process.env.ROLE || 'web'}:${process.pid}:${Date.now()}`;
+  const r = await pool.query(`
+    INSERT INTO saas_scan_runs (name, owner, label) VALUES ($1, $2, $3)
+    ON CONFLICT (name) DO UPDATE SET
+      owner = EXCLUDED.owner, label = EXCLUDED.label,
+      started_at = NOW(), heartbeat_at = NOW(), stop_requested = FALSE
+    WHERE saas_scan_runs.heartbeat_at < NOW() - INTERVAL '${SAAS_SCAN_STALE_MINUTES} minutes'
+    RETURNING owner`, [SAAS_SCAN_LOCK, owner, label]);
+  return r.rowCount > 0 ? owner : null;
+}
+
+// Refreshes the heartbeat and reports whether this scan should stop — either because someone
+// asked it to, or because it lost the lock to another process and must not keep spending the
+// shared token. Failing to reach the DB is NOT a stop signal: a transient blip should not abort
+// an hours-long scan.
+async function saasScanShouldStop(owner) {
+  try {
+    const r = await pool.query(
+      `UPDATE saas_scan_runs SET heartbeat_at = NOW() WHERE name = $1 AND owner = $2 RETURNING stop_requested`,
+      [SAAS_SCAN_LOCK, owner]
+    );
+    if (r.rowCount === 0) return true;
+    return r.rows[0].stop_requested === true;
+  } catch { return false; }
+}
+
+// Who currently holds the lock, or null. Used by the trigger endpoints so they can say "busy"
+// instead of returning started:true for a run the lock is about to refuse — the page would
+// otherwise report a scan as started that never began.
+async function saasScanLockHolder() {
+  try {
+    return (await pool.query(
+      `SELECT label, started_at FROM saas_scan_runs
+        WHERE name = $1 AND heartbeat_at > NOW() - INTERVAL '${SAAS_SCAN_STALE_MINUTES} minutes'`,
+      [SAAS_SCAN_LOCK]
+    )).rows[0] || null;
+  } catch { return null; }
+}
+
+async function releaseSaasScanLock(owner) {
+  await pool.query(`DELETE FROM saas_scan_runs WHERE name = $1 AND owner = $2`, [SAAS_SCAN_LOCK, owner]).catch(() => {});
+}
+
 // A base price counts as verified only when BOTH halves exist: the monthly figure (used to sum
 // MRR across cadences) and the per-period figure (what actually gets written to Zoho's plan.price).
 // The row badge and the push guard already test both; the progress counter tested only
@@ -14665,6 +14738,8 @@ app.get('/api/admin/saas-increase/subscriptions', authenticateToken, async (req,
 // tenure + last-price-change scan on demand instead of waiting for the next scheduled run.
 app.post('/api/admin/saas-increase/insights/refresh', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  const busy = await saasScanLockHolder();
+  if (busy) return res.json({ started: false, busy: busy.label });
   runSaasSubscriptionInsightsScan().catch(e => console.error('[saas-insights] manual run failed:', e.message));
   res.json({ started: true });
 });
@@ -14672,8 +14747,23 @@ app.post('/api/admin/saas-increase/insights/refresh', authenticateToken, async (
 // POST /api/admin/saas-increase/insights/refresh-base — the fast pass: base plan price + addons
 // only. This is the one that unblocks pushing, so it's what the page's button triggers; the full
 // price-history walk is left to the nightly job because it costs ~25 Zoho calls per subscription.
+// POST /api/admin/saas-increase/insights/stop — asks whichever scan holds the lock to stop at its
+// next heartbeat. Until now the ONLY way to halt a manually-started scan was restarting the dyno,
+// which is what every deploy was silently doing to David's runs.
+app.post('/api/admin/saas-increase/insights/stop', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  try {
+    const r = await pool.query(
+      `UPDATE saas_scan_runs SET stop_requested = TRUE WHERE name = $1 RETURNING label`, [SAAS_SCAN_LOCK]
+    );
+    res.json({ stopping: r.rowCount > 0, scan: r.rows[0]?.label || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/admin/saas-increase/insights/refresh-base', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  const busy = await saasScanLockHolder();
+  if (busy) return res.json({ started: false, busy: busy.label });
   runSaasBasePriceScan().catch(e => console.error('[saas-base] manual run failed:', e.message));
   res.json({ started: true });
 });
@@ -14741,6 +14831,11 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
        WHERE (org_id || '||' || subscription_number) = ANY($1::text[])`, [pairs])).rows[0];
     // The actual failure text, grouped. Storing per-row errors that nothing ever displays makes a
     // scan that fails on every subscription indistinguishable from one that never ran.
+    const lock = (await pool.query(
+      `SELECT label, started_at, stop_requested FROM saas_scan_runs
+        WHERE name = $1 AND heartbeat_at > NOW() - INTERVAL '${SAAS_SCAN_STALE_MINUTES} minutes'`,
+      [SAAS_SCAN_LOCK]
+    )).rows[0] || null;
     const topErrors = (await pool.query(`
       SELECT check_error AS error, COUNT(*)::int AS count
         FROM saas_subscription_insights
@@ -14754,9 +14849,14 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
       collisionSample: collisions.slice(0, 5),
       verified: r.verified,
       errors: r.errors,
-      active: r.recent > 0,
+      // A heartbeating lock is now the authoritative signal. Recently-written rows stay in the
+      // test because a scan spending minutes on one slow subscription still counts as running.
+      active: r.recent > 0 || !!lock,
       lastCheckedAt: r.last_checked,
       lastScanError: saasBaseScanLastError,
+      // Which scan actually holds the token, so the page can offer to stop THAT one by name
+      // instead of inferring "something is running" from recently-written rows.
+      runningScan: lock ? { label: lock.label, startedAt: lock.started_at, stopRequested: lock.stop_requested } : null,
       topErrors,
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -15582,6 +15682,14 @@ let saasBasePriceScanRunning = false;
 let saasBaseScanLastError = null;
 async function runSaasBasePriceScan() {
   if (saasBasePriceScanRunning) { console.log('[saas-base] already running, skipping'); return; }
+  // Cross-dyno: the scheduled price-history scan lives on the worker, so the boolean above cannot
+  // see it. Both spend the same Zoho token, and each token refresh invalidates the other's.
+  const lockOwner = await acquireSaasScanLock('base');
+  if (!lockOwner) {
+    saasBaseScanLastError = 'another Zoho scan is already running — try again once it finishes';
+    console.log('[saas-base] lock held by another scan, skipping');
+    return;
+  }
   saasBasePriceScanRunning = true;
   saasBaseScanLastError = null;
   try {
@@ -15598,6 +15706,10 @@ async function runSaasBasePriceScan() {
         console.log(`[saas-base] ${i}/${subs.length} (${ok} ok, ${failed} failed) — token refreshed`);
       }
       i++;
+      if (i % SAAS_SCAN_HEARTBEAT_EVERY === 0 && await saasScanShouldStop(lockOwner)) {
+        console.log(`[saas-base] stopped by request at ${i}/${subs.length} (${ok} ok, ${failed} failed)`);
+        break;
+      }
       try {
         let detail;
         try {
@@ -15643,6 +15755,7 @@ async function runSaasBasePriceScan() {
     saasBaseScanLastError = e.message;
     console.error('[saas-base] scan failed:', e.message);
   } finally {
+    await releaseSaasScanLock(lockOwner);
     saasBasePriceScanRunning = false;
   }
 }
@@ -15767,6 +15880,10 @@ async function fetchSaasPriceChange(apiDomain, accessToken, orgId, subscriptionI
 let saasInsightsScanRunning = false;
 async function runSaasSubscriptionInsightsScan() {
   if (saasInsightsScanRunning) { console.log('[saas-insights] scan already running, skipping'); return; }
+  // This one starts itself ~20 min after every boot, so a deploy during a manual base-price run
+  // used to silently put a second scan on the same Zoho token. It yields to whatever is running.
+  const lockOwner = await acquireSaasScanLock('insights');
+  if (!lockOwner) { console.log('[saas-insights] lock held by another scan, skipping'); return; }
   saasInsightsScanRunning = true;
   try {
     let { accessToken, apiDomain } = await getAdminBooksAuth();
@@ -15801,6 +15918,10 @@ async function runSaasSubscriptionInsightsScan() {
         console.log(`[saas-insights] ${i}/${subs.length} (${ok} ok, ${failed} failed) — token refreshed`);
       }
       i++;
+      if (i % SAAS_SCAN_HEARTBEAT_EVERY === 0 && await saasScanShouldStop(lockOwner)) {
+        console.log(`[saas-insights] stopped by request at ${i}/${subs.length} (${ok} ok, ${failed} failed)`);
+        break;
+      }
       try {
         const { activatedAt, planMonthly, addonsMonthly, planPeriod } = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
         // planPeriod comes free with this same detail call and is what gates pushing to Zoho.
@@ -15839,6 +15960,7 @@ async function runSaasSubscriptionInsightsScan() {
   } catch (e) {
     console.error('[saas-insights] scan failed:', e.message);
   } finally {
+    await releaseSaasScanLock(lockOwner);
     saasInsightsScanRunning = false;
   }
 }
