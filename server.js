@@ -14636,6 +14636,7 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
       errors: r.errors,
       active: r.recent > 0,
       lastCheckedAt: r.last_checked,
+      lastScanError: saasBaseScanLastError,
       topErrors,
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -15297,9 +15298,14 @@ const SAAS_CHURN_RESCAN_AFTER_DAYS = 7;
 // walking each customer's invoice history purely to date the last price change. Separating them
 // takes "unblock the pushes" from hours down to minutes; price history stays on the nightly job.
 let saasBasePriceScanRunning = false;
+// A scan that dies wholesale (bad token, Zoho outage, dyno restart) records nothing per-row, so
+// the page could only show "stopped, no errors" with no way to know why. Kept here and surfaced
+// by the status endpoint.
+let saasBaseScanLastError = null;
 async function runSaasBasePriceScan() {
   if (saasBasePriceScanRunning) { console.log('[saas-base] already running, skipping'); return; }
   saasBasePriceScanRunning = true;
+  saasBaseScanLastError = null;
   try {
     let { accessToken, apiDomain } = await getAdminBooksAuth();
     const allSubs = await getSaasIncreaseSubscriptions();
@@ -15350,6 +15356,7 @@ async function runSaasBasePriceScan() {
     }
     console.log(`[saas-base] complete: ${ok} ok, ${failed} failed`);
   } catch (e) {
+    saasBaseScanLastError = e.message;
     console.error('[saas-base] scan failed:', e.message);
   } finally {
     saasBasePriceScanRunning = false;
