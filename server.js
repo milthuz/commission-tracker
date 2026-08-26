@@ -15485,7 +15485,7 @@ async function fetchSaasSubscriptionTenure(apiDomain, accessToken, orgId, subscr
 // compared (lets the caller tell "checked 24 invoices, price never moved" apart from "barely any
 // invoice history to compare" — both would otherwise look identical as change === null).
 // `change` is { date, before, after } for the most recent differing pair, or null if none found.
-async function fetchSaasPriceChange(apiDomain, accessToken, orgId, subscriptionId, customerId, planCodes, planNames) {
+async function fetchSaasPriceChange(apiDomain, accessToken, orgId, subscriptionId, customerId, subPlanCode, subPlanName) {
   if (!customerId || !subscriptionId) return { points: 0, change: null };
   const listRes = await axios.get(`${apiDomain}/books/v3/invoices`, {
     params: { organization_id: orgId, customer_id: customerId, sort_column: 'date', sort_order: 'D', per_page: SAAS_INSIGHTS_INVOICE_LOOKBACK },
@@ -15517,18 +15517,25 @@ async function fetchSaasPriceChange(apiDomain, accessToken, orgId, subscriptionI
       full = detRes.data?.invoice;
       if (!full) continue;
     }
-    const saasLines = (full.line_items || [])
-      .filter(li => classifyLineType(li.name, li.sku || li.item_code, planCodes, planNames) === 'saas');
+    // Match THIS subscription's plan line only. classifyLineType answers "is this SaaS?", which is
+    // true of the addons too — "Online Ordering", "MEV-WEB Integration" and friends all match its
+    // keyword list. Summing every SaaS line therefore tracked plan + addons, so adding an addon
+    // looked exactly like a price increase and dated a "last price change" that never happened.
+    const wantSku = String(subPlanCode || '').toLowerCase().trim();
+    const wantName = normalizePlanName(subPlanName || '');
+    const isPlanLine = (li) => {
+      const sku = String(li.sku || li.item_code || '').toLowerCase().trim();
+      if (wantSku && sku && sku === wantSku) return true;
+      const n = normalizePlanName(li.name);
+      return !!wantName && !!n && n === wantName;
+    };
+    const planLines = (full.line_items || []).filter(isPlanLine);
+    // Can't identify the plan line on this invoice — skip it rather than fall back to a total that
+    // would include addons. A missing data point is honest; a contaminated one is not.
+    if (!planLines.length) continue;
     const lineAmount = (li) => { const it = parseFloat(li.item_total); return Number.isFinite(it) ? it : ((parseFloat(li.rate) * parseInt(li.quantity)) || 0); };
-    const saasAmount = saasLines.reduce((s, li) => s + lineAmount(li), 0);
-    // Representative plan_code for this invoice — the largest single SaaS line — so a plan
-    // upgrade/downgrade (different sku, still classified 'saas') is distinguishable from a
-    // same-plan price change instead of being silently counted as one.
-    const repPlanCode = saasLines.reduce((best, li) => {
-      const amt = lineAmount(li);
-      return (!best || amt > best.amt) ? { amt, sku: String(li.sku || li.item_code || '').toLowerCase().trim() || null } : best;
-    }, null)?.sku || null;
-    points.push({ date: full.date, amount: Math.round(saasAmount * 100) / 100, planCode: repPlanCode });
+    const planAmount = planLines.reduce((s, li) => s + lineAmount(li), 0);
+    points.push({ date: full.date, amount: Math.round(planAmount * 100) / 100, planCode: wantSku || null });
     await new Promise(r => setTimeout(r, 150));
   }
   for (let i = 0; i < points.length - 1; i++) {
@@ -15584,7 +15591,7 @@ async function runSaasSubscriptionInsightsScan() {
         // Zoho, whereas price history is only informational. Failing it is recorded, not fatal.
         let points = null, change = null, priceErr = null;
         try {
-          ({ points, change } = await fetchSaasPriceChange(apiDomain, accessToken, booksOrgId, s.subscriptionId, s.customerId, planCodes, planNames));
+          ({ points, change } = await fetchSaasPriceChange(apiDomain, accessToken, booksOrgId, s.subscriptionId, s.customerId, s.planCode, s.planName));
         } catch (e) {
           priceErr = `price history: ${e.message}`;
         }
@@ -15649,7 +15656,7 @@ async function runSaasChurnHistoryBackfill() {
         if (freshNumbers.has(num)) { skipped++; continue; }
         try {
           const { activatedAt, cancelledAt } = await fetchSaasSubscriptionTenure(apiDomain, accessToken, orgId, raw.subscription_id);
-          const { change } = await fetchSaasPriceChange(apiDomain, accessToken, booksOrgId, raw.subscription_id, raw.customer_id, planCodes, planNames);
+          const { change } = await fetchSaasPriceChange(apiDomain, accessToken, booksOrgId, raw.subscription_id, raw.customer_id, raw.plan_code || raw.plan?.plan_code, raw.plan_name);
 
           let tenureMonthsAtIncrease = null, monthsIncreaseToCancel = null;
           if (change?.date && activatedAt) {
