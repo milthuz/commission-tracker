@@ -15281,7 +15281,7 @@ const SAAS_INSIGHTS_DELAY_MS = 250; // per-subscription throttle, rate-limit fri
 const SAAS_BASE_DELAY_MS = 120;
 // Zoho access tokens last about an hour; these scans run much longer than that, so the token is
 // re-fetched every N subscriptions (getAdminBooksAuth refreshes it only when actually expired).
-const SAAS_TOKEN_REFRESH_EVERY = 200;
+const SAAS_TOKEN_REFRESH_EVERY = 100;
 // Skip subscriptions checked more recently than this — without it, every run (nightly or manual)
 // rescans EVERY subscription from scratch, which at real-world scale (thousands of subscriptions,
 // each needing several Zoho calls) can take hours and burn through a large share of the org's daily
@@ -15315,7 +15315,18 @@ async function runSaasBasePriceScan() {
       }
       i++;
       try {
-        const { activatedAt, planMonthly, addonsMonthly } = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
+        let detail;
+        try {
+          detail = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
+        } catch (e) {
+          // The Zoho token is SHARED: any other job refreshing it invalidates the one this loop is
+          // holding, so periodic renewal alone can't prevent 401s. Re-fetch and retry this one
+          // subscription before writing it off as a failure.
+          if (!/401/.test(e.message)) throw e;
+          ({ accessToken, apiDomain } = await getAdminBooksAuth());
+          detail = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
+        }
+        const { activatedAt, planMonthly, addonsMonthly } = detail;
         if (planMonthly == null) throw new Error('Zoho returned no plan amount for this subscription');
         await pool.query(`
           INSERT INTO saas_subscription_insights (subscription_number, activated_at, plan_monthly, addons_monthly, checked_at, check_error)
