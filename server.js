@@ -15292,6 +15292,51 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
 // permission AND a Sales-Hub-native confirmation PIN (see saas_push_pins) — this is the one
 // action in the tool that changes real customer billing, so it continues past individual
 // item failures rather than aborting the whole batch (same convention as notifications/send).
+// GET /api/admin/saas-increase/scenarios/:id/items/:itemId/scheduled — what Zoho ACTUALLY has
+// pending for this subscription. Zoho's own UI doesn't surface the scheduled price anywhere
+// convenient (the More menu has no entry for it, and the activity log says a change is pending
+// without the amount), so after a push the only independent confirmation of what was recorded is
+// this endpoint. That matters: "the API returned 200" is not the same as "the right price is
+// scheduled for the right date".
+app.get('/api/admin/saas-increase/scenarios/:id/items/:itemId/scheduled', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  try {
+    const item = (await pool.query(
+      `SELECT * FROM saas_increase_items WHERE id = $1 AND scenario_id = $2`,
+      [req.params.itemId, req.params.id]
+    )).rows[0];
+    if (!item) return res.status(404).json({ error: 'item not found' });
+
+    const live = (await getSaasIncreaseSubscriptions())
+      .find(s => s.orgId === item.org_id && s.subscriptionNumber === item.subscription_number);
+    if (!live?.subscriptionId) return res.status(404).json({ error: 'subscription not found in Zoho' });
+
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    const r = await axios.get(`${apiDomain}/billing/v1/subscriptions/${live.subscriptionId}/scheduledchanges`, {
+      headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, 'X-com-zoho-subscriptions-organizationid': item.org_id },
+      validateStatus: () => true, timeout: 20000,
+    });
+    if (r.status !== 200) return res.status(502).json({ error: `Zoho HTTP ${r.status}`, raw: JSON.stringify(r.data).slice(0, 600) });
+
+    // Zoho's exact response shape for this endpoint isn't documented, so pull the fields from the
+    // likely containers and always return `raw` — a parse that silently finds nothing would be
+    // indistinguishable from "no change scheduled", which is the one thing this must never confuse.
+    const d = r.data || {};
+    const box = d.scheduled_changes || d.scheduled_change || d.subscription || d;
+    const price = box?.plan?.price ?? box?.price ?? null;
+    const planCode = box?.plan?.plan_code ?? box?.plan_code ?? null;
+    const at = box?.scheduled_at || box?.effective_from || box?.next_billing_at || box?.current_term_ends_at || null;
+    res.json({
+      scheduled: price != null || at != null,
+      price: price != null ? Number(price) : null,
+      planCode,
+      effectiveAt: at,
+      expected: { price: Number(item.new_monthly), planCode: item.plan_code },
+      raw: JSON.stringify(d).slice(0, 900),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:execute'))) return;
   const itemIds = Array.isArray(req.body?.itemIds) ? req.body.itemIds.map(Number).filter(Boolean) : [];
