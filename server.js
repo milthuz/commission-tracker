@@ -14621,6 +14621,28 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
     // permanently stuck (e.g. 3107 verified "of 3462" when only 3107 distinct numbers exist).
     const numbers = Array.from(new Set(subs.map(s => s.subscriptionNumber)));
     const duplicates = subs.length - numbers.length;
+
+    // Per-organisation breakdown, plus which subscription numbers exist in MORE THAN ONE org.
+    // Those are the collisions: saas_subscription_insights is keyed by subscription_number alone,
+    // so they share a single row and one org's base plan price can overwrite another's. Note the
+    // per-org `verified` count is necessarily ambiguous for exactly those numbers — the table
+    // cannot say which org a shared row belongs to, which is itself the argument for re-keying it.
+    const verifiedSet = new Set((await pool.query(
+      `SELECT subscription_number FROM saas_subscription_insights
+        WHERE plan_monthly IS NOT NULL AND subscription_number = ANY($1::text[])`, [numbers]
+    )).rows.map(r => r.subscription_number));
+    const orgsByNumber = new Map();
+    const byOrgMap = new Map();
+    for (const sub of subs) {
+      const e = byOrgMap.get(sub.orgId) || { orgId: sub.orgId, orgName: sub.orgName, total: 0, verified: 0 };
+      e.total++;
+      if (verifiedSet.has(sub.subscriptionNumber)) e.verified++;
+      byOrgMap.set(sub.orgId, e);
+      if (!orgsByNumber.has(sub.subscriptionNumber)) orgsByNumber.set(sub.subscriptionNumber, new Set());
+      orgsByNumber.get(sub.subscriptionNumber).add(sub.orgId);
+    }
+    const collisions = Array.from(orgsByNumber.entries()).filter(([, o]) => o.size > 1).map(([n]) => n);
+    const byOrg = Array.from(byOrgMap.values()).sort((a, b) => a.orgName.localeCompare(b.orgName));
     const r = (await pool.query(`
       SELECT COUNT(*) FILTER (WHERE plan_monthly IS NOT NULL)::int AS verified,
              COUNT(*) FILTER (WHERE check_error IS NOT NULL)::int AS errors,
@@ -14638,6 +14660,9 @@ app.get('/api/admin/saas-increase/insights/status', authenticateToken, async (re
     res.json({
       total: numbers.length,
       duplicates,
+      byOrg,
+      crossOrgCollisions: collisions.length,
+      collisionSample: collisions.slice(0, 5),
       verified: r.verified,
       errors: r.errors,
       active: r.recent > 0,
