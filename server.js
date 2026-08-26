@@ -15672,15 +15672,17 @@ async function runSaasSubscriptionInsightsScan() {
     for (const p of plansRes.rows) { const k = normalizeName(p.name); if (k) planNames.set(k, p.plan_code); }
 
     const allSubs = await getSaasIncreaseSubscriptions();
-    // "Fresh" must also mean "has everything this scan is supposed to produce". plan_monthly was
-    // added after the table shipped, so rows written by an earlier build have a recent checked_at
-    // but a NULL plan price — without this condition they'd be skipped as fresh and the plan/addon
-    // split would never be filled in, leaving every push blocked. Any future column added here
-    // needs the same treatment.
+    // "Fresh" must mean "has everything THIS scan produces", not merely "was touched recently".
+    // The fast base-price pass stamps checked_at and plan_monthly for every subscription without
+    // computing any price history, so checking those two alone made this scan consider all 3462
+    // rows up to date and skip them all — the price-history column would have stayed empty
+    // indefinitely. price_points_checked is what this scan actually writes, so that is the test.
+    // Any future column added here needs the same treatment.
     const freshRes = await pool.query(
       `SELECT org_id, subscription_number FROM saas_subscription_insights
         WHERE checked_at > NOW() - INTERVAL '${SAAS_INSIGHTS_RESCAN_AFTER_HOURS} hours'
-          AND plan_monthly IS NOT NULL`
+          AND plan_monthly IS NOT NULL
+          AND price_points_checked IS NOT NULL`
     );
     const freshNumbers = new Set(freshRes.rows.map(r => `${r.org_id}||${r.subscription_number}`));
     const subs = allSubs.filter(s => !freshNumbers.has(`${s.orgId}||${s.subscriptionNumber}`));
