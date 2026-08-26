@@ -2397,6 +2397,10 @@ async function initializeDatabase() {
     // the customer reads on their invoice. Keeping the raw figure removes the conversion entirely
     // from the push and from the merchant email.
     await pool.query(`ALTER TABLE saas_subscription_insights ADD COLUMN IF NOT EXISTS plan_price_period NUMERIC(12,2)`);
+    // Addons, same treatment and for the same reason: they are shown right under the plan price,
+    // so a monthly addon figure sitting beneath a yearly plan price reads as one total. Purely
+    // informational (addons are never pushed), but a figure the reader will add up in their head.
+    await pool.query(`ALTER TABLE saas_subscription_insights ADD COLUMN IF NOT EXISTS addons_price_period NUMERIC(12,2)`);
 
     // Cross-process lock for the two Zoho-heavy SaaS scans. The scheduled price-history scan runs
     // on the WORKER dyno and the manual ones on WEB, so the in-process booleans they each kept
@@ -14719,12 +14723,14 @@ app.get('/api/admin/saas-increase/subscriptions', authenticateToken, async (req,
       const planMonthly = i?.plan_monthly != null ? Number(i.plan_monthly) : null;
       const addonsMonthly = i?.addons_monthly != null ? Number(i.addons_monthly) : null;
       const planPeriod = i?.plan_price_period != null ? Number(i.plan_price_period) : null;
+      const addonsPeriod = i?.addons_price_period != null ? Number(i.addons_price_period) : null;
       return {
         ...s,
         totalMonthly: s.currentMonthly,
         currentMonthly: planMonthly != null ? planMonthly : s.currentMonthly,
         addonsMonthly,
         planPeriod,
+        addonsPeriod,
         baseVerified: planMonthly != null && planPeriod != null,
         activatedAt: i?.activated_at || null,
         lastPriceChangeAt: i?.last_price_change_at || null,
@@ -15744,15 +15750,16 @@ async function runSaasBasePriceScan() {
           } else throw e;
           detail = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
         }
-        const { activatedAt, planMonthly, addonsMonthly, planPeriod } = detail;
+        const { activatedAt, planMonthly, addonsMonthly, planPeriod, addonsPeriod } = detail;
         if (planMonthly == null) throw new Error('Zoho returned no plan amount for this subscription');
         await pool.query(`
-          INSERT INTO saas_subscription_insights (org_id, subscription_number, activated_at, plan_monthly, addons_monthly, plan_price_period, checked_at, check_error)
-          VALUES ($1, $2, $3, $4, $5, $6, NOW(), NULL)
+          INSERT INTO saas_subscription_insights (org_id, subscription_number, activated_at, plan_monthly, addons_monthly, plan_price_period, addons_price_period, checked_at, check_error)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NULL)
           ON CONFLICT (org_id, subscription_number) DO UPDATE SET
             activated_at = COALESCE($3, saas_subscription_insights.activated_at),
-            plan_monthly = $4, addons_monthly = $5, plan_price_period = $6, checked_at = NOW(), check_error = NULL`,
-          [s.orgId, s.subscriptionNumber, activatedAt, planMonthly, addonsMonthly, planPeriod]
+            plan_monthly = $4, addons_monthly = $5, plan_price_period = $6, addons_price_period = $7,
+            checked_at = NOW(), check_error = NULL`,
+          [s.orgId, s.subscriptionNumber, activatedAt, planMonthly, addonsMonthly, planPeriod, addonsPeriod]
         );
         ok++;
       } catch (e) {
@@ -15816,6 +15823,7 @@ async function fetchSaasSubscriptionTenure(apiDomain, accessToken, orgId, subscr
     planMonthly: perMonth(planRaw),
     addonsMonthly: perMonth(addonsRaw),
     planPeriod: planRaw == null ? null : r2Money(planRaw),
+    addonsPeriod: addonsRaw == null ? null : r2Money(addonsRaw),
   };
 }
 
@@ -15939,7 +15947,7 @@ async function runSaasSubscriptionInsightsScan() {
         break;
       }
       try {
-        const { activatedAt, planMonthly, addonsMonthly, planPeriod } = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
+        const { activatedAt, planMonthly, addonsMonthly, planPeriod, addonsPeriod } = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
         // planPeriod comes free with this same detail call and is what gates pushing to Zoho.
         // Discarding it meant a subscription this scan had already fully inspected still showed
         // "incl. addons" until the separate base-price pass re-fetched the identical record.
@@ -15953,12 +15961,13 @@ async function runSaasSubscriptionInsightsScan() {
           priceErr = `price history: ${e.message}`;
         }
         await pool.query(`
-          INSERT INTO saas_subscription_insights (org_id, subscription_number, activated_at, last_price_change_at, last_price_before, last_price_after, price_points_checked, plan_monthly, addons_monthly, plan_price_period, checked_at, check_error)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), $11)
+          INSERT INTO saas_subscription_insights (org_id, subscription_number, activated_at, last_price_change_at, last_price_before, last_price_after, price_points_checked, plan_monthly, addons_monthly, plan_price_period, addons_price_period, checked_at, check_error)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), $12)
           ON CONFLICT (org_id, subscription_number) DO UPDATE SET
             activated_at = $3, last_price_change_at = $4, last_price_before = $5, last_price_after = $6, price_points_checked = $7,
-            plan_monthly = $8, addons_monthly = $9, plan_price_period = $10, checked_at = NOW(), check_error = $11`,
-          [s.orgId, s.subscriptionNumber, activatedAt, change?.date || null, change?.before ?? null, change?.after ?? null, points, planMonthly, addonsMonthly, planPeriod, priceErr]
+            plan_monthly = $8, addons_monthly = $9, plan_price_period = $10, addons_price_period = $11,
+            checked_at = NOW(), check_error = $12`,
+          [s.orgId, s.subscriptionNumber, activatedAt, change?.date || null, change?.before ?? null, change?.after ?? null, points, planMonthly, addonsMonthly, planPeriod, addonsPeriod, priceErr]
         );
         if (priceErr) failed++; else ok++;
       } catch (e) {
