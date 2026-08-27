@@ -521,6 +521,22 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE partner_users ADD COLUMN IF NOT EXISTS invited_at TIMESTAMP`);
     await pool.query(`ALTER TABLE partner_users ADD COLUMN IF NOT EXISTS invite_opened_at TIMESTAMP`);
     await pool.query(`ALTER TABLE partner_users ADD COLUMN IF NOT EXISTS activated_at TIMESTAMP`);
+    // La date de la PREMIERE invitation. `invited_at` est ecrase a chaque renvoi (qui remet aussi
+    // invite_opened_at et activated_at a NULL) : sans cette colonne, relancer quelqu'un efface la
+    // trace du premier envoi. Demande de David le 2026-08-19, avant la relance des 175 comptes
+    // Moneris jamais actives.
+    await pool.query(`ALTER TABLE partner_users ADD COLUMN IF NOT EXISTS first_invited_at TIMESTAMP`);
+    // Remplissage IDEMPOTENT et volontairement NON garde par une cle sync_state, contrairement aux
+    // migrations uniques de ce fichier : il ne touche que des NULL, donc il ne peut rien defaire.
+    // Le laisser tourner a chaque demarrage est meme un AVANTAGE — une future reprise qui poserait
+    // `invited_at` directement en base serait rattrapee au redemarrage suivant, ce qu'un one-shot
+    // garde ne ferait pas.
+    {
+      const rFi = await pool.query(
+        `UPDATE partner_users SET first_invited_at = invited_at
+          WHERE first_invited_at IS NULL AND invited_at IS NOT NULL`);
+      if (rFi.rowCount) console.log(`📅 [partner-users] premiere invitation renseignee sur ${rFi.rowCount} compte(s)`);
+    }
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_access_token TEXT`);
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_refresh_token TEXT`);
     await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS crm_expires_at BIGINT`);
@@ -5039,12 +5055,13 @@ app.post('/api/partner-portal/team/invite', authenticatePartnerToken, async (req
       // partner_id = $1 in the DO UPDATE is deliberate and load-bearing: it re-asserts ownership
       // on the conflict path so a re-invite can never leave a row pointing at another company
       // (mirrors the internal admin twin, /api/admin/partners/:id/invite-admin).
-      `INSERT INTO partner_users (partner_id, email, display_name, role, status, invite_token_hash, invite_expires_at, invited_by, locale, invited_at, invite_opened_at, activated_at)
-       VALUES ($1,$2,$3,$4,'invited',$5,$6,$7,$8,NOW(),NULL,NULL)
+      `INSERT INTO partner_users (partner_id, email, display_name, role, status, invite_token_hash, invite_expires_at, invited_by, locale, invited_at, first_invited_at, invite_opened_at, activated_at)
+       VALUES ($1,$2,$3,$4,'invited',$5,$6,$7,$8,NOW(),NOW(),NULL,NULL)
        ON CONFLICT (email) DO UPDATE SET
          partner_id = $1, display_name = $3, role = $4, status = 'invited', invite_token_hash = $5,
          invite_expires_at = $6, invited_by = $7, locale = $8,
-         invited_at = NOW(), invite_opened_at = NULL, activated_at = NULL, updated_at = CURRENT_TIMESTAMP`,
+         invited_at = NOW(), first_invited_at = COALESCE(partner_users.first_invited_at, NOW()),
+             invite_opened_at = NULL, activated_at = NULL, updated_at = CURRENT_TIMESTAMP`,
       [req.partnerUser.partnerId, email, name || null, role, sha256hex(raw), expires, req.partnerUser.email, locale]
     );
     const inviteUrl = `${PARTNER_WEB_BASE(locale)}/partner-portal/accept-invite?token=${raw}`;
@@ -5959,7 +5976,8 @@ app.post('/api/admin/partner-users/invite', authenticateToken, async (req, res) 
           // NI le role NI la langue ne sont touches : ils appartiennent au compte, pas a l'envoi.
           `UPDATE partner_users
               SET status = 'invited', invite_token_hash = $2, invite_expires_at = $3, invited_by = $4,
-                  invited_at = NOW(), invite_opened_at = NULL, activated_at = NULL,
+                  invited_at = NOW(), first_invited_at = COALESCE(first_invited_at, NOW()),
+                  invite_opened_at = NULL, activated_at = NULL,
                   updated_at = CURRENT_TIMESTAMP
             WHERE id = $1`,
           [u.id, sha256hex(raw), expires, actor]
@@ -6150,7 +6168,7 @@ app.get('/api/admin/partner-invites', authenticateToken, async (req, res) => {
   try {
     const rows = (await pool.query(
       `SELECT pu.id, pu.email, pu.display_name, pu.role, pu.status, pu.locale,
-              pu.invited_by, pu.invited_at, pu.invite_opened_at, pu.activated_at,
+              pu.invited_by, pu.invited_at, pu.first_invited_at, pu.invite_opened_at, pu.activated_at,
               pu.invite_expires_at, pu.last_login_at, p.name AS partner_name
          FROM partner_users pu JOIN partners p ON p.id = pu.partner_id
         ORDER BY COALESCE(pu.invited_at, pu.created_at) DESC NULLS LAST, pu.id DESC`
@@ -6158,7 +6176,8 @@ app.get('/api/admin/partner-invites', authenticateToken, async (req, res) => {
     res.json({ invites: rows.map((r) => ({
       id: r.id, email: r.email, name: r.display_name, role: r.role, status: r.status,
       locale: r.locale, partnerName: r.partner_name, invitedBy: r.invited_by,
-      invitedAt: r.invited_at, openedAt: r.invite_opened_at, activatedAt: r.activated_at,
+      invitedAt: r.invited_at, firstInvitedAt: r.first_invited_at,
+      openedAt: r.invite_opened_at, activatedAt: r.activated_at,
       expiresAt: r.invite_expires_at, lastLoginAt: r.last_login_at,
     })) });
   } catch (e) {
@@ -6224,11 +6243,13 @@ app.get('/api/admin/partner-invites/export', authenticateToken, async (req, res)
     };
     const T = en
       ? { email: 'Email', name: 'Name', partner: 'Partner', role: 'Role', lang: 'Language',
-          status: 'Status', invited: 'Invitation sent (Montreal time)', opened: 'Link opened',
+          status: 'Status', invited: 'Invitation sent (Montreal time)', first: 'First invitation sent',
+          opened: 'Link opened',
           activated: 'Account activated', last: 'Last sign-in', by: 'Invited by', src: 'Source',
           migrated: 'migrated from the old portal', created: 'created in Sales Hub', sheet: 'Invited users' }
       : { email: 'Courriel', name: 'Nom', partner: 'Partenaire', role: 'Rôle', lang: 'Langue',
-          status: 'Statut', invited: 'Invitation envoyée (heure de Montréal)', opened: 'Lien ouvert',
+          status: 'Statut', invited: 'Invitation envoyée (heure de Montréal)', first: 'Première invitation',
+          opened: 'Lien ouvert',
           activated: 'Compte activé', last: 'Dernière connexion', by: 'Invité par', src: 'Origine',
           migrated: 'reprise de l’ancien portail', created: 'créé dans Sales Hub', sheet: 'Comptes invités' };
 
@@ -6240,6 +6261,7 @@ app.get('/api/admin/partner-invites/export', authenticateToken, async (req, res)
       [T.lang]: r.locale || '',
       [T.status]: r.status,
       [T.invited]: dt(r.invited_at),
+      [T.first]: dt(r.first_invited_at),
       [T.opened]: dt(r.invite_opened_at),
       [T.activated]: dt(r.activated_at),
       [T.last]: dt(r.last_login_at),
@@ -6251,10 +6273,10 @@ app.get('/api/admin/partner-invites/export', authenticateToken, async (req, res)
     // En-tetes explicites : sans `header`, json_to_sheet deduit les colonnes de la PREMIERE ligne
     // et un export vide sortirait sans aucun en-tete.
     const colonnes = [T.email, T.name, T.partner, T.role, T.lang, T.status,
-                      T.invited, T.opened, T.activated, T.last, T.by, T.src];
+                      T.invited, T.first, T.opened, T.activated, T.last, T.by, T.src];
     const ws = xlsx.utils.json_to_sheet(lignes, { header: colonnes });
     ws['!cols'] = [{ wch: 34 }, { wch: 24 }, { wch: 16 }, { wch: 10 }, { wch: 8 }, { wch: 10 },
-                   { wch: 26 }, { wch: 17 }, { wch: 17 }, { wch: 17 }, { wch: 28 }, { wch: 26 }];
+                   { wch: 26 }, { wch: 20 }, { wch: 17 }, { wch: 17 }, { wch: 17 }, { wch: 28 }, { wch: 26 }];
     ws['!autofilter'] = { ref: xlsx.utils.encode_range({ s: { c: 0, r: 0 }, e: { c: colonnes.length - 1, r: Math.max(lignes.length, 1) } }) };
     xlsx.utils.book_append_sheet(wb, ws, String(T.sheet).slice(0, 31));
     const buf = xlsx.write(wb, { type: 'buffer', bookType: 'xlsx' });
@@ -6371,12 +6393,13 @@ app.post('/api/admin/partners/:id/invite-admin', authenticateToken, async (req, 
     const locale = isFrLocale(req.body.locale) ? 'fr' : 'en';
     const partnerName = partner.name || null;
     await pool.query(
-      `INSERT INTO partner_users (partner_id, email, display_name, role, status, invite_token_hash, invite_expires_at, invited_by, locale, invited_at, invite_opened_at, activated_at)
-       VALUES ($1,$2,$3,'admin','invited',$4,$5,$6,$7,NOW(),NULL,NULL)
+      `INSERT INTO partner_users (partner_id, email, display_name, role, status, invite_token_hash, invite_expires_at, invited_by, locale, invited_at, first_invited_at, invite_opened_at, activated_at)
+       VALUES ($1,$2,$3,'admin','invited',$4,$5,$6,$7,NOW(),NOW(),NULL,NULL)
        ON CONFLICT (email) DO UPDATE SET
          partner_id = $1, display_name = $3, role = 'admin', status = 'invited', invite_token_hash = $4,
          invite_expires_at = $5, invited_by = $6, locale = $7,
-         invited_at = NOW(), invite_opened_at = NULL, activated_at = NULL, updated_at = CURRENT_TIMESTAMP`,
+         invited_at = NOW(), first_invited_at = COALESCE(partner_users.first_invited_at, NOW()),
+             invite_opened_at = NULL, activated_at = NULL, updated_at = CURRENT_TIMESTAMP`,
       [partnerId, email, name || null, sha256hex(raw), expires, actor, locale]
     );
     const inviteUrl = `${PARTNER_WEB_BASE(locale)}/partner-portal/accept-invite?token=${raw}`;
