@@ -2301,6 +2301,10 @@ async function initializeDatabase() {
     // increase: an untouched subscription is unfinished work, a skipped one is a decision, and
     // only the decision should let a segment drop out of the To-do list.
     await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS skipped BOOLEAN NOT NULL DEFAULT FALSE`);
+    // The notice's headline, drafted alongside the subject and body so a hand-picked template's
+    // title survives a reload and reaches the send — it was previously recomputed at send time
+    // from the hardcoded default, which silently ignored the template's own heading.
+    await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notify_heading VARCHAR(300)`);
     // Widen scenario-item uniqueness to include the org. Zoho subscription numbers are per-ORG,
     // so (scenario_id, subscription_number) meant two different customers sharing a number could
     // not both be in one scenario — the second silently overwrote the first, losing a real
@@ -2369,6 +2373,61 @@ async function initializeDatabase() {
         updated_at = NOW()
       WHERE is_default = true
         AND body_en = 'Hello {{customerName}},\n\nWe''re writing to let you know that the monthly price of your {{planName}} will change from {{currentMonthly}} to {{newMonthly}} per month, effective at your next renewal.\n\nIf you have any questions about this change, just reply to this email — we''re happy to help.\n\nThank you for being a Cluster Systems customer.\n\nBest regards,';
+    `);
+    // The notice's headline. Templates carried only a subject and a body, so an admin who wrote
+    // their own template still got the generic hardcoded title above their text.
+    await pool.query(`ALTER TABLE saas_increase_email_templates ADD COLUMN IF NOT EXISTS heading_en VARCHAR(300)`);
+    await pool.query(`ALTER TABLE saas_increase_email_templates ADD COLUMN IF NOT EXISTS heading_fr VARCHAR(300)`);
+
+    // Bring the shipped template up to the current copy — the reason for the increase, the
+    // "you don't need to do anything" reassurance, per-period placeholders instead of the
+    // monthly-only ones, and no dangling "Best regards," now that notices are signed by the
+    // company. Same guard as the backfill below: matched against the exact previous text, so a
+    // template an admin has edited is never overwritten. David does not want to author these,
+    // so the library has to arrive correct rather than merely non-empty.
+    await pool.query(`
+      UPDATE saas_increase_email_templates SET
+        name       = 'Avis de hausse — standard',
+        subject_en = 'A change to your {{planName}} pricing',
+        subject_fr = 'Changement au prix de votre {{planName}}',
+        heading_en = 'A change to your Cluster subscription pricing.',
+        heading_fr = 'Changement au prix de votre abonnement Cluster.',
+        body_en    = 'Hello {{customerName}},
+
+At Cluster, we invest continuously in the platform your business runs on — the software, the integrations and the support behind them. To sustain that work, the {{billingPeriodAdj}} price of your {{planName}} will change from {{currentPrice}} to {{newPrice}} {{billingPeriod}}, effective {{effectiveDate}}.
+
+You do not need to do anything. The new price applies automatically from that date.
+
+If you have any questions about this change, reply to this email and our team will be happy to help.
+
+Thank you for being a Cluster Systems customer.',
+        body_fr    = 'Bonjour {{customerName}},
+
+Chez Cluster, nous investissons continuellement dans la plateforme qui fait rouler votre commerce — le logiciel, les intégrations et le soutien qui les accompagne. Pour soutenir ces investissements, le prix {{billingPeriodAdj}} de votre {{planName}} passera de {{currentPrice}} à {{newPrice}} {{billingPeriod}}, en vigueur le {{effectiveDate}}.
+
+Vous n''avez rien à faire. Le nouveau prix s''appliquera automatiquement à compter de cette date.
+
+Pour toute question à ce sujet, répondez à ce courriel et notre équipe se fera un plaisir de vous aider.
+
+Merci d''être client de Cluster Systems.',
+        updated_at = NOW()
+      WHERE is_default = true AND body_en = 'Hello {{customerName}},
+
+We''re writing to let you know that the monthly price of your {{planName}} will change from {{currentMonthly}} to {{newMonthly}} per month, effective {{effectiveDate}}.
+
+If you have any questions about this change, just reply to this email — we''re happy to help.
+
+Thank you for being a Cluster Systems customer.
+
+Best regards,' AND body_fr = 'Bonjour {{customerName}},
+
+Nous vous écrivons pour vous informer que le prix mensuel de votre {{planName}} passera de {{currentMonthly}} à {{newMonthly}} par mois, à compter du {{effectiveDate}}.
+
+Pour toute question à ce sujet, répondez simplement à ce courriel — il nous fera plaisir de vous aider.
+
+Merci d''être client de Cluster Systems.
+
+Cordialement,';
     `);
 
     // Per-subscription insights for the SaaS Increase tool — subscription tenure + when the
@@ -15009,7 +15068,7 @@ function serializeSaasIncreaseItem(row) {
     skipped: row.skipped === true,
     pushedBy: row.pushed_by, pushedAt: row.pushed_at,
     notifyTo: row.notify_to, notifySubject: row.notify_subject, notifyBody: row.notify_body,
-    notifyStatus: row.notify_status, notifyError: row.notify_error,
+    notifyStatus: row.notify_status, notifyError: row.notify_error, notifyHeading: row.notify_heading,
     notifiedBy: row.notified_by, notifiedAt: row.notified_at,
   };
 }
@@ -15417,7 +15476,7 @@ app.get('/api/admin/saas-increase/email-templates', authenticateToken, async (re
   try {
     const rows = (await pool.query(`SELECT * FROM saas_increase_email_templates ORDER BY is_default DESC, name`)).rows;
     res.json({ templates: rows.map(r => ({
-      id: r.id, name: r.name, subjectEn: r.subject_en, bodyEn: r.body_en, subjectFr: r.subject_fr, bodyFr: r.body_fr, isDefault: r.is_default,
+      id: r.id, name: r.name, subjectEn: r.subject_en, bodyEn: r.body_en, subjectFr: r.subject_fr, bodyFr: r.body_fr, isDefault: r.is_default, headingEn: r.heading_en, headingFr: r.heading_fr,
     })) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -15425,29 +15484,31 @@ app.get('/api/admin/saas-increase/email-templates', authenticateToken, async (re
 // POST /api/admin/saas-increase/email-templates — create a template.
 app.post('/api/admin/saas-increase/email-templates', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
-  const { name, subjectEn, bodyEn, subjectFr, bodyFr } = req.body || {};
+  const { name, subjectEn, bodyEn, subjectFr, bodyFr, headingEn, headingFr } = req.body || {};
   if (!name || !subjectEn || !bodyEn || !subjectFr || !bodyFr) return res.status(400).json({ error: 'name, subjectEn, bodyEn, subjectFr, bodyFr are all required' });
   const actor = req.user.realAdminEmail || req.user.email || 'unknown';
   try {
     const row = (await pool.query(
-      `INSERT INTO saas_increase_email_templates (name, subject_en, body_en, subject_fr, body_fr, created_by) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [name, subjectEn, bodyEn, subjectFr, bodyFr, actor]
+      `INSERT INTO saas_increase_email_templates (name, subject_en, body_en, subject_fr, body_fr, heading_en, heading_fr, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [name, subjectEn, bodyEn, subjectFr, bodyFr, headingEn || null, headingFr || null, actor]
     )).rows[0];
-    res.json({ template: { id: row.id, name: row.name, subjectEn: row.subject_en, bodyEn: row.body_en, subjectFr: row.subject_fr, bodyFr: row.body_fr, isDefault: row.is_default } });
+    res.json({ template: { id: row.id, name: row.name, subjectEn: row.subject_en, bodyEn: row.body_en, subjectFr: row.subject_fr, bodyFr: row.body_fr, headingEn: row.heading_en, headingFr: row.heading_fr, isDefault: row.is_default } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // PUT /api/admin/saas-increase/email-templates/:id — update a template.
 app.put('/api/admin/saas-increase/email-templates/:id', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
-  const { name, subjectEn, bodyEn, subjectFr, bodyFr } = req.body || {};
+  const { name, subjectEn, bodyEn, subjectFr, bodyFr, headingEn, headingFr } = req.body || {};
   try {
     const row = (await pool.query(
       `UPDATE saas_increase_email_templates SET
          name = COALESCE($1, name), subject_en = COALESCE($2, subject_en), body_en = COALESCE($3, body_en),
-         subject_fr = COALESCE($4, subject_fr), body_fr = COALESCE($5, body_fr), updated_at = NOW()
-       WHERE id = $6 RETURNING *`,
-      [name || null, subjectEn || null, bodyEn || null, subjectFr || null, bodyFr || null, req.params.id]
+         subject_fr = COALESCE($4, subject_fr), body_fr = COALESCE($5, body_fr),
+         heading_en = COALESCE($6, heading_en), heading_fr = COALESCE($7, heading_fr), updated_at = NOW()
+       WHERE id = $8 RETURNING *`,
+      [name || null, subjectEn || null, bodyEn || null, subjectFr || null, bodyFr || null,
+       headingEn || null, headingFr || null, req.params.id]
     )).rows[0];
     if (!row) return res.status(404).json({ error: 'template not found' });
     res.json({ success: true });
@@ -15478,9 +15539,12 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authentic
   const templateId = req.body?.templateId != null ? Number(req.body.templateId) : null;
   if (!itemIds.length) return res.status(400).json({ error: 'itemIds required' });
   try {
+    // No template chosen means "use the standard one", not "use copy buried in the source". The
+    // shipped template IS the standard notice, so this is what makes the library the single place
+    // the wording lives — and the only place David has to look to change it.
     const template = templateId
       ? (await pool.query(`SELECT * FROM saas_increase_email_templates WHERE id = $1`, [templateId])).rows[0]
-      : null;
+      : (await pool.query(`SELECT * FROM saas_increase_email_templates WHERE is_default = true ORDER BY id LIMIT 1`)).rows[0] || null;
     const items = (await pool.query(
       // A skipped item is an explicit "do not touch this customer" for this scenario. Filtering
       // it here, rather than trusting the caller's id list, means the decision holds even if a
@@ -15505,13 +15569,14 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authentic
       // invoice could disagree by a few cents on annual plans.
       const curPeriod = periodByKey.get(`${it.org_id}||${it.subscription_number}`) ?? null;
       const nxtPeriod = curPeriod == null ? null : saasNewPeriodPrice(curPeriod, it.increase_type, it.increase_value);
-      let subject, body;
+      let subject, body, heading;
       if (template) {
         const vars = saasTemplatePlaceholders({ customerName: it.customer_name, planName: it.plan_name, currentMonthly: it.current_monthly, newMonthly: it.new_monthly, currentPeriod: curPeriod, newPeriod: nxtPeriod, effectiveDate, interval: liveSub?.interval, intervalUnit: liveSub?.intervalUnit, lang });
         subject = renderSaasTemplate(lang === 'en' ? template.subject_en : template.subject_fr, vars);
         body = renderSaasTemplate(lang === 'en' ? template.body_en : template.body_fr, vars);
+        heading = renderSaasTemplate((lang === 'en' ? template.heading_en : template.heading_fr) || saasIncreaseDraftCopy({ lang }).heading, vars);
       } else {
-        ({ subject, body } = saasIncreaseDraftCopy({
+        ({ subject, body, heading } = saasIncreaseDraftCopy({
           customerName: it.customer_name, planName: it.plan_name,
           currentMonthly: it.current_monthly, newMonthly: it.new_monthly,
           currentPeriod: curPeriod, newPeriod: nxtPeriod, effectiveDate,
@@ -15519,9 +15584,10 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authentic
         }));
       }
       const row = (await pool.query(
-        `UPDATE saas_increase_items SET notify_to = $1, notify_subject = $2, notify_body = $3, notify_status = 'drafted', notify_error = NULL
-         WHERE id = $4 RETURNING *`,
-        [to, subject, body, it.id]
+        `UPDATE saas_increase_items SET notify_to = $1, notify_subject = $2, notify_body = $3, notify_heading = $4,
+           notify_status = 'drafted', notify_error = NULL
+         WHERE id = $5 RETURNING *`,
+        [to, subject, body, heading || null, it.id]
       )).rows[0];
       results.push(serializeSaasIncreaseItem(row));
     }
@@ -15641,7 +15707,7 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
           };
         }
       }
-      const html = buildSaasNoticeEmailHtml({ heading: noticeHeading, bodyText, frontendBase, change, lang, toAddress: to });
+      const html = buildSaasNoticeEmailHtml({ heading: it.heading || dbRow?.notify_heading || noticeHeading, bodyText, frontendBase, change, lang, toAddress: to });
       const r = await sendMail(to, subject, html, {
         from: { name: SAAS_NOTICE_FROM_NAME, address: SAAS_NOTICE_FROM }, replyTo: SAAS_NOTICE_FROM,
       });
