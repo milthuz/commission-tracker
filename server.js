@@ -15267,50 +15267,81 @@ const SAAS_NOTICE_FROM_NAME = process.env.SAAS_NOTICE_FROM_NAME || 'Cluster Syst
 // thing a price-change notice needs and prose cannot do as well: the change itself, laid out so it
 // can be read at a glance and checked against the invoice that follows. Table-based and
 // inline-styled throughout — Outlook supports neither flexbox nor grid.
-function buildSaasNoticeEmailHtml({ bodyText, signatureHtml, frontendBase, change, lang }) {
+function buildSaasNoticeEmailHtml({ heading, bodyText, frontendBase, change, toAddress, lang }) {
   const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const NAVY = '#1c2434', ORANGE = '#fe6523', LINE = '#e6ebf2', MUTED = '#64748b';
   const L = lang === 'en'
-    ? { heading: 'Summary of the change', plan: 'Plan', current: 'Current price', next: 'New price', when: 'Takes effect', note: 'Nothing else about your service changes. Your plan, features and support stay exactly as they are today.' }
-    : { heading: 'Résumé du changement', plan: 'Forfait', current: 'Prix actuel', next: 'Nouveau prix', when: 'En vigueur', note: "Rien d'autre ne change à votre service. Votre forfait, vos fonctionnalités et votre soutien restent exactement les mêmes." };
+    ? {
+        colItem: 'Service', colChange: 'Price adjustment',
+        plan: 'Plan', current: 'Current price', next: 'New price', when: 'Takes effect',
+        invoice: 'To see your current pricing, check your most recent invoice.',
+        note: 'Nothing else about your service changes. Your plan, features and support stay exactly as they are today.',
+        support: 'Customer support', links: ['clusterpos.com', 'Support'],
+        sentTo: (a) => `This email was sent to ${a}.`,
+        rights: 'Cluster Systems, 2026. All rights reserved.',
+      }
+    : {
+        colItem: 'Service', colChange: 'Ajustement du prix',
+        plan: 'Forfait', current: 'Prix actuel', next: 'Nouveau prix', when: 'En vigueur le',
+        invoice: 'Pour voir votre tarif actuel, consultez votre plus récente facture.',
+        note: "Rien d'autre ne change à votre service. Votre forfait, vos fonctionnalités et votre soutien restent exactement les mêmes.",
+        support: 'Soutien à la clientèle', links: ['clusterpos.com', 'Soutien'],
+        sentTo: (a) => `Le présent courriel a été envoyé à l'adresse ${a}.`,
+        rights: 'Cluster Systems, 2026. Tous droits réservés.',
+      };
 
-  const row = (label, value, strong) => `
-    <tr>
-      <td style="padding:9px 0;font-size:13px;color:#64748b;white-space:nowrap">${esc(label)}</td>
-      <td style="padding:9px 0;font-size:${strong ? '15px' : '14px'};color:#1c2434;font-weight:${strong ? '700' : '500'};text-align:right">${esc(value)}</td>
-    </tr>`;
+  // A bordered table with a filled header row, rather than a list of label/value pairs: the change
+  // is the point of the email, and a table is what a customer expects to check a bill against.
+  const cell = (v, opts = {}) =>
+    `<td style="padding:11px 14px;border-top:1px solid ${LINE};font-size:13px;color:${opts.strong ? NAVY : MUTED};font-weight:${opts.strong ? '700' : '400'};${opts.right ? 'text-align:right;' : ''}">${esc(v)}</td>`;
+  const table = !change ? '' : `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid ${LINE};border-radius:8px;border-collapse:separate;overflow:hidden">
+      <tr>
+        <th align="left" style="padding:11px 14px;background:${NAVY};color:#ffffff;font-size:12px;font-weight:700;letter-spacing:.03em">${esc(L.colItem)}</th>
+        <th align="right" style="padding:11px 14px;background:${NAVY};color:#ffffff;font-size:12px;font-weight:700;letter-spacing:.03em">${esc(L.colChange)}</th>
+      </tr>
+      ${change.planName ? `<tr>${cell(L.plan)}${cell(saasPlanLabel(change.planName), { right: true, strong: true })}</tr>` : ''}
+      <tr>${cell(L.current)}${cell(change.currentPrice, { right: true })}</tr>
+      <tr>${cell(L.next)}${cell(change.newPrice, { right: true, strong: true })}</tr>
+      ${change.effectiveDate ? `<tr>${cell(L.when)}${cell(change.effectiveDate, { right: true, strong: true })}</tr>` : ''}
+    </table>`;
 
-  const panel = !change ? '' : `
-    <tr><td style="padding:8px 36px 0">
-      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f8fafc;border:1px solid #e6ebf2;border-radius:12px">
-        <tr><td style="padding:18px 22px">
-          <p style="margin:0 0 6px;font-size:11px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:#94a3b8">${esc(L.heading)}</p>
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-            ${change.planName ? row(L.plan, saasPlanLabel(change.planName)) : ''}
-            ${row(L.current, change.currentPrice)}
-            ${row(L.next, change.newPrice, true)}
-            ${change.effectiveDate ? row(L.when, change.effectiveDate) : ''}
-          </table>
-        </td></tr>
-      </table>
-      <p style="margin:14px 2px 0;font-size:12px;line-height:1.6;color:#94a3b8">${esc(L.note)}</p>
-    </td></tr>`;
+  const link = (href, label) => `<a href="${href}" style="color:#c7d0dd;text-decoration:none;font-size:12px;font-weight:700">${esc(label)}</a>`;
 
   return `<!doctype html><html><body style="margin:0;padding:0;background:#eef1f6;font-family:Arial,Helvetica,sans-serif">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f6;padding:32px 12px">
         <tr><td align="center">
           <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(16,23,34,.08),0 10px 28px rgba(16,23,34,.07)">
-            <tr><td style="background:#1c2434;padding:22px 36px">
+            <tr><td style="background:${NAVY};padding:22px 36px">
               <img src="${frontendBase}/cluster-logo-email.png" width="118" height="28" alt="Cluster" style="display:block;border:0">
             </td></tr>
-            <tr><td style="height:4px;background:#fe6523;font-size:0;line-height:0">&nbsp;</td></tr>
-            <tr><td style="padding:32px 36px 8px;font-size:14px;color:#1c2434;line-height:1.6">
+            <tr><td style="height:4px;background:${ORANGE};font-size:0;line-height:0">&nbsp;</td></tr>
+
+            ${heading ? `<tr><td style="padding:30px 36px 0">
+              <h1 style="margin:0;font-size:21px;line-height:1.3;font-weight:700;color:${NAVY}">${esc(heading)}</h1>
+            </td></tr>` : ''}
+
+            <tr><td style="padding:${heading ? '18px' : '30px'} 36px 0;font-size:14px;color:${NAVY};line-height:1.65">
               <div style="white-space:pre-wrap">${esc(bodyText)}</div>
-              ${signatureHtml || ''}
             </td></tr>
-            ${panel}
-            <tr><td style="padding:22px 36px 0"><div style="border-top:1px solid #eef1f6;font-size:0;line-height:0">&nbsp;</div></td></tr>
-            <tr><td style="padding:16px 36px 30px">
-              <p style="margin:0;color:#94a3b8;font-size:12px">Cluster Systems · <a href="https://clusterpos.com" style="color:#94a3b8;text-decoration:none">clusterpos.com</a> · <a href="mailto:${SAAS_NOTICE_FROM}" style="color:#94a3b8;text-decoration:none">${SAAS_NOTICE_FROM}</a></p>
+
+            ${table ? `<tr><td style="padding:20px 36px 0">${table}
+              <p style="margin:14px 0 0;font-size:12px;line-height:1.6;color:${MUTED}">${esc(L.invoice)}</p>
+              <p style="margin:8px 0 0;font-size:12px;line-height:1.6;color:#94a3b8">${esc(L.note)}</p>
+            </td></tr>` : ''}
+
+            <tr><td style="padding:26px 36px 30px;font-size:14px;color:${NAVY};line-height:1.65">
+              <div style="font-weight:700">${esc(L.support)}</div>
+              <div style="color:${MUTED}">Cluster Systems</div>
+            </td></tr>
+
+            <tr><td style="background:${NAVY};padding:18px 36px">
+              ${link('https://clusterpos.com', L.links[0])}
+              <span style="color:#3d4759">&nbsp;&nbsp;·&nbsp;&nbsp;</span>
+              ${link(`mailto:${SAAS_NOTICE_FROM}`, L.links[1])}
+              <div style="height:1px;background:#2b3547;margin:16px 0 12px;font-size:0;line-height:0">&nbsp;</div>
+              <p style="margin:0 0 5px;color:#8f9aad;font-size:11px;line-height:1.6">${toAddress ? esc(L.sentTo(toAddress)) : ''}</p>
+              <p style="margin:0;color:#8f9aad;font-size:11px;line-height:1.6">${esc(L.rights)}</p>
             </td></tr>
           </table>
         </td></tr>
@@ -15330,11 +15361,30 @@ function saasIncreaseDraftCopy({ customerName, planName, currentMonthly, newMont
   const w = saasBillingPeriodWords(interval, intervalUnit, lang);
   const whenEn = effectiveDate ? `on ${formatSaasEffectiveDate(effectiveDate, 'en')}` : 'at your next renewal';
   const whenFr = effectiveDate ? `le ${formatSaasEffectiveDate(effectiveDate, 'fr')}` : 'à votre prochain renouvellement';
-  const subject = lang === 'en' ? `An update to your ${plan} pricing` : `Une mise à jour du prix de votre ${plan}`;
+  const subject = lang === 'en' ? `A change to your ${plan} pricing` : `Changement au prix de votre ${plan}`;
+  const heading = lang === 'en' ? 'A change to your Cluster subscription pricing.' : 'Changement au prix de votre abonnement Cluster.';
+  // No "Best regards," sign-off: the notice is signed by the company in the template's own
+  // closing block, and a dangling salutation with nothing under it reads as a broken email.
   const body = lang === 'en'
-    ? `Hello${greeting},\n\nWe're writing to let you know that the ${w.adj} price of your ${plan} will change from ${money(curr)} to ${money(next)} ${w.per}, effective ${whenEn}.\n\nIf you have any questions about this change, just reply to this email — we're happy to help.\n\nThank you for being a Cluster Systems customer.\n\nBest regards,`
-    : `Bonjour${greeting},\n\nNous vous écrivons pour vous informer que le prix ${w.adj} de votre ${plan} passera de ${money(curr)} à ${money(next)} ${w.per}, ${whenFr}.\n\nPour toute question à ce sujet, répondez simplement à ce courriel — il nous fera plaisir de vous aider.\n\nMerci d'être client de Cluster Systems.\n\nCordialement,`;
-  return { subject, body };
+    ? `Hello${greeting},
+
+At Cluster, we invest continuously in the platform your business runs on — the software, the integrations and the support behind them. To sustain that work, the ${w.adj} price of your ${plan} will change from ${money(curr)} to ${money(next)} ${w.per}, effective ${whenEn}.
+
+You do not need to do anything. The new price applies automatically from that date.
+
+If you have any questions about this change, reply to this email and our team will be happy to help.
+
+Thank you for being a Cluster Systems customer.`
+    : `Bonjour${greeting},
+
+Chez Cluster, nous investissons continuellement dans la plateforme qui fait rouler votre commerce — le logiciel, les intégrations et le soutien qui les accompagne. Pour soutenir ces investissements, le prix ${w.adj} de votre ${plan} passera de ${money(curr)} à ${money(next)} ${w.per}, ${whenFr}.
+
+Vous n'avez rien à faire. Le nouveau prix s'appliquera automatiquement à compter de cette date.
+
+Pour toute question à ce sujet, répondez à ce courriel et notre équipe se fera un plaisir de vous aider.
+
+Merci d'être client de Cluster Systems.`;
+  return { subject, body, heading };
 }
 
 // Plain {{token}} substitution for admin-authored templates — no template engine, no eval, just
@@ -15486,15 +15536,16 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/preview', authent
   if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
   const bodyText = String(req.body?.body || '');
   try {
-    const repName = req.user.name || req.user.email || '';
-    const signatureHtml = await resolveSignatureHtml(req.user, repName);
     const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
     const lang = req.body?.lang === 'fr' ? 'fr' : 'en';
     const change = req.body?.change || {
       planName: 'Cluster OS — Business', currentPrice: '$119.00', newPrice: '$129.00',
       effectiveDate: formatSaasEffectiveDate(new Date(Date.now() + 45 * 86400000).toISOString().slice(0, 10), lang),
     };
-    const html = buildSaasNoticeEmailHtml({ bodyText, signatureHtml, frontendBase, change, lang });
+    const html = buildSaasNoticeEmailHtml({
+      heading: req.body?.heading || saasIncreaseDraftCopy({ lang }).heading,
+      bodyText, frontendBase, change, lang, toAddress: (req.user.email || '').trim(),
+    });
     res.json({ html });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -15513,9 +15564,6 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/test-send', authe
   if (!subject || !bodyText) return res.status(400).json({ error: 'subject and body required' });
   if (!testTo) return res.status(400).json({ error: 'no email on your account' });
   try {
-    const repName = req.user.name || req.user.email || '';
-    let signatureHtml = '';
-    try { signatureHtml = await resolveSignatureHtml(req.user, repName); } catch { /* fall back to no signature */ }
     const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
     // A test with no change panel would not show the half of the email most worth checking, so a
     // representative one is supplied unless the caller sends real figures.
@@ -15524,7 +15572,10 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/test-send', authe
       planName: 'Cluster OS — Business', currentPrice: '$119.00', newPrice: '$129.00',
       effectiveDate: formatSaasEffectiveDate(new Date(Date.now() + 45 * 86400000).toISOString().slice(0, 10), lang),
     };
-    const html = buildSaasNoticeEmailHtml({ bodyText, signatureHtml, frontendBase, change, lang });
+    const html = buildSaasNoticeEmailHtml({
+      heading: req.body?.heading || saasIncreaseDraftCopy({ lang }).heading,
+      bodyText, frontendBase, change, lang, toAddress: testTo,
+    });
     const r = await sendMail(testTo, `[TEST] ${subject}`, html, {
       from: { name: SAAS_NOTICE_FROM_NAME, address: SAAS_NOTICE_FROM }, replyTo: SAAS_NOTICE_FROM,
     });
@@ -15541,11 +15592,12 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
   const items = Array.isArray(req.body?.items) ? req.body.items : [];
   if (!items.length) return res.status(400).json({ error: 'items required' });
   const actor = req.user.realAdminEmail || req.user.email || 'unknown';
-  const repName = req.user.name || req.user.email || '';
   const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const lang = req.body?.lang === 'fr' ? 'fr' : 'en';
-  let signatureHtml = '';
-  try { signatureHtml = await resolveSignatureHtml(req.user, repName); } catch { /* fall back to no signature */ }
+  // No personal signature. A billing change is sent by Cluster Systems, and the template closes
+  // with the company's own support block — a rep's name and phone under it would invite thousands
+  // of merchants to treat one person as their billing contact.
+  const noticeHeading = req.body?.heading || saasIncreaseDraftCopy({ lang }).heading;
   const results = [];
   try {
     // Same two lookups the draft endpoint uses. Rebuilding the panel from the item's stored
@@ -15589,7 +15641,7 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
           };
         }
       }
-      const html = buildSaasNoticeEmailHtml({ bodyText, signatureHtml, frontendBase, change, lang });
+      const html = buildSaasNoticeEmailHtml({ heading: noticeHeading, bodyText, frontendBase, change, lang, toAddress: to });
       const r = await sendMail(to, subject, html, {
         from: { name: SAAS_NOTICE_FROM_NAME, address: SAAS_NOTICE_FROM }, replyTo: SAAS_NOTICE_FROM,
       });
