@@ -15252,10 +15252,76 @@ function saasBillingPeriodWords(interval, intervalUnit, lang) {
   return { adj: en ? 'subscription' : "d'abonnement", per: en ? 'per billing period' : 'par période de facturation' };
 }
 
+// Price-change notices go out from the company, not from whoever happened to click Send. A rep's
+// personal address on a billing change to thousands of merchants invites replies into one inbox
+// and reads as a personal decision rather than a company one. Replies land in the same shared
+// inbox, which is what the copy ("just reply to this email") promises.
+const SAAS_NOTICE_FROM = process.env.SAAS_NOTICE_FROM || 'hello@clustersystems.com';
+// Zoho plan names literally start with asterisks — "**Cluster OS - Business Yearly". They are
+// stripped internally for plan matching, but the customer-facing copy quoted them verbatim, so a
+// merchant would have read "**Cluster OS" as bold markup that failed to render.
+const saasPlanLabel = (name) => String(name || '').trim().replace(/^\*+\s*/, '').trim();
+const SAAS_NOTICE_FROM_NAME = process.env.SAAS_NOTICE_FROM_NAME || 'Cluster Systems';
+
+// The notice's own shell. It reuses the Cluster-branded frame the proposals use, then adds the one
+// thing a price-change notice needs and prose cannot do as well: the change itself, laid out so it
+// can be read at a glance and checked against the invoice that follows. Table-based and
+// inline-styled throughout — Outlook supports neither flexbox nor grid.
+function buildSaasNoticeEmailHtml({ bodyText, signatureHtml, frontendBase, change, lang }) {
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const L = lang === 'en'
+    ? { heading: 'Summary of the change', plan: 'Plan', current: 'Current price', next: 'New price', when: 'Takes effect', note: 'Nothing else about your service changes. Your plan, features and support stay exactly as they are today.' }
+    : { heading: 'Résumé du changement', plan: 'Forfait', current: 'Prix actuel', next: 'Nouveau prix', when: 'En vigueur', note: "Rien d'autre ne change à votre service. Votre forfait, vos fonctionnalités et votre soutien restent exactement les mêmes." };
+
+  const row = (label, value, strong) => `
+    <tr>
+      <td style="padding:9px 0;font-size:13px;color:#64748b;white-space:nowrap">${esc(label)}</td>
+      <td style="padding:9px 0;font-size:${strong ? '15px' : '14px'};color:#1c2434;font-weight:${strong ? '700' : '500'};text-align:right">${esc(value)}</td>
+    </tr>`;
+
+  const panel = !change ? '' : `
+    <tr><td style="padding:8px 36px 0">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f8fafc;border:1px solid #e6ebf2;border-radius:12px">
+        <tr><td style="padding:18px 22px">
+          <p style="margin:0 0 6px;font-size:11px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:#94a3b8">${esc(L.heading)}</p>
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+            ${change.planName ? row(L.plan, saasPlanLabel(change.planName)) : ''}
+            ${row(L.current, change.currentPrice)}
+            ${row(L.next, change.newPrice, true)}
+            ${change.effectiveDate ? row(L.when, change.effectiveDate) : ''}
+          </table>
+        </td></tr>
+      </table>
+      <p style="margin:14px 2px 0;font-size:12px;line-height:1.6;color:#94a3b8">${esc(L.note)}</p>
+    </td></tr>`;
+
+  return `<!doctype html><html><body style="margin:0;padding:0;background:#eef1f6;font-family:Arial,Helvetica,sans-serif">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f6;padding:32px 12px">
+        <tr><td align="center">
+          <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(16,23,34,.08),0 10px 28px rgba(16,23,34,.07)">
+            <tr><td style="background:#1c2434;padding:22px 36px">
+              <img src="${frontendBase}/cluster-logo-email.png" width="118" height="28" alt="Cluster" style="display:block;border:0">
+            </td></tr>
+            <tr><td style="height:4px;background:#fe6523;font-size:0;line-height:0">&nbsp;</td></tr>
+            <tr><td style="padding:32px 36px 8px;font-size:14px;color:#1c2434;line-height:1.6">
+              <div style="white-space:pre-wrap">${esc(bodyText)}</div>
+              ${signatureHtml || ''}
+            </td></tr>
+            ${panel}
+            <tr><td style="padding:22px 36px 0"><div style="border-top:1px solid #eef1f6;font-size:0;line-height:0">&nbsp;</div></td></tr>
+            <tr><td style="padding:16px 36px 30px">
+              <p style="margin:0;color:#94a3b8;font-size:12px">Cluster Systems · <a href="https://clusterpos.com" style="color:#94a3b8;text-decoration:none">clusterpos.com</a> · <a href="mailto:${SAAS_NOTICE_FROM}" style="color:#94a3b8;text-decoration:none">${SAAS_NOTICE_FROM}</a></p>
+            </td></tr>
+          </table>
+        </td></tr>
+      </table>
+    </body></html>`;
+}
+
 function saasIncreaseDraftCopy({ customerName, planName, currentMonthly, newMonthly, currentPeriod, newPeriod, effectiveDate, interval, intervalUnit, lang }) {
   const money = (n) => `$${Number(n || 0).toFixed(2)}`;
   const greeting = customerName ? ` ${customerName}` : '';
-  const plan = planName || (lang === 'en' ? 'subscription' : 'abonnement');
+  const plan = saasPlanLabel(planName) || (lang === 'en' ? 'subscription' : 'abonnement');
   // Quote what the customer is actually billed. The tool reasons in monthly figures, but an annual
   // customer's invoice reads $799.95 once a year, not $66.66 twelve times — sending the monthly
   // equivalent would contradict the invoice that follows.
@@ -15287,7 +15353,7 @@ function saasTemplatePlaceholders({ customerName, planName, currentMonthly, newM
   const next = money(r2Money(newPeriod != null ? newPeriod : subAmountFromMonthly(newMonthly, interval, intervalUnit)));
   const w = saasBillingPeriodWords(interval, intervalUnit, lang);
   return {
-    customerName: customerName || '', planName: planName || '',
+    customerName: customerName || '', planName: saasPlanLabel(planName),
     currentPrice: curr, newPrice: next,
     currentMonthly: curr, newMonthly: next,
     billingPeriod: w.per, billingPeriodAdj: w.adj,
@@ -15423,7 +15489,12 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/preview', authent
     const repName = req.user.name || req.user.email || '';
     const signatureHtml = await resolveSignatureHtml(req.user, repName);
     const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
-    const html = buildProposalEmailHtml({ bodyText, acceptBtn: '', signatureHtml, pixel: '', frontendBase });
+    const lang = req.body?.lang === 'fr' ? 'fr' : 'en';
+    const change = req.body?.change || {
+      planName: 'Cluster OS — Business', currentPrice: '$119.00', newPrice: '$129.00',
+      effectiveDate: formatSaasEffectiveDate(new Date(Date.now() + 45 * 86400000).toISOString().slice(0, 10), lang),
+    };
+    const html = buildSaasNoticeEmailHtml({ bodyText, signatureHtml, frontendBase, change, lang });
     res.json({ html });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -15446,12 +15517,18 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/test-send', authe
     let signatureHtml = '';
     try { signatureHtml = await resolveSignatureHtml(req.user, repName); } catch { /* fall back to no signature */ }
     const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
-    const html = buildProposalEmailHtml({ bodyText, acceptBtn: '', signatureHtml, pixel: '', frontendBase });
-    const verifiedDomains = (process.env.VERIFIED_SENDER_DOMAINS || '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
-    const repDomain = testTo.includes('@') ? testTo.split('@')[1].toLowerCase() : '';
-    const fromAddr = verifiedDomains.includes(repDomain) ? testTo : (process.env.SMTP_FROM || process.env.SMTP_USER);
-    const r = await sendMail(testTo, `[TEST] ${subject}`, html, { from: { name: repName || 'Cluster Systems', address: fromAddr }, replyTo: testTo });
-    res.json({ sent: r.sent, reason: r.reason, to: testTo });
+    // A test with no change panel would not show the half of the email most worth checking, so a
+    // representative one is supplied unless the caller sends real figures.
+    const lang = req.body?.lang === 'fr' ? 'fr' : 'en';
+    const change = req.body?.change || {
+      planName: 'Cluster OS — Business', currentPrice: '$119.00', newPrice: '$129.00',
+      effectiveDate: formatSaasEffectiveDate(new Date(Date.now() + 45 * 86400000).toISOString().slice(0, 10), lang),
+    };
+    const html = buildSaasNoticeEmailHtml({ bodyText, signatureHtml, frontendBase, change, lang });
+    const r = await sendMail(testTo, `[TEST] ${subject}`, html, {
+      from: { name: SAAS_NOTICE_FROM_NAME, address: SAAS_NOTICE_FROM }, replyTo: SAAS_NOTICE_FROM,
+    });
+    res.json({ sent: r.sent, reason: r.reason, to: testTo, from: SAAS_NOTICE_FROM });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -15466,14 +15543,24 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
   const actor = req.user.realAdminEmail || req.user.email || 'unknown';
   const repName = req.user.name || req.user.email || '';
   const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
-  const repEmail = (req.user.email || '').trim();
-  const verifiedDomains = (process.env.VERIFIED_SENDER_DOMAINS || '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
-  const repDomain = repEmail.includes('@') ? repEmail.split('@')[1].toLowerCase() : '';
-  const fromAddr = (repEmail && verifiedDomains.includes(repDomain)) ? repEmail : (process.env.SMTP_FROM || process.env.SMTP_USER);
+  const lang = req.body?.lang === 'fr' ? 'fr' : 'en';
   let signatureHtml = '';
   try { signatureHtml = await resolveSignatureHtml(req.user, repName); } catch { /* fall back to no signature */ }
   const results = [];
   try {
+    // Same two lookups the draft endpoint uses. Rebuilding the panel from the item's stored
+    // monthly figures instead would reintroduce exactly the rounding gap that made an annual
+    // plan's email quote $799.92 for a $799.95 invoice.
+    const liveSubs = await getSaasIncreaseSubscriptions();
+    const nextBillingBySub = new Map(liveSubs.map(x => [x.subscriptionNumber, x.nextBillingAt]));
+    const periodByKey = new Map((await pool.query(
+      `SELECT org_id, subscription_number, plan_price_period FROM saas_subscription_insights
+        WHERE plan_price_period IS NOT NULL`
+    )).rows.map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
+    const rowsById = new Map((await pool.query(
+      `SELECT * FROM saas_increase_items WHERE scenario_id = $1 AND skipped = FALSE`, [req.params.id]
+    )).rows.map(r => [r.id, r]));
+
     for (const it of items) {
       const itemId = Number(it.itemId);
       const to = String(it.to || '').trim();
@@ -15487,8 +15574,25 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
         results.push({ itemId, sent: false, reason: 'to and subject are required' });
         continue;
       }
-      const html = buildProposalEmailHtml({ bodyText, acceptBtn: '', signatureHtml, pixel: '', frontendBase });
-      const r = await sendMail(to, subject, html, { from: { name: repName || 'Cluster Systems', address: fromAddr }, replyTo: repEmail || undefined });
+      const dbRow = rowsById.get(itemId);
+      let change = null;
+      if (dbRow) {
+        const curPeriod = periodByKey.get(`${dbRow.org_id}||${dbRow.subscription_number}`) ?? null;
+        if (curPeriod != null) {
+          const nxtPeriod = saasNewPeriodPrice(curPeriod, dbRow.increase_type, dbRow.increase_value);
+          const effectiveDate = nextBillingBySub.get(dbRow.subscription_number) || null;
+          change = {
+            planName: dbRow.plan_name || '',
+            currentPrice: `$${r2Money(curPeriod).toFixed(2)}`,
+            newPrice: `$${r2Money(nxtPeriod).toFixed(2)}`,
+            effectiveDate: effectiveDate ? formatSaasEffectiveDate(effectiveDate, lang) : '',
+          };
+        }
+      }
+      const html = buildSaasNoticeEmailHtml({ bodyText, signatureHtml, frontendBase, change, lang });
+      const r = await sendMail(to, subject, html, {
+        from: { name: SAAS_NOTICE_FROM_NAME, address: SAAS_NOTICE_FROM }, replyTo: SAAS_NOTICE_FROM,
+      });
       if (r.sent) {
         await pool.query(
           `UPDATE saas_increase_items SET notify_to = $1, notify_subject = $2, notify_body = $3, notify_status = 'sent', notify_error = NULL, notified_by = $4, notified_at = NOW() WHERE id = $5 AND scenario_id = $6`,
