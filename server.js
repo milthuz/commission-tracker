@@ -170,6 +170,15 @@ const PERMISSION_CATALOG = [
   { key: 'partners:stats',             label: 'View partner portal usage statistics (adoption, logins, submissions)', category: 'Partners' },
   { key: 'partners:export_users',      label: 'Export the partner user list to Excel (emails and invitation dates)', category: 'Partners' },
 
+  // Leads (SH-20) — la couche d'accueil AVANT Zoho. `review` est la seule cle qui fasse
+  // entrer quoi que ce soit dans le CRM et partir des courriels a un marchand : elle se
+  // donne a moins de monde que `view_all`, d'ou la separation.
+  { key: 'leads:intake',               label: 'Enter a new lead (phone / walk-in intake form)',                 category: 'Leads' },
+  { key: 'leads:view_own',             label: 'View the leads assigned to me',                                  category: 'Leads' },
+  { key: 'leads:view_all',             label: 'View every lead and the review queue',                           category: 'Leads' },
+  { key: 'leads:review',               label: 'Accept / reject leads, assign a rep, push them into Zoho CRM',   category: 'Leads' },
+  { key: 'leads:manage_rules',         label: 'Configure assignment rules, the rotation and the automations',   category: 'Leads' },
+
   // Sofia (in-app assistant) — CRM tools. Split read/write on purpose: the write key is the
   // only thing standing between a chat message and a real record in Zoho, so it must be
   // grantable on its own, to a smaller set of people than the read key.
@@ -1827,6 +1836,131 @@ async function initializeDatabase() {
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_partner_notifications_partner ON partner_notifications(partner_id, created_at DESC)`);
 
+    // ========================================================================
+    // GESTION DES PISTES (SH-20) — la couche AVANT Zoho CRM
+    // ------------------------------------------------------------------------
+    // Toute demande entrante (formulaire du site public, appel telephonique saisi par un
+    // employe) atterrit ICI d'abord. Rien n'entre dans Zoho sans qu'un humain ait accepte :
+    // decision de David du 2026-08-28. Le CRM ne recoit donc que des pistes examinees, et
+    // Sales Hub garde la trace de TOUT — y compris de ce qui a ete rejete, ce que Zoho ne
+    // conserve nulle part.
+    //
+    // `ref_code` vient d'une SEQUENCE et non de l'id : une piste se cite au telephone
+    // (« votre dossier L-00042 »), et deux allers-retours vers une base hebergee ailleurs
+    // pour fabriquer un numero, c'est un aller-retour de trop.
+    await pool.query(`CREATE SEQUENCE IF NOT EXISTS lead_ref_seq START 1`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS leads (
+        id                   SERIAL PRIMARY KEY,
+        ref_code             VARCHAR(20) UNIQUE NOT NULL DEFAULT ('L-' || LPAD(nextval('lead_ref_seq')::text, 5, '0')),
+        source               VARCHAR(30) NOT NULL DEFAULT 'website',
+        source_detail        VARCHAR(160),
+        status               VARCHAR(20) NOT NULL DEFAULT 'new',
+
+        business_name        VARCHAR(255) NOT NULL,
+        business_type        VARCHAR(120),
+        website              VARCHAR(255),
+
+        contact_first_name   VARCHAR(255),
+        contact_last_name    VARCHAR(255),
+        contact_title        VARCHAR(120),
+        contact_email        VARCHAR(255),
+        contact_phone        VARCHAR(50),
+        contact_phone_digits VARCHAR(20),
+
+        city                 VARCHAR(160),
+        province             VARCHAR(10),
+        postal_code          VARCHAR(12),
+        language             VARCHAR(5) NOT NULL DEFAULT 'fr',
+
+        interest             JSONB NOT NULL DEFAULT '[]'::jsonb,
+        locations_count      INT,
+        current_pos          VARCHAR(160),
+        timeline             VARCHAR(60),
+        notes                TEXT,
+
+        created_by           VARCHAR(255),
+        created_at           TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+        suggested_rep_name   VARCHAR(255),
+        suggested_via        VARCHAR(20),
+        suggested_rule_id    INT,
+        suggested_rule_name  VARCHAR(120),
+
+        assigned_rep_name    VARCHAR(255),
+        assigned_rep_email   VARCHAR(255),
+        assigned_crm_user_id VARCHAR(50),
+        assigned_at          TIMESTAMP,
+        assigned_by          VARCHAR(255),
+
+        reviewed_by          VARCHAR(255),
+        reviewed_at          TIMESTAMP,
+        rejection_reason     TEXT,
+        review_reminded_at   TIMESTAMP,
+
+        crm_match_status     VARCHAR(20),
+        crm_match_summary    TEXT,
+        crm_match_records    JSONB,
+
+        crm_lead_id          VARCHAR(50),
+        crm_lead_error       TEXT,
+        crm_followup_id      VARCHAR(50),
+        crm_followup_kind    VARCHAR(10),
+        crm_deal_id          VARCHAR(50),
+        crm_deal_stage       VARCHAR(120),
+        crm_deposit_date     DATE,
+        callback_at          TIMESTAMP,
+
+        rep_notified_at      TIMESTAMP,
+        merchant_notified_at TIMESTAMP,
+        automation           JSONB NOT NULL DEFAULT '{}'::jsonb,
+        raw                  JSONB
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_leads_status  ON leads(status, created_at DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_leads_rep     ON leads(assigned_rep_name, created_at DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_leads_source  ON leads(source, created_at DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_leads_created ON leads(created_at DESC)`);
+
+    // Regles d'attribution, evaluees DANS L'ORDRE de `position`. Un critere laisse vide ne
+    // filtre rien — une regle sans aucun critere attrape donc tout ce qui lui parvient, ce
+    // qui est la facon normale d'ecrire une regle « fourre-tout » en fin de liste.
+    // `target_reps` peut nommer plusieurs representants : la rotation joue alors A
+    // L'INTERIEUR de la regle, ce qui evite d'avoir a ecrire une regle par personne.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS lead_assignment_rules (
+        id                   SERIAL PRIMARY KEY,
+        position             INT NOT NULL DEFAULT 0,
+        name                 VARCHAR(120) NOT NULL,
+        is_active            BOOLEAN NOT NULL DEFAULT true,
+        match_sources        JSONB NOT NULL DEFAULT '[]'::jsonb,
+        match_provinces      JSONB NOT NULL DEFAULT '[]'::jsonb,
+        match_languages      JSONB NOT NULL DEFAULT '[]'::jsonb,
+        match_business_types JSONB NOT NULL DEFAULT '[]'::jsonb,
+        match_postal_prefix  JSONB NOT NULL DEFAULT '[]'::jsonb,
+        target_reps          JSONB NOT NULL DEFAULT '[]'::jsonb,
+        created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_lead_rules_pos ON lead_assignment_rules(position, id)`);
+
+    // Le tour de role. Pas de curseur : on prend l'eligible dont la DERNIERE attribution est
+    // la plus ancienne. Un curseur d'index se desynchronise des qu'on ajoute, retire ou met
+    // en conge quelqu'un ; « le plus anciennement servi » se repare tout seul.
+    // `away_until` est la mise en conge : la personne reste dans la liste, garde son
+    // historique, et cesse simplement d'etre servie jusqu'a la date indiquee.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS lead_rotation (
+        rep_name         VARCHAR(255) PRIMARY KEY,
+        is_active        BOOLEAN NOT NULL DEFAULT true,
+        away_until       DATE,
+        last_assigned_at TIMESTAMP,
+        assigned_count   INT NOT NULL DEFAULT 0,
+        created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
     // The Pass / La Passe (SH-22) — membres du programme de recommandation marchand.
     // Troisième surface d'identité du produit, séparée de local_users ET de partner_users
     // pour la même raison que celles-ci le sont entre elles : un membre de La Passe ne doit
@@ -3131,6 +3265,26 @@ const DEMO_NAME_KEYS = new Set([
   'merchantname', 'accountname', 'dealname', 'companyname', 'clientname',
   'linked_customer_name', 'linkedcustomername',
 ]);
+// SH-20 — identites de CONTACT (une personne physique, pas un commerce) portees par les pistes
+// entrantes. Elles ne peuvent pas passer par DEMO_NAME_KEYS : remplacer un courriel par
+// « Bistro Merlebleu » se verrait au premier coup d'oeil. Masquage deterministe, meme empreinte
+// que le reste du mode demo, donc la meme piste montre toujours le meme faux contact.
+// ⚠️ Les cles sont volontairement PREFIXEES (`contactEmail` et non `email`) : brouiller `email`
+// tout court toucherait les courriels des representants dans toute l'application.
+const DEMO_CONTACT_KEYS = new Set([
+  'contactfirstname', 'contact_first_name', 'contactlastname', 'contact_last_name',
+  'contactemail', 'contact_email', 'contactphone', 'contact_phone',
+  'contact_phone_digits', 'contactphonedigits',
+]);
+const DEMO_FIRST = ['Julie', 'Marc', 'Sophie', 'Étienne', 'Nadia', 'Simon', 'Claire', 'Alexis'];
+const DEMO_LAST  = ['Tremblay', 'Gagnon', 'Roy', 'Bouchard', 'Lavoie', 'Fortin', 'Côté', 'Girard'];
+function demoFakeContact(key, real) {
+  const h = demoHash(String(real).toLowerCase().trim());
+  if (key.includes('email')) return `contact${(h % 9000) + 1000}@exemple.ca`;
+  if (key.includes('phone')) return `(555) ${(h % 900) + 100}-${((h >>> 5) % 9000) + 1000}`;
+  if (key.includes('last'))  return DEMO_LAST[h % DEMO_LAST.length];
+  return DEMO_FIRST[h % DEMO_FIRST.length];
+}
 // Numeric keys that are MONEY → scaled. Counts/ids/rates are excluded below.
 const DEMO_MONEY_RE = /(commission|revenue|amount|total|salary|profit|balance|price|mrr|arr|ltv|arpu|sub_total|subtotal|bonus|margin|fee|paid|earned|value|cost)/i;
 const DEMO_NOT_MONEY_RE = /(count|issues|qty|quantity|number|_id$|^id$|pct|percent|rate|points|page|index|threshold|days|months|year|interval|clients$|invoices$|merchants$|subs$|periods)/i;
@@ -3146,6 +3300,7 @@ function demoScramble(node, keyHint) {
   const k = String(keyHint || '').toLowerCase();
   if (typeof node === 'string') {
     if (DEMO_NAME_KEYS.has(k) && node.trim()) return demoFakeBizName(node);
+    if (DEMO_CONTACT_KEYS.has(k) && node.trim()) return demoFakeContact(k, node);
     return node;
   }
   if (typeof node === 'number' && Number.isFinite(node) && node !== 0) {
@@ -3634,6 +3789,10 @@ async function sendMail(to, subject, html, opts = {}) {
 // qu'ils doivent lire en premier, Sales Hub venant en mention. Sans le parametre, rien ne
 // change — tous les envois internes gardent leur en-tete a l'identique.
 function mailChrome(inner, preheaderRaw, brand, lang, home) {
+  // `cluster-plain` (SH-20) : le logo Cluster SANS la ligne « Portail partenaire ». Un prospect
+  // qui vient de remplir le formulaire du site fait affaire avec Cluster et n'a jamais entendu
+  // parler ni de Sales Hub ni du portail partenaire — lui montrer l'un ou l'autre le perdrait.
+  const isClusterBrand = brand === 'cluster' || brand === 'cluster-plain';
   const year = new Date().getFullYear();
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   // Le pied de page nommait toujours le domaine INTERNE, y compris dans un courriel
@@ -3652,13 +3811,15 @@ function mailChrome(inner, preheaderRaw, brand, lang, home) {
           <tr><td style="background:#0f1722;padding:22px 36px">
             <table role="presentation" cellpadding="0" cellspacing="0"><tr>
               <td style="padding-right:12px;vertical-align:middle">
-                ${brand === 'cluster'
+                ${isClusterBrand
                   ? `<img src="${base}/cluster-logo-email.png" width="128" height="29" alt="Cluster" style="display:block;border:0">`
                   : `<img src="${base}/saleshub-glyph-on-dark-128.png" width="32" height="40" alt="Sales Hub" style="display:block;border:0">`}
               </td>
               <td style="vertical-align:middle">
                 ${brand === 'cluster'
                   ? `<span style="display:block;color:#8a99af;font-size:12px;letter-spacing:.2px">Portail partenaire &middot; Partner Portal</span>`
+                  : brand === 'cluster-plain'
+                  ? ''
                   : `<span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-.3px">Sales&nbsp;Hub</span>`
                     + `<span style="display:block;color:#8a99af;font-size:12px;margin-top:3px;letter-spacing:.2px">`
                       + `${isFrLocale(lang) ? 'par' : 'by'} <span style="color:#ffffff;font-weight:700">cluster</span> <span style="color:#F58345">&bull;</span>`
@@ -3891,7 +4052,7 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // sampleEmail(), dans TEMPLATE_TYPES de EmailPreview.tsx, et dans les libellés i18n.
 // Les quatre `pass_*` sont les courriels du programme La Passe ; ils sont les seuls de la
 // liste à partir d'une adresse et d'une enveloppe qui ne sont pas celles de Sales Hub.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder'];
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder', 'lead_review', 'lead_assigned', 'lead_welcome'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -3913,6 +4074,33 @@ function sampleEmail(type, lang) {
     }[key] || {};
     const built = passEmailPreview(key, m, { firstName: passFirstName(m), ...vars });
     return built || { subject: `(${type})`, html: `<p>${fr ? 'Gabarit inconnu' : 'Unknown template'}</p>` };
+  }
+
+  // Les trois courriels des PISTES (SH-20) passent par leurs vrais constructeurs, avec une piste
+  // fictive — meme raison que La Passe : un apercu recopie a cote finit toujours par montrer
+  // autre chose que ce qui part reellement. `lead_welcome` est le seul de la liste qui sorte de
+  // l'entreprise : il est UNILINGUE et porte la marque Cluster, pas Sales Hub.
+  if (type.startsWith('lead_')) {
+    const fr = !lang || isFrLocale(lang);
+    const now = new Date();
+    const lead = {
+      id: 0, ref_code: 'L-00042', status: 'in_review', source: 'website', source_detail: 'clusterpos.com — Contact',
+      business_name: 'Café Merlebleu', business_type: 'Restaurant', website: 'https://cafemerlebleu.ca',
+      contact_first_name: 'Julie', contact_last_name: 'Tremblay', contact_title: 'Propriétaire',
+      contact_email: 'julie@cafemerlebleu.ca', contact_phone: '(514) 555-0142',
+      city: 'Montréal', province: 'QC', postal_code: 'H2J 2K9', language: fr ? 'fr' : 'en',
+      interest: ['POS', 'Paiements'], locations_count: 2, current_pos: 'Lightspeed',
+      timeline: fr ? 'Dans 2 mois' : 'In 2 months',
+      notes: fr ? 'On ouvre une 2e succursale en octobre, on veut tout changer.'
+                : 'We open a second location in October and want to switch everything.',
+      created_at: now, created_by: null, suggested_rep_name: 'Amy Tremblay',
+      suggested_rule_name: fr ? 'Québec — français' : 'Quebec — French',
+    };
+    const rep = { name: 'Amy Tremblay', email: 'amy@clustersystems.com', crmUserId: null };
+    const callbackAt = leadCallbackAt(LEAD_SETTINGS_DEFAULTS, now);
+    if (type === 'lead_review') return leadReviewEmail(lead, `${lead.suggested_rep_name} — règle « ${lead.suggested_rule_name} »`);
+    if (type === 'lead_assigned') return leadAssignedEmail(lead, rep, callbackAt, null);
+    if (type === 'lead_welcome') return leadWelcomeEmail(lead, rep, callbackAt, LEAD_SETTINGS_DEFAULTS);
   }
 
   // Les courriels du PORTAIL PARTENAIRE passent par leur vrai texte (PARTNER_EMAIL_COPY) et
@@ -6738,20 +6926,10 @@ app.put('/api/admin/partner-opportunities/:id', authenticateToken, async (req, r
 app.get('/api/admin/partner-opportunities/crm-reps', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'partners:manage'))) return;
   try {
-    const spRows = (await pool.query(`SELECT name, email FROM salespeople WHERE is_active = true`)).rows;
-    const namesLower = new Set(spRows.map((r) => r.name.trim().toLowerCase()));
-    const emailsLower = new Set(spRows.filter((r) => r.email).map((r) => r.email.trim().toLowerCase()));
-
-    const crmToken = await ensureValidCrmToken();
-    const r = await axios.get('https://www.zohoapis.com/crm/v2/users?type=ActiveUsers', {
-      headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true,
-    });
-    if (r.status !== 200) return res.json({ reps: [] }); // 204 = none
-    const reps = (r.data?.users || [])
-      .filter((u) => namesLower.has(String(u.full_name || '').trim().toLowerCase())
-        || (u.email && emailsLower.has(String(u.email).trim().toLowerCase())))
-      .map((u) => ({ id: u.id, name: u.full_name, email: u.email }));
-    res.json({ reps });
+    // Le meme annuaire sert desormais a l'acceptation des pistes (SH-20), qui a besoin de
+    // l'`Owner.id` Zoho a chaque fois : il est passe dans un helper cache 10 minutes plutot que
+    // de refaire cet appel a chaque ouverture d'ecran. Comportement inchange ici.
+    res.json({ reps: await crmRepDirectory() });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -12955,6 +13133,19 @@ function startAutoSync() {
       runSaasChurnHistoryBackfill().catch(e => console.warn('[saas-churn] scheduled run failed:', e.message));
     }, 7 * 24 * 60 * 60 * 1000);
   }, 30 * 60 * 1000);
+
+  // Pistes (SH-20). Deux travaux dans le meme passage horaire, en SEQUENCE : le premier
+  // interroge Zoho, le second n'envoie un courriel que pendant les heures ouvrables. L'heure
+  // suffit largement — une piste qui attend se mesure en heures, pas en minutes — et cela
+  // menage une API Zoho deja sollicitee par quatre autres travaux.
+  setTimeout(() => {
+    const run = () => syncLeadCrmState()
+      .catch((e) => console.warn('[leads] rafraichissement Zoho echoue:', e.message))
+      .then(() => remindStaleLeads())
+      .catch((e) => console.warn('[leads] relance des pistes en attente echouee:', e.message));
+    run();
+    setInterval(run, 60 * 60 * 1000);
+  }, 6 * 60 * 1000);
 }
 
 function stopAutoSync() {
@@ -17130,7 +17321,18 @@ async function createCrmLead(o) {
   // La Passe passe par le même chemin (SH-22) mais doit rester distinguable dans le CRM :
   // ce n'est pas un partenaire tiers qui recommande, c'est un marchand client.
   if (o.lead_contact_method) fields.Lead_Contact_Method = o.lead_contact_method;
+  // SH-20 — `lead_contact_method: null` EFFACE le champ, au lieu de laisser le defaut
+  // « Partner Portal » : les pistes du site et du telephone ne viennent pas d'un partenaire, et
+  // c'est aussi ce qui permet de reessayer sans les listes de choix quand Zoho refuse.
+  if (o.lead_contact_method === null) delete fields.Lead_Contact_Method;
   if (o.lead_source) fields.Lead_Source = o.lead_source;
+  // Adresse et site web (SH-20) — un representant qui rappelle veut savoir OU est le commerce.
+  // Champs standards du module Leads ; s'ils manquaient a la mise en page, Zoho les ignorerait
+  // en silence, comme il le fait deja pour Description.
+  if (o.city) fields.City = String(o.city).slice(0, 100);
+  if (o.province) fields.State = String(o.province).slice(0, 100);
+  if (o.postal_code) fields.Zip_Code = String(o.postal_code).slice(0, 30);
+  if (o.website) fields.Website = String(o.website).slice(0, 255);
   if (o.contact_first_name) fields.First_Name = o.contact_first_name;
   if (o.contact_email) fields.Email = o.contact_email;
   if (o.contact_phone) fields.Phone = o.contact_phone;
@@ -17204,10 +17406,12 @@ async function createCrmLead(o) {
               // Le nom de l'approbateur est dans le TITRE aussi : la liste liee « Notes » n'affiche
               // que le titre et l'auteur, et l'auteur est le jeton partage. Sans ca il faut ouvrir
               // la note pour savoir qui a approuve.
-              Note_Title: [`Référence partenaire — ${o.partner_name}`,
+              // SH-20 : les pistes du site/telephone fournissent leur propre note. Sans cette
+              // sortie, elles heriteraient du texte « Référence partenaire », qui serait faux.
+              Note_Title: (o.note_title || [`Référence partenaire — ${o.partner_name}`,
                 o.approver_name || o.approver_email ? `approuvée par ${o.approver_name || o.approver_email}` : null]
-                .filter(Boolean).join(' — ').slice(0, 250),
-              Note_Content: corps.slice(0, 32000),
+                .filter(Boolean).join(' — ')).slice(0, 250),
+              Note_Content: (o.note_body || corps).slice(0, 32000),
               Parent_Id: { id: leadId },
               se_module: 'Leads',
             }] },
@@ -29600,6 +29804,1481 @@ app.patch('/api/releases/fix-urls', authenticateToken, async (req, res) => {
 // ============================================================================
 // HEALTH CHECK
 // ============================================================================
+
+
+// ============================================================================
+// GESTION DES PISTES / LEAD MANAGEMENT (SH-20)
+// ============================================================================
+// La couche d'accueil AVANT Zoho CRM. Deux portes d'entree, une seule sortie :
+//
+//   formulaire du site public ──┐
+//                               ├──► file d'examen Sales Hub ──► [accepter] ──► Zoho CRM
+//   saisie telephonique interne ─┘                            │                 + rappel planifie
+//                                                             │                 + courriel au representant
+//                                                             └── [rejeter]     + courriel de bienvenue au marchand
+//
+// ⚠️ RIEN n'entre dans Zoho sans qu'un humain ait accepte (decision de David, 2026-08-28).
+// L'attribution est SUGGEREE des l'arrivee — l'examinateur voit « → Amy, regle Québec/FR » et
+// peut passer outre — mais elle n'est ECRITE nulle part avant l'acceptation.
+//
+// Ce que cette couche apporte et que Zoho seul ne donne pas : les pistes REJETEES restent
+// visibles et comptees (Zoho n'en garde aucune trace), le delai entre l'arrivee et le premier
+// contact devient mesurable, et le marchand recoit une reponse le jour meme meme si personne
+// n'ouvre le CRM.
+
+const LEAD_SOURCES  = ['website', 'phone', 'walk_in', 'referral', 'event', 'other'];
+const LEAD_STATUSES = ['new', 'in_review', 'accepted', 'rejected', 'duplicate'];
+
+// `leadSource*` par defaut a VIDE, et c'est delibere : `Lead_Source` est une liste de choix
+// chez Zoho, et une valeur absente de la liste fait rejeter TOUT l'enregistrement, pas
+// seulement le champ. On n'ecrit donc rien tant qu'un admin n'a pas saisi la valeur exacte que
+// son organisation utilise. `contactMethod*` suit la convention deja en place cote portail
+// partenaire, ou « Partner Portal » est ecrit tel quel depuis des mois.
+const LEAD_SETTINGS_DEFAULTS = {
+  callbackEnabled:      true,
+  callbackType:         'call',              // 'call' → module Calls, 'task' → module Tasks
+  callbackDelayHours:   2,
+  businessHours:        { start: 9, end: 17 },
+  notifyRep:            true,
+  notifyMerchant:       true,
+  merchantFrom:         '',                  // vide → l'expediteur SMTP habituel
+  merchantSiteUrl:      'https://www.clusterpos.com',
+  reviewReminderHours:  4,
+  leadSourceWebsite:    '',
+  leadSourcePhone:      '',
+  contactMethodWebsite: 'Website — Sales Hub',
+  contactMethodPhone:   'Phone — Sales Hub',
+};
+
+let _leadSettingsCache = { at: 0, value: null };
+async function leadSettings(force = false) {
+  if (!force && _leadSettingsCache.value && Date.now() - _leadSettingsCache.at < 60 * 1000) {
+    return _leadSettingsCache.value;
+  }
+  let stored = {};
+  try {
+    const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'lead_settings'`);
+    if (r.rows[0]?.value && typeof r.rows[0].value === 'object') stored = r.rows[0].value;
+  } catch { /* au tout premier demarrage la table peut manquer — les defauts suffisent */ }
+  const value = {
+    ...LEAD_SETTINGS_DEFAULTS,
+    ...stored,
+    businessHours: { ...LEAD_SETTINGS_DEFAULTS.businessHours, ...(stored.businessHours || {}) },
+  };
+  _leadSettingsCache = { at: Date.now(), value };
+  return value;
+}
+
+// ── Heure de Montreal, quel que soit le fuseau du serveur ───────────────────
+// Le processus tourne en UTC chez Railway (aucun TZ n'y est defini). Planifier « 9 h » avec les
+// fonctions locales de Node y donnerait 9 h UTC, soit 5 h du matin a Montreal. Tout ce qui suit
+// calcule DANS le fuseau de l'entreprise et n'utilise jamais l'heure locale du processus.
+const LEAD_TZ = 'America/Toronto';
+const _leadTzFmt = new Intl.DateTimeFormat('en-CA', {
+  timeZone: LEAD_TZ, hour12: false,
+  year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit',
+});
+function tzParts(d) {
+  const p = {};
+  for (const { type, value } of _leadTzFmt.formatToParts(d)) {
+    if (type !== 'literal') p[type] = parseInt(value, 10);
+  }
+  // `hour12: false` rend 24 pour minuit sur certaines plateformes — on le ramene a 0.
+  if (p.hour === 24) p.hour = 0;
+  return p;
+}
+function tzOffsetMinutes(d) {
+  const p = tzParts(d);
+  const asIfUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+  return Math.round((asIfUtc - d.getTime()) / 60000);
+}
+function tzOffsetString(d) {
+  const m = tzOffsetMinutes(d);
+  const sign = m >= 0 ? '+' : '-';
+  const a = Math.abs(m);
+  return `${sign}${String(Math.floor(a / 60)).padStart(2, '0')}:${String(a % 60).padStart(2, '0')}`;
+}
+// Construit un instant a partir d'une heure de MUR montrealaise. Deux passes : la premiere donne
+// un decalage approximatif, la seconde le corrige si le premier essai tombait de l'autre cote
+// d'un changement d'heure.
+function fromTz(year, month, day, hour, minute = 0) {
+  let t = Date.UTC(year, month - 1, day, hour, minute);
+  for (let i = 0; i < 2; i++) {
+    t = Date.UTC(year, month - 1, day, hour, minute) - tzOffsetMinutes(new Date(t)) * 60000;
+  }
+  return new Date(t);
+}
+function tzDayOfWeek(d) {
+  const p = tzParts(d);
+  return new Date(Date.UTC(p.year, p.month - 1, p.day)).getUTCDay(); // 0 = dimanche
+}
+
+// L'heure du rappel : maintenant + le delai configure, puis ramenee dans les heures ouvrables et
+// hors fin de semaine. Une piste recue le vendredi a 18 h est rappelee le lundi a 9 h, pas le
+// samedi a 20 h.
+function leadCallbackAt(settings, from = new Date()) {
+  const delay = Number(settings.callbackDelayHours);
+  const start = Math.min(23, Math.max(0, parseInt(settings.businessHours?.start, 10) || 9));
+  const end   = Math.min(24, Math.max(start + 1, parseInt(settings.businessHours?.end, 10) || 17));
+  let t = new Date(from.getTime() + (Number.isFinite(delay) ? delay : 2) * 3600000);
+  // 12 sauts au plus. La borne garantit qu'on ne boucle jamais, et aucun enchainement reel de
+  // fin de semaine + jours feries n'en approche.
+  for (let i = 0; i < 12; i++) {
+    const p = tzParts(t);
+    const dow = tzDayOfWeek(t);
+    if (dow === 6) { t = fromTz(p.year, p.month, p.day + 2, start); continue; }  // samedi → lundi
+    if (dow === 0) { t = fromTz(p.year, p.month, p.day + 1, start); continue; }  // dimanche → lundi
+    if (p.hour < start) { t = fromTz(p.year, p.month, p.day, start); continue; }
+    if (p.hour >= end)  { t = fromTz(p.year, p.month, p.day + 1, start); continue; }
+    return t;
+  }
+  return t;
+}
+
+// ── Annuaire des representants dans Zoho CRM ────────────────────────────────
+// Les utilisateurs actifs du CRM, reduits aux representants de Sales Hub (par nom, ou par
+// courriel quand il est renseigne). C'est ce qui donne l'`Owner.id` a poser sur le Lead et sur
+// le rappel : sans lui, la fiche atterrit chez le proprietaire du jeton partage et le
+// representant ne la voit jamais dans sa liste.
+//
+// Cache de 10 minutes ET conservation du dernier annuaire connu en cas de panne Zoho : perdre
+// l'annuaire ne doit pas faire retomber une acceptation sur « aucun proprietaire ».
+let _crmRepDirCache = { at: 0, reps: [] };
+async function crmRepDirectory(force = false) {
+  if (!force && _crmRepDirCache.reps.length && Date.now() - _crmRepDirCache.at < 10 * 60 * 1000) {
+    return _crmRepDirCache.reps;
+  }
+  try {
+    const spRows = (await pool.query(`SELECT name, email FROM salespeople WHERE is_active = true`)).rows;
+    const namesLower  = new Set(spRows.map((r) => String(r.name).trim().toLowerCase()));
+    const emailsLower = new Set(spRows.filter((r) => r.email).map((r) => String(r.email).trim().toLowerCase()));
+    const crmToken = await ensureValidCrmToken();
+    const r = await axios.get('https://www.zohoapis.com/crm/v2/users?type=ActiveUsers', {
+      headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true, timeout: 20000,
+    });
+    if (r.status !== 200) return _crmRepDirCache.reps;   // 204 = aucun ; on garde ce qu'on avait
+    const reps = (r.data?.users || [])
+      .filter((u) => namesLower.has(String(u.full_name || '').trim().toLowerCase())
+                  || (u.email && emailsLower.has(String(u.email).trim().toLowerCase())))
+      .map((u) => ({ id: u.id, name: u.full_name, email: u.email }));
+    if (reps.length) _crmRepDirCache = { at: Date.now(), reps };
+    return reps.length ? reps : _crmRepDirCache.reps;
+  } catch (e) {
+    console.warn('[leads] annuaire CRM indisponible:', e.message);
+    return _crmRepDirCache.reps;
+  }
+}
+
+// Nom → { name, email, crmUserId }. Le courriel suit la meme chaine que partout ailleurs dans
+// l'application : le compte de connexion Zoho d'abord, la fiche salesperson ensuite.
+async function leadRepContact(repName) {
+  if (!repName) return null;
+  const row = (await pool.query(
+    `SELECT s.name,
+            COALESCE((SELECT email FROM user_tokens WHERE LOWER(display_name) = LOWER(s.name) LIMIT 1), s.email) AS email
+       FROM salespeople s WHERE LOWER(s.name) = LOWER($1) LIMIT 1`,
+    [repName]
+  )).rows[0];
+  const name  = row?.name || String(repName);
+  const email = row?.email || null;
+  const dir = await crmRepDirectory();
+  const hit = dir.find((u) => String(u.name || '').trim().toLowerCase() === name.trim().toLowerCase())
+    || (email ? dir.find((u) => String(u.email || '').trim().toLowerCase() === email.toLowerCase()) : null);
+  return { name, email: email || hit?.email || null, crmUserId: hit?.id || null };
+}
+
+// ── Le moteur d'attribution ─────────────────────────────────────────────────
+// Regles evaluees DANS L'ORDRE, tour de role en filet. Un critere vide ne filtre rien : une
+// regle sans aucun critere attrape donc tout ce qui lui parvient, ce qui est la maniere normale
+// d'ecrire un « fourre-tout » en fin de liste.
+function leadMatchesRule(lead, rule) {
+  const norm = (s) => String(s == null ? '' : s).trim().toLowerCase();
+  const list = (v) => (Array.isArray(v) ? v.filter((x) => String(x || '').trim()) : []);
+  const inList = (arr, val) => arr.map(norm).includes(norm(val));
+
+  const sources = list(rule.match_sources);
+  if (sources.length && !inList(sources, lead.source)) return false;
+  const provinces = list(rule.match_provinces);
+  if (provinces.length && !inList(provinces, lead.province)) return false;
+  const langs = list(rule.match_languages);
+  if (langs.length && !inList(langs, lead.language)) return false;
+  const types = list(rule.match_business_types);
+  if (types.length && !inList(types, lead.business_type)) return false;
+  const prefixes = list(rule.match_postal_prefix);
+  if (prefixes.length) {
+    const pc = norm(lead.postal_code).replace(/[\s-]/g, '');
+    if (!pc) return false;
+    if (!prefixes.some((x) => pc.startsWith(norm(x).replace(/[\s-]/g, '')))) return false;
+  }
+  return true;
+}
+
+// Le tour de role general : l'eligible dont la DERNIERE attribution est la plus ancienne. Pas de
+// curseur d'index — il se desynchronise des qu'on ajoute, retire ou met en conge quelqu'un,
+// alors que « le plus anciennement servi » se repare tout seul.
+async function pickRotationRep() {
+  const r = await pool.query(
+    `SELECT rep_name FROM lead_rotation
+      WHERE is_active = true AND (away_until IS NULL OR away_until < CURRENT_DATE)
+      ORDER BY last_assigned_at NULLS FIRST, rep_name
+      LIMIT 1`
+  );
+  return r.rows[0]?.rep_name || null;
+}
+
+// La rotation A L'INTERIEUR d'une regle qui nomme plusieurs representants. Une personne nommee
+// par une regle mais absente de la table de rotation compte comme « jamais servie » — sinon une
+// regle parfaitement valide ne se declencherait jamais, faute d'une ligne que personne n'a pense
+// a creer. Le conge, lui, vaut AUSSI pour une regle nommee : quelqu'un d'absent ne doit pas
+// recevoir de piste sous pretexte qu'une regle le designe.
+async function pickAmongTargets(names) {
+  const targets = (Array.isArray(names) ? names : []).map((n) => String(n || '').trim()).filter(Boolean);
+  if (!targets.length) return null;
+  const rows = (await pool.query(
+    `SELECT rep_name, is_active, away_until, last_assigned_at FROM lead_rotation
+      WHERE LOWER(rep_name) = ANY (SELECT LOWER(x) FROM unnest($1::text[]) AS x)`,
+    [targets]
+  )).rows;
+  const byName = new Map(rows.map((r) => [String(r.rep_name).toLowerCase(), r]));
+  const today = new Date().toISOString().slice(0, 10);
+  const eligible = targets.filter((n) => {
+    const r = byName.get(n.toLowerCase());
+    if (!r) return true;
+    if (!r.is_active) return false;
+    const away = r.away_until instanceof Date ? r.away_until.toISOString().slice(0, 10) : String(r.away_until || '').slice(0, 10);
+    if (away && away >= today) return false;
+    return true;
+  });
+  if (!eligible.length) return null;
+  eligible.sort((a, b) => {
+    const ta = byName.get(a.toLowerCase())?.last_assigned_at;
+    const tb = byName.get(b.toLowerCase())?.last_assigned_at;
+    return (ta ? new Date(ta).getTime() : 0) - (tb ? new Date(tb).getTime() : 0) || a.localeCompare(b);
+  });
+  return eligible[0];
+}
+
+async function suggestLeadAssignment(lead) {
+  const none = { repName: null, via: 'none', ruleId: null, ruleName: null };
+  try {
+    const rules = (await pool.query(
+      `SELECT * FROM lead_assignment_rules WHERE is_active = true ORDER BY position, id`
+    )).rows;
+    for (const rule of rules) {
+      if (!leadMatchesRule(lead, rule)) continue;
+      // Une regle sans cible utilisable est une regle inachevee, pas une regle qui bloque.
+      const pick = await pickAmongTargets(rule.target_reps);
+      if (!pick) continue;
+      return { repName: pick, via: 'rule', ruleId: rule.id, ruleName: rule.name };
+    }
+    const pick = await pickRotationRep();
+    return pick ? { repName: pick, via: 'rotation', ruleId: null, ruleName: null } : none;
+  } catch (e) {
+    console.warn('[leads] suggestion d\'attribution impossible:', e.message);
+    return none;
+  }
+}
+
+// ⚠️ `is_active = false` a la creation, et ce n'est pas une faute de frappe : un representant
+// nomme par une regle est ainsi SUIVI (compteur, derniere attribution) sans etre verse d'office
+// dans le tour de role general. Sans cela, nommer quelqu'un dans une regle « Ontario » le ferait
+// aussi recevoir toutes les pistes fourre-tout, ce que personne n'a demande.
+async function bumpLeadRotation(repName) {
+  if (!repName) return;
+  try {
+    await pool.query(
+      `INSERT INTO lead_rotation (rep_name, is_active, last_assigned_at, assigned_count)
+       VALUES ($1, false, CURRENT_TIMESTAMP, 1)
+       ON CONFLICT (rep_name) DO UPDATE
+         SET last_assigned_at = CURRENT_TIMESTAMP,
+             assigned_count   = lead_rotation.assigned_count + 1`,
+      [repName]
+    );
+  } catch (e) { console.warn('[leads] rotation non mise a jour:', e.message); }
+}
+
+
+// ── Saisie : un seul normalisateur pour les deux portes d'entree ────────────
+// Le formulaire du site et la saisie telephonique produisent la MEME ligne. Ecrire deux
+// analyseurs, c'est se garantir que l'un des deux finira par accepter ce que l'autre refuse.
+// Les cles sont tolerantes (camelCase, snake_case, libelles frequents) pour la meme raison que
+// le webhook des formulaires Zoho l'est deja : on ne controle pas la forme du site public.
+function leadPhoneDigits(s) {
+  const d = String(s || '').replace(/\D/g, '');
+  return d ? d.slice(-15) : null;
+}
+function normalizeLeadInput(b, defaults = {}) {
+  const pick = (...keys) => {
+    for (const k of keys) {
+      const v = b?.[k];
+      if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
+    }
+    return null;
+  };
+  const cut = (v, n) => (v == null ? null : String(v).slice(0, n));
+
+  const businessName = pick('businessName', 'business_name', 'company', 'Company', 'entreprise', 'Nom Entreprise');
+  const rawSource = String(pick('source') || defaults.source || 'website').toLowerCase();
+  const source = LEAD_SOURCES.includes(rawSource) ? rawSource : 'other';
+
+  // Nom du contact : accepte aussi un « nom complet » d'un seul tenant, ce que la plupart des
+  // formulaires de site envoient.
+  let first = pick('contactFirstName', 'contact_first_name', 'firstName', 'first_name', 'prenom');
+  let last  = pick('contactLastName', 'contact_last_name', 'lastName', 'last_name', 'nom');
+  const full = pick('contactName', 'contact_name', 'fullName', 'full_name', 'name');
+  if (!first && !last && full) {
+    const parts = full.split(/\s+/);
+    first = parts[0] || null;
+    last  = parts.slice(1).join(' ') || null;
+  }
+
+  const langRaw = String(pick('language', 'lang', 'locale') || defaults.language || 'fr').toLowerCase();
+  const language = langRaw.startsWith('en') ? 'en' : 'fr';
+
+  const province = (pick('province', 'state', 'region') || '').toUpperCase().slice(0, 10) || null;
+  const phone = pick('contactPhone', 'contact_phone', 'phone', 'telephone', 'tel');
+
+  // `interest` accepte une liste ou une chaine separee par des virgules — les cases a cocher
+  // d'un formulaire HTML arrivent dans l'une ou l'autre forme selon l'outil.
+  let interest = b?.interest ?? b?.interests ?? b?.interet;
+  if (typeof interest === 'string') interest = interest.split(/[,;]/).map((s) => s.trim()).filter(Boolean);
+  if (!Array.isArray(interest)) interest = [];
+  interest = interest.map((s) => String(s).slice(0, 60)).slice(0, 12);
+
+  const locations = parseInt(pick('locationsCount', 'locations_count', 'locations', 'succursales'), 10);
+
+  return {
+    businessName: cut(businessName, 255),
+    businessType: cut(pick('businessType', 'business_type', 'industry', 'secteur'), 120),
+    website:      cut(pick('website', 'site', 'url'), 255),
+    firstName:    cut(first, 255),
+    lastName:     cut(last, 255),
+    title:        cut(pick('contactTitle', 'contact_title', 'title', 'titre'), 120),
+    email:        cut((pick('contactEmail', 'contact_email', 'email', 'courriel') || '').toLowerCase() || null, 255),
+    phone:        cut(phone, 50),
+    phoneDigits:  leadPhoneDigits(phone),
+    city:         cut(pick('city', 'ville'), 160),
+    province,
+    postalCode:   cut(pick('postalCode', 'postal_code', 'zip', 'codePostal', 'code_postal'), 12),
+    language,
+    source,
+    sourceDetail: cut(pick('sourceDetail', 'source_detail', 'formName', 'form_name', 'campaign', 'utm_campaign', 'utm_source'), 160),
+    interest,
+    locationsCount: Number.isFinite(locations) ? Math.max(0, Math.min(9999, locations)) : null,
+    currentPos:   cut(pick('currentPos', 'current_pos', 'currentSystem', 'systeme_actuel'), 160),
+    timeline:     cut(pick('timeline', 'echeance', 'when'), 60),
+    notes:        cut(pick('notes', 'message', 'comments', 'commentaires', 'details'), 8000),
+  };
+}
+
+// Insere la piste, calcule sa suggestion d'attribution, puis lance en arriere-plan la detection
+// de doublon et l'avis aux examinateurs. Le doublon et le courriel sont deliberement DETACHES :
+// un formulaire de site public ne doit jamais attendre un aller-retour vers Zoho pour repondre.
+// `waitForDuplicate` renverse ce choix pour la saisie telephonique — l'employe est au telephone
+// avec la personne, savoir tout de suite « on l'a deja, et c'est Amy qui la suit » vaut la
+// seconde d'attente.
+async function createLeadRow(input, { createdBy = null, raw = null, waitForDuplicate = false } = {}) {
+  const suggestion = await suggestLeadAssignment({
+    source: input.source, province: input.province, language: input.language,
+    business_type: input.businessType, postal_code: input.postalCode,
+  });
+
+  const r = await pool.query(
+    `INSERT INTO leads
+       (source, source_detail, business_name, business_type, website,
+        contact_first_name, contact_last_name, contact_title, contact_email, contact_phone, contact_phone_digits,
+        city, province, postal_code, language, interest, locations_count, current_pos, timeline, notes,
+        created_by, suggested_rep_name, suggested_via, suggested_rule_id, suggested_rule_name, raw)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26::jsonb)
+     RETURNING id, ref_code`,
+    [input.source, input.sourceDetail, input.businessName, input.businessType, input.website,
+     input.firstName, input.lastName, input.title, input.email, input.phone, input.phoneDigits,
+     input.city, input.province, input.postalCode, input.language, JSON.stringify(input.interest),
+     input.locationsCount, input.currentPos, input.timeline, input.notes,
+     createdBy, suggestion.repName, suggestion.via, suggestion.ruleId, suggestion.ruleName,
+     raw ? JSON.stringify(raw) : null]
+  );
+  const { id, ref_code: refCode } = r.rows[0];
+
+  logActivity('lead', id, 'received',
+    `${refCode} — ${input.businessName} (${input.source})`, createdBy || 'website');
+
+  const dup = checkCrmDuplicate({
+    businessName: input.businessName, contactEmail: input.email, contactPhone: input.phone,
+  })
+    .then(async (result) => {
+      await pool.query(
+        `UPDATE leads SET crm_match_status = $2, crm_match_summary = $3, crm_match_records = $4::jsonb WHERE id = $1`,
+        [id, result.status, result.summary, JSON.stringify(result.matches || [])]
+      );
+      return result;
+    })
+    .catch((e) => { console.warn('[leads] detection de doublon impossible:', e.message); return null; });
+
+  notifyLeadReviewers(id).catch(() => {});
+
+  return { id, refCode, suggestion, duplicate: waitForDuplicate ? await dup : null };
+}
+
+// ── Les trois courriels ─────────────────────────────────────────────────────
+const leadEsc = (s) => String(s == null ? '' : s)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+function leadDisplayName(lead) {
+  return [lead.contact_first_name, lead.contact_last_name].filter(Boolean).join(' ') || null;
+}
+function leadWhenLabel(iso, lang) {
+  if (!iso) return null;
+  return new Date(iso).toLocaleString(lang === 'en' ? 'en-CA' : 'fr-CA', {
+    timeZone: LEAD_TZ, weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit',
+  });
+}
+
+// 1. Aux examinateurs — « une piste attend ». Bilingue : c'est un courriel interne.
+function leadReviewEmail(lead, suggestionLabel) {
+  const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+  const who = leadDisplayName(lead);
+  const rows = [
+    `<strong>${leadEsc(lead.business_name)}</strong> — ${leadEsc(lead.ref_code)}`,
+    who ? `Contact : ${leadEsc(who)}` : null,
+    lead.contact_phone ? `Tél. : ${leadEsc(lead.contact_phone)}` : null,
+    lead.contact_email ? `Courriel : ${leadEsc(lead.contact_email)}` : null,
+    [lead.city, lead.province].filter(Boolean).length ? `Lieu : ${leadEsc([lead.city, lead.province].filter(Boolean).join(', '))}` : null,
+    `Source : ${leadEsc(lead.source)}${lead.source_detail ? ` (${leadEsc(lead.source_detail)})` : ''}`,
+    suggestionLabel ? `Attribution suggérée : <strong>${leadEsc(suggestionLabel)}</strong>` : 'Aucune attribution suggérée — la rotation est vide.',
+    lead.notes ? `<br>Message :<br><em>${leadEsc(lead.notes).replace(/\n/g, '<br>')}</em>` : null,
+  ].filter(Boolean).join('<br>');
+  return {
+    subject: `Nouvelle piste — ${lead.business_name} (${lead.ref_code})`,
+    html: mailShell(
+      'Nouvelle piste à examiner / New lead to review',
+      `${rows}<br><br>Rien n'est encore entré dans Zoho : la piste attend une acceptation.<br>Nothing has reached Zoho yet — the lead is waiting for a review.`,
+      'Ouvrir la file / Open the queue', `${base}/leads`
+    ),
+  };
+}
+
+// 2. Au representant — « cette piste est a toi ». Bilingue, meme raison.
+function leadAssignedEmail(lead, rep, callbackAt, crmLeadId) {
+  const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+  const who = leadDisplayName(lead);
+  const when = leadWhenLabel(callbackAt, 'fr');
+  const whenEn = leadWhenLabel(callbackAt, 'en');
+  const rows = [
+    `<strong>${leadEsc(lead.business_name)}</strong> — ${leadEsc(lead.ref_code)}`,
+    who ? `Contact : ${leadEsc(who)}${lead.contact_title ? ` (${leadEsc(lead.contact_title)})` : ''}` : null,
+    lead.contact_phone ? `Tél. : <a href="tel:${leadEsc(String(lead.contact_phone).replace(/[^\d+]/g, ''))}" style="color:#3c50e0;text-decoration:none">${leadEsc(lead.contact_phone)}</a>` : null,
+    lead.contact_email ? `Courriel : <a href="mailto:${leadEsc(lead.contact_email)}" style="color:#3c50e0;text-decoration:none">${leadEsc(lead.contact_email)}</a>` : null,
+    [lead.city, lead.province].filter(Boolean).length ? `Lieu : ${leadEsc([lead.city, lead.province].filter(Boolean).join(', '))}` : null,
+    `Langue du client / Client language : <strong>${lead.language === 'en' ? 'English' : 'Français'}</strong>`,
+    lead.business_type ? `Type : ${leadEsc(lead.business_type)}` : null,
+    lead.current_pos ? `Système actuel : ${leadEsc(lead.current_pos)}` : null,
+    Array.isArray(lead.interest) && lead.interest.length ? `Intérêt : ${leadEsc(lead.interest.join(', '))}` : null,
+    lead.notes ? `<br>Message du client :<br><em>${leadEsc(lead.notes).replace(/\n/g, '<br>')}</em>` : null,
+  ].filter(Boolean).join('<br>');
+
+  // ⚠️ Le marchand a DEJA recu le nom du representant et l'heure du rappel. Le dire ici noir sur
+  // blanc, sinon le representant ne sait pas qu'une promesse a ete faite en son nom.
+  const promise = when
+    ? `<br><br><div style="border-left:3px solid #f97316;padding:10px 0 10px 14px;color:#0f1722;font-size:14px">`
+      + `<strong>Le client a été prévenu que vous le contacteriez.</strong><br>`
+      + `Rappel planifié dans Zoho : <strong>${leadEsc(when)}</strong>.<br>`
+      + `<span style="color:#64748b">The client has been told you would reach out — callback scheduled for ${leadEsc(whenEn)}.</span>`
+      + `</div>`
+    : '';
+
+  return {
+    subject: `Nouvelle piste assignée — ${lead.business_name}`,
+    html: mailShell(
+      `Une nouvelle piste vous est assignée / A new lead is yours`,
+      `${rows}${promise}`,
+      'Voir la piste / View the lead',
+      crmLeadId ? `https://crm.zoho.com/crm/tab/Leads/${crmLeadId}` : `${base}/leads?ref=${encodeURIComponent(lead.ref_code)}`
+    ),
+  };
+}
+
+// 3. Au marchand — remerciement + nom de son representant. UNILINGUE, dans la langue de la
+// piste : c'est le seul de la trilogie qui sorte de l'entreprise, et un client ne doit pas lire
+// sa propre langue en deuxieme. Marque CLUSTER, pas Sales Hub : le prospect fait affaire avec
+// Cluster et n'a jamais entendu parler de l'outil interne.
+function leadWelcomeEmail(lead, rep, callbackAt, settings) {
+  const fr = lead.language !== 'en';
+  const first = lead.contact_first_name ? String(lead.contact_first_name).trim() : null;
+  const when = leadWhenLabel(callbackAt, fr ? 'fr' : 'en');
+  const repName = rep?.name || null;
+  const home = settings.merchantSiteUrl || LEAD_SETTINGS_DEFAULTS.merchantSiteUrl;
+
+  const title = fr ? 'Merci d\'avoir communiqué avec nous' : 'Thanks for getting in touch';
+  const hello = fr ? (first ? `Bonjour ${leadEsc(first)},` : 'Bonjour,')
+                   : (first ? `Hi ${leadEsc(first)},` : 'Hello,');
+
+  const intro = fr
+    ? `${hello}<br><br>Merci d'avoir communiqué avec Cluster aujourd'hui au sujet de <strong>${leadEsc(lead.business_name)}</strong>. Votre demande est bien reçue, et elle est déjà entre les mains d'une personne — pas d'une file d'attente.`
+    : `${hello}<br><br>Thanks for getting in touch with Cluster today about <strong>${leadEsc(lead.business_name)}</strong>. We have your request, and it is already with a person — not a queue.`;
+
+  const repBlock = repName
+    ? `<div style="margin:22px 0;padding:16px 18px;background:#f8fafc;border-radius:10px">
+         <p style="margin:0 0 4px;color:#94a3b8;font-size:11px;text-transform:uppercase;font-weight:700;letter-spacing:.4px">${fr ? 'Votre conseiller' : 'Your advisor'}</p>
+         <p style="margin:0;color:#0f1722;font-size:17px;font-weight:700">${leadEsc(repName)}</p>
+         ${rep?.email ? `<p style="margin:4px 0 0;font-size:14px"><a href="mailto:${leadEsc(rep.email)}" style="color:#3c50e0;text-decoration:none">${leadEsc(rep.email)}</a></p>` : ''}
+       </div>`
+    : '';
+
+  const promise = when
+    ? (fr
+        ? `<p style="margin:0;color:#475569;font-size:14.5px;line-height:1.65">${repName ? leadEsc(repName) : 'Un conseiller'} vous contactera <strong>${leadEsc(when)}</strong>. Si ce moment ne vous convient pas, répondez simplement à ce courriel et nous nous ajusterons.</p>`
+        : `<p style="margin:0;color:#475569;font-size:14.5px;line-height:1.65">${repName ? leadEsc(repName) : 'An advisor'} will reach out on <strong>${leadEsc(when)}</strong>. If that time doesn't work, just reply to this email and we'll adjust.</p>`)
+    : (fr
+        ? `<p style="margin:0;color:#475569;font-size:14.5px;line-height:1.65">${repName ? leadEsc(repName) : 'Un conseiller'} vous contactera sous peu. Vous pouvez aussi répondre directement à ce courriel.</p>`
+        : `<p style="margin:0;color:#475569;font-size:14.5px;line-height:1.65">${repName ? leadEsc(repName) : 'An advisor'} will be in touch shortly. You can also just reply to this email.</p>`);
+
+  const inner = `<h1 style="margin:0 0 14px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${title}</h1>
+    <div style="color:#475569;font-size:14.5px;line-height:1.65">${intro}</div>
+    ${repBlock}
+    ${promise}`;
+
+  return {
+    subject: fr ? `Merci — votre demande est entre bonnes mains` : `Thank you — your request is in good hands`,
+    html: mailChrome(inner, title, 'cluster-plain', fr ? 'fr' : 'en', home),
+  };
+}
+
+// app_settings 'lead_review_recipients' — qui recoit « une piste attend ». Liste VIDE = aucun
+// courriel, la file reste la seule source. Meme convention que les rapports de commission
+// manquante : on ne devine pas une audience.
+async function getLeadReviewRecipients() {
+  try {
+    const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'lead_review_recipients'`);
+    const v = r.rows[0]?.value;
+    return Array.isArray(v) ? v.filter((e) => typeof e === 'string') : [];
+  } catch { return []; }
+}
+
+// Ne leve JAMAIS : appele en mode « oublie-le » depuis la saisie, et un echec d'envoi ne doit
+// pas faire echouer la reception d'une piste.
+async function notifyLeadReviewers(leadId) {
+  try {
+    const recipients = await getLeadReviewRecipients();
+    if (!recipients.length) return;
+    const lead = (await pool.query(`SELECT * FROM leads WHERE id = $1`, [leadId])).rows[0];
+    if (!lead) return;
+    const label = lead.suggested_rep_name
+      ? `${lead.suggested_rep_name}${lead.suggested_rule_name ? ` — règle « ${lead.suggested_rule_name} »` : ' — tour de rôle'}`
+      : null;
+    const { subject, html } = leadReviewEmail(lead, label);
+    await sendMail(recipients.join(','), subject, html);
+  } catch (e) { console.warn('[leads] avis aux examinateurs non envoye:', e.message); }
+}
+
+
+// ── Le rappel planifie dans Zoho ────────────────────────────────────────────
+// Un Call (par defaut) ou une Task, POSSEDE PAR LE REPRESENTANT et non par le jeton partage —
+// sinon le rappel atterrit dans la liste de quelqu'un d'autre et personne n'appelle.
+//
+// ⚠️ Rattachement : pour une piste, Zoho attend `Who_Id` (+ `$se_module: 'Leads'`), la ou
+// `toolCrmScheduleFollowup` de Sofia utilise `What_Id`. Les deux formes existent chez Zoho
+// selon le module vise, et je n'ai pas pu essayer contre l'organisation reelle — d'ou le
+// second essai avec l'autre forme quand le premier est refuse, et la forme retenue consignee
+// dans `automation` pour qu'on sache laquelle marche apres le premier vrai rappel.
+async function scheduleLeadCallback(lead, rep, crmLeadId, when, settings) {
+  const kind = String(settings.callbackType || 'call').toLowerCase() === 'task' ? 'Tasks' : 'Calls';
+  const pad = (n) => String(n).padStart(2, '0');
+  const p = tzParts(when);
+  const dateStr = `${p.year}-${pad(p.month)}-${pad(p.day)}`;
+  const subject = `Rappel — ${lead.business_name} (${lead.ref_code})`.slice(0, 250);
+  const description = [
+    `Piste reçue via Sales Hub (${lead.source}${lead.source_detail ? ` — ${lead.source_detail}` : ''}).`,
+    lead.contact_phone ? `Tél. : ${lead.contact_phone}` : null,
+    lead.contact_email ? `Courriel : ${lead.contact_email}` : null,
+    `Le client a été avisé qu'on le contacterait à ce moment.`,
+  ].filter(Boolean).join('\n');
+
+  const common = {
+    Subject: subject,
+    Description: description,
+    ...(rep?.crmUserId ? { Owner: { id: rep.crmUserId } } : {}),
+  };
+  const specific = kind === 'Calls'
+    ? {
+        Call_Type: 'Outbound',
+        Call_Start_Time: `${dateStr}T${pad(p.hour)}:${pad(p.minute)}:00${tzOffsetString(when)}`,
+        Call_Duration: '15',
+      }
+    : { Due_Date: dateStr, Status: 'Not Started' };
+
+  const attempt = async (linkField) => {
+    const token = await ensureValidCrmToken();
+    const r = await axios.post(
+      `https://www.zohoapis.com/crm/v2/${kind}`,
+      { data: [{ ...common, ...specific, [linkField]: { id: crmLeadId }, $se_module: 'Leads' }] },
+      { headers: { Authorization: `Zoho-oauthtoken ${token}`, 'Content-Type': 'application/json' },
+        validateStatus: () => true, timeout: 20000 }
+    );
+    const res = r.data?.data?.[0];
+    if (r.status >= 200 && r.status < 300 && res?.status === 'success') {
+      return { ok: true, id: res.details?.id || null, linkField };
+    }
+    return { ok: false, error: String(res?.message || r.data?.message || `HTTP ${r.status}`).slice(0, 300) };
+  };
+
+  try {
+    let out = await attempt('Who_Id');
+    if (!out.ok) {
+      const first = out.error;
+      out = await attempt('What_Id');
+      if (!out.ok) return { ok: false, kind, error: `${first} / ${out.error}` };
+    }
+    return { ok: true, kind, id: out.id, linkField: out.linkField };
+  } catch (e) {
+    return { ok: false, kind, error: e.message.slice(0, 300) };
+  }
+}
+
+// ── L'acceptation : le seul endroit qui ecrit dans Zoho ─────────────────────
+// Quatre gestes, dans cet ordre, et un seul est bloquant :
+//   1. creer la piste dans Zoho CRM      ← BLOQUANT : si Zoho refuse, on n'accepte pas
+//   2. planifier le rappel du representant
+//   3. prevenir le representant par courriel
+//   4. remercier le marchand et lui nommer son representant
+//
+// Pourquoi un seul bloquant : sans fiche Zoho, il n'y a rien a rattacher et la piste doit
+// rester dans la file pour etre reessayee. Les trois autres sont des avis — echouer sur un
+// serveur SMTP ne doit pas empecher une piste d'exister dans le CRM, et un echec silencieux
+// serait pire : chaque etape consigne son resultat dans `automation`, que l'ecran affiche.
+async function acceptLead(leadId, actor, opts = {}) {
+  const lead = (await pool.query(`SELECT * FROM leads WHERE id = $1`, [leadId])).rows[0];
+  if (!lead) return { error: 'not_found' };
+  if (lead.status === 'accepted') return { error: 'already_accepted' };
+
+  const settings = await leadSettings();
+  const repName = String(opts.repName || '').trim() || lead.assigned_rep_name || lead.suggested_rep_name;
+  if (!repName) return { error: 'no_rep' };
+  const rep = await leadRepContact(repName);
+
+  const steps = {};
+  const contactMethod = lead.source === 'website' ? settings.contactMethodWebsite : settings.contactMethodPhone;
+  const leadSource    = lead.source === 'website' ? settings.leadSourceWebsite    : settings.leadSourcePhone;
+  const contactName = leadDisplayName(lead);
+
+  const noteBody = [
+    `Accepté dans Sales Hub par ${opts.approverName ? `${opts.approverName} (${actor})` : actor}.`,
+    '',
+    `Référence Sales Hub : ${lead.ref_code}`,
+    `Source : ${lead.source}${lead.source_detail ? ` — ${lead.source_detail}` : ''}`,
+    `Reçue le : ${new Date(lead.created_at).toLocaleString('fr-CA', { timeZone: LEAD_TZ })}`,
+    lead.created_by ? `Saisie par : ${lead.created_by}` : null,
+    `Langue du client : ${lead.language === 'en' ? 'anglais' : 'français'}`,
+    lead.business_type ? `Type de commerce : ${lead.business_type}` : null,
+    lead.locations_count ? `Nombre de succursales : ${lead.locations_count}` : null,
+    lead.current_pos ? `Système actuel : ${lead.current_pos}` : null,
+    lead.timeline ? `Échéance : ${lead.timeline}` : null,
+    Array.isArray(lead.interest) && lead.interest.length ? `Intérêt : ${lead.interest.join(', ')}` : null,
+    lead.website ? `Site web : ${lead.website}` : null,
+    lead.notes ? `\nMessage du client :\n${lead.notes}` : null,
+  ].filter((l) => l !== null).join('\n').trim();
+
+  const payload = {
+    business_name:      lead.business_name,
+    contact_first_name: lead.contact_first_name,
+    contact_last_name:  lead.contact_last_name,
+    contact_email:      lead.contact_email,
+    contact_phone:      lead.contact_phone,
+    city:               lead.city,
+    province:           lead.province,
+    postal_code:        lead.postal_code,
+    website:            lead.website,
+    lead_contact_method: contactMethod || null,
+    lead_source:        leadSource || null,
+    crm_owner_id:       rep?.crmUserId || null,
+    approver_email:     actor,
+    approver_name:      opts.approverName || null,
+    description:        noteBody,
+    note_title:         `Piste ${lead.ref_code} — ${lead.source === 'website' ? 'formulaire du site' : 'saisie Sales Hub'}`,
+    note_body:          noteBody,
+  };
+
+  // 1. Zoho — bloquant.
+  let crm = await createCrmLead(payload);
+  if (!crm.success && (leadSource || contactMethod)) {
+    // `Lead_Source` et `Lead_Contact_Method` sont des listes de choix : une valeur absente de
+    // la liste fait rejeter TOUT l'enregistrement. Plutot que de perdre la piste, on refait un
+    // essai sans elles et on le dit — l'admin corrige ensuite la valeur dans les reglages.
+    crm = await createCrmLead({ ...payload, lead_source: null, lead_contact_method: null });
+    if (crm.success) steps.crmRetriedWithoutPicklists = true;
+  }
+  if (!crm.success) {
+    await pool.query(`UPDATE leads SET crm_lead_error = $2 WHERE id = $1`, [leadId, crm.error]);
+    logActivity('lead', leadId, 'crm_failed', `${lead.ref_code} — Zoho a refusé : ${crm.error}`, actor);
+    return { error: 'crm_failed', detail: crm.error };
+  }
+  steps.crm = { ok: true, leadId: crm.leadId };
+
+  // 2. Le rappel.
+  let callbackAt = null;
+  if (settings.callbackEnabled) {
+    callbackAt = leadCallbackAt(settings);
+    const cb = await scheduleLeadCallback(lead, rep, crm.leadId, callbackAt, settings);
+    steps.callback = cb.ok
+      ? { ok: true, kind: cb.kind, id: cb.id, at: callbackAt.toISOString(), linkField: cb.linkField }
+      : { ok: false, kind: cb.kind, error: cb.error };
+    // Un rappel qui n'a pas pu etre planifie ne doit pas etre PROMIS au marchand.
+    if (!cb.ok) callbackAt = null;
+  } else {
+    steps.callback = { ok: false, skipped: 'disabled' };
+  }
+
+  // 3. Le representant.
+  if (settings.notifyRep && rep?.email) {
+    const { subject, html } = leadAssignedEmail(lead, rep, callbackAt, crm.leadId);
+    const m = await sendMail(rep.email, subject, html);
+    steps.repEmail = m.sent ? { ok: true, to: rep.email } : { ok: false, to: rep.email, error: m.reason };
+  } else {
+    steps.repEmail = { ok: false, skipped: !settings.notifyRep ? 'disabled' : 'no_rep_email' };
+  }
+
+  // 4. Le marchand. `replyTo` pointe sur le representant : une reponse doit atterrir chez la
+  // personne nommee dans le courriel, pas dans une boite generique que personne ne relit.
+  if (settings.notifyMerchant && lead.contact_email) {
+    const { subject, html } = leadWelcomeEmail(lead, rep, callbackAt, settings);
+    const m = await sendMail(lead.contact_email, subject, html, {
+      from: settings.merchantFrom || undefined,
+      replyTo: rep?.email || undefined,
+    });
+    steps.merchantEmail = m.sent ? { ok: true, to: lead.contact_email } : { ok: false, to: lead.contact_email, error: m.reason };
+  } else {
+    steps.merchantEmail = { ok: false, skipped: !settings.notifyMerchant ? 'disabled' : 'no_contact_email' };
+  }
+
+  await pool.query(
+    `UPDATE leads
+        SET status = 'accepted', reviewed_by = $2, reviewed_at = CURRENT_TIMESTAMP, rejection_reason = NULL,
+            assigned_rep_name = $3, assigned_rep_email = $4, assigned_crm_user_id = $5,
+            assigned_at = CURRENT_TIMESTAMP, assigned_by = $2,
+            crm_lead_id = $6, crm_lead_error = NULL,
+            crm_followup_id = $7, crm_followup_kind = $8, callback_at = $9,
+            rep_notified_at      = CASE WHEN $10 THEN CURRENT_TIMESTAMP ELSE rep_notified_at END,
+            merchant_notified_at = CASE WHEN $11 THEN CURRENT_TIMESTAMP ELSE merchant_notified_at END,
+            automation = $12::jsonb
+      WHERE id = $1`,
+    [leadId, actor, rep.name, rep.email, rep.crmUserId, crm.leadId,
+     steps.callback?.id || null, steps.callback?.ok ? steps.callback.kind : null,
+     callbackAt ? callbackAt.toISOString() : null,
+     !!steps.repEmail?.ok, !!steps.merchantEmail?.ok, JSON.stringify(steps)]
+  );
+  await bumpLeadRotation(rep.name);
+
+  logActivity('lead', leadId, 'accepted',
+    `${lead.ref_code} — ${lead.business_name} → ${rep.name} (Zoho ${crm.leadId})`, actor,
+    { metadata: { crmLeadId: crm.leadId, rep: rep.name, steps } });
+
+  return { ok: true, crmLeadId: crm.leadId, rep, callbackAt, steps };
+}
+
+// ── Endpoints ───────────────────────────────────────────────────────────────
+
+// Porte d'entree PUBLIQUE : le formulaire du site. Secret partage dans l'en-tete
+// `X-Cluster-Webhook-Secret` ou `?secret=`, meme mecanique que les webhooks Zoho deja en place.
+// Tolerant sur la forme du corps (JSON ou form-encoded) et sur le nom des champs : on ne
+// controle pas le site public, et une piste perdue parce qu'un champ s'appelle `company` au
+// lieu de `businessName` serait le pire echec possible pour cette fonctionnalite.
+app.post('/api/webhooks/website-lead',
+  bodyParser.urlencoded({ extended: true }),
+  requireWebhookSecret('LEAD_WEBHOOK_SECRET', 'ZOHO_WEBHOOK_SECRET'),
+  async (req, res) => {
+    try {
+      const input = normalizeLeadInput(req.body || {}, { source: 'website' });
+      if (!input.businessName && !input.email && !input.phone) {
+        return res.status(400).json({ error: 'business name, email or phone required' });
+      }
+      // Un formulaire de site laisse souvent le nom d'entreprise vide. Refuser la piste pour ca
+      // serait absurde : on retombe sur le nom du contact, quitte a ce que l'examinateur corrige.
+      if (!input.businessName) {
+        input.businessName = [input.firstName, input.lastName].filter(Boolean).join(' ')
+          || input.email || input.phone;
+      }
+      const out = await createLeadRow(input, { raw: req.body });
+      console.log(`🎯 [leads] ${out.refCode} — ${input.businessName} (${input.source})`);
+      res.json({ success: true, ref: out.refCode });
+    } catch (e) {
+      console.error('[leads] webhook error:', e.message);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+// Qui a le droit de voir quoi. `view_all` (ou admin) voit tout ; sinon on ne montre que ce qui
+// touche la personne : les pistes qui lui sont attribuees, et celles qu'elle a saisies
+// elle-meme. Decision de David : les reps RECOIVENT leurs pistes, ils ne piochent pas dans un
+// bassin commun — il n'y a donc volontairement aucun moyen de voir les pistes non attribuees.
+async function leadAccess(req) {
+  const isAdmin = req.user.isAdmin === true;
+  // ⚠️ Un SET, pas un tableau : `userHasPermission` appelle `.has()`. Le court-circuit
+  // `isAdmin ||` ci-dessous rendrait un tableau inoffensif aujourd'hui, mais la premiere
+  // personne qui reordonne cette condition heriterait d'un « .has is not a function ».
+  const perms = isAdmin ? new Set(['*']) : await getUserPermissions(req.user.email);
+  const has = (p) => isAdmin || userHasPermission(perms, p);
+  return {
+    isAdmin,
+    viewAll: has('leads:view_all'),
+    viewOwn: has('leads:view_own'),
+    review:  has('leads:review'),
+    intake:  has('leads:intake'),
+    rules:   has('leads:manage_rules'),
+  };
+}
+
+// ⚠️ Ces deux routes doivent rester AVANT `/api/leads/:id` : Express prend la premiere qui
+// correspond, et `:id` avalerait « stats » comme un identifiant.
+app.get('/api/leads/stats', authenticateToken, async (req, res) => {
+  const acc = await leadAccess(req);
+  if (!acc.viewAll && !acc.review) return res.status(403).json({ error: 'Permission required: leads:view_all' });
+  const months = Math.min(24, Math.max(1, parseInt(req.query.months, 10) || 6));
+  try {
+    const since = `${months} months`;
+    const [byStatus, bySource, byMonth, byRep, funnel, queue, speed] = await Promise.all([
+      pool.query(`SELECT status, COUNT(*)::int AS n FROM leads GROUP BY status`),
+      pool.query(`SELECT source, COUNT(*)::int AS n,
+                         COUNT(*) FILTER (WHERE status = 'accepted')::int AS accepted
+                    FROM leads WHERE created_at >= NOW() - INTERVAL '${since}'
+                   GROUP BY source ORDER BY n DESC`),
+      pool.query(`SELECT to_char(date_trunc('month', created_at), 'YYYY-MM') AS month,
+                         COUNT(*)::int AS n,
+                         COUNT(*) FILTER (WHERE status = 'accepted')::int AS accepted,
+                         COUNT(*) FILTER (WHERE status IN ('rejected','duplicate'))::int AS rejected
+                    FROM leads WHERE created_at >= NOW() - INTERVAL '${since}'
+                   GROUP BY 1 ORDER BY 1`),
+      pool.query(`SELECT assigned_rep_name AS rep, COUNT(*)::int AS n,
+                         COUNT(*) FILTER (WHERE crm_deal_id IS NOT NULL)::int AS converted,
+                         COUNT(*) FILTER (WHERE crm_deposit_date IS NOT NULL)::int AS won
+                    FROM leads
+                   WHERE assigned_rep_name IS NOT NULL AND created_at >= NOW() - INTERVAL '${since}'
+                   GROUP BY 1 ORDER BY n DESC`),
+      // L'entonnoir complet — c'est la seule vue qui relie une piste a de l'argent reel, via
+      // l'etat du Deal Zoho rafraichi par le travail horaire.
+      pool.query(`SELECT COUNT(*)::int AS received,
+                         COUNT(*) FILTER (WHERE status = 'accepted')::int AS accepted,
+                         COUNT(*) FILTER (WHERE crm_deal_id IS NOT NULL)::int AS converted,
+                         COUNT(*) FILTER (WHERE crm_deposit_date IS NOT NULL)::int AS won
+                    FROM leads WHERE created_at >= NOW() - INTERVAL '${since}'`),
+      // L'age de la file : une piste de trois jours qui attend est un client perdu, et c'est
+      // exactement ce qu'un compteur global ne montre pas.
+      pool.query(`SELECT COUNT(*)::int AS waiting,
+                         COUNT(*) FILTER (WHERE created_at < NOW() - INTERVAL '4 hours')::int AS over_4h,
+                         COUNT(*) FILTER (WHERE created_at < NOW() - INTERVAL '24 hours')::int AS over_24h,
+                         MIN(created_at) AS oldest
+                    FROM leads WHERE status IN ('new', 'in_review')`),
+      pool.query(`SELECT ROUND(AVG(EXTRACT(EPOCH FROM (reviewed_at - created_at)) / 3600)::numeric, 1)::float AS avg_hours,
+                         ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (
+                           ORDER BY EXTRACT(EPOCH FROM (reviewed_at - created_at)) / 3600))::numeric, 1)::float AS median_hours
+                    FROM leads
+                   WHERE reviewed_at IS NOT NULL AND created_at >= NOW() - INTERVAL '${since}'`),
+    ]);
+    res.json({
+      byStatus: Object.fromEntries(byStatus.rows.map((r) => [r.status, r.n])),
+      bySource: bySource.rows,
+      byMonth:  byMonth.rows,
+      byRep:    byRep.rows,
+      funnel:   funnel.rows[0],
+      queue:    queue.rows[0],
+      speed:    speed.rows[0],
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// La liste des representants attribuables : le tour de role d'abord (avec son etat), puis tout
+// representant actif absent de la rotation — un examinateur doit pouvoir attribuer a quelqu'un
+// qui n'est pas dans le bassin automatique.
+app.get('/api/leads/meta/reps', authenticateToken, async (req, res) => {
+  const acc = await leadAccess(req);
+  if (!acc.review && !acc.intake && !acc.viewAll) return res.status(403).json({ error: 'Permission required: leads:review' });
+  try {
+    const rows = (await pool.query(
+      `SELECT s.name,
+              COALESCE(r.is_active, false) AS in_rotation,
+              r.away_until, r.last_assigned_at, COALESCE(r.assigned_count, 0)::int AS assigned_count
+         FROM salespeople s
+         LEFT JOIN lead_rotation r ON LOWER(r.rep_name) = LOWER(s.name)
+        WHERE s.is_active = true
+        ORDER BY s.name`
+    )).rows;
+    res.json({ reps: rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/leads', authenticateToken, async (req, res) => {
+  const acc = await leadAccess(req);
+  if (!acc.viewAll && !acc.viewOwn && !acc.review) return res.status(403).json({ error: 'Permission required: leads:view_own' });
+  const where = [];
+  const params = [];
+  const add = (sql, ...vals) => { params.push(...vals); where.push(sql); };
+
+  if (!acc.viewAll && !acc.review) {
+    add(`(LOWER(assigned_rep_name) = LOWER($${params.length + 1})
+          OR LOWER(COALESCE(assigned_rep_email, '')) = LOWER($${params.length + 2})
+          OR LOWER(COALESCE(created_by, '')) = LOWER($${params.length + 2}))`,
+      req.user.name || ' ', req.user.email || ' ');
+  }
+  if (LEAD_STATUSES.includes(req.query.status)) add(`status = $${params.length + 1}`, req.query.status);
+  if (LEAD_SOURCES.includes(req.query.source)) add(`source = $${params.length + 1}`, req.query.source);
+  if (req.query.rep) add(`LOWER(assigned_rep_name) = LOWER($${params.length + 1})`, String(req.query.rep));
+  if (req.query.from) add(`created_at >= $${params.length + 1}`, String(req.query.from));
+  if (req.query.to) add(`created_at < ($${params.length + 1}::date + 1)`, String(req.query.to));
+  const q = String(req.query.q || '').trim();
+  if (q.length >= 2) {
+    const like = `%${q.toLowerCase()}%`;
+    add(`(LOWER(business_name) LIKE $${params.length + 1}
+          OR LOWER(COALESCE(contact_email, '')) LIKE $${params.length + 1}
+          OR LOWER(COALESCE(contact_first_name, '') || ' ' || COALESCE(contact_last_name, '')) LIKE $${params.length + 1}
+          OR LOWER(ref_code) LIKE $${params.length + 1}
+          OR COALESCE(contact_phone_digits, '') LIKE $${params.length + 2})`,
+      like, `%${q.replace(/\D/g, '')}%`);
+  }
+  const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 200));
+  try {
+    const rows = (await pool.query(
+      `SELECT * FROM leads
+        ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+        ORDER BY created_at DESC LIMIT ${limit}`,
+      params
+    )).rows;
+    // Les compteurs de la barre de pastilles doivent refleter le MEME perimetre que la liste,
+    // sinon « 3 à examiner » s'affiche a quelqu'un qui n'en voit aucune.
+    const scope = (!acc.viewAll && !acc.review) ? where[0] : null;
+    const counts = (await pool.query(
+      `SELECT status, COUNT(*)::int AS n FROM leads ${scope ? `WHERE ${scope}` : ''} GROUP BY status`,
+      scope ? params.slice(0, 2) : []
+    )).rows;
+    res.json({
+      leads: rows.map(publicLead),
+      counts: Object.fromEntries(counts.map((r) => [r.status, r.n])),
+      can: { review: acc.review, intake: acc.intake, viewAll: acc.viewAll, rules: acc.rules },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Forme envoyee au navigateur. Les colonnes brutes portent des noms de base de donnees ; l'ecran
+// en veut une poignee, nommees comme le reste de l'application.
+function publicLead(r) {
+  return {
+    id: r.id, refCode: r.ref_code, status: r.status, source: r.source, sourceDetail: r.source_detail,
+    businessName: r.business_name, businessType: r.business_type, website: r.website,
+    // ⚠️ A PLAT, et pas dans un objet `contact: { email, phone }` : le mode demo masque par NOM
+    // de cle, et brouiller les cles generiques `email`/`phone` toucherait aussi les courriels
+    // des representants partout ailleurs dans l'application. Voir DEMO_CONTACT_KEYS.
+    contactFirstName: r.contact_first_name, contactLastName: r.contact_last_name,
+    contactTitle: r.contact_title, contactEmail: r.contact_email, contactPhone: r.contact_phone,
+    city: r.city, province: r.province, postalCode: r.postal_code, language: r.language,
+    interest: Array.isArray(r.interest) ? r.interest : [],
+    locationsCount: r.locations_count, currentPos: r.current_pos, timeline: r.timeline, notes: r.notes,
+    createdBy: r.created_by, createdAt: r.created_at,
+    suggested: r.suggested_rep_name
+      ? { repName: r.suggested_rep_name, via: r.suggested_via, ruleId: r.suggested_rule_id, ruleName: r.suggested_rule_name }
+      : null,
+    assigned: r.assigned_rep_name
+      ? { repName: r.assigned_rep_name, email: r.assigned_rep_email, at: r.assigned_at, by: r.assigned_by }
+      : null,
+    reviewedBy: r.reviewed_by, reviewedAt: r.reviewed_at, rejectionReason: r.rejection_reason,
+    duplicate: { status: r.crm_match_status, summary: r.crm_match_summary, records: r.crm_match_records || [] },
+    crm: {
+      leadId: r.crm_lead_id, error: r.crm_lead_error, dealId: r.crm_deal_id,
+      dealStage: r.crm_deal_stage, depositDate: r.crm_deposit_date,
+      followupId: r.crm_followup_id, followupKind: r.crm_followup_kind,
+    },
+    callbackAt: r.callback_at, repNotifiedAt: r.rep_notified_at, merchantNotifiedAt: r.merchant_notified_at,
+    automation: r.automation || {},
+  };
+}
+
+app.get('/api/leads/:id', authenticateToken, async (req, res) => {
+  const acc = await leadAccess(req);
+  if (!acc.viewAll && !acc.viewOwn && !acc.review) return res.status(403).json({ error: 'Permission required: leads:view_own' });
+  try {
+    const r = (await pool.query(`SELECT * FROM leads WHERE id = $1`, [parseInt(req.params.id, 10)])).rows[0];
+    if (!r) return res.status(404).json({ error: 'Lead not found' });
+    if (!acc.viewAll && !acc.review) {
+      const mine = [r.assigned_rep_name, r.assigned_rep_email, r.created_by]
+        .filter(Boolean).map((s) => String(s).toLowerCase());
+      const me = [req.user.name, req.user.email].filter(Boolean).map((s) => String(s).toLowerCase());
+      if (!mine.some((x) => me.includes(x))) return res.status(403).json({ error: 'Not your lead' });
+    }
+    const history = (await pool.query(
+      `SELECT event_type, description, actor, created_at FROM activity_log
+        WHERE entity_type = 'lead' AND entity_id = $1 ORDER BY created_at DESC LIMIT 50`,
+      [String(r.id)]
+    )).rows;
+    res.json({ lead: publicLead(r), history, can: { review: acc.review } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Saisie interne — le formulaire que l'employe remplit pendant l'appel. La detection de doublon
+// est ATTENDUE ici (contrairement au webhook) : savoir tout de suite « on l'a deja, Amy la
+// suit » vaut la seconde d'attente quand on a la personne au bout du fil.
+app.post('/api/leads', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:intake'))) return;
+  try {
+    const input = normalizeLeadInput(req.body || {}, { source: 'phone' });
+    if (!input.businessName) return res.status(400).json({ error: 'businessName is required' });
+    const out = await createLeadRow(input, {
+      createdBy: req.user.realAdminEmail || req.user.email || 'unknown',
+      waitForDuplicate: true,
+    });
+    res.json({
+      success: true, id: out.id, refCode: out.refCode,
+      suggestion: out.suggestion,
+      duplicate: out.duplicate ? { status: out.duplicate.status, summary: out.duplicate.summary, records: out.duplicate.matches || [] } : null,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Correction avant acceptation. Une piste ACCEPTEE ne se modifie plus ici : sa verite vit dans
+// Zoho a partir de ce moment-la, et laisser les deux diverger en silence serait pire que de
+// refuser la modification.
+app.put('/api/leads/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:review'))) return;
+  const id = parseInt(req.params.id, 10);
+  try {
+    const cur = (await pool.query(`SELECT status FROM leads WHERE id = $1`, [id])).rows[0];
+    if (!cur) return res.status(404).json({ error: 'Lead not found' });
+    if (cur.status === 'accepted') return res.status(409).json({ error: 'accepted_lead_is_read_only' });
+    const input = normalizeLeadInput(req.body || {}, { source: 'phone' });
+    if (!input.businessName) return res.status(400).json({ error: 'businessName is required' });
+    await pool.query(
+      `UPDATE leads SET business_name = $2, business_type = $3, website = $4,
+              contact_first_name = $5, contact_last_name = $6, contact_title = $7,
+              contact_email = $8, contact_phone = $9, contact_phone_digits = $10,
+              city = $11, province = $12, postal_code = $13, language = $14,
+              interest = $15::jsonb, locations_count = $16, current_pos = $17, timeline = $18, notes = $19,
+              status = CASE WHEN status = 'new' THEN 'in_review' ELSE status END
+        WHERE id = $1`,
+      [id, input.businessName, input.businessType, input.website,
+       input.firstName, input.lastName, input.title, input.email, input.phone, input.phoneDigits,
+       input.city, input.province, input.postalCode, input.language, JSON.stringify(input.interest),
+       input.locationsCount, input.currentPos, input.timeline, input.notes]
+    );
+    logActivity('lead', id, 'edited', `Fiche corrigée avant acceptation`, req.user.realAdminEmail || req.user.email);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Attribution manuelle AVANT acceptation : elle remplace la suggestion sans rien envoyer. Les
+// courriels et le rappel partent a l'acceptation, jamais ici — une reattribution ne doit pas
+// prevenir trois personnes differentes.
+app.post('/api/leads/:id/assign', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:review'))) return;
+  const id = parseInt(req.params.id, 10);
+  const repName = String(req.body?.repName || '').trim();
+  try {
+    const cur = (await pool.query(`SELECT status, ref_code FROM leads WHERE id = $1`, [id])).rows[0];
+    if (!cur) return res.status(404).json({ error: 'Lead not found' });
+    if (cur.status === 'accepted') return res.status(409).json({ error: 'accepted_lead_is_read_only' });
+    const rep = repName ? await leadRepContact(repName) : null;
+    await pool.query(
+      `UPDATE leads SET assigned_rep_name = $2, assigned_rep_email = $3, assigned_crm_user_id = $4,
+              assigned_at = CASE WHEN $2::varchar IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END,
+              assigned_by = $5,
+              status = CASE WHEN status = 'new' THEN 'in_review' ELSE status END
+        WHERE id = $1`,
+      [id, rep?.name || null, rep?.email || null, rep?.crmUserId || null,
+       req.user.realAdminEmail || req.user.email]
+    );
+    logActivity('lead', id, 'assigned', `${cur.ref_code} → ${rep?.name || '(aucun)'}`,
+      req.user.realAdminEmail || req.user.email);
+    res.json({ success: true, rep });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/leads/:id/accept', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:review'))) return;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  try {
+    const out = await acceptLead(parseInt(req.params.id, 10), actor, {
+      repName: req.body?.repName,
+      // Le NOM n'est repris que hors usurpation d'identite — meme regle que l'approbation d'une
+      // opportunite partenaire : pendant une usurpation, `req.user.name` est celui de la
+      // personne visitee alors que `actor` reste l'admin.
+      approverName: req.user.realAdminEmail ? null : (req.user.name || null),
+    });
+    if (out.error === 'not_found') return res.status(404).json({ error: 'Lead not found' });
+    if (out.error === 'already_accepted') return res.status(409).json({ error: 'already_accepted' });
+    if (out.error === 'no_rep') return res.status(400).json({ error: 'no_rep' });
+    if (out.error === 'crm_failed') return res.status(502).json({ error: 'crm_failed', detail: out.detail });
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/leads/:id/reject', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:review'))) return;
+  const id = parseInt(req.params.id, 10);
+  const asDuplicate = req.body?.duplicate === true;
+  const reason = String(req.body?.reason || '').trim();
+  try {
+    const r = (await pool.query(
+      `UPDATE leads SET status = $2, reviewed_by = $3, reviewed_at = CURRENT_TIMESTAMP, rejection_reason = $4
+        WHERE id = $1 AND status <> 'accepted' RETURNING ref_code, business_name`,
+      [id, asDuplicate ? 'duplicate' : 'rejected', req.user.realAdminEmail || req.user.email, reason || null]
+    ));
+    if (!r.rowCount) return res.status(404).json({ error: 'Lead not found, or already accepted' });
+    logActivity('lead', id, asDuplicate ? 'duplicate' : 'rejected',
+      `${r.rows[0].ref_code} — ${r.rows[0].business_name}${reason ? ` : ${reason}` : ''}`,
+      req.user.realAdminEmail || req.user.email);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Relancer la detection de doublon a la demande — les donnees bougent, et un examen fait trois
+// jours apres l'arrivee doit pouvoir reposer la question a Zoho.
+app.post('/api/leads/:id/recheck', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:review'))) return;
+  const id = parseInt(req.params.id, 10);
+  try {
+    const lead = (await pool.query(`SELECT * FROM leads WHERE id = $1`, [id])).rows[0];
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    const result = await checkCrmDuplicate({
+      businessName: lead.business_name, contactEmail: lead.contact_email, contactPhone: lead.contact_phone,
+    });
+    await pool.query(
+      `UPDATE leads SET crm_match_status = $2, crm_match_summary = $3, crm_match_records = $4::jsonb WHERE id = $1`,
+      [id, result.status, result.summary, JSON.stringify(result.matches || [])]
+    );
+    res.json({ status: result.status, summary: result.summary, records: result.matches || [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
+// ── Administration : regles, rotation, automatisations, destinataires ───────
+
+app.get('/api/admin/lead-settings', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:manage_rules'))) return;
+  try {
+    const settings = await leadSettings(true);
+    // L'exemple d'heure de rappel est calcule ICI et non dans le navigateur : c'est le serveur
+    // qui decide, et un ecran qui montrerait « 11 h » quand Zoho planifie « 9 h » serait pire
+    // que pas d'exemple du tout.
+    res.json({
+      settings,
+      webhookUrl: `${process.env.BACKEND_URL || 'https://commission-tracker-production-b7f9.up.railway.app'}/api/webhooks/website-lead`,
+      webhookSecretSet: !!(process.env.LEAD_WEBHOOK_SECRET || process.env.ZOHO_WEBHOOK_SECRET),
+      webhookSecretVar: process.env.LEAD_WEBHOOK_SECRET ? 'LEAD_WEBHOOK_SECRET' : 'ZOHO_WEBHOOK_SECRET',
+      exampleCallback: leadCallbackAt(settings).toISOString(),
+      serverNow: new Date().toISOString(),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/admin/lead-settings', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:manage_rules'))) return;
+  const b = req.body || {};
+  const num = (v, def, min, max) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : def;
+  };
+  const str = (v, def, max) => (v === undefined ? def : String(v || '').trim().slice(0, max));
+  const d = LEAD_SETTINGS_DEFAULTS;
+  const start = num(b.businessHours?.start, d.businessHours.start, 0, 23);
+  const settings = {
+    callbackEnabled:      b.callbackEnabled !== false,
+    callbackType:         String(b.callbackType || d.callbackType).toLowerCase() === 'task' ? 'task' : 'call',
+    callbackDelayHours:   num(b.callbackDelayHours, d.callbackDelayHours, 0, 168),
+    businessHours:        { start, end: num(b.businessHours?.end, d.businessHours.end, start + 1, 24) },
+    notifyRep:            b.notifyRep !== false,
+    notifyMerchant:       b.notifyMerchant !== false,
+    merchantFrom:         str(b.merchantFrom, d.merchantFrom, 160),
+    merchantSiteUrl:      str(b.merchantSiteUrl, d.merchantSiteUrl, 200) || d.merchantSiteUrl,
+    reviewReminderHours:  num(b.reviewReminderHours, d.reviewReminderHours, 0, 168),
+    leadSourceWebsite:    str(b.leadSourceWebsite, d.leadSourceWebsite, 80),
+    leadSourcePhone:      str(b.leadSourcePhone, d.leadSourcePhone, 80),
+    contactMethodWebsite: str(b.contactMethodWebsite, d.contactMethodWebsite, 80),
+    contactMethodPhone:   str(b.contactMethodPhone, d.contactMethodPhone, 80),
+  };
+  if (settings.merchantFrom && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(settings.merchantFrom)) {
+    return res.status(400).json({ error: 'merchantFrom must be an email address' });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('lead_settings', $1::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [JSON.stringify(settings)]
+    );
+    _leadSettingsCache = { at: 0, value: null };
+    logActivity('lead_settings', 0, 'updated', 'Automatisations des pistes modifiées',
+      req.user.realAdminEmail || req.user.email);
+    res.json({ settings, exampleCallback: leadCallbackAt(settings).toISOString() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/admin/lead-review-recipients', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:manage_rules'))) return;
+  try { res.json({ recipients: await getLeadReviewRecipients() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/admin/lead-review-recipients', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:manage_rules'))) return;
+  const emails = Array.isArray(req.body?.emails)
+    ? req.body.emails.map((e) => String(e).trim().toLowerCase()).filter(Boolean) : null;
+  if (!emails) return res.status(400).json({ error: 'emails array required' });
+  if (emails.some((e) => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e))) return res.status(400).json({ error: 'invalid email' });
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('lead_review_recipients', $1::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [JSON.stringify(emails)]
+    );
+    res.json({ recipients: emails });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+const leadRuleList = (v) => (Array.isArray(v) ? v.map((x) => String(x || '').trim()).filter(Boolean).slice(0, 60) : []);
+
+app.get('/api/admin/lead-rules', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:manage_rules'))) return;
+  try {
+    const [rules, rotation] = await Promise.all([
+      pool.query(`SELECT * FROM lead_assignment_rules ORDER BY position, id`),
+      pool.query(
+        `SELECT s.name AS rep_name,
+                COALESCE(r.is_active, false) AS is_active,
+                r.away_until, r.last_assigned_at, COALESCE(r.assigned_count, 0)::int AS assigned_count
+           FROM salespeople s
+           LEFT JOIN lead_rotation r ON LOWER(r.rep_name) = LOWER(s.name)
+          WHERE s.is_active = true ORDER BY s.name`
+      ),
+    ]);
+    res.json({ rules: rules.rows, rotation: rotation.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/lead-rules', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:manage_rules'))) return;
+  const b = req.body || {};
+  const name = String(b.name || '').trim().slice(0, 120);
+  if (!name) return res.status(400).json({ error: 'name is required' });
+  try {
+    const pos = (await pool.query(`SELECT COALESCE(MAX(position), 0) + 1 AS p FROM lead_assignment_rules`)).rows[0].p;
+    const r = await pool.query(
+      `INSERT INTO lead_assignment_rules
+         (position, name, is_active, match_sources, match_provinces, match_languages,
+          match_business_types, match_postal_prefix, target_reps)
+       VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb) RETURNING *`,
+      [pos, name, b.isActive !== false,
+       JSON.stringify(leadRuleList(b.matchSources)), JSON.stringify(leadRuleList(b.matchProvinces)),
+       JSON.stringify(leadRuleList(b.matchLanguages)), JSON.stringify(leadRuleList(b.matchBusinessTypes)),
+       JSON.stringify(leadRuleList(b.matchPostalPrefix)), JSON.stringify(leadRuleList(b.targetReps))]
+    );
+    logActivity('lead_rule', r.rows[0].id, 'created', `Règle « ${name} »`, req.user.realAdminEmail || req.user.email);
+    res.json({ rule: r.rows[0] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// L'ordre EST la logique : la premiere regle qui correspond gagne. Le reordonnancement se fait
+// donc en une seule requete, sur la liste complete, plutot qu'en deplacant une ligne a la fois —
+// deux deplacements concurrents ne peuvent pas laisser deux regles a la meme position.
+app.put('/api/admin/lead-rules/reorder', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:manage_rules'))) return;
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map((n) => parseInt(n, 10)).filter(Number.isFinite) : null;
+  if (!ids || !ids.length) return res.status(400).json({ error: 'ids array required' });
+  try {
+    await pool.query(
+      `UPDATE lead_assignment_rules r SET position = x.pos
+         FROM (SELECT id, ordinality AS pos FROM unnest($1::int[]) WITH ORDINALITY AS t(id, ordinality)) x
+        WHERE r.id = x.id`,
+      [ids]
+    );
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/admin/lead-rules/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:manage_rules'))) return;
+  const b = req.body || {};
+  const name = String(b.name || '').trim().slice(0, 120);
+  if (!name) return res.status(400).json({ error: 'name is required' });
+  try {
+    const r = await pool.query(
+      `UPDATE lead_assignment_rules
+          SET name = $2, is_active = $3, match_sources = $4::jsonb, match_provinces = $5::jsonb,
+              match_languages = $6::jsonb, match_business_types = $7::jsonb,
+              match_postal_prefix = $8::jsonb, target_reps = $9::jsonb, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1 RETURNING *`,
+      [parseInt(req.params.id, 10), name, b.isActive !== false,
+       JSON.stringify(leadRuleList(b.matchSources)), JSON.stringify(leadRuleList(b.matchProvinces)),
+       JSON.stringify(leadRuleList(b.matchLanguages)), JSON.stringify(leadRuleList(b.matchBusinessTypes)),
+       JSON.stringify(leadRuleList(b.matchPostalPrefix)), JSON.stringify(leadRuleList(b.targetReps))]
+    );
+    if (!r.rowCount) return res.status(404).json({ error: 'Rule not found' });
+    logActivity('lead_rule', req.params.id, 'updated', `Règle « ${name} »`, req.user.realAdminEmail || req.user.email);
+    res.json({ rule: r.rows[0] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/admin/lead-rules/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:manage_rules'))) return;
+  try {
+    const r = await pool.query(`DELETE FROM lead_assignment_rules WHERE id = $1 RETURNING name`,
+      [parseInt(req.params.id, 10)]);
+    if (!r.rowCount) return res.status(404).json({ error: 'Rule not found' });
+    logActivity('lead_rule', req.params.id, 'deleted', `Règle « ${r.rows[0].name} »`,
+      req.user.realAdminEmail || req.user.email);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// « Si une piste comme celle-ci arrivait, qui la recevrait ? » — sans rien ecrire, sans faire
+// avancer le tour de role. Une regle mal ordonnee est invisible autrement : on ne s'en apercoit
+// qu'a la premiere vraie piste partie chez la mauvaise personne.
+app.post('/api/admin/lead-rules/simulate', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:manage_rules'))) return;
+  const b = req.body || {};
+  const sample = {
+    source: LEAD_SOURCES.includes(b.source) ? b.source : 'website',
+    province: String(b.province || '').trim().toUpperCase() || null,
+    language: String(b.language || 'fr').toLowerCase().startsWith('en') ? 'en' : 'fr',
+    business_type: String(b.businessType || '').trim() || null,
+    postal_code: String(b.postalCode || '').trim() || null,
+  };
+  try {
+    const rules = (await pool.query(
+      `SELECT * FROM lead_assignment_rules ORDER BY position, id`
+    )).rows;
+    // Chaque regle est rendue avec SON verdict, pas seulement la gagnante : c'est ce qui rend
+    // le diagnostic possible (« la 3 correspond, mais la 1 l'attrape avant »).
+    const trace = rules.map((rule) => ({
+      id: rule.id, name: rule.name, position: rule.position, isActive: rule.is_active,
+      matches: rule.is_active ? leadMatchesRule(sample, rule) : false,
+      targetReps: rule.target_reps,
+    }));
+    const result = await suggestLeadAssignment(sample);
+    res.json({ sample, trace, result });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Le tour de role. `awayUntil` est une DATE de retour, pas une duree : « absent jusqu'au 12 »
+// se lit et se corrige, « absent 9 jours » exige de savoir quand ca a ete saisi.
+app.put('/api/admin/lead-rotation', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:manage_rules'))) return;
+  const reps = Array.isArray(req.body?.reps) ? req.body.reps : null;
+  if (!reps) return res.status(400).json({ error: 'reps array required' });
+  try {
+    for (const r of reps) {
+      const name = String(r?.repName || '').trim();
+      if (!name) continue;
+      const away = /^\d{4}-\d{2}-\d{2}$/.test(String(r?.awayUntil || '')) ? r.awayUntil : null;
+      await pool.query(
+        `INSERT INTO lead_rotation (rep_name, is_active, away_until)
+         VALUES ($1, $2, $3::date)
+         ON CONFLICT (rep_name) DO UPDATE SET is_active = EXCLUDED.is_active, away_until = EXCLUDED.away_until`,
+        [name, r?.isActive === true, away]
+      );
+    }
+    logActivity('lead_rotation', 0, 'updated', 'Tour de rôle des pistes modifié',
+      req.user.realAdminEmail || req.user.email);
+    const rotation = (await pool.query(
+      `SELECT s.name AS rep_name, COALESCE(r.is_active, false) AS is_active,
+              r.away_until, r.last_assigned_at, COALESCE(r.assigned_count, 0)::int AS assigned_count
+         FROM salespeople s LEFT JOIN lead_rotation r ON LOWER(r.rep_name) = LOWER(s.name)
+        WHERE s.is_active = true ORDER BY s.name`
+    )).rows;
+    res.json({ rotation });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Travaux planifies (worker) ──────────────────────────────────────────────
+
+// Rafraichit l'etat Zoho des pistes acceptees. C'est ce qui remplit l'entonnoir « reçue →
+// acceptée → convertie → gagnée » : sans lui, le rapport s'arrete a l'acceptation et ne dit
+// rien de ce que les pistes RAPPORTENT.
+//
+// Meme prudence que le suivi des deals partenaires, pour la meme raison : Zoho muet ne veut pas
+// dire « plus de deal », donc on n'ecrase jamais une valeur connue par un null.
+const LEAD_CRM_SYNC_LIMIT = 200;
+async function syncLeadCrmState() {
+  const rows = (await pool.query(
+    `SELECT id, ref_code, business_name, crm_lead_id, crm_deal_id
+       FROM leads
+      WHERE status = 'accepted' AND crm_lead_id IS NOT NULL AND crm_deposit_date IS NULL
+      ORDER BY reviewed_at DESC
+      LIMIT ${LEAD_CRM_SYNC_LIMIT + 1}`
+  )).rows;
+  if (!rows.length) return;
+  if (rows.length > LEAD_CRM_SYNC_LIMIT) {
+    console.warn(`⚠️ [leads] plus de ${LEAD_CRM_SYNC_LIMIT} pistes à rafraîchir — le reste attend le prochain passage`);
+    rows.length = LEAD_CRM_SYNC_LIMIT;
+  }
+  let changed = 0;
+  for (const r of rows) {
+    const state = await getCrmLeadStage(r.crm_lead_id, r.business_name, r.crm_deal_id);
+    if (!state) continue;
+    const up = await pool.query(
+      `UPDATE leads
+          SET crm_deal_id      = COALESCE($2::varchar, crm_deal_id),
+              crm_deal_stage   = COALESCE($3::varchar, crm_deal_stage),
+              crm_deposit_date = COALESCE($4::date, crm_deposit_date)
+        WHERE id = $1
+          AND (($2::varchar IS NOT NULL AND crm_deal_id IS DISTINCT FROM $2::varchar)
+            OR ($3::varchar IS NOT NULL AND crm_deal_stage IS DISTINCT FROM $3::varchar)
+            OR ($4::date IS NOT NULL AND crm_deposit_date IS DISTINCT FROM $4::date))
+        RETURNING id`,
+      [r.id, state.dealId || null, state.dealStage || null, state.depositDate || null]
+    );
+    if (up.rows.length) changed++;
+  }
+  if (changed) console.log(`🎯 [leads] ${changed} piste(s) mise(s) à jour depuis Zoho`);
+}
+
+// Une piste qui dort dans la file est un client qui appelle le concurrent. Une seule relance par
+// piste (`review_reminded_at`), et seulement pendant les heures ouvrables — reveiller quelqu'un
+// a 3 h du matin pour une piste recue a 23 h ne la fait pas traiter plus vite.
+async function remindStaleLeads() {
+  const settings = await leadSettings();
+  const hours = Number(settings.reviewReminderHours);
+  if (!Number.isFinite(hours) || hours <= 0) return;
+  const recipients = await getLeadReviewRecipients();
+  if (!recipients.length) return;
+  const now = new Date();
+  const p = tzParts(now);
+  const dow = tzDayOfWeek(now);
+  const start = parseInt(settings.businessHours?.start, 10) || 9;
+  const end = parseInt(settings.businessHours?.end, 10) || 17;
+  if (dow === 0 || dow === 6 || p.hour < start || p.hour >= end) return;
+
+  const rows = (await pool.query(
+    `SELECT * FROM leads
+      WHERE status IN ('new', 'in_review') AND review_reminded_at IS NULL
+        AND created_at < NOW() - ($1::text || ' hours')::interval
+      ORDER BY created_at LIMIT 25`,
+    [String(hours)]
+  )).rows;
+  if (!rows.length) return;
+
+  const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+  const lignes = rows.map((l) => {
+    const age = Math.round((Date.now() - new Date(l.created_at).getTime()) / 3600000);
+    return `<li style="margin-bottom:6px"><strong>${leadEsc(l.business_name)}</strong> (${leadEsc(l.ref_code)})`
+      + ` — ${age} h d'attente${l.suggested_rep_name ? ` · suggéré : ${leadEsc(l.suggested_rep_name)}` : ''}</li>`;
+  }).join('');
+  const { sent } = await sendMail(
+    recipients.join(','),
+    `${rows.length} piste(s) en attente depuis plus de ${hours} h`,
+    mailShell(
+      'Des pistes attendent / Leads are waiting',
+      `Ces pistes sont arrivées il y a plus de ${hours} heures et n'ont pas encore été examinées.`
+      + ` Rien n'est entré dans Zoho et personne n'a été contacté.<br><br>`
+      + `<ul style="margin:0;padding-left:18px;color:#475569;font-size:14.5px;line-height:1.6">${lignes}</ul>`,
+      'Ouvrir la file / Open the queue', `${base}/leads`
+    )
+  );
+  // On ne marque « relancé » que si le courriel est REELLEMENT parti : sinon une panne SMTP
+  // consommerait l'unique relance de chaque piste, en silence.
+  if (!sent) return;
+  await pool.query(`UPDATE leads SET review_reminded_at = CURRENT_TIMESTAMP WHERE id = ANY($1::int[])`,
+    [rows.map((r) => r.id)]);
+  console.log(`⏰ [leads] relance envoyée pour ${rows.length} piste(s) en attente`);
+}
+
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'healthy' });
