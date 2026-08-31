@@ -1109,6 +1109,12 @@ async function initializeDatabase() {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_pricing_packages_cat ON pricing_packages(cat_id)`);
+    // Partner/vendor logo for a package — same bytea-in-the-DB pattern as hardware_products and
+    // reseller logos (this app has no object storage). ALTER rather than part of the CREATE above
+    // because the table already exists everywhere.
+    await pool.query(`ALTER TABLE pricing_packages ADD COLUMN IF NOT EXISTS img_data BYTEA`);
+    await pool.query(`ALTER TABLE pricing_packages ADD COLUMN IF NOT EXISTS img_mime_type VARCHAR(100)`);
+    await pool.query(`ALTER TABLE pricing_packages ADD COLUMN IF NOT EXISTS img_file_name VARCHAR(200)`);
     // One-time migration: compat/status used to be single-value TEXT (a package could only be
     // tagged V1 OR V2, "new" OR "legacy"), preventing multi-select in the admin editor. Widen to
     // TEXT[] so a package can carry more than one tag, matching hardware_products' pattern.
@@ -19819,7 +19825,8 @@ app.get('/api/pricing', authenticateToken, async (req, res) => {
     )).rows;
     const pkgs = (await pool.query(`
       SELECT id, cat_id, name_en, name_fr, sku, sku_year, compat, pos, price_monthly, price_yearly, price_flat, unit, activation,
-             includes_en, includes_fr, internal_en, internal_fr, status, group_name, tier, mode, rates, visible, sort_order
+             includes_en, includes_fr, internal_en, internal_fr, status, group_name, tier, mode, rates,
+             (img_data IS NOT NULL) AS has_image, visible, sort_order
         FROM pricing_packages
         ${canManage ? '' : 'WHERE visible = true'}
        ORDER BY sort_order, name_en
@@ -19841,7 +19848,8 @@ app.get('/api/pricing', authenticateToken, async (req, res) => {
         unit: p.unit, activation: p.activation != null ? parseFloat(p.activation) : null,
         includesEn: p.includes_en || [], includesFr: p.includes_fr || [],
         internalEn: p.internal_en || null, internalFr: p.internal_fr || null,
-        status: p.status || [], groupName: p.group_name, tier: p.tier, mode: p.mode, rates: p.rates || null, visible: p.visible,
+        status: p.status || [], groupName: p.group_name, tier: p.tier, mode: p.mode, rates: p.rates || null,
+        hasImage: p.has_image, visible: p.visible,
       })),
       guides: guides.map(g => ({ id: g.id, titleEn: g.title_en, titleFr: g.title_fr, bodyEn: g.body_en, bodyFr: g.body_fr })),
     });
@@ -20129,6 +20137,58 @@ function parseHardwarePrice(price) {
   const m = String(price).replace(/[, ]/g, '').match(/\$([0-9]+(?:\.[0-9]+)?)/);
   return m ? parseFloat(m[1]) : null;
 }
+
+// Package logos — the partner/vendor mark shown on an integration card. Same shape and 2 MB cap
+// as hardware photos; kept separate from uploadHardwareImg only so the limits of the two catalogs
+// can diverge later without a surprise.
+const uploadPricingLogo = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
+
+// POST /api/pricing/:id/image — upload/replace a package logo (multipart field "file").
+app.post('/api/pricing/:id/image', authenticateToken, uploadPricingLogo.single('file'), async (req, res) => {
+  if (!(await requirePerm(req, res, 'pricing:manage'))) return;
+  const file = req.file;
+  if (!file) return res.status(400).json({ error: 'file required (multipart field "file")' });
+  if (!/^image\//.test(file.mimetype)) return res.status(400).json({ error: 'file must be an image' });
+  // SVG is refused on purpose: an SVG can carry <script>, and the GET below serves these bytes
+  // from the API's OWN origin, so opening such a logo's URL would run that script there. Raster
+  // only — a PNG/WebP logo is what a vendor kit ships anyway.
+  if (/svg/i.test(file.mimetype)) return res.status(400).json({ error: 'SVG is not accepted — use PNG, JPEG or WebP' });
+  try {
+    const r = await pool.query(
+      `UPDATE pricing_packages SET img_data = $2, img_mime_type = $3, img_file_name = $4, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 RETURNING id`,
+      [req.params.id, file.buffer, file.mimetype, file.originalname]
+    );
+    if (!r.rows[0]) return res.status(404).json({ error: 'package not found' });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/pricing/:id/image — clear a package logo.
+app.delete('/api/pricing/:id/image', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'pricing:manage'))) return;
+  try {
+    await pool.query(
+      `UPDATE pricing_packages SET img_data = NULL, img_mime_type = NULL, img_file_name = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [req.params.id]
+    );
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/pricing/:id/image — serve the logo. Intentionally UNAUTHENTICATED, same reasoning as
+// hardware photos and reseller logos: a vendor logo is not sensitive, and <img src> can't send a
+// bearer token.
+app.get('/api/pricing/:id/image', async (req, res) => {
+  try {
+    const r = (await pool.query(`SELECT img_data, img_mime_type FROM pricing_packages WHERE id = $1`, [req.params.id])).rows[0];
+    if (!r || !r.img_data) return res.status(404).end();
+    res.setHeader('Content-Type', r.img_mime_type || 'image/png');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    res.send(r.img_data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // POST /api/pricing/quote/pdf — builds a formal Cluster-branded quote PDF for a merchant from
 // items the rep staged in the Hardware & Service Guide's quote tray. Prices are re-fetched from
