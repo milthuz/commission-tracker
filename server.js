@@ -611,8 +611,8 @@ async function initializeDatabase() {
       WHERE commission_paid = true AND approval_status = 'pending'
     `);
 
-    // Restore paid state from the pay-file record. The full-reset path (DELETE FROM invoices,
-    // see /api/admin/reset-invoices) rebuilds the table from Zoho and wipes approval_status /
+    // Restore paid state from the pay-file record. The flush path (DELETE /api/invoices/flush,
+    // then resync from Zoho) rebuilds the table and wipes approval_status /
     // commission_paid / approved_by / payout_paid_by, while commission_payment_imports and
     // commission_payment_lines are separate tables that survive. The backfill above cannot
     // recover those rows because it keys on commission_paid, which the reset cleared too — so a
@@ -1311,20 +1311,40 @@ async function initializeDatabase() {
     // quota-review queue can show admins real numbers instead of a bare "$0, no reason given".
     await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS quota_forfeited_amount NUMERIC(12,2)`);
     await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS quota_forfeited_period DATE`);
-    // One-time migration: convert OLD-style adjustments (source invoice marked paid in its
-    // original month) to the new re-home model (move the unlock month to the target, keep
-    // pending). Idempotent — after conversion the payout note is cleared so it won't re-match.
+    // Restore the adjustment re-home. An invoice-based adjustment carries a commission from the
+    // month it unlocked in to the month it will actually be paid, by stamping payable_override +
+    // commission_payable_date on the invoice. Both live only on the invoice row, so the flush
+    // path (DELETE /api/invoices/flush, then resync from Zoho) loses them while
+    // commission_adjustments survives — the adjustment would still be listed, but the invoice
+    // would fall back to its original unlock month, drop off the target stub and never be paid.
+    // On 2026-08-31 that would have silently undone 43 carried-forward commissions ($4,994.82).
+    //
+    // Deliberately does NOT touch approval_status / commission_paid / payout_*: the pay-file
+    // restore that runs earlier in this function has already decided those, and a re-homed
+    // invoice that was genuinely paid in its target month must stay 'paid'. This only puts the
+    // unlock month back. recalc honours payable_override, so the value survives the next pass.
+    //
+    // Replaces a one-time migration that converted OLD-style adjustments (source invoice marked
+    // paid in its original month) to this re-home model. That one keyed on
+    // `payout_paid_by LIKE 'adjustment:%'`, a value no code path writes any more — it matched
+    // zero rows and could never fire again, so it was dead cover for this gap rather than a fix.
+    //
+    // DISTINCT ON keeps this single-valued if an invoice ever collects more than one adjustment
+    // (the create endpoint blocks duplicates, but nothing at the DB level enforces it); the most
+    // recently created one wins. Idempotent via IS DISTINCT FROM.
     await pool.query(`
       UPDATE invoices i
          SET payable_override = ca.target_period,
              commission_payable_date = ca.target_period,
-             approval_status = 'pending', commission_paid = false,
-             payout_paid_by = NULL, payout_paid_at = NULL,
              updated_at = CURRENT_TIMESTAMP
-        FROM commission_adjustments ca
+        FROM (
+          SELECT DISTINCT ON (invoice_number) invoice_number, target_period
+            FROM commission_adjustments
+           WHERE invoice_number IS NOT NULL
+           ORDER BY invoice_number, id DESC
+        ) ca
        WHERE i.invoice_number = ca.invoice_number
-         AND i.payout_paid_by LIKE 'adjustment:%'
-         AND i.payable_override IS NULL
+         AND i.payable_override IS DISTINCT FROM ca.target_period
     `);
     // Sum of ALL line amounts (hw + saas + noncommission), pre-discount. The discount factor
     // = (sub_total - discount_total) / gross_line_total, because Zoho sometimes bakes the
