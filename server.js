@@ -6996,7 +6996,7 @@ app.post('/api/admin/partner-opportunities/:id/retry-lead', authenticateToken, a
   try {
     const id = parseInt(req.params.id, 10);
     const full = (await pool.query(
-      `SELECT o.status, o.crm_lead_id, o.crm_owner_name, o.business_name, o.contact_first_name,
+      `SELECT o.status, o.crm_lead_id, o.crm_owner_name, o.business_name, o.reviewed_by, o.contact_first_name,
               o.contact_last_name, o.contact_phone, o.contact_email, o.rep_first_name,
               o.rep_last_name, o.rep_phone, o.rep_email, o.notes,
               p.name AS partner_name, p.lead_source AS lead_source, pu.email AS submitted_by_email
@@ -7024,8 +7024,13 @@ app.post('/api/admin/partner-opportunities/:id/retry-lead', authenticateToken, a
       } catch (e) { console.warn('[retry-lead] proprietaire non resolu :', e.message); }
     }
     const actor = req.user.realAdminEmail || req.user.email || 'unknown';
-    full.approver_email = actor;
-    full.approver_name = req.user.realAdminEmail ? null : (req.user.name || null);
+    // ⚠️ La note nomme l'APPROBATEUR D'ORIGINE (`reviewed_by`), PAS qui reclique. Un reessai est
+    // une reparation technique, pas une nouvelle decision : crediter le depanneur ferait dire a la
+    // fiche Zoho que quelqu'un d'autre a approuve l'affaire. Constate en vrai le 2026-08-28 —
+    // Gabriella avait approuve #2707, David a reclique, et la note portait le nom de David.
+    // Le nom d'affichage n'est pas connu ici : on met le courriel, qui est exact.
+    full.approver_email = full.reviewed_by || actor;
+    full.approver_name = null;
 
     const result = await createCrmLead(full);
     await pool.query(
