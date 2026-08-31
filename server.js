@@ -6980,6 +6980,66 @@ app.put('/api/admin/partner-opportunities/:id', authenticateToken, async (req, r
   }
 });
 
+// POST /api/admin/partner-opportunities/:id/retry-lead — refaire la creation du Lead Zoho pour une
+// opportunite DEJA approuvee dont le lead a echoue.
+//
+// Pourquoi ca doit exister : la creation se fait au moment de l'approbation, et une fois
+// l'opportunite approuvee les boutons Approuver/Rejeter disparaissent. Quand Zoho refusait la
+// fiche, le dossier restait donc approuve SANS lead et il n'existait aucun moyen de reessayer —
+// le message disait « creez-le a la main ». Vecu le 2026-08-28 sur « Jardin du cerf ».
+//
+// Meme permission que l'approbation : ce n'est pas un pouvoir de plus, c'est terminer un geste
+// deja pose. Le rep choisi a l'approbation est repris depuis `crm_owner_name` — on ne redemande
+// pas de choisir, et on ne reecrit pas ce choix.
+app.post('/api/admin/partner-opportunities/:id/retry-lead', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const id = parseInt(req.params.id, 10);
+    const full = (await pool.query(
+      `SELECT o.status, o.crm_lead_id, o.crm_owner_name, o.business_name, o.contact_first_name,
+              o.contact_last_name, o.contact_phone, o.contact_email, o.rep_first_name,
+              o.rep_last_name, o.rep_phone, o.rep_email, o.notes,
+              p.name AS partner_name, p.lead_source AS lead_source, pu.email AS submitted_by_email
+         FROM partner_opportunities o
+         JOIN partners p ON p.id = o.partner_id
+         LEFT JOIN partner_users pu ON pu.id = o.submitted_by
+        WHERE o.id = $1`, [id])).rows[0];
+    if (!full) return res.status(404).json({ error: 'Opportunity not found' });
+    // Deux garde-fous. Reessayer sur une opportunite non approuvee creerait un Lead pour une
+    // affaire que personne n'a validee ; reessayer quand le lead EXISTE en creerait un second,
+    // ce qui scinde l'historique du marchand — l'erreur couteuse de ce flux.
+    if (full.status !== 'approved') return res.status(409).json({ error: 'not_approved' });
+    if (full.crm_lead_id) return res.status(409).json({ error: 'lead_already_exists', leadId: full.crm_lead_id });
+
+    // Le rep choisi a l'approbation, retrouve par son nom dans les utilisateurs Zoho : c'est
+    // `crm_owner_name` qui a ete conserve, pas l'identifiant.
+    if (full.crm_owner_name) {
+      try {
+        const crmToken = await ensureValidCrmToken();
+        const u = await axios.get('https://www.zohoapis.com/crm/v2/users?type=ActiveUsers', {
+          headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true });
+        const trouve = (u.data?.users || []).find((x) =>
+          String(x.full_name || '').trim().toLowerCase() === String(full.crm_owner_name).trim().toLowerCase());
+        if (trouve) full.crm_owner_id = trouve.id;
+      } catch (e) { console.warn('[retry-lead] proprietaire non resolu :', e.message); }
+    }
+    const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+    full.approver_email = actor;
+    full.approver_name = req.user.realAdminEmail ? null : (req.user.name || null);
+
+    const result = await createCrmLead(full);
+    await pool.query(
+      `UPDATE partner_opportunities SET crm_lead_id = $2, crm_lead_error = $3 WHERE id = $1`,
+      [id, result.success ? result.leadId : null, result.success ? null : result.error]);
+    logActivity('partner_opportunity', String(id), 'retry_lead',
+      `${full.business_name} — nouvelle tentative de creation du Lead : ${result.success ? 'reussie' : result.error}`, actor);
+    res.json(result.success ? { success: true, leadId: result.leadId } : { success: false, error: result.error });
+  } catch (e) {
+    console.error('[retry-lead] echec:', e.stack || e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/admin/partner-opportunities/crm-reps — Zoho CRM's active users, so the partner manager
 // can pick who a Lead gets assigned to at approval time (SH-30 follow-up). Filtered down to
 // Sales Hub's own active salespeople (matched by name, or email when set) — the CRM org's full
@@ -17373,6 +17433,52 @@ async function checkCrmDuplicate({ businessName, contactEmail, contactPhone }) {
 // Lead_Status, and Lead_Contact_Method (API name confirmed via the temp diagnostic endpoint,
 // value = "Website Form" style) are fixed per the partner manager's instructions.
 // `o` is the joined opportunity+partner+submitter row (see the PUT handler below).
+// Les valeurs acceptees par les listes de choix du module Leads, telles qu'elles sont AUJOURD'HUI
+// dans Zoho. Meme cache de 30 min que crmDealStages, meme raison : ces listes sont configurees
+// par organisation et personne ne nous previent quand elles changent.
+//
+// ⚠️ C'est exactement ce qui a casse le 2026-08-28. Le code envoyait `Lead_Status: 'NEW'` en dur ;
+// la valeur existait le 17 aout (le lead #2706 la portait), elle avait disparu de la liste le 28.
+// Zoho refuse alors TOUTE la fiche pour une seule valeur invalide, et l'opportunite se retrouve
+// approuvee sans lead.
+let _leadPickCache = { at: 0, listes: null };
+async function crmLeadPicklists() {
+  if (_leadPickCache.listes && Date.now() - _leadPickCache.at < 30 * 60 * 1000) return _leadPickCache.listes;
+  try {
+    const token = await ensureValidCrmToken();
+    const r = await axios.get('https://www.zohoapis.com/crm/v2/settings/fields', {
+      params: { module: 'Leads' },
+      headers: { Authorization: `Zoho-oauthtoken ${token}` }, validateStatus: () => true, timeout: 20000,
+    });
+    if (r.status !== 200) return _leadPickCache.listes || {};
+    const listes = {};
+    for (const c of (r.data?.fields || [])) {
+      const vals = (c.pick_list_values || []).map((v) => v.actual_value ?? v.display_value).filter(Boolean);
+      if (vals.length) listes[c.api_name] = vals;
+    }
+    _leadPickCache = { at: Date.now(), listes };
+    return listes;
+  } catch (e) {
+    // Injoignable : on rend le dernier etat connu, ou rien. `null` fait renoncer a la validation
+    // plus bas — mieux vaut tenter l'envoi que refuser une approbation parce que Zoho tousse.
+    console.warn('[crm] listes de choix Leads illisibles :', e.message);
+    return _leadPickCache.listes || {};
+  }
+}
+
+// Ne garde d'une valeur de liste de choix que ce que Zoho accepte, en tolerant la casse (Zoho
+// stocke « New » quand on envoie « NEW »). Renvoie null quand rien ne correspond : l'appelant
+// RETIRE alors le champ, et Zoho applique son propre defaut. Perdre un champ vaut mieux que
+// perdre la fiche.
+function valeurDeListe(listes, apiName, voulu) {
+  const vals = listes && listes[apiName];
+  if (!vals || !vals.length || voulu == null) return voulu ?? null;   // pas de liste connue : ne rien changer
+  const exact = vals.find((v) => v === voulu);
+  if (exact) return exact;
+  const casse = vals.find((v) => String(v).toLowerCase() === String(voulu).toLowerCase());
+  return casse || null;
+}
+
 async function createCrmLead(o) {
   const fields = {
     Company: o.business_name,
@@ -17381,6 +17487,11 @@ async function createCrmLead(o) {
     Lead_Status: 'NEW',
     Lead_Contact_Method: 'Partner Portal',
   };
+  // Ordre de preference pour le statut d'une piste toute neuve. Ce n'est PAS une constante
+  // reconduite : chaque valeur est essayee contre la liste VIVANTE plus bas, et si aucune ne passe
+  // le champ est retire pour laisser Zoho appliquer son defaut. C'est la degradation sure — celle
+  // qui manquait le 2026-08-28.
+  const STATUTS_NEUFS = ['NEW', 'New', 'Not Contacted', 'Nouveau'];
   // La Passe passe par le même chemin (SH-22) mais doit rester distinguable dans le CRM :
   // ce n'est pas un partenaire tiers qui recommande, c'est un marchand client.
   if (o.lead_contact_method) fields.Lead_Contact_Method = o.lead_contact_method;
@@ -17414,6 +17525,25 @@ async function createCrmLead(o) {
     repName ? `Partner's rep on this deal: ${repName}${o.rep_phone ? ` — ${o.rep_phone}` : ''}${o.rep_email ? ` — ${o.rep_email}` : ''}` : null,
     o.notes ? `Notes: ${o.notes}` : null,
   ].filter(Boolean).join('\n');
+
+  // ── Validation des listes de choix, AVANT l'envoi ───────────────────────────────────────────
+  // Zoho refuse la fiche ENTIERE si une seule valeur de liste de choix ne lui plait pas. On lui
+  // demande donc d'abord ce qu'il accepte, et on retire ce qui ne passe pas : un Lead sans source
+  // est reparable en deux clics, un Lead qui n'existe pas se perd.
+  {
+    const listes = await crmLeadPicklists();
+    if (fields.Lead_Status) {
+      const trouve = STATUTS_NEUFS.map((v) => valeurDeListe(listes, 'Lead_Status', v)).find(Boolean);
+      if (trouve) fields.Lead_Status = trouve;
+      else { delete fields.Lead_Status; console.warn('[partner-crm] aucun statut de piste neuve accepte par Zoho — champ retire'); }
+    }
+    for (const api of ['Lead_Source', 'Lead_Contact_Method']) {
+      if (fields[api] == null) continue;
+      const ok = valeurDeListe(listes, api, fields[api]);
+      if (ok) fields[api] = ok;
+      else { console.warn(`[partner-crm] « ${fields[api]} » refuse par la liste ${api} — champ retire`); delete fields[api]; }
+    }
+  }
 
   try {
     // Le jeton de L'APPROBATEUR quand il en a un, sinon le compte systeme. C'est le seul levier
@@ -17487,7 +17617,11 @@ async function createCrmLead(o) {
       }
       return { success: true, leadId };
     }
-    const msg = result?.message || r.data?.message || `HTTP ${r.status}`;
+    // Zoho nomme le champ fautif dans `details.api_name` — on le jetait, d'ou des « invalid data »
+    // qui obligeaient a refaire toute l'enquete. Le code (INVALID_DATA…) est garde aussi.
+    const det = result?.details || {};
+    const champ = det.api_name ? ` (champ ${det.api_name}${det.expected_data_type ? `, attendu ${det.expected_data_type}` : ''})` : '';
+    const msg = `${result?.message || r.data?.message || `HTTP ${r.status}`}${champ}${result?.code ? ` [${result.code}]` : ''}`;
     console.warn('[partner-crm] Lead creation failed:', msg);
     return { success: false, error: String(msg).slice(0, 300) };
   } catch (e) {
