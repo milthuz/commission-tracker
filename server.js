@@ -17466,6 +17466,34 @@ async function crmLeadPicklists() {
   }
 }
 
+// Zoho valide le format des champs `phone` et refuse la fiche ENTIERE quand il n'aime pas.
+// Vecu le 2026-08-28 sur « Jardin du cerf » : « 514) 585-9966 », une parenthese fermante
+// orpheline, a fait echouer la creation (1 numero sur 629 en base, mais il coute un lead entier).
+//
+// On ne TOUCHE PAS a un numero deja propre : 629 numeros existants marchent tels quels, les
+// reformater tous pour un cas serait un risque pour zero gain. On ne reecrit que ce qui sort du
+// format sur.
+function telephonePourZoho(v) {
+  const brut = String(v == null ? '' : v).trim();
+  if (!brut) return null;
+  const equilibre = (brut.match(/\(/g) || []).length === (brut.match(/\)/g) || []).length;
+  if (/^[+]?[0-9 ()\-.]{7,25}$/.test(brut) && equilibre) return brut;   // deja acceptable
+  const plus = brut.trim().startsWith('+');
+  // On travaille par GROUPES de chiffres, pas sur leur concatenation. « tel: 5145859966 poste 4 »
+  // recolle en « 51458599664 » : un numero FAUX qui a l'air valide, donc pire qu'un champ vide —
+  // quelqu'un le composerait. Un groupe qui ressemble deja a un numero l'emporte.
+  const groupes = brut.match(/\d+/g) || [];
+  const vraisemblable = groupes.find((g) => g.length === 10 || (g.length === 11 && g[0] === '1'));
+  const d = vraisemblable || groupes.join('');
+  if (plus && d.length >= 8 && d.length <= 15) return '+' + d;
+  if (d.length === 10) return `${d.slice(0,3)}-${d.slice(3,6)}-${d.slice(6)}`;
+  if (d.length === 11 && d[0] === '1') return `1-${d.slice(1,4)}-${d.slice(4,7)}-${d.slice(7)}`;
+  if (d.length >= 7 && d.length <= 15) return d;
+  // Rien d'exploitable : on RETIRE le champ. Un lead sans telephone se corrige, un lead qui
+  // n'existe pas se perd.
+  return null;
+}
+
 // Ne garde d'une valeur de liste de choix que ce que Zoho accepte, en tolerant la casse (Zoho
 // stocke « New » quand on envoie « NEW »). Renvoie null quand rien ne correspond : l'appelant
 // RETIRE alors le champ, et Zoho applique son propre defaut. Perdre un champ vaut mieux que
@@ -17509,7 +17537,13 @@ async function createCrmLead(o) {
   if (o.website) fields.Website = String(o.website).slice(0, 255);
   if (o.contact_first_name) fields.First_Name = o.contact_first_name;
   if (o.contact_email) fields.Email = o.contact_email;
-  if (o.contact_phone) fields.Phone = o.contact_phone;
+  // Normalise, et RETIRE le champ si le numero est inexploitable — Zoho valide le format et
+  // refuse la fiche entiere sinon.
+  {
+    const tel = telephonePourZoho(o.contact_phone);
+    if (tel) fields.Phone = tel;
+    else if (o.contact_phone) console.warn(`[partner-crm] telephone inexploitable, champ retire : ${JSON.stringify(o.contact_phone)}`);
+  }
   // SH-30 follow-up — the partner manager's chosen rep to own this Lead in Zoho CRM.
   if (o.crm_owner_id) fields.Owner = { id: o.crm_owner_id };
   const repName = [o.rep_first_name, o.rep_last_name].filter(Boolean).join(' ');
@@ -17556,12 +17590,31 @@ async function createCrmLead(o) {
         && String(actingAs).toLowerCase() !== String(o.approver_email).toLowerCase()) {
       console.log(`[partner-crm] ecriture Zoho sous ${actingAs} (approbateur ${o.approver_email} sans compte Zoho connecte)`);
     }
-    const r = await axios.post(
+    // Filet de securite general : si Zoho refuse la fiche pour UN champ qu'il nomme, on retire ce
+    // champ et on reessaie UNE fois. C'est ce qui aurait sauve les deux incidents du 2026-08-28
+    // (Lead_Status disparu de sa liste, puis un telephone malforme) sans aucune intervention.
+    //
+    // Ne s'applique qu'aux champs SACRIFIABLES : retirer Company ou Last_Name donnerait un lead
+    // anonyme, ce qui est pire qu'un echec visible. Et une seule tentative — boucler jusqu'a ce
+    // que Zoho accepte pourrait vider la fiche champ par champ sans que personne le voie.
+    const SACRIFIABLES = new Set(['Phone', 'Email', 'Lead_Source', 'Lead_Contact_Method',
+                                  'Lead_Status', 'Country', 'City', 'State', 'Zip_Code',
+                                  'Website', 'First_Name', 'Description']);
+    const envoyer = () => axios.post(
       'https://www.zohoapis.com/crm/v2/Leads',
       { data: [fields] },
       { headers: { Authorization: `Zoho-oauthtoken ${crmToken}`, 'Content-Type': 'application/json' }, validateStatus: () => true }
     );
-    const result = r.data?.data?.[0];
+    let r = await envoyer();
+    let premier = r.data?.data?.[0];
+    const fautif = premier?.details?.api_name;
+    if (premier?.status === 'error' && fautif && SACRIFIABLES.has(fautif) && fields[fautif] !== undefined) {
+      console.warn(`[partner-crm] Zoho refuse « ${fautif} » (${JSON.stringify(fields[fautif])}) — champ retire, seconde tentative`);
+      delete fields[fautif];
+      r = await envoyer();
+      premier = r.data?.data?.[0];
+    }
+    const result = premier;
     if (r.status >= 200 && r.status < 300 && result?.status === 'success') {
       const leadId = result.details?.id || null;
       // La note va dans la liste liee « Notes » du Lead — c'est la que les representants la
