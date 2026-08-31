@@ -1173,11 +1173,23 @@ async function initializeDatabase() {
       }
     }
     const pricingSeed = require('./seed/pricingSeed');
+    // 2026-08-31: the Integrations & Add-ons category is seeded at sort_order 1, right after SaaS.
+    // Categories are seeded ON CONFLICT DO NOTHING and admins can't reorder them, so the rows
+    // already in the table keep their original sort_order — push everything from 1 onward up by
+    // one BEFORE the seed loop runs, exactly once (guarded on the row not existing yet). The +1
+    // covers admin-created categories too (they get MAX(sort_order)+1), so no two categories end
+    // up sharing a sort_order.
+    {
+      const hasIntegrations = (await pool.query(`SELECT 1 FROM pricing_categories WHERE id = 'integrations'`)).rowCount > 0;
+      if (!hasIntegrations) {
+        await pool.query(`UPDATE pricing_categories SET sort_order = sort_order + 1 WHERE sort_order >= 1`);
+      }
+    }
     for (const c of pricingSeed.categories) {
       await pool.query(
         `INSERT INTO pricing_categories (id, name_en, name_fr, sort_order, hourly, note_en, note_fr, considerations_en, considerations_fr)
-         VALUES ($1,$2,$2,$3,$4,$5,$5,$6,$6) ON CONFLICT (id) DO NOTHING`,
-        [c.id, c.name, c.sort, c.hourly, c.note, c.considerations]
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8) ON CONFLICT (id) DO NOTHING`,
+        [c.id, c.name, c.nameFr || c.name, c.sort, c.hourly, c.note, c.noteFr || c.note, c.considerations]
       );
     }
     for (const p of pricingSeed.packages) {
@@ -1185,9 +1197,9 @@ async function initializeDatabase() {
         `INSERT INTO pricing_packages
            (id, cat_id, name_en, name_fr, sku, sku_year, compat, pos, price_monthly, price_yearly, price_flat, unit, activation,
             includes_en, includes_fr, internal_en, internal_fr, status, group_name, tier, mode, rates)
-         VALUES ($1,$2,$3,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
          ON CONFLICT (id) DO NOTHING`,
-        [p.id, p.cat, p.name, p.sku || null, p.skuYear || null, p.compat ? [p.compat] : [], p.pos || null,
+        [p.id, p.cat, p.name, p.nameFr || p.name, p.sku || null, p.skuYear || null, p.compat ? [p.compat] : [], p.pos || null,
          p.priceMonthly ?? null, p.priceYearly ?? null, p.priceFlat ?? null, p.unit || null, p.activation ?? null,
          p.includes || [], p.includesFr || p.includes || [],
          p.internal ? JSON.stringify(p.internal) : null, p.internalFr ? JSON.stringify(p.internalFr) : (p.internal ? JSON.stringify(p.internal) : null),
@@ -1200,6 +1212,10 @@ async function initializeDatabase() {
     // column — never touches a row an admin has since translated by hand.
     for (const p of pricingSeed.packages) {
       if (!p.includesFr && !p.internalFr) continue;
+      // Packages authored WITH a French name (2026-08-31 integrations onward) shipped with their
+      // FR content already in the INSERT above, so they never need this backfill — skipping them
+      // keeps the "FR diverges from EN" warning below meaningful instead of firing every boot.
+      if (p.nameFr) continue;
       const newIncludesFr = p.includesFr || p.includes || [];
       const newInternalFr = p.internalFr ? JSON.stringify(p.internalFr) : (p.internal ? JSON.stringify(p.internal) : null);
       const r = await pool.query(
@@ -9475,7 +9491,7 @@ THE APP'S SECTIONS (left sidebar):
 - Processing Revenue (Revenus de paiements): monthly payment-processing revenue per rep/reseller (transaction profit + other revenue).
 - Resources: the shared sales-document library — search, browse and download guides and templates. Two featured tiles here open the Hardware Overview and Services & Pricing Guide (see below).
 - Hardware Overview: the full Cluster hardware catalog (POS terminals, printers, payment devices, displays, networking, peripherals) — searchable, filterable by Kaizen(V2)/V1 compatibility and lifecycle status, with a compare tool (up to 4 side by side) and one-click SKU copy.
-- Services & Pricing Guide: Cluster's pricing reference (SaaS, Rental, Menu Build, Installation, Support, Online Ordering, Shipping, On-Site/XPERIO) with a monthly/yearly toggle and a built-in quote builder that totals recurring vs one-time costs.
+- Services & Pricing Guide: Cluster's pricing reference (SaaS, Integrations & Add-ons, Rental, Menu Build, Installation, Support, Online Ordering, Shipping, On-Site/XPERIO) with a monthly/yearly toggle and a built-in quote builder that totals recurring vs one-time costs. "Integrations & Add-ons" holds the recurring monthly add-ons: the non-Cluster payment-processing integration ($45/mo, +$15 per extra terminal), Cluster KDS ($39/mo), the Aligner kitchen-display integrations ($69 suite / $39 extra screen / $169 unlimited 3+ units) and the third-party integrations (7Shifts, Androbar, Datacandy, Deliverect, Freebees, GGGolf, LIBRO, Mews, Octogone, Piecemeal, PIVOT, Planifico, PUSH, QuickBooks, Rapid Bar, RESTOCK, Sage, UEAT, Wisk) — $19/month each except Freebees, PIVOT and RESTOCK (free) and GGGolf ($59).
 - Proposals: build and send a branded sales proposal (cover + company deck + optional Zoho Books estimate) to a client, with open/click tracking.
 - Partners: the referral-partner program (Moneris and others). Partner staff submit merchant leads through their own portal; a Cluster partner manager reviews each one in the Opportunity Queue, and approving it creates a real Lead in Zoho CRM assigned to a chosen Cluster rep. Sub-tabs: Opportunity Queue (review/approve/reject), Manage Partners, Users, Payouts, Data import, and Statistics. Statistics has two halves — the deal PIPELINE (volume submitted, what is still open, won vs lost, win rate over decided records, and per-partner conversion) and portal USAGE (invitations, activations, logins, dormant accounts). A partner payout is triggered by the deposit date on the Zoho deal, not by a paid invoice.
 - What each user sees depends on their permissions — some sections may not be visible to everyone.

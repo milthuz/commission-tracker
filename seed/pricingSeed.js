@@ -5,15 +5,19 @@
 
 const categories = [
   { id: 'saas',     name: 'SaaS Packages',           sort: 0, hourly: null, note: null, considerations: null },
-  { id: 'rental',   name: 'Rental Packages',         sort: 1, hourly: null, note: null, considerations: null },
-  { id: 'menu',     name: 'Menu Build Services',     sort: 2, hourly: 125,  note: null, considerations: null },
-  { id: 'install',  name: 'Installation Services',   sort: 3, hourly: null, note: null, considerations: null },
-  { id: 'support',  name: 'Support Packages',        sort: 4, hourly: null, note: null, considerations: null },
-  { id: 'olo',      name: 'Online Ordering',         sort: 5, hourly: null, note: 'CAD — $299 activation fee per service + $29/month per service (training included in activation).',
+  { id: 'integrations', name: 'Integrations & Add-ons', nameFr: 'Intégrations et modules', sort: 1, hourly: null,
+    note: 'CAD — recurring monthly, per merchant. Most third-party integrations are $19/month; every exception is priced on its own card.',
+    noteFr: 'CAD — récurrent mensuel, par marchand. La plupart des intégrations tierces sont à 19 $/mois; chaque exception est affichée sur sa propre carte.',
+    considerations: null },
+  { id: 'rental',   name: 'Rental Packages',         sort: 2, hourly: null, note: null, considerations: null },
+  { id: 'menu',     name: 'Menu Build Services',     sort: 3, hourly: 125,  note: null, considerations: null },
+  { id: 'install',  name: 'Installation Services',   sort: 4, hourly: null, note: null, considerations: null },
+  { id: 'support',  name: 'Support Packages',        sort: 5, hourly: null, note: null, considerations: null },
+  { id: 'olo',      name: 'Online Ordering',         sort: 6, hourly: null, note: 'CAD — $299 activation fee per service + $29/month per service (training included in activation).',
     considerations: ['Global menus: image uploads to OLO are not supported (menu locked in POS).', 'Global menus: out-of-stock items can’t be deactivated from the POS on OLO.', 'Global-menu merchants may not be the best fit — consider a hybrid menu setup.'] },
-  { id: 'shipping', name: 'Shipping Cost Guidelines', sort: 6, hourly: null, note: 'From Montreal · Standard · add $15 for each additional item.',
+  { id: 'shipping', name: 'Shipping Cost Guidelines', sort: 7, hourly: null, note: 'From Montreal · Standard · add $15 for each additional item.',
     considerations: ['Request custom rate for items exceeding weight limitations.', 'Request custom rate for remote locations.'] },
-  { id: 'xperio',   name: 'On-Site & XPERIO Fees',   sort: 7, hourly: null, note: null, considerations: null },
+  { id: 'xperio',   name: 'On-Site & XPERIO Fees',   sort: 8, hourly: null, note: null, considerations: null },
 ];
 
 // includesFr/internalFr: French translations (names/SKUs/tiers aren't translated).
@@ -157,6 +161,43 @@ const packages = [
     includesFr:['Commande à table','Formation incluse dans l’activation'] },
   { id:'olo-qr', cat:'olo', name:'Cluster Counter QR Codes', sku:'CLU-QRC-MON', priceMonthly:29, activation:299, unit:'month', includes:['Counter QR ordering','Training included in activation'],
     includesFr:['Commande par code QR au comptoir','Formation incluse dans l’activation'] },
+
+  // ------------------------------------ Integrations & monthly add-ons
+  // Cluster-side integrations
+  { id:'int-pay-pro', cat:'integrations', name:'Payment Processing Integration (non-Cluster)', nameFr:'Intégration de traitement des paiements (hors Cluster)', sku:'PAY-PRO-INT-MON', priceMonthly:45, unit:'month', group:'payment',
+    includes:['For merchants processing with a non-Cluster provider','+$15 / month per additional terminal'], includesFr:['Pour les marchands qui traitent avec un fournisseur autre que Cluster','+15 $ / mois par terminal additionnel'],
+    internal:{ notes:'Extra terminal: $15 per terminal, per month.' }, internalFr:{ notes:'Terminal additionnel : 15 $ par terminal, par mois.' } },
+  { id:'int-kds-cluster', cat:'integrations', name:'Cluster KDS', nameFr:'KDS Cluster', sku:'KDS-INT-MON', priceMonthly:39, unit:'month', group:'kds',
+    includes:['Cluster kitchen display system'], includesFr:['Système d’affichage cuisine Cluster'] },
+
+  // Aligner kitchen display (third-party KDS)
+  { id:'int-aligner-suite', cat:'integrations', name:'Aligner Kitchen Display · Integration Suite', nameFr:'Affichage cuisine Aligner · suite d’intégration', sku:'CLU-KDS-INT', priceMonthly:69, unit:'month', group:'kds' },
+  { id:'int-aligner-add', cat:'integrations', name:'Aligner Kitchen Display · Additional Screen', nameFr:'Affichage cuisine Aligner · écran additionnel', sku:'CLU-KDS-INT-ADD', priceMonthly:39, unit:'month', group:'kds' },
+  { id:'int-aligner-unl', cat:'integrations', name:'Aligner Kitchen Display · Unlimited (3+ units)', nameFr:'Affichage cuisine Aligner · illimité (3 unités et plus)', sku:'CLU-KDS-INT-UNL', priceMonthly:169, unit:'month', group:'kds' },
+
+  // Third-party integrations — $19/month unless the card says otherwise
+  { id:'int-7shifts', cat:'integrations', name:'7Shifts Integration', nameFr:'Intégration 7Shifts', sku:'CLU-7SHI-INT', priceMonthly:19, unit:'month', group:'third-party' },
+  { id:'int-androbar', cat:'integrations', name:'Androbar Integration', nameFr:'Intégration Androbar', sku:'CLU-AND-INT', priceMonthly:19, unit:'month', group:'third-party' },
+  { id:'int-datacandy', cat:'integrations', name:'Datacandy Integration', nameFr:'Intégration Datacandy', sku:'DAT-INT', priceMonthly:19, unit:'month', group:'third-party' },
+  { id:'int-deliverect', cat:'integrations', name:'Deliverect Integration', nameFr:'Intégration Deliverect', sku:'DEL-INT', priceMonthly:19, unit:'month', group:'third-party' },
+  { id:'int-freebees', cat:'integrations', name:'Freebees Integration', nameFr:'Intégration Freebees', sku:'FREE-INT-MON', priceMonthly:0, unit:'month', group:'third-party',
+    includes:['No monthly fee'], includesFr:['Aucuns frais mensuels'] },
+  { id:'int-gggolf', cat:'integrations', name:'GGGolf Integration', nameFr:'Intégration GGGolf', sku:'CLU-GGG-INT', priceMonthly:59, unit:'month', group:'third-party' },
+  { id:'int-libro', cat:'integrations', name:'LIBRO Integration', nameFr:'Intégration LIBRO', sku:'LIB-INT', priceMonthly:19, unit:'month', group:'third-party' },
+  { id:'int-mews', cat:'integrations', name:'Mews Integration', nameFr:'Intégration Mews', sku:'MEWS-INT', priceMonthly:19, unit:'month', group:'third-party' },
+  { id:'int-octogone', cat:'integrations', name:'Octogone Integration', nameFr:'Intégration Octogone', sku:'CLU-OCT-INT', priceMonthly:19, unit:'month', group:'third-party' },
+  { id:'int-piecemeal', cat:'integrations', name:'Piecemeal Integration', nameFr:'Intégration Piecemeal', sku:'PIE-INT', priceMonthly:19, unit:'month', group:'third-party' },
+  { id:'int-pivot', cat:'integrations', name:'PIVOT Integration', nameFr:'Intégration PIVOT', sku:'Pivot-INT', priceMonthly:0, unit:'month', group:'third-party',
+    includes:['No monthly fee'], includesFr:['Aucuns frais mensuels'] },
+  { id:'int-planifico', cat:'integrations', name:'Planifico Integration', nameFr:'Intégration Planifico', sku:'CLU-PLA-INT', priceMonthly:19, unit:'month', group:'third-party' },
+  { id:'int-push', cat:'integrations', name:'PUSH Integration', nameFr:'Intégration PUSH', sku:'PUSH-INT', priceMonthly:19, unit:'month', group:'third-party' },
+  { id:'int-quickbooks', cat:'integrations', name:'QuickBooks Integration', nameFr:'Intégration QuickBooks', sku:'CLU-QUI-INT', priceMonthly:19, unit:'month', group:'third-party' },
+  { id:'int-rapidbar', cat:'integrations', name:'Rapid Bar Integration', nameFr:'Intégration Rapid Bar', sku:'CLU-RAP-INT', priceMonthly:19, unit:'month', group:'third-party' },
+  { id:'int-restock', cat:'integrations', name:'RESTOCK Integration', nameFr:'Intégration RESTOCK', sku:'RS-INT', priceMonthly:0, unit:'month', group:'third-party',
+    includes:['No monthly fee'], includesFr:['Aucuns frais mensuels'] },
+  { id:'int-sage', cat:'integrations', name:'Sage Integration', nameFr:'Intégration Sage', sku:'SAGE-INT', priceMonthly:19, unit:'month', group:'third-party' },
+  { id:'int-ueat', cat:'integrations', name:'UEAT Integration', nameFr:'Intégration UEAT', sku:'UEA-INT', priceMonthly:19, unit:'month', group:'third-party' },
+  { id:'int-wisk', cat:'integrations', name:'Wisk Integration', nameFr:'Intégration Wisk', sku:'WIS-INT', priceMonthly:19, unit:'month', group:'third-party' },
 ];
 
 const guides = [
