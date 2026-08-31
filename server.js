@@ -611,6 +611,49 @@ async function initializeDatabase() {
       WHERE commission_paid = true AND approval_status = 'pending'
     `);
 
+    // Restore paid state from the pay-file record. The full-reset path (DELETE FROM invoices,
+    // see /api/admin/reset-invoices) rebuilds the table from Zoho and wipes approval_status /
+    // commission_paid / approved_by / payout_paid_by, while commission_payment_imports and
+    // commission_payment_lines are separate tables that survive. The backfill above cannot
+    // recover those rows because it keys on commission_paid, which the reset cleared too — so a
+    // commission genuinely paid through an imported pay file silently reverts to 'pending' and
+    // shows up as owed. That is a double-payment risk: on 2026-08-31 seven invoices across four
+    // reps ($955.16) were sitting in exactly that state. Idempotent; safe on every boot.
+    //
+    // A pay-file line with paid_amount > 0 IS the proof of payment, so this deliberately does
+    // NOT filter on commission/status/payable_override — each of those was tried and was wrong:
+    //   • commission > 0        → skipped 922 of 1442 rows; a commission later recomputed to 0
+    //                             (renewal, quota gate) was still genuinely paid at the time.
+    //   • status NOT IN (void)  → a void-but-paid invoice must stay 'paid', otherwise detector B
+    //                             (over_void) can never propose the clawback.
+    //   • payable_override NULL → looks like it protects carried-forward adjustments, but it also
+    //                             skips re-homed invoices that were legitimately paid once their
+    //                             target month committed — recreating this very bug. Unnecessary
+    //                             anyway: an invoice still awaiting its target month has no
+    //                             pay-file line, so the join already excludes it.
+    // Verified against production in a rolled-back transaction: restores 1442/1442, marks 0 rows
+    // that lack a pay-file line, leaves all 46 pending carried-forward adjustments untouched.
+    await pool.query(`
+      UPDATE invoices i
+      SET approval_status = 'paid',
+          commission_paid = true,
+          approved_by     = COALESCE(i.approved_by, pf.imported_by),
+          approved_at     = COALESCE(i.approved_at, pf.paid_for_period::timestamptz),
+          payout_paid_by  = COALESCE(i.payout_paid_by, 'import:' || pf.filename),
+          payout_paid_at  = COALESCE(i.payout_paid_at, pf.paid_for_period::timestamptz),
+          updated_at      = CURRENT_TIMESTAMP
+      FROM (
+        SELECT DISTINCT ON (l.invoice_number)
+               l.invoice_number, imp.filename, imp.paid_for_period, imp.imported_by
+          FROM commission_payment_lines l
+          JOIN commission_payment_imports imp ON imp.id = l.import_id
+         WHERE l.paid_amount > 0
+         ORDER BY l.invoice_number, imp.paid_for_period
+      ) pf
+      WHERE i.invoice_number = pf.invoice_number
+        AND i.approval_status <> 'paid'
+    `);
+
     // PERFORMANCE: `invoices` is the busiest table in the app (~105 queries reference it) and had
     // NO indexes at all beyond the implicit PK and UNIQUE(invoice_number) — so every commission
     // page, report, pay stub and reconciliation was a full sequential scan over thousands of rows,
@@ -27064,8 +27107,23 @@ app.get('/api/commissions/adjustments/suggestions', authenticateToken, async (re
       detail: { payments: r.payments, totalPaid: Math.round(r.total_paid * 100) / 100 },
     });
 
-    // D. Underpaid: commissions unlocked in a CLOSED platform month (≥ May 2026, at least one
-    //    full month back) that were never paid → suggest carrying them to the current month.
+    // D. Underpaid: commissions unlocked in a CLOSED month (≥ Jan 2026, at least one full month
+    //    back) that were never paid → suggest carrying them to the current month.
+    //    The floor used to be 2026-05-01 (the platform-pays cutover), on the assumption that
+    //    everything earlier was settled by the Excel reports. It wasn't: on 2026-08-31 a rep
+    //    reported four missing commissions and 27 Jan–Apr 2026 misses across four reps
+    //    ($2,538.63) turned out to be absent from every imported pay file — invisible here
+    //    because of that floor, and surfaced only because someone complained. Jan 2026 is the
+    //    new floor so Excel-era misses self-report.
+    //    It is deliberately NOT dropped to zero: ~1,069 pre-2026 invoices ($126,736.60) are of
+    //    undecided status — largely the Jan-2025 book migration, where `saas_first` classified
+    //    recurring renewals that may or may not have been commissionable. Until that business
+    //    rule is settled, including them would bury every real suggestion. Do not lower this
+    //    floor further without resolving that backlog first.
+    //    NOTE: this detector keys on approval_status alone, so it can propose an invoice that
+    //    was in fact paid through a file but lost its flag; the boot-time restore migration
+    //    (search "Restore paid state from the pay-file record") is what keeps that from
+    //    happening — the two are a pair.
     const underpaid = (await pool.query(`
       SELECT invoice_number, customer_name, salesperson_name, commission::float AS commission,
              commission_payable_date::date AS source_period
@@ -27073,7 +27131,7 @@ app.get('/api/commissions/adjustments/suggestions', authenticateToken, async (re
        WHERE organization_id = $1 AND commission > 0
          AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial')
          AND approval_status <> 'paid' AND status NOT IN ('void','deleted')
-         AND commission_payable_date >= '2026-05-01'
+         AND commission_payable_date >= '2026-01-01'
          AND commission_payable_date < date_trunc('month', CURRENT_DATE) - interval '1 month'
          AND ${activeRep.replace('%COL%', 'i.salesperson_name')}`,
       [orgId])).rows;
