@@ -1300,6 +1300,52 @@ async function initializeDatabase() {
       }
     } catch (e) { console.warn('[hardware-seed] image backfill:', e.message); }
 
+    // Load integration/vendor logos for pricing packages from files shipped in the repo
+    // (assets/pricing-seed-img/<package-id>.png) — same idea as the hardware photo backfill above,
+    // with one difference: WHICH files have already been loaded is remembered in app_settings
+    // rather than inferred from the row. Inferring would resurrect a logo an admin deliberately
+    // removed (DELETE clears img_file_name too, so the row looks untouched again), and a single
+    // "did this ever run" flag would block a later batch of new logos. Per-file bookkeeping gets
+    // both right: new files load, removed logos stay removed.
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const logoDir = path.join(__dirname, 'assets', 'pricing-seed-img');
+      if (fs.existsSync(logoDir)) {
+        const row = (await pool.query(`SELECT value FROM app_settings WHERE key = 'pricing_logo_seed_applied'`)).rows[0];
+        let appliedSet;
+        try { appliedSet = new Set(row ? JSON.parse(row.value) : []); } catch { appliedSet = new Set(); }
+        const MIME = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp' };
+        const before = appliedSet.size;
+        let loaded = 0;
+        const notApplied = [];
+        for (const file of fs.readdirSync(logoDir).sort()) {
+          if (appliedSet.has(file)) continue;
+          const mime = MIME[path.extname(file).toLowerCase()];
+          if (!mime) continue;
+          const buf = fs.readFileSync(path.join(logoDir, file));
+          // `img_data IS NULL` so a logo someone uploaded by hand through the editor always wins.
+          const r = await pool.query(
+            `UPDATE pricing_packages SET img_data = $2, img_mime_type = $3, img_file_name = $4, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1 AND img_data IS NULL`,
+            [path.basename(file, path.extname(file)), buf, mime, file]
+          );
+          if (r.rowCount) loaded++; else notApplied.push(file);
+          // Marked either way — a file whose package id doesn't exist must not be retried forever.
+          appliedSet.add(file);
+        }
+        if (appliedSet.size !== before) {
+          await pool.query(
+            `INSERT INTO app_settings (key, value, updated_at) VALUES ('pricing_logo_seed_applied', $1, CURRENT_TIMESTAMP)
+             ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = CURRENT_TIMESTAMP`,
+            [JSON.stringify([...appliedSet].sort())]
+          );
+        }
+        if (loaded) console.log(`✅ Loaded ${loaded} pricing package logo(s) into bytea`);
+        if (notApplied.length) console.warn(`[pricing-seed] logo not applied (no such package, or it already has one): ${notApplied.join(', ')}`);
+      }
+    } catch (e) { console.warn('[pricing-seed] logo backfill:', e.message); }
+
     // Authoritative per-customer tenure fact (2026-07-14): the customer's TRUE earliest invoice
     // ever, fetched directly from Zoho with no date bound — unlike our own invoices table, which
     // only has whatever fell inside the sync window, so an old customer's real first sale can be
