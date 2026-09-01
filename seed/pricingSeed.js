@@ -192,7 +192,7 @@ const packages = [
   { id:'int-planifico', cat:'integrations', name:'Planifico Integration', nameFr:'Intégration Planifico', sku:'CLU-PLA-INT', priceMonthly:19, unit:'month', group:'third-party' },
   { id:'int-push', cat:'integrations', name:'PUSH Integration', nameFr:'Intégration PUSH', sku:'PUSH-INT', priceMonthly:19, unit:'month', group:'third-party' },
   { id:'int-quickbooks', cat:'integrations', name:'QuickBooks Integration', nameFr:'Intégration QuickBooks', sku:'CLU-QUI-INT', priceMonthly:19, unit:'month', group:'third-party' },
-  { id:'int-rapidbar', cat:'integrations', name:'Rapid Bar Integration', nameFr:'Intégration Rapid Bar', sku:'CLU-RAP-INT', priceMonthly:19, unit:'month', group:'third-party' },
+  { id:'int-rapidbar', cat:'integrations', name:'RapidStock Integration', nameFr:'Intégration RapidStock', sku:'CLU-RAP-INT', priceMonthly:19, unit:'month', group:'third-party' },
   { id:'int-restock', cat:'integrations', name:'RESTOCK Integration', nameFr:'Intégration RESTOCK', sku:'RS-INT', priceMonthly:0, unit:'month', group:'third-party',
     includes:['No monthly fee'], includesFr:['Aucuns frais mensuels'] },
   { id:'int-sage', cat:'integrations', name:'Sage Integration', nameFr:'Intégration Sage', sku:'SAGE-INT', priceMonthly:19, unit:'month', group:'third-party' },

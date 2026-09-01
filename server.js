@@ -1277,6 +1277,16 @@ async function initializeDatabase() {
         [m.id, m.price, m.newIncludes, m.oldIncludes]
       );
     }
+    // 2026-09-01 rename: the vendor behind CLU-RAP-INT rebranded from Rapid Bar to RapidStock, so
+    // the card should carry the company's current name. The seed can't do it (packages are seeded
+    // ON CONFLICT DO NOTHING), hence this correction. Guarded on the row still holding the OLD
+    // name, so it renames exactly once and never overwrites a name an admin has since edited.
+    // The SKU is deliberately untouched — it's the Zoho item code, not a label.
+    await pool.query(
+      `UPDATE pricing_packages SET name_en = 'RapidStock Integration', name_fr = 'Intégration RapidStock', updated_at = CURRENT_TIMESTAMP
+       WHERE id = 'int-rapidbar' AND name_en = 'Rapid Bar Integration'`
+    );
+
     // Backfill hardware product photos into bytea — only touches rows that don't have image data
     // yet, so it's a no-op after the first successful run (and harmless to re-run on every boot).
     try {
@@ -9543,7 +9553,7 @@ THE APP'S SECTIONS (left sidebar):
 - Processing Revenue (Revenus de paiements): monthly payment-processing revenue per rep/reseller (transaction profit + other revenue).
 - Resources: the shared sales-document library — search, browse and download guides and templates. Two featured tiles here open the Hardware Overview and Services & Pricing Guide (see below).
 - Hardware Overview: the full Cluster hardware catalog (POS terminals, printers, payment devices, displays, networking, peripherals) — searchable, filterable by Kaizen(V2)/V1 compatibility and lifecycle status, with a compare tool (up to 4 side by side) and one-click SKU copy.
-- Services & Pricing Guide: Cluster's pricing reference (SaaS, Integrations & Add-ons, Rental, Menu Build, Installation, Support, Online Ordering, Shipping, On-Site/XPERIO) with a monthly/yearly toggle and a built-in quote builder that totals recurring vs one-time costs. "Integrations & Add-ons" holds the recurring monthly add-ons: the non-Cluster payment-processing integration ($45/mo, +$15 per extra terminal), Cluster KDS ($39/mo), the Aligner kitchen-display integrations ($69 suite / $39 extra screen / $169 unlimited 3+ units) and the third-party integrations (7Shifts, Androbar, Datacandy, Deliverect, Freebees, GGGolf, LIBRO, Mews, Octogone, Piecemeal, PIVOT, Planifico, PUSH, QuickBooks, Rapid Bar, RESTOCK, Sage, UEAT, Wisk) — $19/month each except Freebees, PIVOT and RESTOCK (free) and GGGolf ($59).
+- Services & Pricing Guide: Cluster's pricing reference (SaaS, Integrations & Add-ons, Rental, Menu Build, Installation, Support, Online Ordering, Shipping, On-Site/XPERIO) with a monthly/yearly toggle and a built-in quote builder that totals recurring vs one-time costs. "Integrations & Add-ons" holds the recurring monthly add-ons: the non-Cluster payment-processing integration ($45/mo, +$15 per extra terminal), Cluster KDS ($39/mo), the Aligner kitchen-display integrations ($69 suite / $39 extra screen / $169 unlimited 3+ units) and the third-party integrations (7Shifts, Androbar, Datacandy, Deliverect, Freebees, GGGolf, LIBRO, Mews, Octogone, Piecemeal, PIVOT, Planifico, PUSH, QuickBooks, RapidStock (formerly Rapid Bar), RESTOCK, Sage, UEAT, Wisk) — $19/month each except Freebees, PIVOT and RESTOCK (free) and GGGolf ($59).
 - Proposals: build and send a branded sales proposal (cover + company deck + optional Zoho Books estimate) to a client, with open/click tracking.
 - Partners: the referral-partner program (Moneris and others). Partner staff submit merchant leads through their own portal; a Cluster partner manager reviews each one in the Opportunity Queue, and approving it creates a real Lead in Zoho CRM assigned to a chosen Cluster rep. Sub-tabs: Opportunity Queue (review/approve/reject), Manage Partners, Users, Payouts, Data import, and Statistics. Statistics has two halves — the deal PIPELINE (volume submitted, what is still open, won vs lost, win rate over decided records, and per-partner conversion) and portal USAGE (invitations, activations, logins, dormant accounts). A partner payout is triggered by the deposit date on the Zoho deal, not by a paid invoice.
 - What each user sees depends on their permissions — some sections may not be visible to everyone.
