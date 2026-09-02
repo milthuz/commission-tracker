@@ -16514,6 +16514,14 @@ const SAAS_INSIGHTS_DELAY_MS = 250; // per-subscription throttle, rate-limit fri
 const SAAS_BASE_DELAY_MS = 120;
 // Zoho access tokens last about an hour; these scans run much longer than that, so the token is
 // re-fetched every N subscriptions (getAdminBooksAuth refreshes it only when actually expired).
+// Token renewal used to be keyed on a COUNT of subscriptions, which means wildly different
+// wall-clock intervals for the two scans: the base pass covers 100 subscriptions in about a
+// minute, while the price-history pass makes up to 24 invoice calls each and can take the better
+// part of an hour for the same 100. A Zoho token lives about an hour, so the slow scan routinely
+// worked with a dead one and recorded "HTTP 401 (Zoho token expired)" against blameless
+// subscriptions — 463 of them in a single run. Age is what matters, so age is what is checked.
+const SAAS_TOKEN_MAX_AGE_MS = 40 * 60 * 1000;
+// Kept only to pace the progress log.
 const SAAS_TOKEN_REFRESH_EVERY = 100;
 // Skip subscriptions checked more recently than this — without it, every run (nightly or manual)
 // rescans EVERY subscription from scratch, which at real-world scale (thousands of subscriptions,
@@ -16547,7 +16555,7 @@ async function runSaasBasePriceScan() {
   saasBasePriceScanRunning = true;
   saasBaseScanLastError = null;
   try {
-    let { accessToken, apiDomain } = await getAdminBooksAuth();
+    const auth = { ...(await getAdminBooksAuth()), fetchedAt: Date.now() };
     const allSubs = await getSaasIncreaseSubscriptions();
     // "Done" must test everything this scan WRITES, not just what gates a push. Leaving
     // addons_price_period out would have made this run skip all 3462 rows that already had a plan
@@ -16562,8 +16570,7 @@ async function runSaasBasePriceScan() {
     let ok = 0, failed = 0, i = 0;
     for (const s of subs) {
       if (i > 0 && i % SAAS_TOKEN_REFRESH_EVERY === 0) {
-        ({ accessToken, apiDomain } = await getAdminBooksAuth());
-        console.log(`[saas-base] ${i}/${subs.length} (${ok} ok, ${failed} failed) — token refreshed`);
+        console.log(`[saas-base] ${i}/${subs.length} (${ok} ok, ${failed} failed)`);
       }
       i++;
       if (i % SAAS_SCAN_HEARTBEAT_EVERY === 0 && await saasScanShouldStop(lockOwner)) {
@@ -16571,23 +16578,7 @@ async function runSaasBasePriceScan() {
         break;
       }
       try {
-        let detail;
-        try {
-          detail = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
-        } catch (e) {
-          // The Zoho token is SHARED: any other job refreshing it invalidates the one this loop is
-          // holding, so periodic renewal alone can't prevent 401s. Re-fetch and retry this one
-          // subscription before writing it off as a failure.
-          // 429 is not a permanent failure, it is Zoho asking us to slow down — most likely
-          // because the price-history scan is running against the same account. Back off once
-          // rather than recording the subscription as having no plan price.
-          if (/HTTP 429/.test(e.message)) {
-            await new Promise(r => setTimeout(r, SAAS_RATE_LIMIT_BACKOFF_MS));
-          } else if (/401/.test(e.message)) {
-            ({ accessToken, apiDomain } = await getAdminBooksAuth());
-          } else throw e;
-          detail = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
-        }
+        const detail = await saasTenureWithRetry(auth, s.orgId, s.subscriptionId);
         const { activatedAt, planMonthly, addonsMonthly, planPeriod, addonsPeriod } = detail;
         if (planMonthly == null) throw new Error('Zoho returned no plan amount for this subscription');
         await pool.query(`
@@ -16618,6 +16609,27 @@ async function runSaasBasePriceScan() {
   } finally {
     await releaseSaasScanLock(lockOwner);
     saasBasePriceScanRunning = false;
+  }
+}
+
+// One place that knows how to survive a dead or throttled token, used by BOTH scans. The base
+// pass had this retry; the price-history pass never did, which is why only the latter piled up
+// 401s. `auth` is mutated in place so the caller keeps the refreshed credentials.
+async function saasTenureWithRetry(auth, orgId, subscriptionId) {
+  if (Date.now() - auth.fetchedAt > SAAS_TOKEN_MAX_AGE_MS) {
+    Object.assign(auth, await getAdminBooksAuth(), { fetchedAt: Date.now() });
+  }
+  try {
+    return await fetchSaasSubscriptionTenure(auth.apiDomain, auth.accessToken, orgId, subscriptionId);
+  } catch (e) {
+    // 429 is Zoho asking us to slow down; 401 is a token another job rotated underneath us. Both
+    // deserve exactly one retry. Anything else is a real failure for this subscription.
+    if (/HTTP 429/.test(e.message)) {
+      await new Promise(r => setTimeout(r, SAAS_RATE_LIMIT_BACKOFF_MS));
+    } else if (/401/.test(e.message)) {
+      Object.assign(auth, await getAdminBooksAuth(), { fetchedAt: Date.now() });
+    } else throw e;
+    return await fetchSaasSubscriptionTenure(auth.apiDomain, auth.accessToken, orgId, subscriptionId);
   }
 }
 
@@ -16748,7 +16760,7 @@ async function runSaasSubscriptionInsightsScan() {
   if (!lockOwner) { console.log('[saas-insights] lock held by another scan, skipping'); return; }
   saasInsightsScanRunning = true;
   try {
-    let { accessToken, apiDomain } = await getAdminBooksAuth();
+    const auth = { ...(await getAdminBooksAuth()), fetchedAt: Date.now() };
     const booksOrgId = process.env.ZOHO_ORG_ID;
     const plansRes = await pool.query('SELECT plan_code, name FROM zoho_plans');
     const planCodes = new Set(plansRes.rows.map(r => (r.plan_code || '').toLowerCase().trim()));
@@ -16776,8 +16788,7 @@ async function runSaasSubscriptionInsightsScan() {
     for (const s of subs) {
       // Same hour-long token expiry as the base scan — this loop runs far longer still.
       if (i > 0 && i % SAAS_TOKEN_REFRESH_EVERY === 0) {
-        ({ accessToken, apiDomain } = await getAdminBooksAuth());
-        console.log(`[saas-insights] ${i}/${subs.length} (${ok} ok, ${failed} failed) — token refreshed`);
+        console.log(`[saas-insights] ${i}/${subs.length} (${ok} ok, ${failed} failed)`);
       }
       i++;
       if (i % SAAS_SCAN_HEARTBEAT_EVERY === 0 && await saasScanShouldStop(lockOwner)) {
@@ -16785,7 +16796,7 @@ async function runSaasSubscriptionInsightsScan() {
         break;
       }
       try {
-        const { activatedAt, planMonthly, addonsMonthly, planPeriod, addonsPeriod } = await fetchSaasSubscriptionTenure(apiDomain, accessToken, s.orgId, s.subscriptionId);
+        const { activatedAt, planMonthly, addonsMonthly, planPeriod, addonsPeriod } = await saasTenureWithRetry(auth, s.orgId, s.subscriptionId);
         // planPeriod comes free with this same detail call and is what gates pushing to Zoho.
         // Discarding it meant a subscription this scan had already fully inspected still showed
         // "incl. addons" until the separate base-price pass re-fetched the identical record.
@@ -16794,7 +16805,9 @@ async function runSaasSubscriptionInsightsScan() {
         // Zoho, whereas price history is only informational. Failing it is recorded, not fatal.
         let points = null, change = null, priceErr = null;
         try {
-          ({ points, change } = await fetchSaasPriceChange(apiDomain, accessToken, booksOrgId, s.subscriptionId, s.customerId, s.planCode, s.planName));
+          // auth was just refreshed by saasTenureWithRetry above if it had gone stale, so the
+          // expensive invoice walk inherits a live token instead of finishing off a dead one.
+          ({ points, change } = await fetchSaasPriceChange(auth.apiDomain, auth.accessToken, booksOrgId, s.subscriptionId, s.customerId, s.planCode, s.planName));
         } catch (e) {
           priceErr = `price history: ${e.message}`;
         }
