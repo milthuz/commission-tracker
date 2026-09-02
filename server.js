@@ -161,6 +161,9 @@ const PERMISSION_CATALOG = [
   { key: 'saas_increase:manage',       label: 'Build & simulate SaaS price-increase scenarios',                 category: 'SaaS Increase' },
   { key: 'saas_increase:notify',       label: 'Send merchant notification emails about a SaaS price increase', category: 'SaaS Increase' },
   { key: 'saas_increase:execute',      label: 'Push SaaS price increases into live Zoho subscriptions',        category: 'SaaS Increase' },
+  // Deliberately separate and read-only: support agents need to answer "what changed for THIS
+  // merchant" without any ability to build, notify or push.
+  { key: 'saas_increase:lookup',       label: 'Look up a merchant price change (support reference)',        category: 'SaaS Increase' },
 
   // Partner Portal (internal staff side — manage partner companies + review submissions;
   // partner accounts themselves never touch this permission system, see partner_users)
@@ -16012,6 +16015,65 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authentic
       results.push(serializeSaasIncreaseItem(row));
     }
     res.json({ items: results });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/saas-increase/lookup?q= — the support desk's answer to "a merchant is calling about
+// their price increase". Read-only and on its own permission: an agent needs the facts for ONE
+// account, never the ability to build a scenario, email anyone or write to Zoho.
+// Matches on customer name, subscription number or merchant account id, because a caller could
+// give any of the three and an agent should not have to know which one the tool wants.
+app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:lookup'))) return;
+  const q = String(req.query.q || '').trim();
+  if (q.length < 2) return res.json({ results: [] });
+  try {
+    const rows = (await pool.query(`
+      SELECT i.*, s.name AS scenario_name, s.status AS scenario_status
+        FROM saas_increase_items i
+        JOIN saas_increase_scenarios s ON s.id = i.scenario_id
+       WHERE i.skipped = FALSE
+         AND (i.customer_name ILIKE $1 OR i.subscription_number ILIKE $1 OR i.merchant_account_id ILIKE $1)
+       ORDER BY i.notified_at DESC NULLS LAST, i.customer_name
+       LIMIT 50`, [`%${q}%`])).rows;
+
+    // Per-period prices and the effective date come from the same two sources the notice quoted,
+    // so what an agent reads back to a merchant matches the email that merchant received.
+    const periodByKey = new Map((await pool.query(
+      `SELECT org_id, subscription_number, plan_price_period FROM saas_subscription_insights
+        WHERE plan_price_period IS NOT NULL`
+    )).rows.map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
+    let nextBillingBySub = new Map();
+    try {
+      const liveSubs = await getSaasIncreaseSubscriptions();
+      nextBillingBySub = new Map(liveSubs.map(x => [x.subscriptionNumber, x.nextBillingAt]));
+    } catch { /* Zoho unreachable: the stored facts are still worth showing */ }
+
+    const results = rows.map(r => {
+      const cur = periodByKey.get(`${r.org_id}||${r.subscription_number}`) ?? null;
+      const next = cur == null ? null : saasNewPeriodPrice(cur, r.increase_type, r.increase_value);
+      return {
+        id: r.id,
+        customerName: r.customer_name,
+        subscriptionNumber: r.subscription_number,
+        merchantAccountId: r.merchant_account_id,
+        orgName: ZOHO_BILLING_ORG_NAMES[r.org_id] || r.org_id,
+        planName: saasPlanLabel(r.plan_name),
+        currentPrice: cur, newPrice: next,
+        effectiveDate: nextBillingBySub.get(r.subscription_number) || null,
+        pushStatus: r.status,
+        pushedAt: r.pushed_at,
+        notifyStatus: r.notify_status,
+        notifyTo: r.notify_to,
+        notifiedAt: r.notified_at,
+        // The exact words that merchant received. An agent contradicting the email the customer
+        // is reading aloud is worse than having no tool at all.
+        notifySubject: r.notify_subject,
+        notifyBody: r.notify_body,
+        scenarioName: r.scenario_name,
+      };
+    });
+    res.json({ results });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
