@@ -16018,6 +16018,100 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authentic
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ---------------------------------------------------------------------------------------------
+// Internal launch notice. When a batch of merchant notices goes out, the people who will take the
+// calls need to hear it from us first — nobody should learn about a price increase from an angry
+// customer. Recipients live in app_settings, same shape as the other notification lists.
+// ---------------------------------------------------------------------------------------------
+async function getSaasIncreaseInternalRecipients() {
+  try {
+    const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'saas_increase_internal_recipients'`);
+    const v = r.rows[0]?.value;
+    return Array.isArray(v) ? v.filter(e => typeof e === 'string') : [];
+  } catch { return []; }
+}
+app.get('/api/admin/saas-increase/internal-recipients', authenticateToken, async (req, res) => {
+  if (!(await requirePermAny(req, res, ['saas_increase:manage', 'admin:notifications']))) return;
+  res.json({ recipients: await getSaasIncreaseInternalRecipients() });
+});
+app.put('/api/admin/saas-increase/internal-recipients', authenticateToken, async (req, res) => {
+  if (!(await requirePermAny(req, res, ['saas_increase:manage', 'admin:notifications']))) return;
+  const list = Array.isArray(req.body?.recipients) ? req.body.recipients : null;
+  if (!list) return res.status(400).json({ error: 'recipients must be an array' });
+  const clean = [...new Set(list.map(e => String(e || '').trim().toLowerCase()).filter(isEmailLike))];
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('saas_increase_internal_recipients', $1::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [JSON.stringify(clean)]
+    );
+    res.json({ recipients: clean });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Builds and sends the one internal summary for a batch. Returns what actually happened so the
+// caller can say so: an empty recipient list that quietly notifies nobody is how the Pass credit
+// notice went unnoticed for weeks.
+async function sendSaasIncreaseInternalNotice({ sentRows, scenarioName, actor, frontendBase }) {
+  const to = await getSaasIncreaseInternalRecipients();
+  if (!to.length) return { sent: false, reason: 'no_recipients', recipients: 0 };
+  if (!sentRows.length) return { sent: false, reason: 'nothing_sent', recipients: to.length };
+
+  const money = (n) => `$${(Number(n) || 0).toFixed(2)}`;
+  const byPlan = new Map();
+  for (const r of sentRows) {
+    const k = `${ZOHO_BILLING_ORG_NAMES[r.org_id] || r.org_id} — ${saasPlanLabel(r.plan_name)}`;
+    byPlan.set(k, (byPlan.get(k) || 0) + 1);
+  }
+  const dates = sentRows.map(r => r.effectiveDate).filter(Boolean).sort();
+  const mrrAdd = sentRows.reduce((sum, r) => sum + (Number(r.monthlyDelta) || 0), 0);
+
+  const rows = Array.from(byPlan.entries()).sort((a, b) => b[1] - a[1]).map(([k, n]) => `
+    <tr>
+      <td style="padding:9px 14px;border-top:1px solid #e6ebf2;font-size:13px;color:#1c2434">${k}</td>
+      <td style="padding:9px 14px;border-top:1px solid #e6ebf2;font-size:13px;color:#64748b;text-align:right">${n}</td>
+    </tr>`).join('');
+
+  const html = `<!doctype html><html><body style="margin:0;padding:0;background:#eef1f6;font-family:Arial,Helvetica,sans-serif">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f6;padding:32px 12px"><tr><td align="center">
+      <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:100%;background:#fff;border-radius:14px;overflow:hidden">
+        <tr><td style="background:#1c2434;padding:20px 32px;color:#fff;font-size:15px;font-weight:700">Hausse de prix SaaS — avis interne</td></tr>
+        <tr><td style="height:4px;background:#fe6523;font-size:0;line-height:0">&nbsp;</td></tr>
+        <tr><td style="padding:26px 32px 0;font-size:14px;color:#1c2434;line-height:1.65">
+          <p style="margin:0 0 14px"><strong>${sentRows.length} marchand(s)</strong> viennent de recevoir un avis de hausse de prix pour la campagne « ${scenarioName} ».</p>
+          <p style="margin:0 0 6px">Prépare-toi à recevoir des appels. Les chiffres exacts de chaque marchand sont dans Sales Hub, sous <strong>Référence hausse SaaS</strong> — cherche le nom ou le numéro d'abonnement du client et tu verras son ancien prix, son nouveau prix, la date d'effet et le courriel exact qu'il a reçu.</p>
+        </td></tr>
+        <tr><td style="padding:18px 32px 0">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e6ebf2;border-radius:8px;border-collapse:separate">
+            <tr>
+              <th align="left" style="padding:10px 14px;background:#f8fafc;font-size:12px;color:#64748b">Organisation et forfait</th>
+              <th align="right" style="padding:10px 14px;background:#f8fafc;font-size:12px;color:#64748b">Marchands</th>
+            </tr>
+            ${rows}
+          </table>
+          <p style="margin:14px 0 0;font-size:13px;color:#64748b">
+            MRR additionnel : <strong style="color:#1c2434">${money(mrrAdd)}/mois</strong><br>
+            Entrée en vigueur : ${dates.length ? `du ${formatSaasEffectiveDate(dates[0], 'fr')} au ${formatSaasEffectiveDate(dates[dates.length - 1], 'fr')}` : 'au prochain renouvellement de chaque abonnement'}<br>
+            Envoyé par : ${actor}
+          </p>
+          <p style="margin:16px 0 0;font-size:12px;color:#94a3b8">Rappel : personne ne peut accorder de rabais, d'exception ou d'annulation de la hausse au téléphone. Toute demande de ce genre s'escalade.</p>
+        </td></tr>
+        <tr><td style="padding:22px 32px 28px">
+          <a href="${frontendBase}/saas-increase/lookup" style="display:inline-block;background:#fe6523;color:#fff;text-decoration:none;font-size:14px;font-weight:700;padding:11px 20px;border-radius:8px">Ouvrir la référence</a>
+        </td></tr>
+      </table>
+    </td></tr></table></body></html>`;
+
+  let ok = 0;
+  for (const addr of to) {
+    const r = await sendMail(addr, `Hausse de prix SaaS — ${sentRows.length} marchand(s) avisé(s)`, html, {
+      from: { name: 'Sales Hub', address: process.env.SMTP_FROM || process.env.SMTP_USER },
+    });
+    if (r.sent) ok++;
+  }
+  return { sent: ok > 0, recipients: to.length, delivered: ok };
+}
+
 // GET /api/saas-increase/lookup?q= — the support desk's answer to "a merchant is calling about
 // their price increase". Read-only and on its own permission: an agent needs the facts for ONE
 // account, never the ability to build a scenario, email anyone or write to Zoho.
@@ -16147,6 +16241,7 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
   // of merchants to treat one person as their billing contact.
   const noticeHeading = req.body?.heading || saasIncreaseDraftCopy({ lang }).heading;
   const results = [];
+  const sentRows = [];
   try {
     // Same two lookups the draft endpoint uses. Rebuilding the panel from the item's stored
     // monthly figures instead would reintroduce exactly the rounding gap that made an annual
@@ -16181,11 +16276,14 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
         if (curPeriod != null) {
           const nxtPeriod = saasNewPeriodPrice(curPeriod, dbRow.increase_type, dbRow.increase_value);
           const effectiveDate = nextBillingBySub.get(dbRow.subscription_number) || null;
+          const liveSub = liveSubs.find(x => x.orgId === dbRow.org_id && x.subscriptionNumber === dbRow.subscription_number);
           change = {
             planName: dbRow.plan_name || '',
             currentPrice: `$${r2Money(curPeriod).toFixed(2)}`,
             newPrice: `$${r2Money(nxtPeriod).toFixed(2)}`,
             effectiveDate: effectiveDate ? formatSaasEffectiveDate(effectiveDate, lang) : '',
+            effectiveDateRaw: effectiveDate || null,
+            monthlyDelta: subMonthlyAmount(nxtPeriod - curPeriod, liveSub?.interval, liveSub?.intervalUnit),
           };
         }
       }
@@ -16194,6 +16292,9 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
         from: { name: SAAS_NOTICE_FROM_NAME, address: SAAS_NOTICE_FROM }, replyTo: SAAS_NOTICE_FROM,
       });
       if (r.sent) {
+        // Kept for the internal summary below: the plan/org mix, the effective-date span and the
+        // MRR added are what the support desk needs, and they are only knowable per batch.
+        if (dbRow) sentRows.push({ ...dbRow, effectiveDate: change?.effectiveDateRaw || null, monthlyDelta: change?.monthlyDelta || 0 });
         await pool.query(
           `UPDATE saas_increase_items SET notify_to = $1, notify_subject = $2, notify_body = $3, notify_status = 'sent', notify_error = NULL, notified_by = $4, notified_at = NOW() WHERE id = $5 AND scenario_id = $6`,
           [to, subject, bodyText, actor, itemId, req.params.id]
@@ -16206,7 +16307,22 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
       }
       results.push({ itemId, sent: r.sent, reason: r.reason });
     }
-    res.json({ results });
+
+    // One internal summary for the whole batch, so the people taking the calls hear it from us
+    // before a customer tells them. Reported back in the response, never silently: a recipient
+    // list nobody filled in is exactly how the Pass credit notice went unnoticed for weeks.
+    let internal = { sent: false, reason: 'not_attempted', recipients: 0 };
+    try {
+      const scenarioName = (await pool.query(
+        `SELECT name FROM saas_increase_scenarios WHERE id = $1`, [req.params.id]
+      )).rows[0]?.name || '';
+      internal = await sendSaasIncreaseInternalNotice({ sentRows, scenarioName, actor, frontendBase });
+    } catch (e) {
+      // The merchants HAVE been emailed by this point; a failed internal notice must not turn a
+      // successful batch into an error the caller reads as "nothing was sent".
+      internal = { sent: false, reason: e.message, recipients: 0 };
+    }
+    res.json({ results, internal });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
