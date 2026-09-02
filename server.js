@@ -14825,17 +14825,57 @@ const SAAS_SCAN_ALIVE_SECONDS = 90;
 // half. One small indexed UPDATE every few seconds is nothing next to that scan's Zoho traffic.
 const SAAS_SCAN_HEARTBEAT_EVERY = 5;
 
+// The two scans are not equals. The base-price pass takes minutes and is what UNBLOCKS PUSHING;
+// the price-history pass takes hours and is purely informational. First-come-first-served meant
+// the slow one could hold the lock all afternoon while newly-created subscriptions sat unverified
+// and unpushable — the counter stuck at 3504 of 3507 with a scan visibly "running".
+const SAAS_SCAN_PREEMPT_WAIT_MS = 60 * 1000;
+
 // Returns an owner token on success, null if another scan holds the lock.
-async function acquireSaasScanLock(label) {
+// `preempt` asks a lower-priority holder to stand down and waits for it to do so. The stop is a
+// request, not a kill: the other scan finishes its current subscription and releases, so its work
+// so far is kept and relaunching resumes where it left off.
+async function acquireSaasScanLock(label, { preempt = false } = {}) {
   const owner = `${label}:${process.env.ROLE || 'web'}:${process.pid}:${Date.now()}`;
-  const r = await pool.query(`
-    INSERT INTO saas_scan_runs (name, owner, label) VALUES ($1, $2, $3)
-    ON CONFLICT (name) DO UPDATE SET
-      owner = EXCLUDED.owner, label = EXCLUDED.label,
-      started_at = NOW(), heartbeat_at = NOW(), stop_requested = FALSE
-    WHERE saas_scan_runs.heartbeat_at < NOW() - INTERVAL '${SAAS_SCAN_STALE_MINUTES} minutes'
-    RETURNING owner`, [SAAS_SCAN_LOCK, owner, label]);
-  return r.rowCount > 0 ? owner : null;
+  const tryTake = async () => {
+    const r = await pool.query(`
+      INSERT INTO saas_scan_runs (name, owner, label) VALUES ($1, $2, $3)
+      ON CONFLICT (name) DO UPDATE SET
+        owner = EXCLUDED.owner, label = EXCLUDED.label,
+        started_at = NOW(), heartbeat_at = NOW(), stop_requested = FALSE
+      WHERE saas_scan_runs.heartbeat_at < NOW() - INTERVAL '${SAAS_SCAN_STALE_MINUTES} minutes'
+      RETURNING owner`, [SAAS_SCAN_LOCK, owner, label]);
+    return r.rowCount > 0 ? owner : null;
+  };
+
+  const got = await tryTake();
+  if (got || !preempt) return got;
+
+  const holder = await saasScanLockHolder();
+  // Never preempt a peer — two base passes racing would just fight over the same rows.
+  if (!holder || holder.label === label) return null;
+  console.log(`[saas-lock] ${label} preempting ${holder.label}`);
+  await pool.query(`UPDATE saas_scan_runs SET stop_requested = TRUE WHERE name = $1`, [SAAS_SCAN_LOCK]);
+
+  const deadline = Date.now() + SAAS_SCAN_PREEMPT_WAIT_MS;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 3000));
+    const taken = await tryTake();
+    if (taken) return taken;
+    // The holder releases on its own; the row disappearing is the signal, so also try a clean
+    // take against an absent row.
+    const still = await saasScanLockHolder();
+    if (!still) {
+      const afterRelease = await tryTake();
+      if (afterRelease) return afterRelease;
+      const insert = await pool.query(`
+        INSERT INTO saas_scan_runs (name, owner, label) VALUES ($1, $2, $3)
+        ON CONFLICT (name) DO NOTHING RETURNING owner`, [SAAS_SCAN_LOCK, owner, label]);
+      if (insert.rowCount > 0) return owner;
+    }
+  }
+  console.log(`[saas-lock] ${label} gave up waiting for ${holder.label}`);
+  return null;
 }
 
 // Refreshes the heartbeat and reports whether this scan should stop — either because someone
@@ -15262,8 +15302,9 @@ app.post('/api/admin/saas-increase/insights/stop', authenticateToken, async (req
 
 app.post('/api/admin/saas-increase/insights/refresh-base', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  // Only another BASE pass is a real conflict; a running history scan gets preempted.
   const busy = await saasScanLockHolder();
-  if (busy) return res.json({ started: false, busy: busy.label });
+  if (busy && busy.label === 'base') return res.json({ started: false, busy: busy.label });
   runSaasBasePriceScan().catch(e => console.error('[saas-base] manual run failed:', e.message));
   res.json({ started: true });
 });
@@ -16546,7 +16587,9 @@ async function runSaasBasePriceScan() {
   if (saasBasePriceScanRunning) { console.log('[saas-base] already running, skipping'); return; }
   // Cross-dyno: the scheduled price-history scan lives on the worker, so the boolean above cannot
   // see it. Both spend the same Zoho token, and each token refresh invalidates the other's.
-  const lockOwner = await acquireSaasScanLock('base');
+  // Preempts the price-history pass: verified base prices are what let a subscription be
+  // pushed, and waiting hours for an informational scan is not a trade worth making.
+  const lockOwner = await acquireSaasScanLock('base', { preempt: true });
   if (!lockOwner) {
     saasBaseScanLastError = 'another Zoho scan is already running — try again once it finishes';
     console.log('[saas-base] lock held by another scan, skipping');
@@ -23765,8 +23808,8 @@ app.post('/api/resources/import-zip', authenticateToken, zipUpload, async (req, 
           seenCats.add(category);
           await pool.query(
             `INSERT INTO resource_categories (name, owner_email, sort_order)
-             SELECT $1, $2, COALESCE((SELECT MAX(sort_order)+1 FROM resource_categories),0)
-             WHERE NOT EXISTS (SELECT 1 FROM resource_categories WHERE name=$1 AND COALESCE(owner_email,'')=COALESCE($2,''))`,
+             SELECT $1::text, $2::text, COALESCE((SELECT MAX(sort_order)+1 FROM resource_categories),0)
+             WHERE NOT EXISTS (SELECT 1 FROM resource_categories WHERE name=$1::text AND COALESCE(owner_email,'')=COALESCE($2::text,''))`,
             [category, w.owner]);
         }
       } catch (e) { console.warn('[import-zip] entry failed:', entry.entryName, e.message); }
@@ -23924,8 +23967,8 @@ app.post('/api/resources/folder/create', authenticateToken, async (req, res) => 
   try {
     await pool.query(
       `INSERT INTO resource_categories (name, owner_email, sort_order)
-       SELECT $1, $2, COALESCE((SELECT MAX(sort_order)+1 FROM resource_categories),0)
-       WHERE NOT EXISTS (SELECT 1 FROM resource_categories WHERE name=$1 AND COALESCE(owner_email,'')=COALESCE($2,''))`,
+       SELECT $1::text, $2::text, COALESCE((SELECT MAX(sort_order)+1 FROM resource_categories),0)
+       WHERE NOT EXISTS (SELECT 1 FROM resource_categories WHERE name=$1::text AND COALESCE(owner_email,'')=COALESCE($2::text,''))`,
       [full, w.owner]);
     res.json({ success: true, path: full });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -23946,8 +23989,8 @@ app.post('/api/resource-categories', authenticateToken, async (req, res) => {
   try {
     const r = await pool.query(
       `INSERT INTO resource_categories (name, owner_email, sort_order)
-       SELECT $1, NULL, COALESCE((SELECT MAX(sort_order)+1 FROM resource_categories), 0)
-       WHERE NOT EXISTS (SELECT 1 FROM resource_categories WHERE name=$1 AND owner_email IS NULL)
+       SELECT $1::text, NULL, COALESCE((SELECT MAX(sort_order)+1 FROM resource_categories), 0)
+       WHERE NOT EXISTS (SELECT 1 FROM resource_categories WHERE name=$1::text AND owner_email IS NULL)
        RETURNING id`, [name]);
     res.json({ success: true, id: r.rows[0]?.id || null });
   } catch (e) { res.status(500).json({ error: e.message }); }
