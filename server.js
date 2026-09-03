@@ -1820,6 +1820,13 @@ async function initializeDatabase() {
     // choisit alors aucun, cf. resolvePartnerDeal) ou 'not_found'. Sans cette trace, une affaire
     // vendue mais introuvable resterait « non eligible » sans que personne ne sache pourquoi.
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_deal_lookup VARCHAR(20)`);
+    // Le rep CHOISI a l'approbation — l'INTENTION, distincte de ce que Zoho affiche.
+    // Jusqu'ici seul le NOM etait garde (`crm_owner_name`), et la synchro horaire l'ECRASAIT avec
+    // le proprietaire lu dans Zoho. Consequence, signalee par David le 2026-09-03 : une
+    // automatisation Zoho reprend le lead, la synchro recopie sa valeur, et l'application adopte
+    // silencieusement le mauvais representant. En conservant le choix, la synchro peut au
+    // contraire le REIMPOSER quand Zoho derive (voir syncPartnerDealState).
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_owner_id VARCHAR(50)`);
     // Migration de l'ancien portail Zoho Creator (2026-08-05). `payout_excluded` sort la ligne du
     // calcul d'eligibilite : ces dossiers sont anterieurs au programme de versement et ne doivent
     // JAMAIS le declencher. Sans ce garde-fou, les 95 deals « Closed Won » importes devenaient
@@ -5016,7 +5023,7 @@ async function getCrmLeadStage(leadId, businessName, knownDealId) {
     // deliberé de leur cote et ca vaut ici aussi — un deal qui franchit l'etape puis avance
     // n'y est plus, mais il a bel et bien ete vendu. Se fier au Stage ferait disparaitre la
     // vente au premier mouvement dans Zoho.
-    let dealStage = null, depositDate = null, dealId = null, ownerName = null;
+    let dealStage = null, depositDate = null, dealId = null, ownerName = null, ownerId = null;
     if (converted) {
       dealId = lead.$converted_detail?.deal || lead.$converted_detail?.deal_id || null;
       if (dealId) {
@@ -5032,6 +5039,7 @@ async function getCrmLeadStage(leadId, businessName, knownDealId) {
           // LISIBLE dans Zoho, donc on passe ici et non par resolvePartnerDeal. L'avoir oublie
           // laissait la colonne « representant Cluster » vide sur presque tous les dossiers.
           ownerName = deal.Owner?.name || null;
+          ownerId = deal.Owner?.id || null;
         }
       }
     }
@@ -5042,6 +5050,9 @@ async function getCrmLeadStage(leadId, businessName, knownDealId) {
     return {
       leadStage: lead.Lead_Status || null, leadConverted: converted, dealId, dealStage, depositDate,
       ownerName: ownerName || lead.Owner?.name || null,
+      // L'IDENTIFIANT en plus du nom : comparer des noms pour decider d'une reassignation est
+      // fragile (homonymes, orthographe changee dans Zoho). L'id tranche.
+      ownerId: ownerId || lead.Owner?.id || null,
     };
   } catch {
     return null;
@@ -7050,8 +7061,13 @@ app.put('/api/admin/partner-opportunities/:id', authenticateToken, async (req, r
       full.approver_name = req.user.realAdminEmail ? null : (req.user.name || null);
       const result = await createCrmLead(full);
       await pool.query(
-        `UPDATE partner_opportunities SET crm_lead_id = $2, crm_lead_error = $3, crm_owner_name = $4 WHERE id = $1`,
-        [id, result.success ? result.leadId : null, result.success ? null : result.error, full.crm_owner_id ? ownerName : null]
+        // `crm_owner_id` est conserve : c'est l'INTENTION, ce que l'humain a choisi. La synchro
+        // s'en sert pour reimposer le rep quand une automatisation Zoho le change (voir
+        // syncPartnerDealState). Sans ca, seule restait une valeur que la synchro ecrasait.
+        `UPDATE partner_opportunities SET crm_lead_id = $2, crm_lead_error = $3, crm_owner_name = $4,
+                crm_owner_id = $5 WHERE id = $1`,
+        [id, result.success ? result.leadId : null, result.success ? null : result.error,
+         full.crm_owner_id ? ownerName : null, full.crm_owner_id || null]
       );
       crmLead = result.success ? { leadId: result.leadId } : { error: result.error };
     }
@@ -7115,8 +7131,10 @@ app.post('/api/admin/partner-opportunities/:id/retry-lead', authenticateToken, a
 
     const result = await createCrmLead(full);
     await pool.query(
-      `UPDATE partner_opportunities SET crm_lead_id = $2, crm_lead_error = $3 WHERE id = $1`,
-      [id, result.success ? result.leadId : null, result.success ? null : result.error]);
+      `UPDATE partner_opportunities SET crm_lead_id = $2, crm_lead_error = $3,
+              crm_owner_id = COALESCE($4, crm_owner_id) WHERE id = $1`,
+      [id, result.success ? result.leadId : null, result.success ? null : result.error,
+       full.crm_owner_id || null]);
     logActivity('partner_opportunity', String(id), 'retry_lead',
       `${full.business_name} — nouvelle tentative de creation du Lead : ${result.success ? 'reussie' : result.error}`, actor);
     res.json(result.success ? { success: true, leadId: result.leadId } : { success: false, error: result.error });
@@ -7255,6 +7273,39 @@ async function syncPartnerDealState() {
     // Zoho injoignable → on ne conclut RIEN. Ecrire null ici effacerait une date de depot deja
     // connue et retirerait au partenaire une eligibilite acquise, sur une simple panne reseau.
     if (!state) continue;
+
+    // ── RECONCILIATION DU REPRESENTANT ────────────────────────────────────────────────────
+    // Le nerf du correctif « pour toujours ». Avant, cette boucle recopiait aveuglement le
+    // proprietaire lu dans Zoho : une automatisation Zoho reprenait le lead et l'application
+    // adoptait sa valeur sans que personne le voie. Desormais, quand une INTENTION existe
+    // (`crm_owner_id`, le rep choisi a l'approbation) et que Zoho affiche autre chose, c'est
+    // ZOHO qu'on corrige — pas la base.
+    //
+    // `trigger: []` : Zoho n'execute aucune automatisation pour cet appel, donc la regle qui a
+    // pris le lead ne se redeclenche pas. Mecanisme essaye EN VRAI sur le Lead
+    // 4322330000273451009 avant d'etre code.
+    //
+    // Et comme ce travail tourne toutes les heures, une derive TARDIVE (automatisation
+    // asynchrone, modification manuelle) est rattrapee au passage suivant. C'est la difference
+    // entre « corrige une fois » et « ne peut plus rester faux ».
+    if (r.crm_owner_id && state.ownerId && String(state.ownerId) !== String(r.crm_owner_id)) {
+      try {
+        const crmToken = await ensureValidCrmToken();
+        const pu = await axios.put(`https://www.zohoapis.com/crm/v2/Leads/${r.crm_lead_id}`,
+          { data: [{ Owner: { id: String(r.crm_owner_id) } }], trigger: [] },
+          { headers: { Authorization: `Zoho-oauthtoken ${crmToken}`, 'Content-Type': 'application/json' },
+            validateStatus: () => true, timeout: 20000 });
+        const ok = pu.status >= 200 && pu.status < 300 && pu.data?.data?.[0]?.status === 'success';
+        console.warn(`[partner-deals] representant remis sur #${r.id} (${r.business_name}) :`
+          + ` Zoho avait ${state.ownerName || state.ownerId}, on remet ${r.crm_owner_name || r.crm_owner_id}`
+          + ` -> ${ok ? 'applique' : 'REFUSE ' + JSON.stringify(pu.data?.data?.[0]?.code || pu.status)}`);
+        // Si l'ecriture a pris, on garde le nom choisi ; sinon on laisse la lecture Zoho
+        // s'inscrire, pour que l'ecran montre la realite plutot qu'un souhait.
+        if (ok) { state.ownerName = r.crm_owner_name || state.ownerName; state.ownerId = r.crm_owner_id; }
+      } catch (e) {
+        console.warn(`[partner-deals] remise du representant impossible sur #${r.id} :`, e.message);
+      }
+    }
     const up = await pool.query(
       // Les types sont FORCES sur chaque parametre. Sans le cast sur $2, Postgres echoue avec
       // « could not determine data type of parameter » : il ne peut pas l'inferer, le parametre
