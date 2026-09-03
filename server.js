@@ -174,6 +174,9 @@ const PERMISSION_CATALOG = [
   { key: 'partners:export_users',      label: 'Export the partner user list to Excel (emails and invitation dates)', category: 'Partners' },
   { key: 'partners:create_opportunity', label: 'Create an opportunity by hand for a partner not yet on the portal', category: 'Partners' },
 
+  // Soutien technique (rapports Zoho Desk). Audience voulue : la direction.
+  { key: 'support:view_reports',       label: 'View the support reports (Zoho Desk volume, delays, topics)',    category: 'Support' },
+
   // Leads (SH-20) — la couche d'accueil AVANT Zoho. `review` est la seule cle qui fasse
   // entrer quoi que ce soit dans le CRM et partir des courriels a un marchand : elle se
   // donne a moins de monde que `view_all`, d'ou la separation.
@@ -2482,6 +2485,41 @@ async function initializeDatabase() {
         excluded_by VARCHAR(255),
         excluded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
+    `);
+
+    // Copie locale des billets Zoho Desk. Voir le bloc « SOUTIEN TECHNIQUE » plus bas pour
+    // le pourquoi : ~156 000 billets et une API qui ne sait pas agreger.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS desk_tickets (
+        id            VARCHAR(64) PRIMARY KEY,
+        ticket_number VARCHAR(32),
+        subject       TEXT,
+        status        VARCHAR(64),
+        status_type   VARCHAR(32),
+        created_time  TIMESTAMPTZ,
+        closed_time   TIMESTAMPTZ,
+        modified_time TIMESTAMPTZ,
+        channel       VARCHAR(64),
+        priority      VARCHAR(32),
+        language      VARCHAR(32),
+        department_id VARCHAR(64),
+        assignee_id   VARCHAR(64),
+        account_id    VARCHAR(64),
+        contact_id    VARCHAR(64),
+        issue_type    VARCHAR(128),
+        pos_software  VARCHAR(128),
+        cs_category   VARCHAR(128),
+        is_spam       BOOLEAN DEFAULT FALSE,
+        web_url       TEXT,
+        synced_at     TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_desk_tickets_created ON desk_tickets (created_time);
+      CREATE INDEX IF NOT EXISTS idx_desk_tickets_dept    ON desk_tickets (department_id, created_time);
+      CREATE INDEX IF NOT EXISTS idx_desk_tickets_account ON desk_tickets (account_id);
+      CREATE INDEX IF NOT EXISTS idx_desk_tickets_type    ON desk_tickets (issue_type);
+      CREATE TABLE IF NOT EXISTS desk_departments (id VARCHAR(64) PRIMARY KEY, name VARCHAR(255));
+      CREATE TABLE IF NOT EXISTS desk_agents      (id VARCHAR(64) PRIMARY KEY, name VARCHAR(255));
+      CREATE TABLE IF NOT EXISTS desk_accounts    (id VARCHAR(64) PRIMARY KEY, name VARCHAR(500));
     `);
 
     // Zentact merchants — stores all merchant accounts pulled from Zentact API.
@@ -13513,6 +13551,16 @@ function startAutoSync() {
     setInterval(runOtherRev, 24 * 60 * 60 * 1000);
   }, 2 * 60 * 1000);
 
+  // Billets Zoho Desk — horaire, en mode incremental (fenetre sur modifiedTimeRange, avec
+  // 2 h de recouvrement). Le rattrapage historique, lui, se declenche a la main : il prend
+  // une vingtaine de minutes et n'a besoin d'etre fait qu'une fois.
+  setTimeout(() => {
+    const runDesk = () => syncDeskTickets({ mode: 'incremental' })
+      .catch((e) => console.warn('[desk] synchro horaire echouee :', e.message));
+    runDesk();
+    setInterval(runDesk, 60 * 60 * 1000);
+  }, 6 * 60 * 1000);
+
   // Probation-ending notifications — daily check (45/30/15 days before end). First run 3 min
   // after boot (staggered).
   setTimeout(() => {
@@ -14206,6 +14254,369 @@ app.get('/api/auth/desk-status', authenticateToken, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ============================================================================
+// SOUTIEN TECHNIQUE — SYNCHRONISATION ZOHO DESK
+// ============================================================================
+// Pourquoi une copie en base plutot que des appels a la volee : il y a ~156 000 billets
+// depuis 2022 et l'API Desk ne sait pas agreger. Aucun rapport ne peut donc etre calcule
+// dans le temps d'une requete HTTP. On copie, puis tout se calcule en SQL.
+//
+// Le seul chemin qui donne A LA FOIS l'historique et les champs personnalises est
+// /tickets/search avec createdTimeRange :
+//   - /tickets accepte `fields` (donc le bloc cf) mais plafonne `from` a ~10 000 et ne sait
+//     pas filtrer par date -> incapable de remonter au-dela de quelques mois ;
+//   - /tickets/search refuse `fields` mais renvoie DEJA l'objet complet, cf compris, et
+//     pagine exactement dans une fenetre (verifie : 2 421 annonces -> 2 421 ids uniques).
+// Les fenetres sont MENSUELLES : le mois le plus charge fait ~3 000 billets, loin du plafond.
+//
+// Couverture : le departement « Integration Emails » (28 431 billets, desactive, alimente
+// par des automatismes) renvoie FORBIDDEN au compte lecteur. Il est donc absent de la copie,
+// et la page le dit au lieu de laisser croire a un total complet.
+
+// Petits acces a sync_state, dans le meme style que deskSystemAccount() juste au-dessus.
+async function deskEtatLire(cle) {
+  const r = await pool.query(`SELECT value FROM sync_state WHERE key = $1`, [cle]);
+  return r.rows[0]?.value || null;
+}
+async function deskEtatEcrire(cle, valeur) {
+  await pool.query(
+    `INSERT INTO sync_state (key, value, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP`,
+    [cle, valeur]);
+}
+
+async function deskSearch(params) {
+  const token = await ensureValidDeskToken();
+  const orgId = await deskOrgId();
+  const r = await axios.get('https://desk.zoho.com/api/v1/tickets/search', {
+    params, headers: { Authorization: `Zoho-oauthtoken ${token}`, orgId },
+    validateStatus: () => true, timeout: 40000,
+  });
+  if (r.status === 204) return { data: [], count: 0 };
+  if (r.status < 200 || r.status >= 300) {
+    throw new Error(`desk search -> HTTP ${r.status} ${JSON.stringify(r.data).slice(0, 250)}`);
+  }
+  return r.data || { data: [], count: 0 };
+}
+
+// Ecrit un lot de billets. Un seul INSERT multi-lignes par lot : la base est derriere un
+// proxy public, chaque aller-retour coute cher.
+async function deskEnregistrerLot(billets) {
+  if (!billets.length) return 0;
+  const cols = ['id', 'ticket_number', 'subject', 'status', 'status_type', 'created_time', 'closed_time',
+    'modified_time', 'channel', 'priority', 'language', 'department_id', 'assignee_id', 'account_id',
+    'contact_id', 'issue_type', 'pos_software', 'cs_category', 'is_spam', 'web_url'];
+  const vals = [];
+  const morceaux = billets.map((t, i) => {
+    const d = i * cols.length;
+    vals.push(
+      String(t.id),
+      t.ticketNumber || null,
+      (t.subject || '').slice(0, 1000),
+      t.status || null,
+      t.statusType || null,
+      t.createdTime || null,
+      t.closedTime || null,
+      t.modifiedTime || null,
+      t.channel || null,
+      t.priority || null,
+      t.language || null,
+      t.departmentId ? String(t.departmentId) : null,
+      t.assigneeId ? String(t.assigneeId) : null,
+      t.accountId ? String(t.accountId) : null,
+      t.contactId ? String(t.contactId) : null,
+      t.cf?.cf_issue_type || null,
+      t.cf?.cf_pos_software || null,
+      t.cf?.cf_cs_category || null,
+      t.isSpam === true,
+      t.webUrl || null,
+    );
+    return '(' + cols.map((_, j) => `$${d + j + 1}`).join(',') + ')';
+  });
+  await pool.query(
+    `INSERT INTO desk_tickets (${cols.join(',')}) VALUES ${morceaux.join(',')}
+     ON CONFLICT (id) DO UPDATE SET
+       ticket_number = EXCLUDED.ticket_number, subject = EXCLUDED.subject,
+       status = EXCLUDED.status, status_type = EXCLUDED.status_type,
+       closed_time = EXCLUDED.closed_time, modified_time = EXCLUDED.modified_time,
+       channel = EXCLUDED.channel, priority = EXCLUDED.priority, language = EXCLUDED.language,
+       department_id = EXCLUDED.department_id, assignee_id = EXCLUDED.assignee_id,
+       account_id = EXCLUDED.account_id, contact_id = EXCLUDED.contact_id,
+       issue_type = EXCLUDED.issue_type, pos_software = EXCLUDED.pos_software,
+       cs_category = EXCLUDED.cs_category, is_spam = EXCLUDED.is_spam,
+       web_url = EXCLUDED.web_url, synced_at = NOW()`,
+    vals);
+  return billets.length;
+}
+
+// Les tables de reference (departements, agents, comptes). Peu de lignes, rafraichies a
+// chaque synchro : les noms changent, les ids non.
+async function deskSyncReferences() {
+  const ecrire = async (table, lignes) => {
+    if (!lignes.length) return;
+    const vals = [];
+    const m = lignes.map((l, i) => { vals.push(l.id, l.nom); return `($${i * 2 + 1},$${i * 2 + 2})`; });
+    await pool.query(`INSERT INTO ${table} (id, name) VALUES ${m.join(',')}
+      ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name`, vals);
+  };
+  const dep = await deskGet('/departments', { limit: 100 });
+  await ecrire('desk_departments', (dep.data || []).map(d => ({ id: String(d.id), nom: d.name })));
+
+  const ag = await deskGet('/agents', { limit: 200 });
+  await ecrire('desk_agents', (ag.data || []).map(a => ({
+    id: String(a.id),
+    nom: [a.firstName, a.lastName].filter(Boolean).join(' ') || a.emailId || String(a.id),
+  })));
+
+  // Comptes : pagines jusqu'a epuisement, par lots de 100 lignes ecrites d'un coup.
+  let from = 0, total = 0;
+  while (from < 20000) {
+    const r = await deskGet('/accounts', { limit: 100, from });
+    const lot = r.data || [];
+    if (!lot.length) break;
+    await ecrire('desk_accounts', lot.map(a => ({ id: String(a.id), nom: a.accountName || String(a.id) })));
+    total += lot.length; from += 100;
+    if (lot.length < 100) break;
+  }
+  console.log(`[desk] references : ${(dep.data || []).length} departements, ${(ag.data || []).length} agents, ${total} comptes`);
+}
+
+let deskSyncEnCours = false;
+
+// mode 'incremental' : les billets MODIFIES depuis le dernier passage (statut, fermeture,
+// categorisation ajoutee apres coup). mode 'backfill' : tout l'historique, mois par mois.
+async function syncDeskTickets({ mode = 'incremental', depuis = null } = {}) {
+  if (deskSyncEnCours) { console.log('[desk] synchro deja en cours, on passe'); return { skipped: true }; }
+  deskSyncEnCours = true;
+  const t0 = Date.now();
+  let ecrits = 0, fenetres = 0;
+  try {
+    await deskSyncReferences();
+
+    const fen = [];
+    if (mode === 'backfill') {
+      const debut = depuis ? new Date(depuis) : new Date(Date.UTC(2022, 0, 1));
+      const fin = new Date();
+      for (let d = new Date(Date.UTC(debut.getUTCFullYear(), debut.getUTCMonth(), 1)); d <= fin;
+        d = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1))) {
+        const f = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1) - 1000);
+        fen.push({ cle: 'createdTimeRange', de: d.toISOString(), a: f.toISOString() });
+      }
+    } else {
+      const dernier = await deskEtatLire('desk_last_sync');
+      // 2 h de recouvrement : une fenetre qui commence exactement ou la precedente s'est
+      // arretee laisse passer ce qui a bouge PENDANT la synchro elle-meme.
+      const de = dernier
+        ? new Date(new Date(dernier).getTime() - 2 * 3600 * 1000)
+        : new Date(Date.now() - 7 * 24 * 3600 * 1000);
+      fen.push({ cle: 'modifiedTimeRange', de: de.toISOString(), a: new Date(Date.now() + 60000).toISOString() });
+    }
+
+    for (const f of fen) {
+      fenetres++;
+      let from = 0;
+      for (let page = 0; page < 120; page++) {
+        let r;
+        try {
+          r = await deskSearch({ limit: 100, from, sortBy: 'createdTime', [f.cle]: `${f.de},${f.a}` });
+        } catch (e) {
+          // Une fenetre qui echoue ne doit pas emporter tout le rattrapage.
+          console.warn(`[desk] fenetre ${f.de} echouee :`, e.message);
+          break;
+        }
+        const lot = r.data || [];
+        if (!lot.length) break;
+        ecrits += await deskEnregistrerLot(lot);
+        from += 100;
+        if (lot.length < 100) break;
+      }
+      if (mode === 'backfill') {
+        await deskEtatEcrire('desk_backfill_progress', `${f.de.slice(0, 7)} : ${ecrits} billets`);
+        if (fenetres % 6 === 0) console.log(`[desk] rattrapage ${f.de.slice(0, 7)} : ${ecrits} billets cumules`);
+      }
+    }
+
+    await deskEtatEcrire('desk_last_sync', new Date().toISOString());
+    if (mode === 'backfill') await deskEtatEcrire('desk_backfill_done', new Date().toISOString());
+    const s = Math.round((Date.now() - t0) / 1000);
+    console.log(`[desk] synchro ${mode} : ${ecrits} billets sur ${fenetres} fenetre(s) en ${s}s`);
+    return { mode, ecrits, fenetres, secondes: s };
+  } finally {
+    deskSyncEnCours = false;
+  }
+}
+
+// ============================================================================
+// SOUTIEN TECHNIQUE — RAPPORTS
+// ============================================================================
+
+// Les mots qui ne disent rien d'un probleme. On y ajoute, en SQL, tous les mots qui
+// composent un nom de marchand : sans ca le palmares des sujets est domine par
+// « sushi », « pizza », « cafe » — le nom du client, pas son probleme.
+const DESK_MOTS_VIDES = ['the', 'and', 'for', 'with', 'from', 'not', 'are', 'was', 'has', 'have',
+  'this', 'that', 'you', 'your', 'our', 'all', 'can', 'but', 'out', 'get', 'got', 'its', 'they',
+  'pour', 'avec', 'dans', 'les', 'des', 'une', 'pas', 'plus', 'sur', 'par', 'est', 'sont', 'qui',
+  'que', 'nous', 'vous', 'leur', 'son', 'ses', 'aux', 'ont', 'fait', 'faire', 'etre', 'cette',
+  'request', 'requests', 'issue', 'issues', 'ticket', 'tickets', 'support', 'probleme', 'problem',
+  'urgent', 'need', 'needs', 'help', 'aide', 'svp', 'please', 'client', 'customer', 'cluster',
+  'pos', 'fwd', 'new', 'nouveau', 'nouvelle', 'demande', 'question', 'info', 'information',
+  'update', 'test', 'merci', 'thanks', 'bonjour', 'hello', 'case', 'cases', 'about', 'when',
+  'what', 'which', 'been', 'will', 'would', 'could', 'should', 'there', 'their', 'more', 'some'];
+
+async function soutienRapport({ de, a, departement }) {
+  const p = [de, a, departement || null];
+  const filtre = `created_time >= $1 AND created_time < $2 AND NOT is_spam
+                  AND ($3::text IS NULL OR department_id = $3)`;
+
+  // Deux allers-retours seulement : la base est derriere un proxy public, multiplier les
+  // requetes coute plus cher que d'ecrire de gros CTE.
+  const q1 = await pool.query(`
+    WITH base AS (SELECT * FROM desk_tickets WHERE ${filtre}),
+    calc AS (SELECT *, EXTRACT(EPOCH FROM (closed_time - created_time)) / 3600.0 AS h FROM base)
+    SELECT json_build_object(
+      'total',       (SELECT count(*) FROM base),
+      'resolus',     (SELECT count(*) FROM base WHERE closed_time IS NOT NULL),
+      'ouverts',     (SELECT count(*) FROM base WHERE closed_time IS NULL),
+      'categorises', (SELECT count(*) FROM base WHERE issue_type IS NOT NULL),
+      'marchands',   (SELECT count(DISTINCT account_id) FROM base WHERE account_id IS NOT NULL),
+      'medianeH',    (SELECT round(percentile_cont(0.5) WITHIN GROUP (ORDER BY h)::numeric, 1) FROM calc WHERE h >= 0),
+      'p90H',        (SELECT round(percentile_cont(0.9) WITHIN GROUP (ORDER BY h)::numeric, 1) FROM calc WHERE h >= 0),
+      'parMois',     (SELECT COALESCE(json_agg(x ORDER BY x.mois), '[]'::json) FROM (
+                        SELECT to_char(date_trunc('month', created_time), 'YYYY-MM') AS mois,
+                               count(*)::int AS crees,
+                               count(*) FILTER (WHERE closed_time IS NOT NULL)::int AS resolus
+                        FROM base GROUP BY 1) x),
+      'parType',     (SELECT COALESCE(json_agg(x ORDER BY x.n DESC), '[]'::json) FROM (
+                        SELECT issue_type AS type, count(*)::int AS n,
+                               round(percentile_cont(0.5) WITHIN GROUP (ORDER BY h)::numeric, 1) AS mediane_h
+                        FROM calc WHERE issue_type IS NOT NULL GROUP BY 1) x),
+      'sousTypes',   (SELECT COALESCE(json_agg(x ORDER BY x.n DESC), '[]'::json) FROM (
+                        SELECT 'POS Software' AS famille, pos_software AS valeur, count(*)::int AS n
+                        FROM base WHERE pos_software IS NOT NULL GROUP BY 2
+                        UNION ALL
+                        SELECT 'Customer Success', cs_category, count(*)::int
+                        FROM base WHERE cs_category IS NOT NULL GROUP BY 2) x),
+      'parCanal',    (SELECT COALESCE(json_agg(x ORDER BY x.n DESC), '[]'::json) FROM (
+                        SELECT COALESCE(channel, 'n/d') AS canal, count(*)::int AS n FROM base GROUP BY 1) x),
+      'parLangue',   (SELECT COALESCE(json_agg(x ORDER BY x.n DESC), '[]'::json) FROM (
+                        SELECT COALESCE(language, 'n/d') AS langue, count(*)::int AS n FROM base GROUP BY 1) x),
+      'parPriorite', (SELECT COALESCE(json_agg(x ORDER BY x.n DESC), '[]'::json) FROM (
+                        SELECT COALESCE(priority, 'n/d') AS priorite, count(*)::int AS n FROM base GROUP BY 1) x),
+      'delais',      (SELECT COALESCE(json_agg(x ORDER BY x.rang), '[]'::json) FROM (
+                        SELECT CASE WHEN h < 1 THEN 1 WHEN h < 4 THEN 2 WHEN h < 24 THEN 3
+                                    WHEN h < 72 THEN 4 ELSE 5 END AS rang,
+                               count(*)::int AS n
+                        FROM calc WHERE h >= 0 GROUP BY 1) x)
+    ) AS r`, p);
+
+  const q2 = await pool.query(`
+    WITH base AS (SELECT * FROM desk_tickets WHERE ${filtre}),
+    calc AS (SELECT *, EXTRACT(EPOCH FROM (closed_time - created_time)) / 3600.0 AS h FROM base),
+    noms AS (SELECT DISTINCT lower(m) AS mot
+             FROM desk_accounts, regexp_split_to_table(COALESCE(name, ''), '[^[:alnum:]]+') AS m
+             WHERE length(m) >= 3),
+    mots AS (SELECT lower(m) AS mot
+             FROM base, regexp_split_to_table(COALESCE(subject, ''), '[^[:alnum:]]+') AS m
+             WHERE length(m) >= 3)
+    SELECT json_build_object(
+      'parDepartement', (SELECT COALESCE(json_agg(x ORDER BY x.n DESC), '[]'::json) FROM (
+          SELECT COALESCE(d.name, c.department_id, 'n/d') AS nom, count(*)::int AS n,
+                 count(*) FILTER (WHERE c.closed_time IS NULL)::int AS ouverts,
+                 round(percentile_cont(0.5) WITHIN GROUP (ORDER BY c.h)::numeric, 1) AS mediane_h
+          FROM calc c LEFT JOIN desk_departments d ON d.id = c.department_id
+          GROUP BY 1) x),
+      'parAgent',       (SELECT COALESCE(json_agg(x ORDER BY x.n DESC), '[]'::json) FROM (
+          SELECT COALESCE(a.name, 'non assigne') AS nom, count(*)::int AS n,
+                 count(*) FILTER (WHERE c.closed_time IS NOT NULL)::int AS resolus,
+                 count(*) FILTER (WHERE c.closed_time IS NULL)::int AS ouverts,
+                 round(percentile_cont(0.5) WITHIN GROUP (ORDER BY c.h)::numeric, 1) AS mediane_h
+          FROM calc c LEFT JOIN desk_agents a ON a.id = c.assignee_id
+          GROUP BY 1 ORDER BY 2 DESC LIMIT 40) x),
+      'parMarchand',    (SELECT COALESCE(json_agg(x ORDER BY x.n DESC), '[]'::json) FROM (
+          SELECT COALESCE(ac.name, 'compte inconnu') AS nom, count(*)::int AS n,
+                 count(*) FILTER (WHERE c.closed_time IS NULL)::int AS ouverts,
+                 max(c.created_time) AS dernier,
+                 round(percentile_cont(0.5) WITHIN GROUP (ORDER BY c.h)::numeric, 1) AS mediane_h
+          FROM calc c LEFT JOIN desk_accounts ac ON ac.id = c.account_id
+          WHERE c.account_id IS NOT NULL
+          GROUP BY 1 ORDER BY 2 DESC LIMIT 40) x),
+      'motsSujets',     (SELECT COALESCE(json_agg(x ORDER BY x.n DESC), '[]'::json) FROM (
+          SELECT mot, count(*)::int AS n FROM mots
+          WHERE NOT (mot = ANY($4::text[]))
+            AND mot !~ '^[0-9]+$'
+            AND mot NOT IN (SELECT mot FROM noms)
+          GROUP BY 1 HAVING count(*) >= 5 ORDER BY 2 DESC LIMIT 45) x)
+    ) AS r`, [...p, DESK_MOTS_VIDES]);
+
+  return { ...q1.rows[0].r, ...q2.rows[0].r };
+}
+
+// GET /api/support/overview — toutes les sections du rapport en un appel.
+app.get('/api/support/overview', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'support:view_reports'))) return;
+  try {
+    const mois = Math.min(Math.max(parseInt(req.query.months) || 12, 1), 60);
+    const fin = new Date();
+    const de = req.query.from ? new Date(req.query.from)
+      : new Date(Date.UTC(fin.getUTCFullYear(), fin.getUTCMonth() - mois + 1, 1));
+    const a = req.query.to ? new Date(req.query.to) : new Date(fin.getTime() + 86400000);
+    const dep = req.query.department && req.query.department !== 'all' ? String(req.query.department) : null;
+
+    const rapport = await soutienRapport({ de: de.toISOString(), a: a.toISOString(), departement: dep });
+    const meta = await pool.query(
+      `SELECT (SELECT count(*) FROM desk_tickets) AS copies,
+              (SELECT min(created_time) FROM desk_tickets) AS plus_ancien,
+              (SELECT max(created_time) FROM desk_tickets) AS plus_recent`);
+    const departements = (await pool.query(
+      `SELECT d.id, d.name, count(t.id)::int AS n FROM desk_departments d
+        LEFT JOIN desk_tickets t ON t.department_id = d.id
+        GROUP BY 1, 2 HAVING count(t.id) > 0 ORDER BY 3 DESC`)).rows;
+
+    res.json({
+      periode: { de: de.toISOString(), a: a.toISOString(), mois, departement: dep },
+      departements,
+      copie: {
+        billets: Number(meta.rows[0].copies),
+        plusAncien: meta.rows[0].plus_ancien,
+        plusRecent: meta.rows[0].plus_recent,
+        derniereSynchro: await deskEtatLire('desk_last_sync'),
+        rattrapage: await deskEtatLire('desk_backfill_done') || await deskEtatLire('desk_backfill_progress'),
+        // Dit explicitement ce qui MANQUE : ce departement est refuse par Zoho au compte lecteur.
+        exclu: 'Integration Emails (departement desactive, non autorise au compte lecteur Desk)',
+      },
+      ...rapport,
+    });
+  } catch (e) {
+    console.error('[soutien] rapport echoue :', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/support/sync — rattrapage ou rafraichissement, declenche a la main.
+// Reserve aux admins : c'est long et ca tape sur l'API Zoho.
+app.post('/api/support/sync', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin access required' });
+  if (deskSyncEnCours) return res.status(409).json({ error: 'sync_already_running' });
+  const mode = req.body?.mode === 'backfill' ? 'backfill' : 'incremental';
+  // On repond tout de suite : un rattrapage complet prend une vingtaine de minutes et
+  // aucune requete HTTP ne doit rester ouverte aussi longtemps.
+  res.json({ started: true, mode });
+  syncDeskTickets({ mode }).catch(e => console.error('[desk] synchro echouee :', e.message));
+});
+
+// GET /api/support/sync-status — l'avancement, pour ne pas avoir a lire les journaux.
+app.get('/api/support/sync-status', authenticateToken, async (req, res) => {
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin access required' });
+  const n = await pool.query('SELECT count(*)::int AS n FROM desk_tickets');
+  res.json({
+    enCours: deskSyncEnCours,
+    billets: n.rows[0].n,
+    derniereSynchro: await deskEtatLire('desk_last_sync'),
+    rattrapageTermine: await deskEtatLire('desk_backfill_done'),
+    avancement: await deskEtatLire('desk_backfill_progress'),
+  });
 });
 
 // ============================================================================
