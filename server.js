@@ -31395,7 +31395,7 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
     add(`(LOWER(assigned_rep_name) = LOWER($${params.length + 1})
           OR LOWER(COALESCE(assigned_rep_email, '')) = LOWER($${params.length + 2})
           OR LOWER(COALESCE(created_by, '')) = LOWER($${params.length + 2}))`,
-      req.user.name || ' ', req.user.email || ' ');
+      req.user.name || '\u0000', req.user.email || '\u0000');
   }
   if (LEAD_STATUSES.includes(req.query.status)) add(`status = $${params.length + 1}`, req.query.status);
   if (LEAD_SOURCES.includes(req.query.source)) add(`source = $${params.length + 1}`, req.query.source);
