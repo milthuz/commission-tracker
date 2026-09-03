@@ -18040,7 +18040,7 @@ async function createCrmLead(o) {
     // permet ni de le fixer a la creation ni de le corriger apres. Tant que la personne n'a pas
     // connecte son compte Zoho, on retombe sur le compte systeme — le Lead est cree quand meme,
     // et la note nomme l'approbateur dans son corps.
-    const { token: crmToken, actingAs } = await crmTokenForActor(o.approver_email);
+    let { token: crmToken, actingAs } = await crmTokenForActor(o.approver_email);
     if (actingAs && o.approver_email
         && String(actingAs).toLowerCase() !== String(o.approver_email).toLowerCase()) {
       console.log(`[partner-crm] ecriture Zoho sous ${actingAs} (approbateur ${o.approver_email} sans compte Zoho connecte)`);
@@ -18061,6 +18061,31 @@ async function createCrmLead(o) {
       { headers: { Authorization: `Zoho-oauthtoken ${crmToken}`, 'Content-Type': 'application/json' }, validateStatus: () => true }
     );
     let r = await envoyer();
+
+    // ── REPLI QUAND ZOHO REFUSE LE JETON PERSONNEL ────────────────────────────────────────
+    // Vecu le 2026-09-03 : Gabriella connecte son compte Zoho, et l'approbation suivante
+    // echoue avec « permission denied ». Son profil Zoho (Sales-Lead) n'a pas le privilege
+    // d'ACCES A L'API (`Crm_Implied_Api_Access`) : son jeton ne peut RIEN faire, meme pas lire
+    // sa propre identite. Rien a voir avec les Leads.
+    //
+    // L'attribution est un confort ; creer le Lead est le travail. On retombe donc sur le
+    // compte systeme plutot que de faire echouer l'approbation. L'approbateur reste nomme dans
+    // le corps ET le titre de la note, donc l'information ne se perd pas.
+    const refuse = r.status === 401 || r.status === 403
+      || r.data?.code === 'NO_PERMISSION' || r.data?.code === 'OAUTH_SCOPE_MISMATCH'
+      || r.data?.code === 'INVALID_TOKEN' || r.data?.code === 'AUTHENTICATION_FAILURE';
+    const systeme = await crmSystemAccount();
+    const etaitPersonnel = actingAs && systeme
+      && String(actingAs).toLowerCase() !== String(systeme).toLowerCase();
+    if (refuse && etaitPersonnel) {
+      console.warn(`[partner-crm] Zoho refuse le jeton de ${actingAs}`
+        + ` (${r.status} ${r.data?.code || ''}${r.data?.details?.permissions ? ' ' + JSON.stringify(r.data.details.permissions) : ''})`
+        + ` — repli sur le compte systeme ${systeme}. Son profil Zoho n'a probablement pas l'acces API.`);
+      crmToken = await ensureValidCrmToken();
+      actingAs = systeme;
+      r = await envoyer();
+    }
+
     let premier = r.data?.data?.[0];
     const fautif = premier?.details?.api_name;
     if (premier?.status === 'error' && fautif && SACRIFIABLES.has(fautif) && fields[fautif] !== undefined) {
