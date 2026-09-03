@@ -479,6 +479,12 @@ function chunk(arr, size) {
 // temporelle. Ca tiendrait par accident — le premier `await` laisse le module se terminer — mais
 // c'est exactement le genre de dependance invisible qui casse au premier remaniement.
 const CRM_SYSTEM_KEY = 'crm_system_account';
+// Meme raison d'etre, et meme raison d'etre declaree ICI : le compte sous lequel
+// l'application lit Zoho DESK. Voir la note de CRM_SYSTEM_KEY juste au-dessus.
+const DESK_SYSTEM_KEY = 'desk_system_account';
+// L'organisation Desk, decouverte une fois puis epinglee : l'API Desk exige un en-tete
+// `orgId` sur CHAQUE appel, et la redecouvrir a chaque requete couterait un aller-retour.
+const DESK_ORG_KEY = 'desk_org_id';
 
 // Initialize database tables
 async function initializeDatabase() {
@@ -1835,6 +1841,15 @@ async function initializeDatabase() {
     // lit `migration_source IS NOT NULL` comme « dossier repris, exclu des versements ». Une
     // saisie manuelle compte NORMALEMENT (decision de David, 2026-09-03).
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS created_by_admin VARCHAR(255)`);
+
+    // ── ZOHO DESK ─────────────────────────────────────────────────────────────────────────
+    // Troisieme constellation Zoho, a cote de Books/Billing (`access_token`) et du CRM
+    // (`crm_*`). Un jeton SEPARE, delibere : ajouter les portees Desk a la subvention du CRM
+    // aurait exige de RECONNECTER Zoho CRM, dont dependent Sofia, les synchros et les leads
+    // partenaires. Un probleme cote Desk ne peut donc pas toucher le CRM.
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS desk_access_token TEXT`);
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS desk_refresh_token TEXT`);
+    await pool.query(`ALTER TABLE user_tokens ADD COLUMN IF NOT EXISTS desk_expires_at BIGINT`);
     // Migration de l'ancien portail Zoho Creator (2026-08-05). `payout_excluded` sort la ligne du
     // calcul d'eligibilite : ces dossiers sont anterieurs au programme de versement et ne doivent
     // JAMAIS le declencher. Sans ce garde-fou, les 95 deals « Closed Won » importes devenaient
@@ -10466,6 +10481,35 @@ app.get('/api/auth/zoho-crm', authenticateToken, (req, res) => {
   res.json({ authUrl, state });
 });
 
+// GET /api/auth/zoho-desk — demarrer la connexion a Zoho DESK (support).
+//
+// Portees en LECTURE SEULE : l'objectif est de construire des rapports, pas de modifier des
+// billets. Les elargir plus tard exigera une reconnexion (Zoho ne sait pas ajouter une portee a
+// une subvention existante), c'est le prix a payer pour ne pas donner a l'application le pouvoir
+// d'ecrire dans le support tant que personne ne l'a demande.
+//
+// ⚠️ On reutilise l'URL de retour du CRM et on distingue par le `state` SIGNE. En ajouter une
+// troisieme obligerait a l'enregistrer a la main dans la console API de Zoho — une friction
+// evitable, et le `state` porte deja une identite signee depuis le 2026-08-17.
+const DESK_SCOPES = 'Desk.tickets.READ,Desk.contacts.READ,Desk.basic.READ,Desk.settings.READ,Desk.search.READ';
+app.get('/api/auth/zoho-desk', authenticateToken, (req, res) => {
+  const back = req.query.back === 'partners' ? '/admin/partners' : '/admin/sync';
+  const state = jwt.sign(
+    { email: req.user.realAdminEmail || req.user.email, k: 'desk-oauth', back },
+    process.env.JWT_SECRET,
+    { expiresIn: '15m' }
+  );
+  const authUrl = `${ZOHO_CONFIG.accounts_url}/oauth/v2/auth?` +
+    `scope=${DESK_SCOPES}` +
+    `&client_id=${ZOHO_CONFIG.client_id}` +
+    `&response_type=code` +
+    `&redirect_uri=${process.env.ZOHO_CRM_REDIRECT_URI || ZOHO_CONFIG.redirect_uri.replace('/callback', '/crm-callback')}` +
+    `&state=${state}` +
+    `&access_type=offline` +
+    `&prompt=consent`;
+  res.json({ authUrl });
+});
+
 // 2. Handle CRM OAuth callback
 app.get('/api/auth/crm-callback', async (req, res) => {
   const { code, accounts_server } = req.query;
@@ -10497,9 +10541,15 @@ app.get('/api/auth/crm-callback', async (req, res) => {
     // autre est precisement le defaut qu'on corrige, et un flux refuse se relance en un clic.
     let adminEmail = null;
     let back = '/admin/sync';
+    // Ce retour sert DEUX connexions — CRM et Desk — parce qu'ajouter une URL de retour
+    // obligerait a l'enregistrer a la main dans la console API de Zoho. Le `state` signe dit
+    // laquelle : `k`.
+    let genre = null;
     try {
       const p = jwt.verify(String(req.query.state || ''), process.env.JWT_SECRET);
-      if (p && p.k === 'crm-oauth' && p.email) adminEmail = String(p.email);
+      if (p && (p.k === 'crm-oauth' || p.k === 'desk-oauth') && p.email) {
+        adminEmail = String(p.email); genre = p.k;
+      }
       // Re-verifie la liste blanche a l'arrivee aussi : le `state` est signe, donc non falsifie,
       // mais une valeur ecrite par une version future du code ne doit pas devenir une redirection.
       if (p && (p.back === '/admin/partners' || p.back === '/admin/sync')) back = p.back;
@@ -10509,9 +10559,12 @@ app.get('/api/auth/crm-callback', async (req, res) => {
     if (!adminEmail) {
       return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/admin/sync?crm=state_invalide`);
     }
+    const colonnes = genre === 'desk-oauth'
+      ? { a: 'desk_access_token', r: 'desk_refresh_token', e: 'desk_expires_at' }
+      : { a: 'crm_access_token',  r: 'crm_refresh_token',  e: 'crm_expires_at' };
     const pose = await pool.query(
       `UPDATE user_tokens
-       SET crm_access_token = $1, crm_refresh_token = $2, crm_expires_at = $3, updated_at = CURRENT_TIMESTAMP
+       SET ${colonnes.a} = $1, ${colonnes.r} = $2, ${colonnes.e} = $3, updated_at = CURRENT_TIMESTAMP
        WHERE LOWER(email) = LOWER($4)`,
       [access_token, refresh_token, Date.now() + (expires_in * 1000), adminEmail]
     );
@@ -10524,12 +10577,26 @@ app.get('/api/auth/crm-callback', async (req, res) => {
 
     // Reconnection succeeded — drop any 'disconnected' flag right away so the
     // banner clears instead of waiting on the next token refresh.
-    if (refresh_token) await markServiceConnected('crm', adminEmail);
+    // Le drapeau « deconnecte » et la banniere de reconnexion ne concernent que le CRM.
+    if (refresh_token && genre !== 'desk-oauth') await markServiceConnected('crm', adminEmail);
 
-    console.log(`✅ CRM tokens stored for ${adminEmail}, expires at ${new Date(Date.now() + expires_in * 1000).toISOString()}`);
+    const quoi = genre === 'desk-oauth' ? 'Desk' : 'CRM';
+    console.log(`✅ ${quoi} tokens stored for ${adminEmail}, expires at ${new Date(Date.now() + expires_in * 1000).toISOString()}`);
+
+    // Epinglage du compte Desk, meme raison que pour le CRM : « la ligne la plus recemment
+    // mise a jour » bouge toute seule au fil des rafraichissements, et une deuxieme connexion
+    // detournerait silencieusement toutes les lectures Desk.
+    if (genre === 'desk-oauth') {
+      await pool.query(
+        `INSERT INTO sync_state (key, value, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP)
+         ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = CURRENT_TIMESTAMP`,
+        [DESK_SYSTEM_KEY, adminEmail]);
+      console.log(`📌 [desk] compte Zoho Desk epingle sur ${adminEmail}`);
+    }
 
     // Redirect back to admin panel
-    const redirectUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}${back}?crm=connected`;
+    const param = genre === 'desk-oauth' ? 'desk=connected' : 'crm=connected';
+    const redirectUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}${back}?${param}`;
     res.redirect(redirectUrl);
   } catch (error) {
     console.error('CRM OAuth callback error:', error.response?.data || error.message);
@@ -14014,6 +14081,128 @@ async function crmTokenFromRow(row) {
   }
   return row.crm_access_token;
 }
+
+// ============================================================================
+// ZOHO DESK — jeton, organisation, lecture
+// ============================================================================
+//
+// Volontairement calque sur le CRM, sans partager son code : les deux subventions ont des cycles
+// de vie independants, et melanger leurs rafraichissements ferait qu'une panne Desk pourrait
+// invalider le jeton dont depend tout le reste.
+
+async function deskSystemAccount() {
+  const r = await pool.query(`SELECT value FROM sync_state WHERE key = $1`, [DESK_SYSTEM_KEY]);
+  return r.rows[0]?.value || null;
+}
+
+async function ensureValidDeskToken() {
+  const epingle = await deskSystemAccount();
+  let row = epingle
+    ? (await pool.query(
+        `SELECT email, desk_access_token, desk_refresh_token, desk_expires_at FROM user_tokens
+          WHERE LOWER(email) = LOWER($1) AND desk_refresh_token IS NOT NULL`, [epingle])).rows[0]
+    : null;
+  // Repli : n'importe quelle connexion Desk valide. Utile avant que l'epinglage ait ete pose, ou
+  // si le compte epingle a ete deconnecte depuis.
+  if (!row) {
+    row = (await pool.query(
+      `SELECT email, desk_access_token, desk_refresh_token, desk_expires_at FROM user_tokens
+        WHERE desk_refresh_token IS NOT NULL ORDER BY updated_at DESC LIMIT 1`)).rows[0];
+  }
+  if (!row) throw new Error('desk_not_connected');
+
+  const exp = row.desk_expires_at ? parseInt(row.desk_expires_at) : null;
+  if (exp && exp > Date.now() + 10 * 60 * 1000 && row.desk_access_token) return row.desk_access_token;
+
+  const r = await axios.post('https://accounts.zoho.com/oauth/v2/token',
+    new URLSearchParams({
+      grant_type: 'refresh_token',
+      client_id: process.env.ZOHO_CLIENT_ID,
+      client_secret: process.env.ZOHO_CLIENT_SECRET,
+      refresh_token: row.desk_refresh_token,
+    }),
+    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, validateStatus: () => true });
+  const neuf = r.data?.access_token;
+  if (!neuf) {
+    // On ne jette PAS si l'ancien jeton a encore de la vie : une panne de rafraichissement ne doit
+    // pas casser un rapport qui aurait pu s'afficher.
+    if (exp && exp > Date.now() && row.desk_access_token) {
+      console.warn('[desk] rafraichissement refuse, on garde le jeton existant :', JSON.stringify(r.data).slice(0, 200));
+      return row.desk_access_token;
+    }
+    throw new Error('desk_refresh_failed: ' + JSON.stringify(r.data).slice(0, 200));
+  }
+  await pool.query(
+    `UPDATE user_tokens SET desk_access_token = $1, desk_refresh_token = $2, desk_expires_at = $3,
+            updated_at = CURRENT_TIMESTAMP WHERE email = $4`,
+    [neuf, r.data.refresh_token || row.desk_refresh_token,
+     Date.now() + (parseInt(r.data.expires_in) || 3600) * 1000, row.email]);
+  return neuf;
+}
+
+// L'identifiant d'organisation Desk. Decouvert une fois, puis epingle : l'API l'exige sur chaque
+// appel. ⚠️ Un compte Desk peut porter PLUSIEURS organisations — on refuse de choisir a l'aveugle
+// et on le dit, plutot que de prendre la premiere et de produire des rapports sur la mauvaise.
+async function deskOrgId() {
+  const r = await pool.query(`SELECT value FROM sync_state WHERE key = $1`, [DESK_ORG_KEY]);
+  if (r.rows[0]?.value) return r.rows[0].value;
+  const token = await ensureValidDeskToken();
+  const o = await axios.get('https://desk.zoho.com/api/v1/organizations', {
+    headers: { Authorization: `Zoho-oauthtoken ${token}` }, validateStatus: () => true, timeout: 20000 });
+  if (o.status !== 200) throw new Error(`desk_orgs_failed: HTTP ${o.status} ${JSON.stringify(o.data).slice(0, 200)}`);
+  const orgs = o.data?.data || [];
+  if (!orgs.length) throw new Error('desk_no_org');
+  if (orgs.length > 1) {
+    throw new Error('desk_multiple_orgs: ' + orgs.map((x) => `${x.companyName || x.portalName} (${x.id})`).join(', '));
+  }
+  const id = String(orgs[0].id);
+  await pool.query(
+    `INSERT INTO sync_state (key, value, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP)
+     ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = CURRENT_TIMESTAMP`, [DESK_ORG_KEY, id]);
+  console.log(`📌 [desk] organisation epinglee : ${orgs[0].companyName || orgs[0].portalName} (${id})`);
+  return id;
+}
+
+// Un seul point de passage pour toute lecture Desk : l'en-tete `orgId` est obligatoire et
+// l'oublier donne une erreur opaque. Tout futur rapport passe par ici.
+async function deskGet(chemin, params = {}) {
+  const token = await ensureValidDeskToken();
+  const orgId = await deskOrgId();
+  const r = await axios.get(`https://desk.zoho.com/api/v1${chemin}`, {
+    params,
+    headers: { Authorization: `Zoho-oauthtoken ${token}`, orgId },
+    validateStatus: () => true, timeout: 30000,
+  });
+  if (r.status < 200 || r.status >= 300) {
+    throw new Error(`desk ${chemin} -> HTTP ${r.status} ${JSON.stringify(r.data).slice(0, 300)}`);
+  }
+  return r.data;
+}
+
+// GET /api/auth/desk-status — l'etat de la connexion, et une VRAIE lecture pour le prouver.
+// Un « connecte » base sur la seule presence d'un jeton en base mentirait : c'est exactement
+// comme ca qu'un profil Zoho sans acces API est passe inapercu cote CRM.
+app.get('/api/auth/desk-status', authenticateToken, async (req, res) => {
+  try {
+    const row = (await pool.query(
+      `SELECT email FROM user_tokens WHERE desk_refresh_token IS NOT NULL ORDER BY updated_at DESC LIMIT 1`)).rows[0];
+    if (!row) return res.json({ connected: false });
+    const compte = await deskSystemAccount();
+    let org = null;
+    let billets = null;
+    let erreur = null;
+    try {
+      const o = await deskGet('/organizations');
+      const premiere = (o?.data || [])[0];
+      org = premiere ? { id: String(premiere.id), name: premiere.companyName || premiere.portalName } : null;
+      const t = await deskGet('/tickets', { limit: 1 });
+      billets = Array.isArray(t?.data) ? 'lecture des billets OK' : 'aucun billet lisible';
+    } catch (e) { erreur = e.message; }
+    res.json({ connected: true, account: compte || row.email, org, tickets: billets, error: erreur });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ============================================================================
 // SYNC INVOICES FROM ZOHO TO DATABASE
