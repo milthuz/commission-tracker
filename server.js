@@ -17888,39 +17888,6 @@ async function checkCrmDuplicate({ businessName, contactEmail, contactPhone }) {
 // Lead_Status, and Lead_Contact_Method (API name confirmed via the temp diagnostic endpoint,
 // value = "Website Form" style) are fixed per the partner manager's instructions.
 // `o` is the joined opportunity+partner+submitter row (see the PUT handler below).
-// Les valeurs acceptees par les listes de choix du module Leads, telles qu'elles sont AUJOURD'HUI
-// dans Zoho. Meme cache de 30 min que crmDealStages, meme raison : ces listes sont configurees
-// par organisation et personne ne nous previent quand elles changent.
-//
-// ⚠️ C'est exactement ce qui a casse le 2026-08-28. Le code envoyait `Lead_Status: 'NEW'` en dur ;
-// la valeur existait le 17 aout (le lead #2706 la portait), elle avait disparu de la liste le 28.
-// Zoho refuse alors TOUTE la fiche pour une seule valeur invalide, et l'opportunite se retrouve
-// approuvee sans lead.
-let _leadPickCache = { at: 0, listes: null };
-async function crmLeadPicklists() {
-  if (_leadPickCache.listes && Date.now() - _leadPickCache.at < 30 * 60 * 1000) return _leadPickCache.listes;
-  try {
-    const token = await ensureValidCrmToken();
-    const r = await axios.get('https://www.zohoapis.com/crm/v2/settings/fields', {
-      params: { module: 'Leads' },
-      headers: { Authorization: `Zoho-oauthtoken ${token}` }, validateStatus: () => true, timeout: 20000,
-    });
-    if (r.status !== 200) return _leadPickCache.listes || {};
-    const listes = {};
-    for (const c of (r.data?.fields || [])) {
-      const vals = (c.pick_list_values || []).map((v) => v.actual_value ?? v.display_value).filter(Boolean);
-      if (vals.length) listes[c.api_name] = vals;
-    }
-    _leadPickCache = { at: Date.now(), listes };
-    return listes;
-  } catch (e) {
-    // Injoignable : on rend le dernier etat connu, ou rien. `null` fait renoncer a la validation
-    // plus bas — mieux vaut tenter l'envoi que refuser une approbation parce que Zoho tousse.
-    console.warn('[crm] listes de choix Leads illisibles :', e.message);
-    return _leadPickCache.listes || {};
-  }
-}
-
 // Zoho valide le format des champs `phone` et refuse la fiche ENTIERE quand il n'aime pas.
 // Vecu le 2026-08-28 sur « Jardin du cerf » : « 514) 585-9966 », une parenthese fermante
 // orpheline, a fait echouer la creation (1 numero sur 629 en base, mais il coute un lead entier).
@@ -17949,32 +17916,27 @@ function telephonePourZoho(v) {
   return null;
 }
 
-// Ne garde d'une valeur de liste de choix que ce que Zoho accepte, en tolerant la casse (Zoho
-// stocke « New » quand on envoie « NEW »). Renvoie null quand rien ne correspond : l'appelant
-// RETIRE alors le champ, et Zoho applique son propre defaut. Perdre un champ vaut mieux que
-// perdre la fiche.
-function valeurDeListe(listes, apiName, voulu) {
-  const vals = listes && listes[apiName];
-  if (!vals || !vals.length || voulu == null) return voulu ?? null;   // pas de liste connue : ne rien changer
-  const exact = vals.find((v) => v === voulu);
-  if (exact) return exact;
-  const casse = vals.find((v) => String(v).toLowerCase() === String(voulu).toLowerCase());
-  return casse || null;
-}
-
 async function createCrmLead(o) {
   const fields = {
     Company: o.business_name,
     Last_Name: o.contact_last_name || o.business_name,
     Country: 'Canada',
-    Lead_Status: 'NEW',
+    // « New », la forme exacte que Zoho stocke et que les vues de l'equipe filtrent.
+    Lead_Status: 'New',
     Lead_Contact_Method: 'Partner Portal',
   };
-  // Ordre de preference pour le statut d'une piste toute neuve. Ce n'est PAS une constante
-  // reconduite : chaque valeur est essayee contre la liste VIVANTE plus bas, et si aucune ne passe
-  // le champ est retire pour laisser Zoho appliquer son defaut. C'est la degradation sure — celle
-  // qui manquait le 2026-08-28.
-  const STATUTS_NEUFS = ['NEW', 'New', 'Not Contacted', 'Nouveau'];
+  // ⚠️ `New` n'est PAS dans ce que l'API annonce comme liste de choix de `Lead_Status` — ni au
+  // niveau du module, ni sur la mise en page POS, ni sur PAY. Les metadonnees de Zoho sont
+  // DESYNCHRONISEES de sa vraie configuration : l'interface offre `New`, 34 fiches le portent, et
+  // le Lead #2706 l'a recu de ce code meme.
+  //
+  // Ne plus se fier a ces metadonnees. C'est en les croyant, le 2026-08-28, que j'ai rétrogradé
+  // le statut en `Not Contacted` — une valeur valide mais absente des quatre vues de travail de
+  // l'equipe (« POS - Open Leads », « My OPEN Leads »…), qui filtrent sur New/In Progress/On Hold.
+  // Les leads devenaient invisibles partout sauf dans « All Leads ».
+  //
+  // La seule autorite fiable est le REFUS de Zoho lui-meme, et le filet plus bas s'en charge :
+  // si un champ est rejete, Zoho le nomme, on le retire et on renvoie.
   // La Passe passe par le même chemin (SH-22) mais doit rester distinguable dans le CRM :
   // ce n'est pas un partenaire tiers qui recommande, c'est un marchand client.
   if (o.lead_contact_method) fields.Lead_Contact_Method = o.lead_contact_method;
@@ -18014,25 +17976,6 @@ async function createCrmLead(o) {
     repName ? `Partner's rep on this deal: ${repName}${o.rep_phone ? ` — ${o.rep_phone}` : ''}${o.rep_email ? ` — ${o.rep_email}` : ''}` : null,
     o.notes ? `Notes: ${o.notes}` : null,
   ].filter(Boolean).join('\n');
-
-  // ── Validation des listes de choix, AVANT l'envoi ───────────────────────────────────────────
-  // Zoho refuse la fiche ENTIERE si une seule valeur de liste de choix ne lui plait pas. On lui
-  // demande donc d'abord ce qu'il accepte, et on retire ce qui ne passe pas : un Lead sans source
-  // est reparable en deux clics, un Lead qui n'existe pas se perd.
-  {
-    const listes = await crmLeadPicklists();
-    if (fields.Lead_Status) {
-      const trouve = STATUTS_NEUFS.map((v) => valeurDeListe(listes, 'Lead_Status', v)).find(Boolean);
-      if (trouve) fields.Lead_Status = trouve;
-      else { delete fields.Lead_Status; console.warn('[partner-crm] aucun statut de piste neuve accepte par Zoho — champ retire'); }
-    }
-    for (const api of ['Lead_Source', 'Lead_Contact_Method']) {
-      if (fields[api] == null) continue;
-      const ok = valeurDeListe(listes, api, fields[api]);
-      if (ok) fields[api] = ok;
-      else { console.warn(`[partner-crm] « ${fields[api]} » refuse par la liste ${api} — champ retire`); delete fields[api]; }
-    }
-  }
 
   try {
     // Le jeton de L'APPROBATEUR quand il en a un, sinon le compte systeme. C'est le seul levier
