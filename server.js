@@ -172,6 +172,7 @@ const PERMISSION_CATALOG = [
   { key: 'partners:migrate',           label: 'Bulk-import partners, portal users and opportunities (migration)', category: 'Partners' },
   { key: 'partners:stats',             label: 'View partner portal usage statistics (adoption, logins, submissions)', category: 'Partners' },
   { key: 'partners:export_users',      label: 'Export the partner user list to Excel (emails and invitation dates)', category: 'Partners' },
+  { key: 'partners:create_opportunity', label: 'Create an opportunity by hand for a partner not yet on the portal', category: 'Partners' },
 
   // Leads (SH-20) — la couche d'accueil AVANT Zoho. `review` est la seule cle qui fasse
   // entrer quoi que ce soit dans le CRM et partir des courriels a un marchand : elle se
@@ -1827,6 +1828,13 @@ async function initializeDatabase() {
     // silencieusement le mauvais representant. En conservant le choix, la synchro peut au
     // contraire le REIMPOSER quand Zoho derive (voir syncPartnerDealState).
     await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS crm_owner_id VARCHAR(50)`);
+    // Saisie MANUELLE depuis le panneau d'admin, pour un partenaire qui n'utilise pas encore le
+    // portail. `submitted_by` est alors null (aucun compte partenaire n'existe) : sans cette
+    // colonne, la file ne pourrait plus dire d'ou vient la ligne.
+    // ⚠️ On n'utilise PAS `migration_source` pour marquer ces lignes : une bonne partie du code
+    // lit `migration_source IS NOT NULL` comme « dossier repris, exclu des versements ». Une
+    // saisie manuelle compte NORMALEMENT (decision de David, 2026-09-03).
+    await pool.query(`ALTER TABLE partner_opportunities ADD COLUMN IF NOT EXISTS created_by_admin VARCHAR(255)`);
     // Migration de l'ancien portail Zoho Creator (2026-08-05). `payout_excluded` sort la ligne du
     // calcul d'eligibilite : ces dossiers sont anterieurs au programme de versement et ne doivent
     // JAMAIS le declencher. Sans ce garde-fou, les 95 deals « Closed Won » importes devenaient
@@ -6953,6 +6961,7 @@ app.get('/api/admin/partner-opportunities', authenticateToken, async (req, res) 
               o.rep_first_name, o.rep_last_name, o.rep_phone, o.rep_email, o.notes, o.status,
               o.reviewed_by, o.reviewed_at, o.rejection_reason, o.created_at,
               o.crm_match_status, o.crm_match_summary, o.crm_match_records, o.crm_lead_id, o.crm_lead_error,
+              o.created_by_admin,
               o.crm_owner_name,
               o.linked_customer_name, o.payout_status, o.crm_deposit_date, o.crm_deal_stage, o.crm_deal_lookup,
               p.name AS partner_name, pu.email AS submitted_by_email
@@ -6972,6 +6981,7 @@ app.get('/api/admin/partner-opportunities', authenticateToken, async (req, res) 
       crmMatchRecords: r.crm_match_records || [],
       crmLeadId: r.crm_lead_id,
       crmLeadError: r.crm_lead_error,
+      createdByAdmin: r.created_by_admin,
       linkedCustomerName: r.linked_customer_name,
       payoutStatus: r.payout_status,
       // Ce qui COMMANDE le versement, expose pour que l'admin puisse voir pourquoi une ligne est
@@ -7008,6 +7018,75 @@ app.post('/api/admin/partner-opportunities/:id/crm-check', authenticateToken, as
     );
     res.json({ crmMatchStatus: result.status, crmMatchSummary: result.summary, crmMatchRecords: result.matches });
   } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/partner-opportunities — saisir une opportunite A LA MAIN, pour le compte d'un
+// partenaire qui n'utilise pas encore le portail (demande de David, 2026-09-03).
+//
+// Jumeau volontaire de POST /api/partner-portal/opportunities : meme table, meme statut de depart
+// `pending`, meme verification de doublon Zoho en arriere-plan. La ligne rejoint donc la file
+// d'approbation et suit EXACTEMENT le meme chemin — c'est a l'approbation qu'on choisit le rep
+// Cluster et que le Lead Zoho est cree. Creer la ligne deja approuvee court-circuiterait cette
+// etape, qui est justement celle ou une decision humaine est prise.
+//
+// Elle COMPTE normalement dans les versements : ni `payout_excluded`, ni `migration_source`.
+// C'est la difference avec les 674 dossiers repris de Moneris.
+//
+// `submitted_by` reste null : aucun compte partenaire n'existe. `created_by_admin` garde qui a
+// saisi, sinon la file ne pourrait plus dire d'ou vient la ligne.
+//
+// Permission propre (`partners:create_opportunity`) et non `partners:manage` : reviser ce que des
+// partenaires ont soumis et INSCRIRE soi-meme une affaire qui comptera dans leurs versements sont
+// deux pouvoirs differents.
+app.post('/api/admin/partner-opportunities', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:create_opportunity'))) return;
+  const b = req.body || {};
+  const partnerId = parseInt(b.partnerId, 10);
+  const businessName = String(b.businessName || '').trim();
+  if (!partnerId) return res.status(400).json({ error: 'partner_required' });
+  if (!businessName) return res.status(400).json({ error: 'business_name_required' });
+  try {
+    // Le partenaire doit exister ET etre actif : inscrire une affaire au nom d'un partenaire
+    // desactive creerait une dette envers quelqu'un dont on a justement ferme l'acces.
+    const p = (await pool.query(`SELECT id, name, active FROM partners WHERE id = $1`, [partnerId])).rows[0];
+    if (!p) return res.status(404).json({ error: 'partner_not_found' });
+    if (!p.active) return res.status(409).json({ error: 'partner_inactive' });
+
+    const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+    const contactEmail = String(b.contactEmail || '').trim() || null;
+    const contactPhone = String(b.contactPhone || '').trim() || null;
+    const r = await pool.query(
+      `INSERT INTO partner_opportunities
+         (partner_id, submitted_by, business_name, contact_first_name, contact_last_name, contact_phone,
+          contact_email, rep_first_name, rep_last_name, rep_phone, rep_email, notes, created_by_admin)
+       VALUES ($1,NULL,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+      [partnerId, businessName,
+       String(b.contactFirstName || '').trim() || null, String(b.contactLastName || '').trim() || null,
+       contactPhone, contactEmail,
+       String(b.repFirstName || '').trim() || null, String(b.repLastName || '').trim() || null,
+       String(b.repPhone || '').trim() || null, String(b.repEmail || '').trim() || null,
+       String(b.notes || '').trim() || null, actor]
+    );
+    const id = r.rows[0].id;
+    logActivity('partner_opportunity', String(id), 'submitted',
+      `${businessName} saisi a la main pour ${p.name} par ${actor}`, actor);
+
+    // Meme idiome que le portail : la verification de doublon part sans bloquer la reponse, et le
+    // resultat est la bien avant que quiconque revise la ligne.
+    checkCrmDuplicate({ businessName, contactEmail: contactEmail || '', contactPhone: contactPhone || '' })
+      .then((result) => pool.query(
+        `UPDATE partner_opportunities SET crm_match_status = $2, crm_match_summary = $3, crm_match_records = $4 WHERE id = $1`,
+        [id, result.status, result.summary, JSON.stringify(result.matches)]
+      ))
+      .catch((e) => console.warn('[partner-crm] doublon non persiste:', e.message));
+
+    // Pas de notification aux gestionnaires de partenaires, contrairement au portail : celui qui
+    // saisit EST le gestionnaire. Se prevenir soi-meme par courriel serait du bruit.
+    res.json({ success: true, id });
+  } catch (e) {
+    console.error('[partner-opportunities] creation manuelle echouee:', e.stack || e.message);
     res.status(500).json({ error: e.message });
   }
 });
