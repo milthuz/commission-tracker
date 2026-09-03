@@ -17934,6 +17934,46 @@ async function createCrmLead(o) {
     const result = premier;
     if (r.status >= 200 && r.status < 300 && result?.status === 'success') {
       const leadId = result.details?.id || null;
+
+      // ── Le rep choisi PASSE EN DERNIER ────────────────────────────────────────────────────
+      // Signale par David le 2026-09-03 : Gabriella assigne un lead a Sophie, la fiche Zoho reste
+      // a son nom. Verifie sur le Lead 4322330000273451009 — `Owner` valait Gabriella des la
+      // creation, sans modification ulterieure, alors que l'application avait bien envoye un
+      // proprietaire.
+      //
+      // Cause exacte non identifiee : ce compte Zoho a 32 regles de flux ACTIVES sur les Leads, et
+      // les flux s'executent a la creation meme par l'API. J'ai verifie « Change Lead Owner based
+      // on the Source » — ses criteres ne correspondent PAS a notre cas, donc c'est une autre.
+      // Auditer les 31 restantes couterait plus que de rendre le probleme impossible.
+      //
+      // D'ou ce correctif independant de la cause : on REPOSE le proprietaire juste apres la
+      // creation, avec `trigger: []` qui demande a Zoho de n'executer AUCUNE automatisation pour
+      // cet appel. Notre ecriture est donc la derniere, et rien ne la reecrit. On ne met pas
+      // `trigger: []` sur la CREATION : ca desactiverait aussi les 31 autres regles (notifications,
+      // synchro Creator, blueprint), dont on ne sait pas qui en depend.
+      if (leadId && o.crm_owner_id) {
+        try {
+          const rp = await axios.put(`https://www.zohoapis.com/crm/v2/Leads/${leadId}`,
+            { data: [{ Owner: { id: String(o.crm_owner_id) } }], trigger: [] },
+            { headers: { Authorization: `Zoho-oauthtoken ${crmToken}`, 'Content-Type': 'application/json' },
+              validateStatus: () => true });
+          // On RELIT, au lieu de croire le succes annonce : c'est justement une ecriture qui
+          // reussissait deja sans que la valeur tienne.
+          const lu = await axios.get(`https://www.zohoapis.com/crm/v2/Leads/${leadId}`, {
+            headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true });
+          const proprio = lu.data?.data?.[0]?.Owner;
+          if (String(proprio?.id) !== String(o.crm_owner_id)) {
+            console.warn(`[partner-crm] proprietaire NON applique sur ${leadId} :`
+              + ` demande ${o.crm_owner_id}, Zoho garde ${proprio?.id} (${proprio?.name}).`
+              + ` PUT -> ${rp.status} ${JSON.stringify(rp.data?.data?.[0]?.code || '')}`);
+          } else {
+            console.log(`[partner-crm] proprietaire confirme sur ${leadId} : ${proprio?.name}`);
+          }
+        } catch (e) {
+          // Le lead existe : on ne fait pas echouer l'approbation pour un proprietaire.
+          console.warn('[partner-crm] reaffirmation du proprietaire impossible :', e.message);
+        }
+      }
       // La note va dans la liste liee « Notes » du Lead — c'est la que les representants la
       // cherchent. Ce n'est pas un champ de la fiche mais un enregistrement a part, d'ou ce
       // SECOND appel, apres la creation.
