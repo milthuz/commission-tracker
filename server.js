@@ -13555,8 +13555,20 @@ function startAutoSync() {
   // 2 h de recouvrement). Le rattrapage historique, lui, se declenche a la main : il prend
   // une vingtaine de minutes et n'a besoin d'etre fait qu'une fois.
   setTimeout(() => {
-    const runDesk = () => syncDeskTickets({ mode: 'incremental' })
-      .catch((e) => console.warn('[desk] synchro horaire echouee :', e.message));
+    // Premier passage : s'il n'y a pas encore d'historique, on le rattrape AVANT de passer
+    // en incremental. Sans ca la page n'aurait que 7 jours de donnees et il faudrait qu'un
+    // humain pense a cliquer un bouton pour qu'elle devienne utile. Garde par
+    // desk_backfill_done, donc ca ne se reproduit pas a chaque redemarrage.
+    const runDesk = async () => {
+      try {
+        const dejaFait = await deskEtatLire('desk_backfill_done');
+        await syncDeskTickets({ mode: dejaFait ? 'incremental' : 'backfill' });
+      } catch (e) {
+        // desk_not_connected inclus : tant que personne n'a connecte Desk, on reessaiera
+        // simplement a l'heure suivante.
+        console.warn('[desk] synchro horaire echouee :', e.message);
+      }
+    };
     runDesk();
     setInterval(runDesk, 60 * 60 * 1000);
   }, 6 * 60 * 1000);
