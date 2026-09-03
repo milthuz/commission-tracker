@@ -7288,7 +7288,15 @@ async function syncPartnerDealState() {
     // Et comme ce travail tourne toutes les heures, une derive TARDIVE (automatisation
     // asynchrone, modification manuelle) est rattrapee au passage suivant. C'est la difference
     // entre « corrige une fois » et « ne peut plus rester faux ».
-    if (r.crm_owner_id && state.ownerId && String(state.ownerId) !== String(r.crm_owner_id)) {
+    // ⚠️ BORNE : on ne reconcilie que TANT QUE LA PISTE N'EST PAS CONVERTIE. Une fois le Deal
+    // ouvert, le processus de vente a pris le relais et un changement de proprietaire dans Zoho
+    // est une decision legitime — un directeur qui reassigne une affaire en cours. Sans cette
+    // borne, la reconciliation horaire la defaisait toutes les heures, indefiniment : un
+    // correctif « pour toujours » qui passe par-dessus les humains pour toujours serait pire que
+    // le defaut qu'il corrige. L'intention porte sur QUI RECOIT la reference, pas sur qui mene
+    // la vente ensuite.
+    if (!state.leadConverted
+        && r.crm_owner_id && state.ownerId && String(state.ownerId) !== String(r.crm_owner_id)) {
       try {
         const crmToken = await ensureValidCrmToken();
         const pu = await axios.put(`https://www.zohoapis.com/crm/v2/Leads/${r.crm_lead_id}`,
