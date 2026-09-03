@@ -10493,6 +10493,10 @@ app.get('/api/auth/zoho-crm', authenticateToken, (req, res) => {
 // evitable, et le `state` porte deja une identite signee depuis le 2026-08-17.
 const DESK_SCOPES = 'Desk.tickets.READ,Desk.contacts.READ,Desk.basic.READ,Desk.settings.READ,Desk.search.READ';
 app.get('/api/auth/zoho-desk', authenticateToken, (req, res) => {
+  // Reserve aux admins : contrairement au CRM (un jeton PAR personne), Desk n'a qu'un seul
+  // compte lecteur, epingle. Laisser n'importe qui lancer ce flux laisserait repointer
+  // le compte qui lit les billets pour tous les rapports.
+  if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin access required' });
   const back = req.query.back === 'partners' ? '/admin/partners' : '/admin/sync';
   const state = jwt.sign(
     { email: req.user.realAdminEmail || req.user.email, k: 'desk-oauth', back },
