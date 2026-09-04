@@ -204,6 +204,7 @@ const PERMISSION_CATALOG = [
   // so this grants "Sofia may reach my Sales Hub data", never extra access.
   { key: 'assistant:hub',              label: "Sofia can read the user's own Sales Hub data (commission, pay stub, points)", category: 'Assistant' },
   { key: 'assistant:governance',       label: 'Turn Sofia\'s CRM access on/off and review what she did',        category: 'Assistant' },
+  { key: 'assistant:support_read',     label: 'Sofia can read support tickets and merchant support history (read-only)', category: 'Assistant' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -9324,6 +9325,213 @@ app.get('/api/assistant/export', authenticateToken, async (req, res) => {
   }
 });
 
+// ============================================================================
+// SOFIA — OUTILS DE SOUTIEN (ZOHO DESK, LECTURE SEULE)
+// ============================================================================
+// Trois d'entre eux lisent la COPIE LOCALE des billets, pas Zoho : 126 000 billets et une API
+// qui ne sait pas agreger rendraient toute question chiffree impossible a tenir dans un tour
+// de conversation. Seul support_read_ticket va chercher le contenu des echanges en direct,
+// parce qu'il ne rapatrie qu'un billet a la fois.
+//
+// La portee Desk est READ uniquement : aucune ecriture n'est possible, meme par erreur.
+// L'acces est gouverne par assistant:support_read (les admins l'ont d'office).
+
+// Le texte des echanges arrive en HTML. On le nettoie et on le plafonne : un fil de courriels
+// avec ses signatures et ses citations peut faire des dizaines de milliers de caracteres, ce
+// qui noierait le reste du contexte pour rien.
+function deskTexteLisible(html, max = 1200) {
+  return String(html || '')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&#39;|&apos;/g, "'").replace(/&quot;/g, '"')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+    .slice(0, max);
+}
+
+const DESK_DELAI_H = `EXTRACT(EPOCH FROM (t.closed_time - t.created_time)) / 3600.0`;
+
+async function toolSupportFindTickets(scope, { merchant, keyword, issueType, months, openOnly, limit }) {
+  const mois = Math.min(Math.max(parseInt(months) || 12, 1), 60);
+  const n = Math.min(Math.max(parseInt(limit) || 25, 1), 60);
+  const cond = [`t.created_time >= now() - ($1 || ' months')::interval`, 'NOT t.is_spam'];
+  const p = [String(mois)];
+  if (merchant) { p.push(String(merchant)); cond.push(`sh_norm_name(ac.name) LIKE '%' || sh_norm_name($${p.length}) || '%'`); }
+  if (keyword) { p.push(String(keyword)); cond.push(`t.subject ILIKE '%' || $${p.length} || '%'`); }
+  if (issueType) { p.push(String(issueType)); cond.push(`t.issue_type ILIKE $${p.length}`); }
+  if (openOnly === true) cond.push('t.closed_time IS NULL');
+  p.push(n);
+
+  const r = await pool.query(`
+    SELECT t.id, t.ticket_number, t.subject, t.status, t.created_time, t.closed_time,
+           t.channel, t.issue_type, t.pos_software, t.cs_category, t.web_url,
+           ac.name AS marchand, d.name AS departement, ag.name AS agent,
+           round(${DESK_DELAI_H}::numeric, 1) AS heures
+      FROM desk_tickets t
+      LEFT JOIN desk_accounts ac ON ac.id = t.account_id
+      LEFT JOIN desk_departments d ON d.id = t.department_id
+      LEFT JOIN desk_agents ag ON ag.id = t.assignee_id
+     WHERE ${cond.join(' AND ')}
+     ORDER BY t.created_time DESC
+     LIMIT $${p.length}`, p);
+
+  if (!r.rowCount) {
+    return {
+      tickets: [],
+      // Dire POURQUOI c'est vide : sans ca le modele conclut joyeusement « ce marchand n'a
+      // aucun probleme », alors que c'est peut-etre le nom qui ne correspond a rien.
+      note: `Aucun billet sur ${mois} mois avec ces criteres. Si un marchand etait demande, verifier l'orthographe du nom : la correspondance se fait sur le nom du compte Zoho Desk, qui peut differer du nom de facturation.`,
+    };
+  }
+  return {
+    periodeMois: mois,
+    tickets: r.rows.map((x) => ({
+      ticketId: x.id, numero: x.ticket_number, sujet: x.subject, statut: x.status,
+      marchand: x.marchand, departement: x.departement, agent: x.agent,
+      cree: x.created_time, ferme: x.closed_time, heuresPourFermer: x.heures,
+      canal: x.channel, type: x.issue_type, sousType: x.pos_software || x.cs_category,
+      lien: x.web_url,
+    })),
+    note: 'ticketId se passe a support_read_ticket pour lire les echanges.',
+  };
+}
+
+// Le seul outil qui appelle Zoho en direct : un billet a la fois, avec ses echanges.
+async function toolSupportReadTicket(scope, { ticketId }) {
+  const id = String(ticketId || '').trim();
+  if (!/^\d+$/.test(id)) return { error: 'ticketId doit etre l identifiant numerique renvoye par support_find_tickets.' };
+
+  let billet, conv;
+  try {
+    billet = await deskGet(`/tickets/${id}`);
+    conv = await deskGet(`/tickets/${id}/conversations`);
+  } catch (e) {
+    return { error: `Zoho Desk a refuse la lecture de ce billet : ${e.message}` };
+  }
+  const echanges = (conv?.data || []).map((c) => ({
+    quand: c.commentedTime || c.createdTime || null,
+    qui: c.commenter?.name || c.author?.name || c.fromEmailAddress || null,
+    interne: c.isPublic === false,
+    texte: deskTexteLisible(c.content || c.summary),
+  })).filter((e) => e.texte);
+
+  return {
+    numero: billet.ticketNumber,
+    sujet: billet.subject,
+    statut: billet.status,
+    marchand: billet.account?.accountName || null,
+    contact: billet.contact ? [billet.contact.firstName, billet.contact.lastName].filter(Boolean).join(' ') : null,
+    cree: billet.createdTime, ferme: billet.closedTime,
+    canal: billet.channel, priorite: billet.priority, langue: billet.language,
+    type: billet.cf?.cf_issue_type || null,
+    sousType: billet.cf?.cf_pos_software || billet.cf?.cf_cs_category || null,
+    description: deskTexteLisible(billet.description, 900),
+    resolution: deskTexteLisible(billet.resolution, 600) || null,
+    echanges: echanges.slice(0, 12),
+    lien: billet.webUrl,
+  };
+}
+
+// L'outil qui repond a « que se passe-t-il avec ce marchand » : billets, revenu, representant,
+// et son statut d'abonnement — c'est le croisement que Zoho Desk seul ne peut pas faire.
+async function toolSupportMerchantProfile(scope, { merchant, months }) {
+  const nom = String(merchant || '').trim();
+  if (nom.length < 2) return { error: 'merchant doit faire au moins 2 caracteres.' };
+  const mois = Math.min(Math.max(parseInt(months) || 12, 1), 60);
+
+  const r = await pool.query(`
+    WITH cible AS (
+      SELECT ac.id, ac.name, sh_norm_name(ac.name) AS k
+        FROM desk_accounts ac
+       WHERE sh_norm_name(ac.name) LIKE '%' || sh_norm_name($1) || '%'
+       ORDER BY length(ac.name) LIMIT 5
+    ),
+    bil AS (
+      SELECT c.k, c.name,
+             count(t.id)::int AS billets,
+             count(t.id) FILTER (WHERE t.closed_time IS NULL)::int AS ouverts,
+             count(t.id) FILTER (WHERE ${DESK_DELAI_H} > 72)::int AS lents,
+             round(percentile_cont(0.5) WITHIN GROUP (ORDER BY ${DESK_DELAI_H})::numeric, 1) AS mediane_h,
+             max(t.created_time) AS dernier,
+             json_agg(DISTINCT t.issue_type) FILTER (WHERE t.issue_type IS NOT NULL) AS types
+        FROM cible c
+        LEFT JOIN desk_tickets t ON t.account_id = c.id AND NOT t.is_spam
+             AND t.created_time >= now() - ($2 || ' months')::interval
+       GROUP BY 1, 2
+    )
+    SELECT b.*,
+           (SELECT round(sum(i.total)::numeric, 2) FROM invoices i
+             WHERE sh_norm_name(i.customer_name) = b.k
+               AND i.date >= now() - ($2 || ' months')::interval
+               AND i.status NOT IN ('deleted','void','draft')) AS revenu,
+           (SELECT max(i.salesperson_name) FROM invoices i
+             WHERE sh_norm_name(i.customer_name) = b.k) AS representant,
+           (SELECT json_build_object('resilie', max(ce.cancelled_at), 'motif', max(ce.cancel_reason))
+              FROM saas_churn_events ce
+             WHERE sh_norm_name(ce.customer_name) = b.k AND ce.cancelled_at IS NOT NULL) AS abonnement
+      FROM bil b ORDER BY b.billets DESC`, [nom, String(mois)]);
+
+  if (!r.rowCount) return { error: `Aucun compte Zoho Desk ne ressemble a « ${nom} ».` };
+
+  return {
+    periodeMois: mois,
+    correspondances: r.rows.map((x) => ({
+      marchand: x.name,
+      revenu: x.revenu != null ? Number(x.revenu) : null,
+      representant: x.representant,
+      billets: x.billets, ouverts: x.ouverts,
+      billetsLents72h: x.lents,
+      medianeHeures: x.mediane_h,
+      dernierBillet: x.dernier,
+      types: x.types || [],
+      abonnementResilie: x.abonnement?.resilie || null,
+      motifResiliation: x.abonnement?.motif || null,
+    })),
+    note: 'billetsLents72h est le signal a regarder : chez les marchands partis chez un concurrent il est en moyenne de 1,86 contre 0,84 chez les clients actifs. Le nombre brut de billets, lui, distingue mal.',
+  };
+}
+
+async function toolSupportStats(scope, { months, department }) {
+  const mois = Math.min(Math.max(parseInt(months) || 12, 1), 60);
+  const p = [String(mois)];
+  let filtreDept = '';
+  if (department) { p.push(String(department)); filtreDept = `AND d.name ILIKE '%' || $${p.length} || '%'`; }
+
+  const r = await pool.query(`
+    WITH base AS (
+      SELECT t.*, d.name AS dept FROM desk_tickets t
+        LEFT JOIN desk_departments d ON d.id = t.department_id
+       WHERE t.created_time >= now() - ($1 || ' months')::interval AND NOT t.is_spam ${filtreDept}
+    )
+    SELECT json_build_object(
+      'billets', (SELECT count(*) FROM base),
+      'ouverts', (SELECT count(*) FROM base WHERE closed_time IS NULL),
+      'medianeHeures', (SELECT round(percentile_cont(0.5) WITHIN GROUP (
+          ORDER BY EXTRACT(EPOCH FROM (closed_time - created_time))/3600.0)::numeric, 1) FROM base),
+      'p90Heures', (SELECT round(percentile_cont(0.9) WITHIN GROUP (
+          ORDER BY EXTRACT(EPOCH FROM (closed_time - created_time))/3600.0)::numeric, 1) FROM base),
+      'parType', (SELECT COALESCE(json_agg(x ORDER BY x.n DESC), '[]'::json) FROM (
+          SELECT issue_type AS type, count(*)::int AS n FROM base
+           WHERE issue_type IS NOT NULL GROUP BY 1) x),
+      'parDepartement', (SELECT COALESCE(json_agg(x ORDER BY x.n DESC), '[]'::json) FROM (
+          SELECT COALESCE(dept, 'n/d') AS departement, count(*)::int AS n FROM base GROUP BY 1) x),
+      'parMois', (SELECT COALESCE(json_agg(x ORDER BY x.mois), '[]'::json) FROM (
+          SELECT to_char(date_trunc('month', created_time), 'YYYY-MM') AS mois, count(*)::int AS n
+            FROM base GROUP BY 1) x)
+    ) AS r`, p);
+
+  return {
+    periodeMois: mois, departement: department || 'tous',
+    ...r.rows[0].r,
+    note: 'Le departement « Integration Emails » est absent de la copie : Zoho en refuse la lecture au compte lecteur. Ce sont des courriels automatises, pas du soutien.',
+  };
+}
+
 // --- tool registry ---------------------------------------------------------
 // `perm` gates who is even SHOWN the tool; `write` marks the ones that change
 // Zoho and therefore need confirmation + a demo-mode block.
@@ -9657,6 +9865,70 @@ const SOFIA_TOOLS = [
     },
     handler: toolCrmScheduleFollowup,
   },
+
+  // --- soutien technique (Zoho Desk, LECTURE SEULE) ---------------------------------------
+  // Trois de ces outils lisent la copie locale des billets et non Zoho : 126 000 billets et
+  // une API qui ne sait pas agreger rendraient toute question chiffree intenable dans un tour
+  // de conversation. Seul support_read_ticket appelle Zoho, pour un billet a la fois.
+  {
+    name: 'support_find_tickets',
+    perm: 'assistant:support_read',
+    write: false,
+    description: "Find support tickets in the local Zoho Desk copy (126k tickets since 2022). Use this to answer questions about a merchant's support history, a recurring problem, or what is currently open. Returns a ticketId you can pass to support_read_ticket. Prefer support_merchant_profile when the question is about ONE merchant overall rather than about individual tickets.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        merchant: { type: 'string', description: 'Merchant / account name, partial and accent-insensitive.' },
+        keyword: { type: 'string', description: 'Word that must appear in the ticket subject (e.g. printer, MEV, offline).' },
+        issueType: { type: 'string', description: 'Ticket Type: POS Software, POS Hardware, Payments, POS Integration, Deployment, Dispatch.' },
+        months: { type: 'number', description: 'How far back to look, in months. Defaults to 12, max 60.' },
+        openOnly: { type: 'boolean', description: 'Only tickets that are still open.' },
+        limit: { type: 'number', description: 'Max tickets to return (default 25, max 60).' },
+      },
+    },
+    handler: toolSupportFindTickets,
+  },
+  {
+    name: 'support_read_ticket',
+    perm: 'assistant:support_read',
+    write: false,
+    description: 'Read one support ticket in full from Zoho Desk, including its description and up to 12 messages of the conversation (agent and customer). Requires a ticketId from support_find_tickets. Use it when the user asks what actually happened on a ticket, not just how many there were.',
+    input_schema: {
+      type: 'object',
+      properties: { ticketId: { type: 'string', description: 'Numeric ticket id from support_find_tickets.' } },
+      required: ['ticketId'],
+    },
+    handler: toolSupportReadTicket,
+  },
+  {
+    name: 'support_merchant_profile',
+    perm: 'assistant:support_read',
+    write: false,
+    description: "The full picture for one merchant, crossing support with Sales Hub: invoiced revenue, sales rep, ticket count, tickets still open, tickets that dragged past 72 hours, median resolution time, issue types, and whether their subscription was cancelled and why. This is the cross-reference Zoho Desk cannot do on its own — use it for churn-risk and account-review questions.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        merchant: { type: 'string', description: 'Merchant name, partial and accent-insensitive.' },
+        months: { type: 'number', description: 'Window in months for revenue and tickets. Defaults to 12, max 60.' },
+      },
+      required: ['merchant'],
+    },
+    handler: toolSupportMerchantProfile,
+  },
+  {
+    name: 'support_stats',
+    perm: 'assistant:support_read',
+    write: false,
+    description: 'Aggregate support numbers over a period: ticket volume, still-open count, median and 90th-percentile resolution time, breakdown by issue type, by department and by month. Use it for company-level questions rather than looping over tickets.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        months: { type: 'number', description: 'Window in months. Defaults to 12, max 60.' },
+        department: { type: 'string', description: 'Restrict to a department, partial name (e.g. Technical, Customer Success).' },
+      },
+    },
+    handler: toolSupportStats,
+  },
 ];
 
 // --- governance ------------------------------------------------------------
@@ -9810,6 +10082,9 @@ THE APP'S SECTIONS (left sidebar):
 - Services & Pricing Guide: Cluster's pricing reference (SaaS, Integrations & Add-ons, Rental, Menu Build, Installation, Support, Online Ordering, Shipping, On-Site/XPERIO) with a monthly/yearly toggle and a built-in quote builder that totals recurring vs one-time costs. "Integrations & Add-ons" holds the recurring monthly add-ons: the non-Cluster payment-processing integration ($45/mo, +$15 per extra terminal), Cluster KDS ($39/mo), the Aligner kitchen-display integrations ($69 suite / $39 extra screen / $169 unlimited 3+ units) and the third-party integrations (7Shifts, Androbar, Datacandy, Deliverect, Freebees, GGGolf, LIBRO, Mews, Octogone, Piecemeal, PIVOT, Planifico, PUSH, QuickBooks, RapidStock (formerly Rapid Bar), RESTOCK, Sage, UEAT, Wisk) — $19/month each except Freebees, PIVOT and RESTOCK (free) and GGGolf ($59).
 - Proposals: build and send a branded sales proposal (cover + company deck + optional Zoho Books estimate) to a client, with open/click tracking.
 - Partners: the referral-partner program (Moneris and others). Partner staff submit merchant leads through their own portal; a Cluster partner manager reviews each one in the Opportunity Queue, and approving it creates a real Lead in Zoho CRM assigned to a chosen Cluster rep. Sub-tabs: Opportunity Queue (review/approve/reject), Manage Partners, Users, Payouts, Data import, and Statistics. Statistics has two halves — the deal PIPELINE (volume submitted, what is still open, won vs lost, win rate over decided records, and per-partner conversion) and portal USAGE (invitations, activations, logins, dormant accounts). A partner payout is triggered by the deposit date on the Zoho deal, not by a paid invoice.
+- Support (Soutien technique): high-level reports on Zoho Desk tickets — a local copy of ~126k tickets since 2022, refreshed hourly. Sub-tabs: Overview (monthly volume, resolution-time distribution, channels), Issues (Ticket Type, sub-categories, recurring words in subjects), Team (departments and agents), Merchants (who opens the most tickets), and Revenue & churn (tickets crossed with invoiced revenue, plus a churned-vs-active comparison). Two things to know when answering: the measured delay is creation-to-closure, because Zoho only exposes FIRST-RESPONSE time one ticket at a time; and the "Integration Emails" department is absent, because Zoho refuses to serve it to the reader account — it is automated lead email, not support.
+  What the numbers actually say about churn, so you do not overclaim: ticket VOLUME barely separates merchants who left from those who stayed (8.2 vs 6.6 on average over 12 months). What does separate them is tickets that DRAGGED past 72 hours — 1.86 per merchant who left for a competitor and 2.17 for those who stopped using the system, against 0.84 for active merchants. And 61% of cancellations are a business closure or a change of owner, which support cannot influence at all. Point people at slow tickets, not at ticket counts.
+- The Pass (La Passe): the merchant referral program. A merchant refers another merchant; the credit is floored when the referral is submitted, capped at the tier when the new merchant goes live, then the final amount is confirmed by hand (its own permission) before accounting is notified.
 - What each user sees depends on their permissions — some sections may not be visible to everyone.
 
 THE COMMISSION MODEL:
