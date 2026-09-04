@@ -176,6 +176,7 @@ const PERMISSION_CATALOG = [
 
   // Soutien technique (rapports Zoho Desk). Audience voulue : la direction.
   { key: 'support:view_reports',       label: 'View the support reports (Zoho Desk volume, delays, topics)',    category: 'Support' },
+  { key: 'support:manage_exclusions',  label: 'Maintain the non-merchant account list (processors, internal)',  category: 'Support' },
 
   // Leads (SH-20) — la couche d'accueil AVANT Zoho. `review` est la seule cle qui fasse
   // entrer quoi que ce soit dans le CRM et partir des courriels a un marchand : elle se
@@ -485,6 +486,32 @@ const CRM_SYSTEM_KEY = 'crm_system_account';
 // Meme raison d'etre, et meme raison d'etre declaree ICI : le compte sous lequel
 // l'application lit Zoho DESK. Voir la note de CRM_SYSTEM_KEY juste au-dessus.
 const DESK_SYSTEM_KEY = 'desk_system_account';
+
+// Declarees ICI et non dans le bloc « SOUTIEN » plus bas : initializeDatabase() tourne avant
+// la fin de l'evaluation du module, donc une const declaree apres serait en zone morte (TDZ).
+const SH_NORM_SQL = `
+  CREATE OR REPLACE FUNCTION sh_norm_name(t text) RETURNS text AS $NORM$
+    SELECT regexp_replace(
+             regexp_replace(
+               lower(translate(COALESCE(t, ''),
+                     'àâäéèêëîïôöùûüçÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ',
+                     'aaaeeeeiioouuucAAAEEEEIIOOUUUC')),
+               '\\y(inc|ltd|ltee|llc|corp|co|enr|senc|srl|sec|the|le|la|les)\\y', '', 'g'),
+             '[^a-z0-9]', '', 'g')
+  $NORM$ LANGUAGE sql IMMUTABLE;
+`;
+
+// Les comptes Desk qui ne sont PAS des marchands : processeurs, partenaires, entites internes.
+// Sans cette liste, un classement par revenu est domine par Adyen (785 895 $, zero billet) et
+// par « Cluster », « no business related », « Cluster Test ». Modifiable dans l'interface
+// plutot que codee en dur — c'est une connaissance metier qui bouge.
+const SUPPORT_EXCLUS_DEFAUT = [
+  'Cluster', 'cluster', 'Cluster Test', 'Cluster - General Inquiry', 'Cluster USA AR Adjusting',
+  'no business related', 'No account', 'Adyen Canada Limited', 'One Solution Payments',
+  'One Solution', 'Global Payments', 'First Data', 'Revenu Quebec', 'Sekure Payment Experts',
+  'Microsale', 'Xperio', 'Deliverect', 'Atom Growth Inc.', 'Lafleur Head Office',
+];
+
 // L'organisation Desk, decouverte une fois puis epinglee : l'API Desk exige un en-tete
 // `orgId` sur CHAQUE appel, et la redecouvrir a chaque requete couterait un aller-retour.
 const DESK_ORG_KEY = 'desk_org_id';
@@ -2521,6 +2548,39 @@ async function initializeDatabase() {
       CREATE TABLE IF NOT EXISTS desk_agents      (id VARCHAR(64) PRIMARY KEY, name VARCHAR(255));
       CREATE TABLE IF NOT EXISTS desk_accounts    (id VARCHAR(64) PRIMARY KEY, name VARCHAR(500));
     `);
+
+    // Normalisation de nom PARTAGEE : la seule cle qui relie un compte Zoho Desk a un client
+    // de Sales Hub, Desk n'exposant aucun identifiant commun avec Zoho Books. IMMUTABLE pour
+    // etre indexable, et definie une seule fois — deux variantes donneraient deux taux
+    // d'appariement selon l'ecran.
+    await pool.query(SH_NORM_SQL);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_invoices_norm_customer ON invoices (sh_norm_name(customer_name));
+      CREATE INDEX IF NOT EXISTS idx_desk_accounts_norm     ON desk_accounts (sh_norm_name(name));
+      CREATE TABLE IF NOT EXISTS support_excluded_accounts (
+        name     VARCHAR(500) PRIMARY KEY,
+        added_by VARCHAR(255),
+        added_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      ALTER TABLE saas_churn_events ADD COLUMN IF NOT EXISTS customer_name VARCHAR(500);
+      ALTER TABLE saas_churn_events ADD COLUMN IF NOT EXISTS customer_id   VARCHAR(64);
+      ALTER TABLE saas_churn_events ADD COLUMN IF NOT EXISTS cancel_reason VARCHAR(255);
+    `);
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_churn_norm_customer ON saas_churn_events (sh_norm_name(customer_name))`);
+
+    // Amorce idempotente de la liste d'exclusion : gardee par une cle sync_state pour ne
+    // JAMAIS re-inserer un nom que quelqu'un a volontairement retire.
+    if (!(await pool.query(`SELECT 1 FROM sync_state WHERE key = 'support_exclus_seed'`)).rowCount) {
+      for (const nom of SUPPORT_EXCLUS_DEFAUT) {
+        await pool.query(
+          `INSERT INTO support_excluded_accounts (name, added_by) VALUES ($1, 'seed')
+             ON CONFLICT (name) DO NOTHING`, [nom]);
+      }
+      await pool.query(
+        `INSERT INTO sync_state (key, value, updated_at) VALUES ('support_exclus_seed', $1, CURRENT_TIMESTAMP)
+           ON CONFLICT (key) DO NOTHING`, [new Date().toISOString()]);
+    }
 
     // Zentact merchants — stores all merchant accounts pulled from Zentact API.
     // activated_at is stamped the first time we see status = ACTIVE (never overwritten).
@@ -13559,10 +13619,18 @@ function startAutoSync() {
     // en incremental. Sans ca la page n'aurait que 7 jours de donnees et il faudrait qu'un
     // humain pense a cliquer un bouton pour qu'elle devienne utile. Garde par
     // desk_backfill_done, donc ca ne se reproduit pas a chaque redemarrage.
+    // Le pont resiliation -> client : QUOTIDIEN, pas horaire. Trois listes Zoho Billing
+    // suffisent (aucun appel par abonnement) et l'historique des resiliations bouge peu.
+    let dernierPontChurn = 0;
     const runDesk = async () => {
       try {
         const dejaFait = await deskEtatLire('desk_backfill_done');
         await syncDeskTickets({ mode: dejaFait ? 'incremental' : 'backfill' });
+        if (Date.now() - dernierPontChurn > 24 * 3600 * 1000) {
+          dernierPontChurn = Date.now();
+          await remplirClientsChurn().catch((e) =>
+            console.warn('[churn-clients] echec :', e.message));
+        }
       } catch (e) {
         // desk_not_connected inclus : tant que personne n'a connecte Desk, on reessaiera
         // simplement a l'heure suivante.
@@ -14629,6 +14697,238 @@ app.get('/api/support/sync-status', authenticateToken, async (req, res) => {
     rattrapageTermine: await deskEtatLire('desk_backfill_done'),
     avancement: await deskEtatLire('desk_backfill_progress'),
   });
+});
+
+// ============================================================================
+// SOUTIEN × SALES HUB — CROISEMENT REVENUS / FRICTION, ET SIGNAUX DE DEPART
+// ============================================================================
+// La jointure entre un compte Zoho Desk et un client de Sales Hub se fait par le NOM
+// normalise. Mesure du 2026-09-03 : 2 898 comptes Desk sur 3 852 porteurs de billets se
+// relient a un client facture, soit 75 % des comptes et 74 % des billets. C'est la meilleure
+// cle disponible — Desk ne partage aucun identifiant avec Zoho Books.
+//
+// Ce que les donnees ont dit, et qui dicte la conception :
+//   - le VOLUME de billets ne distingue presque pas les partants des restants
+//     (8,23 contre 6,55 en moyenne sur 12 mois) ;
+//   - les billets qui TRAINENT, eux, distinguent nettement : 1,86 billet de plus de 72 h par
+//     marchand parti chez un concurrent, 2,17 chez ceux qui cessent d'utiliser le systeme,
+//     contre 0,84 chez les actifs ;
+//   - 61 % des resiliations sont une fermeture de commerce ou un changement de proprietaire,
+//     donc hors de portee du service.
+// La page met donc en avant les billets LENTS, pas le decompte brut.
+
+// Normalisation partagee. Declaree comme fonction SQL IMMUTABLE pour qu'elle soit indexable
+// et surtout pour qu'il n'existe QU'UNE definition : deux variantes divergentes donneraient
+// deux taux d'appariement differents selon l'ecran.
+// ── Le pont resiliation → client ───────────────────────────────────────────────────────────
+// Zoho Billing renvoie DEJA customer_name et le motif d'annulation sur chaque abonnement
+// resilie : le scanner hebdomadaire les recevait et les jetait. Ce passage ne fait donc AUCUN
+// appel par abonnement — trois listes, une par organisation de facturation.
+async function remplirClientsChurn() {
+  const { accessToken, apiDomain } = await getAdminBooksAuth();
+  let vus = 0, ecrits = 0;
+  for (const orgId of ZOHO_BILLING_ORG_IDS) {
+    let subs;
+    try {
+      subs = await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.CANCELLED');
+    } catch (e) {
+      console.warn(`[churn-clients] org ${orgId} illisible :`, e.message);
+      continue;
+    }
+    const lignes = subs.filter((s) => s.subscription_number);
+    for (let i = 0; i < lignes.length; i += 100) {
+      const lot = lignes.slice(i, i + 100);
+      const vals = [];
+      const ph = lot.map((s, k) => {
+        const d = k * 6;
+        vals.push(
+          String(s.subscription_number).trim(),
+          orgId,
+          s.customer_name || null,
+          s.customer_id ? String(s.customer_id) : null,
+          s.cf_reason_for_cancel_formatted || s.cf_reason_for_cancel || null,
+          s.cancelled_at || null,
+        );
+        return `($${d + 1},$${d + 2},$${d + 3},$${d + 4},$${d + 5},$${d + 6}::date)`;
+      });
+      // On ne touche PAS aux colonnes que possede le scanner de hausses de prix ; on ne fait
+      // qu'ajouter l'identite du client et le motif. cancelled_at n'est ecrit que s'il manque.
+      await pool.query(
+        `INSERT INTO saas_churn_events
+           (subscription_number, org_id, customer_name, customer_id, cancel_reason, cancelled_at)
+         VALUES ${ph.join(',')}
+         ON CONFLICT (subscription_number) DO UPDATE SET
+           customer_name = EXCLUDED.customer_name,
+           customer_id   = EXCLUDED.customer_id,
+           cancel_reason = EXCLUDED.cancel_reason,
+           cancelled_at  = COALESCE(saas_churn_events.cancelled_at, EXCLUDED.cancelled_at)`,
+        vals);
+      ecrits += lot.length;
+    }
+    vus += subs.length;
+  }
+  console.log(`[churn-clients] ${ecrits} abonnements resilies relies a un client (${vus} vus)`);
+  return { vus, ecrits };
+}
+
+// ── Le rapport ─────────────────────────────────────────────────────────────────────────────
+async function soutienMarchands({ de, a, revenuMin = 0, limite = 200 }) {
+  const exclus = (await pool.query('SELECT name FROM support_excluded_accounts')).rows.map((r) => r.name);
+  const p = [de, a, exclus, revenuMin, limite];
+
+  const q = await pool.query(`
+    WITH rev AS (
+      SELECT sh_norm_name(customer_name) AS k,
+             max(customer_name) AS nom,
+             sum(total)::numeric AS revenu,
+             sum(COALESCE(saas_amount, 0))::numeric AS saas,
+             max(salesperson_name) AS rep
+        FROM invoices
+       WHERE date >= $1 AND date < $2
+         AND customer_name IS NOT NULL
+         AND status NOT IN ('deleted', 'void', 'draft')
+       GROUP BY 1
+      HAVING sh_norm_name(customer_name) <> ''
+         AND sh_norm_name(customer_name) <> ALL (SELECT sh_norm_name(x) FROM unnest($3::text[]) AS x)
+    ),
+    bil AS (
+      SELECT sh_norm_name(ac.name) AS k,
+             count(*)::int AS billets,
+             count(*) FILTER (WHERE t.closed_time IS NULL)::int AS ouverts,
+             -- Le signal qui distingue vraiment les partants : les billets qui TRAINENT.
+             count(*) FILTER (WHERE EXTRACT(EPOCH FROM (t.closed_time - t.created_time)) / 3600.0 > 72)::int AS lents,
+             round(percentile_cont(0.5) WITHIN GROUP (
+               ORDER BY EXTRACT(EPOCH FROM (t.closed_time - t.created_time)) / 3600.0)::numeric, 1) AS mediane_h,
+             max(t.created_time) AS dernier,
+             mode() WITHIN GROUP (ORDER BY t.issue_type) AS type_dominant
+        FROM desk_tickets t JOIN desk_accounts ac ON ac.id = t.account_id
+       WHERE t.created_time >= $1 AND t.created_time < $2 AND NOT t.is_spam
+       GROUP BY 1
+    )
+    SELECT json_build_object(
+      'marchands', (SELECT COALESCE(json_agg(x ORDER BY x.lents DESC NULLS LAST, x.billets DESC), '[]'::json) FROM (
+          SELECT rev.nom, round(rev.revenu, 0)::float AS revenu, round(rev.saas, 0)::float AS saas,
+                 rev.rep,
+                 COALESCE(b.billets, 0) AS billets, COALESCE(b.ouverts, 0) AS ouverts,
+                 COALESCE(b.lents, 0) AS lents, b.mediane_h, b.dernier, b.type_dominant,
+                 CASE WHEN COALESCE(b.billets, 0) > 0
+                      THEN round(rev.revenu / b.billets, 0)::float END AS revenu_par_billet
+            FROM rev LEFT JOIN bil b ON b.k = rev.k
+           WHERE rev.revenu >= $4
+           ORDER BY COALESCE(b.lents, 0) DESC, COALESCE(b.billets, 0) DESC
+           LIMIT $5) x),
+      'resume', (SELECT json_build_object(
+          'clients', count(*),
+          'apparies', count(*) FILTER (WHERE b.billets IS NOT NULL),
+          'revenu', round(sum(rev.revenu), 0)::float,
+          'billets', COALESCE(sum(b.billets), 0),
+          'lents', COALESCE(sum(b.lents), 0))
+        FROM rev LEFT JOIN bil b ON b.k = rev.k WHERE rev.revenu >= $4)
+    ) AS r`, p);
+
+  return { ...q.rows[0].r, exclus };
+}
+
+// Comparaison partants / restants. C'est ce tableau qui repond a « le soutien fait-il partir
+// des clients », et il faut qu'il puisse repondre NON.
+async function soutienChurn() {
+  const q = await pool.query(`
+    WITH res AS (
+      SELECT sh_norm_name(customer_name) AS k,
+             min(cancelled_at) AS fin,
+             COALESCE(min(cancel_reason), 'non renseigne') AS motif
+        FROM saas_churn_events
+       WHERE customer_name IS NOT NULL AND cancelled_at IS NOT NULL
+       GROUP BY 1
+    ),
+    resBil AS (
+      SELECT r.k, r.motif,
+             count(t.id) FILTER (WHERE t.created_time >= r.fin - interval '12 months')::int AS b12,
+             count(t.id) FILTER (WHERE t.created_time >= r.fin - interval '3 months')::int AS b3,
+             count(t.id) FILTER (WHERE t.created_time >= r.fin - interval '12 months'
+                                   AND EXTRACT(EPOCH FROM (t.closed_time - t.created_time)) / 3600.0 > 72)::int AS lents
+        FROM res r
+        JOIN desk_accounts ac ON sh_norm_name(ac.name) = r.k
+        LEFT JOIN desk_tickets t ON t.account_id = ac.id AND NOT t.is_spam AND t.created_time < r.fin
+       GROUP BY 1, 2
+    ),
+    actifs AS (
+      SELECT DISTINCT sh_norm_name(i.customer_name) AS k
+        FROM invoices i
+       WHERE i.date >= now() - interval '12 months' AND i.customer_name IS NOT NULL
+         AND i.status NOT IN ('deleted', 'void', 'draft')
+         AND sh_norm_name(i.customer_name) <> ''
+         AND sh_norm_name(i.customer_name) NOT IN (SELECT k FROM res)
+    ),
+    actBil AS (
+      SELECT ac2.k,
+             count(t.id) FILTER (WHERE t.created_time >= now() - interval '12 months')::int AS b12,
+             count(t.id) FILTER (WHERE t.created_time >= now() - interval '3 months')::int AS b3,
+             count(t.id) FILTER (WHERE t.created_time >= now() - interval '12 months'
+                                   AND EXTRACT(EPOCH FROM (t.closed_time - t.created_time)) / 3600.0 > 72)::int AS lents
+        FROM actifs ac2 JOIN desk_accounts a ON sh_norm_name(a.name) = ac2.k
+        LEFT JOIN desk_tickets t ON t.account_id = a.id AND NOT t.is_spam
+       GROUP BY 1
+    )
+    SELECT json_build_object(
+      'parMotif', (SELECT COALESCE(json_agg(x ORDER BY x.marchands DESC), '[]'::json) FROM (
+          SELECT motif, count(*)::int AS marchands,
+                 round(avg(b12)::numeric, 2)::float AS moy12,
+                 percentile_cont(0.5) WITHIN GROUP (ORDER BY b12)::float AS med12,
+                 round(avg(b3)::numeric, 2)::float AS moy3,
+                 round(avg(lents)::numeric, 2)::float AS moy_lents
+            FROM resBil GROUP BY 1 HAVING count(*) >= 20) x),
+      'temoin', (SELECT json_build_object(
+          'marchands', count(*),
+          'moy12', round(avg(b12)::numeric, 2)::float,
+          'med12', percentile_cont(0.5) WITHIN GROUP (ORDER BY b12)::float,
+          'moy3', round(avg(b3)::numeric, 2)::float,
+          'moy_lents', round(avg(lents)::numeric, 2)::float)
+        FROM actBil),
+      'motifs', (SELECT COALESCE(json_agg(x ORDER BY x.n DESC), '[]'::json) FROM (
+          SELECT COALESCE(cancel_reason, 'non renseigne') AS motif, count(*)::int AS n
+            FROM saas_churn_events WHERE cancelled_at IS NOT NULL GROUP BY 1) x)
+    ) AS r`);
+  return q.rows[0].r;
+}
+
+// GET /api/support/merchants — le croisement revenus × friction + les signaux de depart.
+app.get('/api/support/merchants', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'support:view_reports'))) return;
+  try {
+    const mois = Math.min(Math.max(parseInt(req.query.months) || 12, 1), 60);
+    const fin = new Date();
+    const de = new Date(Date.UTC(fin.getUTCFullYear(), fin.getUTCMonth() - mois + 1, 1)).toISOString();
+    const a = new Date(fin.getTime() + 86400000).toISOString();
+    const revenuMin = Math.max(0, parseFloat(req.query.minRevenue) || 0);
+
+    const [marchands, churn] = await Promise.all([
+      soutienMarchands({ de, a, revenuMin }),
+      req.query.churn === '0' ? Promise.resolve(null) : soutienChurn(),
+    ]);
+    res.json({ periode: { de, a, mois, revenuMin }, ...marchands, churn });
+  } catch (e) {
+    console.error('[soutien] croisement echoue :', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Liste d'exclusion : ajouter / retirer un compte non marchand.
+app.post('/api/support/excluded-accounts', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'support:manage_exclusions'))) return;
+  const nom = String(req.body?.name || '').trim();
+  if (!nom) return res.status(400).json({ error: 'name requis' });
+  await pool.query(
+    `INSERT INTO support_excluded_accounts (name, added_by) VALUES ($1, $2)
+       ON CONFLICT (name) DO NOTHING`, [nom, req.user.email]);
+  res.json({ ok: true, name: nom });
+});
+
+app.delete('/api/support/excluded-accounts', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'support:manage_exclusions'))) return;
+  const nom = String(req.query?.name || '').trim();
+  const r = await pool.query('DELETE FROM support_excluded_accounts WHERE name = $1', [nom]);
+  res.json({ ok: true, supprime: r.rowCount });
 });
 
 // ============================================================================
