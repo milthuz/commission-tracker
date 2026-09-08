@@ -29959,7 +29959,20 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
       [repName, periodDate]
     )).rows;
     const reviewTotal = reviewRows.reduce((a, r) => a + (r.amount || 0), 0);
-    const total      = invRows.reduce((a, r) => a + (r.commission || 0), 0) + bonusTotal + perfBonus + manualTotal + reviewTotal;
+    // Ajustements libres (±) de la periode. Ils MANQUAIENT ici alors que l'autre chemin de
+    // commit (snapshotAppGeneratedStub) les prend : deux chemins, deux bulletins differents
+    // pour la meme situation. Un bulletin fige est ensuite la SEULE source de l'envoi a la paye
+    // — `payrollDataForMonth` ne relit pas les ajustements pour un vendeur deja fige — donc
+    // l'oubli sortait en argent. Le 2026-09-08, une reprise de 189,30 $ creee 6 minutes avant
+    // le commit d'Amy Spicer n'est jamais partie : 181,80 $ verses en trop.
+    const adjRows = (await client.query(
+      `SELECT amount::float AS amount, description FROM commission_adjustments
+        WHERE rep_name = $1 AND target_period = $2::date AND invoice_number IS NULL
+        ORDER BY created_at`,
+      [repName, periodDate]
+    )).rows;
+    const adjTotal = adjRows.reduce((a, r) => a + (r.amount || 0), 0);
+    const total      = invRows.reduce((a, r) => a + (r.commission || 0), 0) + bonusTotal + perfBonus + manualTotal + reviewTotal + adjTotal;
 
     // Idempotent re-commit: drop any prior app-generated stub for this rep+period (cascades).
     await client.query(
@@ -30011,6 +30024,13 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
         `INSERT INTO commission_bonuses (import_id, rep_name, bonus_type, merchant_name, amount, paid_for_period)
          VALUES ($1, $2, 'review', $3, $4, $5::date)`,
         [imp.id, repName, reviewLabel(r), r.amount, periodDate]
+      );
+    }
+    for (const a of adjRows) {
+      await client.query(
+        `INSERT INTO commission_bonuses (import_id, rep_name, bonus_type, merchant_name, amount, paid_for_period)
+         VALUES ($1, $2, 'adjustment', $3, $4, $5::date)`,
+        [imp.id, repName, a.description || null, a.amount, periodDate]
       );
     }
     if (perfBonus > 0) {
