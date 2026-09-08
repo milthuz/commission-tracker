@@ -28041,6 +28041,10 @@ app.get('/api/commissions/report', authenticateToken, async (req, res) => {
       baseSalary,
       canViewSalary,
       probation: probationInfo(spResult.rows[0]?.hire_date),
+      // La date d'embauche sert au bandeau de remuneration : le salaire de base ne peut pas
+      // s'accumuler depuis le 1er janvier pour quelqu'un arrive en cours d'annee.
+      hireDate: spResult.rows[0]?.hire_date
+        ? new Date(spResult.rows[0].hire_date).toISOString().slice(0, 10) : null,
       year: targetYear,
       groupBy,
       months,
