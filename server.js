@@ -95,6 +95,7 @@ const PERMISSION_CATALOG = [
   { key: 'report:annual_reconciliation', label: 'View the annual reconciliation report (paid vs calculated)', category: 'Commission Report' },
   { key: 'report:adjustments',         label: 'Manage commission adjustments & reconciliation suggestions', category: 'Commission Report' },
   { key: 'report:quota_review',        label: 'Review quota-gated (forfeited) commissions',  category: 'Commission Report' },
+  { key: 'reviews:manage',             label: 'Record, assign and approve Google review payouts', category: 'Commission Report' },
   { key: 'pass:manage',                label: 'Configure The Pass (merchant referral program)', category: 'The Pass' },
   { key: 'pass:referrals',             label: 'Track The Pass referrals and mark them live',    category: 'The Pass' },
   { key: 'pass:credit_approve',        label: 'Confirm the final credit amount and notify accounting (money)', category: 'The Pass' },
@@ -906,6 +907,51 @@ async function initializeDatabase() {
         dismissed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    // PRIME PAR AVIS GOOGLE (openers sur la route, 2026-09-08). Deux colonnes de plus sur
+    // salespeople plutot qu'une « categorie » de vendeur : l'application decrit deja TOUTE
+    // remuneration par des interrupteurs par personne (base_salary, commission_rate,
+    // signup_bonus_*, processing_bonus_enabled, annual_bonus_enabled). Un opener n'est donc pas
+    // un type a part, c'est une combinaison d'interrupteurs. Une categorie creerait une seconde
+    // facon de decrire une paie, et les deux divergeraient au premier profil hybride.
+    await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS review_bonus_enabled BOOLEAN DEFAULT false`);
+    await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS review_bonus_amount NUMERIC(10,2) DEFAULT 0`);
+
+    // Un avis Google payable. `source` distingue la saisie manuelle (phase 0) de la lecture
+    // automatique par l'API Google Business Profile (phase 1, en attente de l'octroi d'acces) :
+    // l'ecran d'attribution sera le meme, seule la provenance change.
+    //
+    // `amount` et `period` sont FIGES a l'approbation, jamais recalcules. Le montant est lu a ce
+    // moment-la dans salespeople.review_bonus_amount — la lecon du bonus d'inscription, qui
+    // lisait une valeur perimee au lieu de la configuration vivante.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS google_reviews (
+        id            SERIAL PRIMARY KEY,
+        external_id   VARCHAR(255),
+        source        VARCHAR(20)  NOT NULL DEFAULT 'manual',
+        reviewer_name VARCHAR(255),
+        merchant_name VARCHAR(255),
+        rating        INT,
+        review_date   DATE,
+        review_url    TEXT,
+        rep_name      VARCHAR(255),
+        amount        NUMERIC(10,2),
+        status        VARCHAR(20)  NOT NULL DEFAULT 'pending',
+        period        DATE,
+        note          TEXT,
+        created_by    VARCHAR(255),
+        created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        approved_by   VARCHAR(255),
+        approved_at   TIMESTAMP
+      );
+    `);
+    // Un avis Google ne peut entrer qu'une fois — la garde anti-double-paiement cote base, pas
+    // seulement cote ecran. Partielle : la saisie manuelle n'a pas d'identifiant Google.
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_google_reviews_ext
+                        ON google_reviews(external_id) WHERE external_id IS NOT NULL`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_google_reviews_paie
+                        ON google_reviews(rep_name, period) WHERE status = 'approved'`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_google_reviews_statut ON google_reviews(status, review_date DESC)`);
+
     // Payroll send log: one row per (rep, pay month) each time payroll is emailed, so the
     // preview can show a "Sent" badge. Latest sent_at per rep+period is what's displayed.
     await pool.query(`
@@ -24827,6 +24873,168 @@ app.put('/api/salespeople/:name/annual-bonus', authenticateToken, async (req, re
   }
 });
 
+// ============================================================================
+// PRIME PAR AVIS GOOGLE — openers sur la route
+// ============================================================================
+// Phase 0 : saisie manuelle, attribution, approbation. La phase 1 (en attente de l'octroi
+// d'acces Google) remplira la MEME table depuis l'API Business Profile ; l'ecran d'attribution
+// ne changera pas, car l'API dit qui a ECRIT l'avis mais jamais qui l'a OBTENU.
+
+// Le libelle d'une ligne « avis » sur un bulletin. Le marchand d'abord quand il est connu — il
+// situe la visite — puis l'auteur, qui est ce qu'on peut verifier sur la fiche Google. UNE seule
+// definition : ce libelle est fige dans commission_bonuses au commit ET calcule a la volee sur un
+// bulletin genere, et deux versions donneraient deux libelles pour le meme avis.
+function reviewLabel(r) {
+  const parts = [r.merchant_name, r.reviewer_name].map(x => String(x || '').trim()).filter(Boolean);
+  return parts.join(' — ') || null;
+}
+
+// PUT /api/salespeople/:name/review-bonus { enabled, amount } — l'interrupteur « opener ».
+app.put('/api/salespeople/:name/review-bonus', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'reviews:manage'))) return;
+  const enabled = req.body.enabled === true;
+  // Borne serveur : un montant venu du navigateur ne doit pouvoir etre ni negatif ni absurde.
+  // safeRate clampe ET conserve un 0 legitime au lieu de le prendre pour « absent ».
+  const amount = safeRate(req.body.amount, 0, 1000);
+  try {
+    const r = await pool.query(
+      `UPDATE salespeople SET review_bonus_enabled = $1, review_bonus_amount = $2,
+              updated_at = CURRENT_TIMESTAMP WHERE name = $3 RETURNING name`,
+      [enabled, amount, req.params.name]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Salesperson not found' });
+    res.json({ success: true, enabled, amount });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to update review bonus', details: e.message });
+  }
+});
+
+// GET /api/reviews?status=&rep=&period=YYYY-MM — la file d'attribution et l'historique.
+app.get('/api/reviews', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'reviews:manage'))) return;
+  const where = [], vals = [];
+  if (req.query.status) { vals.push(String(req.query.status)); where.push(`status = $${vals.length}`); }
+  if (req.query.rep)    { vals.push(String(req.query.rep));    where.push(`rep_name = $${vals.length}`); }
+  if (/^\d{4}-\d{2}$/.test(String(req.query.period || ''))) {
+    vals.push(`${req.query.period}-01`); where.push(`period = $${vals.length}::date`);
+  }
+  try {
+    const rows = (await pool.query(
+      `SELECT id, external_id, source, reviewer_name, merchant_name, rating,
+              review_date::text AS review_date, review_url, rep_name, amount::float AS amount,
+              status, to_char(period,'YYYY-MM') AS period, note,
+              created_by, created_at, approved_by, approved_at
+         FROM google_reviews ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+        ORDER BY (status = 'pending') DESC, review_date DESC NULLS LAST, id DESC
+        LIMIT 500`, vals)).rows;
+    // TOUS les vendeurs actifs, avec leur configuration de prime. L'ecran s'en sert deux fois :
+    // le menu d'attribution ne garde que ceux dont la prime est activee, et la carte de
+    // configuration a besoin des autres pour pouvoir les activer.
+    const reps = (await pool.query(
+      `SELECT name, COALESCE(review_bonus_enabled, false) AS enabled,
+              COALESCE(review_bonus_amount, 0)::float AS amount
+         FROM salespeople WHERE is_active = true ORDER BY name`)).rows;
+    res.json({ reviews: rows, reps, openers: reps.filter(r => r.enabled) });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load reviews', details: e.message });
+  }
+});
+
+// POST /api/reviews — saisir un avis a la main (phase 0).
+// Refuse un doublon evident (meme auteur, meme date) sauf `allowDuplicate` explicite : deux
+// avis identiques le meme jour existent, mais c'est bien plus souvent une double saisie — et
+// ici une double saisie, c'est un double paiement.
+app.post('/api/reviews', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'reviews:manage'))) return;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  const reviewer = String(req.body.reviewerName || '').trim().slice(0, 255);
+  const merchant = String(req.body.merchantName || '').trim().slice(0, 255) || null;
+  const date     = String(req.body.reviewDate || '').trim();
+  if (!reviewer) return res.status(400).json({ error: 'reviewerName required' });
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'reviewDate (YYYY-MM-DD) required' });
+  const rating = req.body.rating == null ? null : (Math.max(1, Math.min(5, parseInt(req.body.rating) || 0)) || null);
+  try {
+    if (req.body.allowDuplicate !== true) {
+      const dup = (await pool.query(
+        `SELECT id, rep_name, status FROM google_reviews
+          WHERE LOWER(reviewer_name) = LOWER($1) AND review_date = $2::date LIMIT 1`,
+        [reviewer, date])).rows[0];
+      if (dup) return res.status(409).json({ error: 'duplicate', existing: dup });
+    }
+    const row = (await pool.query(
+      `INSERT INTO google_reviews (source, reviewer_name, merchant_name, rating, review_date, review_url, note, created_by)
+       VALUES ('manual', $1, $2, $3, $4::date, $5, $6, $7) RETURNING id`,
+      [reviewer, merchant, rating, date, String(req.body.reviewUrl || '').trim() || null,
+       String(req.body.note || '').trim().slice(0, 2000) || null, actor])).rows[0];
+    res.json({ success: true, id: row.id });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to record review', details: e.message });
+  }
+});
+
+// PATCH /api/reviews/:id — attribuer a un opener et approuver, ou rejeter.
+// Body: { status: 'approved'|'rejected'|'pending', repName, period: 'YYYY-MM' }
+//
+// LE MONTANT NE VIENT JAMAIS DU CORPS DE LA REQUETE. Il est lu a l'approbation dans la
+// configuration VIVANTE du vendeur (salespeople.review_bonus_amount), puis FIGE dans la ligne.
+// C'est la lecon du bonus d'inscription, qui servait une valeur par defaut perimee au lieu de
+// la configuration courante.
+app.patch('/api/reviews/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'reviews:manage'))) return;
+  const id = parseInt(req.params.id);
+  if (!id) return res.status(400).json({ error: 'bad id' });
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  const status = ['approved', 'rejected', 'pending'].includes(req.body.status) ? req.body.status : null;
+  if (!status) return res.status(400).json({ error: 'status must be approved, rejected or pending' });
+  try {
+    if (status !== 'approved') {
+      // Retour en arriere : on EFFACE le montant et la periode figes. Sans ca, un avis rejete
+      // continuerait d'etre compte sur un bulletin, puisque la lecture filtre sur la periode.
+      const r = await pool.query(
+        `UPDATE google_reviews SET status = $2, amount = NULL, period = NULL,
+                approved_by = NULL, approved_at = NULL WHERE id = $1 RETURNING id`, [id, status]);
+      if (!r.rowCount) return res.status(404).json({ error: 'not found' });
+      return res.json({ success: true, status });
+    }
+    const repName = String(req.body.repName || '').trim();
+    if (!repName) return res.status(400).json({ error: 'repName required to approve' });
+    const now = new Date();
+    const period = /^\d{4}-\d{2}$/.test(String(req.body.period || ''))
+      ? `${req.body.period}-01`
+      : `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+    const sp = (await pool.query(
+      `SELECT review_bonus_enabled, review_bonus_amount::float AS amount FROM salespeople WHERE name = $1`,
+      [repName])).rows[0];
+    if (!sp) return res.status(404).json({ error: `Unknown salesperson: ${repName}` });
+    if (sp.review_bonus_enabled !== true) return res.status(400).json({ error: `${repName}: prime par avis desactivee` });
+    const amount = sp.amount || 0;
+    if (amount <= 0) return res.status(400).json({ error: `${repName}: montant par avis a 0 $` });
+    const r = await pool.query(
+      `UPDATE google_reviews
+          SET rep_name = $2, amount = $3, period = $4::date, status = 'approved',
+              approved_by = $5, approved_at = CURRENT_TIMESTAMP
+        WHERE id = $1 RETURNING id`, [id, repName, amount, period, actor]);
+    if (!r.rowCount) return res.status(404).json({ error: 'not found' });
+    logActivity('rep_pay', repName, 'review_approved',
+      `Avis Google approuve (${amount} $) sur la paie de ${String(period).slice(0, 7)}`, actor);
+    res.json({ success: true, repName, amount, period: String(period).slice(0, 7) });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to update review', details: e.message });
+  }
+});
+
+// DELETE /api/reviews/:id — retirer une saisie erronee.
+app.delete('/api/reviews/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'reviews:manage'))) return;
+  try {
+    const r = await pool.query(`DELETE FROM google_reviews WHERE id = $1 RETURNING id`, [parseInt(req.params.id)]);
+    if (!r.rowCount) return res.status(404).json({ error: 'not found' });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/bonus-tiers — current monthly + annual bonus tiers (config).
 app.get('/api/bonus-tiers', authenticateToken, async (req, res) => {
   try {
@@ -28108,13 +28316,20 @@ async function snapshotAppGeneratedStub(repName, year, month, actor) {
     `SELECT amount::float AS amount, description FROM manual_bonuses WHERE rep_name = $1 AND period = $2::date`,
     [repName, periodDate])).rows;
   const manualTotal = manualRows.reduce((a, m) => a + (m.amount || 0), 0);
+  // Avis Google approuves pour cette periode. Le montant a ete FIGE a l'approbation : on le relit
+  // tel quel, on ne le recalcule jamais depuis la configuration courante du vendeur.
+  const reviewRows = (await pool.query(
+    `SELECT amount::float AS amount, reviewer_name, merchant_name FROM google_reviews
+      WHERE rep_name = $1 AND period = $2::date AND status = 'approved' ORDER BY id`,
+    [repName, periodDate])).rows;
+  const reviewTotal = reviewRows.reduce((a, r) => a + (r.amount || 0), 0);
   // Free-form (±) adjustments (overpayment deductions etc.) — part of the committed total.
   const adjRows = (await pool.query(
     `SELECT amount::float AS amount, description FROM commission_adjustments
      WHERE rep_name = $1 AND target_period = $2::date AND invoice_number IS NULL`,
     [repName, periodDate])).rows;
   const adjTotal = adjRows.reduce((a, m) => a + (m.amount || 0), 0);
-  const total = invRows.reduce((a, r) => a + (r.commission || 0), 0) + bonusTotal + perfBonus + manualTotal + adjTotal;
+  const total = invRows.reduce((a, r) => a + (r.commission || 0), 0) + bonusTotal + perfBonus + manualTotal + adjTotal + reviewTotal;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -28127,7 +28342,7 @@ async function snapshotAppGeneratedStub(repName, year, month, actor) {
          (filename, rep_name, paid_for_period, imported_by, invoices_marked, invoices_skipped,
           invoices_not_found, signup_bonuses_count, signup_bonuses_amount, monthly_bonus_amount, total_amount, raw_summary)
        VALUES ($1, $2, $3::date, $4, $5, 0, 0, $6, $7, $8, $9, $10::jsonb) RETURNING id`,
-      [filename, repName, periodDate, actor, invRows.length, bonusRows.length, bonusTotal, perfBonus + manualTotal + adjTotal, total,
+      [filename, repName, periodDate, actor, invRows.length, bonusRows.length, bonusTotal, perfBonus + manualTotal + adjTotal + reviewTotal, total,
        JSON.stringify({ source: 'app-generated', via: 'mark-paid', period: `${year}-${mm}`, performance_points: perfPts })])).rows[0];
     for (const r of invRows) {
       await client.query(
@@ -28146,6 +28361,10 @@ async function snapshotAppGeneratedStub(repName, year, month, actor) {
       [imp.id, repName, m.description || null, m.amount, periodDate]);
     for (const a of adjRows) await client.query(`INSERT INTO commission_bonuses (import_id, rep_name, bonus_type, merchant_name, amount, paid_for_period) VALUES ($1,$2,'adjustment',$3,$4,$5::date)`,
       [imp.id, repName, a.description || null, a.amount, periodDate]);
+    // Fige AUSSI les avis : un bulletin deja valide lit ses bonus dans commission_bonuses, pas
+    // dans google_reviews. Sans cette ligne, la prime disparaitrait du bulletin au commit.
+    for (const r of reviewRows) await client.query(`INSERT INTO commission_bonuses (import_id, rep_name, bonus_type, merchant_name, amount, paid_for_period) VALUES ($1,$2,'review',$3,$4,$5::date)`,
+      [imp.id, repName, reviewLabel(r), r.amount, periodDate]);
     await client.query('COMMIT');
     return { importId: imp.id, total, invoices: invRows.length };
   } catch (e) {
@@ -28323,6 +28542,15 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
       for (const m of manual) {
         bonuses.push({ bonus_type: 'manual', merchant_name: m.description || null, amount: m.amount, report_date: null });
       }
+      // Avis Google approuves pour ce mois — montant fige a l'approbation.
+      const reviews = (await pool.query(
+        `SELECT amount::float AS amount, reviewer_name, merchant_name, review_date::date AS review_date
+           FROM google_reviews WHERE rep_name = $1 AND period = $2::date AND status = 'approved' ORDER BY id`,
+        [targetRep, periodStart]
+      )).rows;
+      for (const r of reviews) {
+        bonuses.push({ bonus_type: 'review', merchant_name: reviewLabel(r), amount: r.amount, report_date: r.review_date || null });
+      }
       // Free-form (±) adjustments targeting this period — e.g. deduct an overpayment from a
       // past month. Invoice-based adjustments are NOT added here (their invoice already moved).
       const freeAdj = (await pool.query(
@@ -28481,7 +28709,8 @@ app.post('/api/commissions/pay-stub/email', authenticateToken, async (req, res) 
     const bonusRows = realBonuses.map(b => {
       const label = b.bonus_type === 'signup' ? 'Bonus d\'inscription'
         : (b.bonus_type === 'monthly' || b.bonus_type === 'monthly_performance') ? 'Bonus mensuel'
-        : b.bonus_type === 'processing' ? 'Bonus de paiement' : esc(b.bonus_type);
+        : b.bonus_type === 'processing' ? 'Bonus de paiement'
+        : b.bonus_type === 'review' ? 'Avis Google / Google review' : esc(b.bonus_type);
       return `<tr><td style="padding:6px 10px;border-top:1px solid #eef1f6">${label}</td>
            <td style="padding:6px 10px;border-top:1px solid #eef1f6">${esc(b.merchant_name) || '—'}</td>
            <td style="padding:6px 10px;border-top:1px solid #eef1f6;text-align:right">${money(b.amount)}</td></tr>`;
@@ -29600,7 +29829,14 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
       [repName, periodDate]
     )).rows;
     const manualTotal = manualRows.reduce((a, m) => a + (m.amount || 0), 0);
-    const total      = invRows.reduce((a, r) => a + (r.commission || 0), 0) + bonusTotal + perfBonus + manualTotal;
+    // Avis Google approuves — meme logique que le commit par « marquer paye ».
+    const reviewRows = (await client.query(
+      `SELECT amount::float AS amount, reviewer_name, merchant_name FROM google_reviews
+        WHERE rep_name = $1 AND period = $2::date AND status = 'approved' ORDER BY id`,
+      [repName, periodDate]
+    )).rows;
+    const reviewTotal = reviewRows.reduce((a, r) => a + (r.amount || 0), 0);
+    const total      = invRows.reduce((a, r) => a + (r.commission || 0), 0) + bonusTotal + perfBonus + manualTotal + reviewTotal;
 
     // Idempotent re-commit: drop any prior app-generated stub for this rep+period (cascades).
     await client.query(
@@ -29645,6 +29881,13 @@ app.post('/api/commissions/pay-stub/commit', authenticateToken, async (req, res)
            (import_id, rep_name, bonus_type, merchant_name, matched_zentact_id, amount, paid_for_period, report_date)
          VALUES ($1, $2, 'signup', $3, $4, $5, $6::date, $7::date)`,
         [imp.id, repName, b.business_name || null, b.merchant_account_id || null, b.bonus_amount || 0, periodDate, b.activated_at || null]
+      );
+    }
+    for (const r of reviewRows) {
+      await client.query(
+        `INSERT INTO commission_bonuses (import_id, rep_name, bonus_type, merchant_name, amount, paid_for_period)
+         VALUES ($1, $2, 'review', $3, $4, $5::date)`,
+        [imp.id, repName, reviewLabel(r), r.amount, periodDate]
       );
     }
     if (perfBonus > 0) {
@@ -29933,6 +30176,12 @@ async function payrollDataForMonth(year, month) {
          WHERE rep_name = $1 AND period = $2::date`, [rep, periodStart]
       )).rows;
       for (const m of manual) bonuses.push({ bonus_type: 'manual', merchant_name: m.description, amount: m.amount });
+      // Avis Google approuves pour ce mois (montant fige a l'approbation).
+      const reviews = (await pool.query(
+        `SELECT amount::float AS amount, reviewer_name, merchant_name FROM google_reviews
+          WHERE rep_name = $1 AND period = $2::date AND status = 'approved' ORDER BY id`, [rep, periodStart]
+      )).rows;
+      for (const r of reviews) bonuses.push({ bonus_type: 'review', merchant_name: reviewLabel(r), amount: r.amount });
       // Free-form (±) adjustments targeting this month (overpayment deductions etc.).
       const freeAdj = (await pool.query(
         `SELECT amount::float AS amount, description FROM commission_adjustments
@@ -29961,6 +30210,7 @@ function payrollI18n(lang) {
     adjustments: 'ADJUSTMENTS', subtotalAdjustments: 'Adjustments subtotal',
     totalPaid: 'TOTAL PAID', grossNote: 'Gross amounts, before taxes and deductions.',
     blSignup: 'Signup bonus', blMonthly: 'Monthly bonus', blProcessing: 'Processing bonus', blAdjustment: 'Adjustment',
+    blReview: 'Google review',
     payRun: 'PAID ON', payRunLabel: 'Paid on the pay of',
   } : {
     emailSubject: 'Commissions à verser', emailFooter: 'Bulletins détaillés en pièce jointe (PDF). Montants bruts, avant impôts et retenues.',
@@ -29971,6 +30221,7 @@ function payrollI18n(lang) {
     adjustments: 'AJUSTEMENTS', subtotalAdjustments: 'Sous-total ajustements',
     totalPaid: 'TOTAL VERSÉ', grossNote: 'Montants bruts, avant impôts et retenues.',
     blSignup: "Bonus d'inscription", blMonthly: 'Bonus mensuel', blProcessing: 'Bonus de processing', blAdjustment: 'Ajustement',
+    blReview: 'Avis Google',
     payRun: 'VERSÉ SUR LA PAIE DU', payRunLabel: 'Versé sur la paie du',
   };
 }
@@ -30032,7 +30283,7 @@ function buildPayrollPdf(periodLabel, reps, lang, payDate) {
       doc.on('data', c => chunks.push(c));
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      const bl = (t) => t === 'signup' ? T.blSignup : (t === 'monthly' || t === 'monthly_performance') ? T.blMonthly : t === 'processing' ? T.blProcessing : t === 'adjustment' ? T.blAdjustment : t;
+      const bl = (t) => t === 'signup' ? T.blSignup : (t === 'monthly' || t === 'monthly_performance') ? T.blMonthly : t === 'processing' ? T.blProcessing : t === 'adjustment' ? T.blAdjustment : t === 'review' ? T.blReview : t;
       const L = 40, R = 572, W = R - L, AMT_X = R - 96;     // content area + amount column
       const C = { dark: '#1c2434', orange: '#f2682c', gray: '#475569', light: '#94a3b8', zebra: '#fafbfd', line: '#e8edf3' };
       const ensure = (h) => { if (doc.y + h > 748) doc.addPage(); };
@@ -30282,6 +30533,11 @@ app.get('/api/commissions/annual-reconciliation', authenticateToken, async (req,
         FROM commission_adjustments
        WHERE invoice_number IS NULL AND target_period >= $1::date AND target_period < $2::date
        GROUP BY 1, 2`, [yearStart, yearEnd])).rows;
+    const reviewRows = (await pool.query(`
+      SELECT rep_name, to_char(period, 'YYYY-MM') AS ym, SUM(amount)::float AS total
+        FROM google_reviews
+       WHERE status = 'approved' AND period >= $1::date AND period < $2::date
+       GROUP BY 1, 2`, [yearStart, yearEnd])).rows;
     // One pass covers every month of the year (map is keyed rep|YYYY-MM).
     const ptsMap = await getMonthlyPointsByRep(new Date(yearStart));
 
@@ -30292,7 +30548,7 @@ app.get('/api/commissions/annual-reconciliation', authenticateToken, async (req,
       return m;
     };
     const paidMap = toMap(paidRows), procMap = toMap(procRows), invMap = toMap(invRows, 'rep'),
-          manualMap = toMap(manualRows), adjMap = toMap(freeAdjRows);
+          manualMap = toMap(manualRows), adjMap = toMap(freeAdjRows), reviewMap = toMap(reviewRows);
     const signupMap = toMap(signupRows, 'rep'); // keyed by LOWER(rep)
 
     const platformFrom = '2026-05'; // the platform pays from May 2026; before = imported truth
@@ -30311,6 +30567,7 @@ app.get('/api/commissions/annual-reconciliation', authenticateToken, async (req,
                  + (signupMap.get(key(rep.toLowerCase(), ym)) || 0)
                  + (manualMap.get(key(rep, ym)) || 0)
                  + (adjMap.get(key(rep, ym)) || 0)
+                 + (reviewMap.get(key(rep, ym)) || 0)
                  + proc;
         if (ym >= platformFrom) {
           const pts = ptsMap.get(`${rep}|${ym}`) || 0;
