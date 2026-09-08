@@ -947,8 +947,15 @@ async function initializeDatabase() {
     // Un avis Google ne peut entrer qu'une fois — la garde anti-double-paiement cote base, pas
     // seulement cote ecran. Partielle : la saisie manuelle n'a pas d'identifiant Google.
     await pool.query(`ALTER TABLE google_reviews ADD COLUMN IF NOT EXISTS review_text TEXT`);
-    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_google_reviews_ext
-                        ON google_reviews(external_id) WHERE external_id IS NOT NULL`);
+    // L'index etait PARTIEL (`WHERE external_id IS NOT NULL`), et Postgres refuse alors de
+    // l'utiliser pour un `ON CONFLICT (external_id)` sans qu'on lui repete le predicat : la
+    // premiere lecture automatique a echoue sur « no unique or exclusion constraint matching
+    // the ON CONFLICT specification ». Index COMPLET desormais : la saisie manuelle laisse
+    // `external_id` a NULL, et deux NULL n'entrent jamais en conflit dans un index unique
+    // Postgres — le partiel n'apportait donc rien, sinon ce piege pour toute future ecriture.
+    await pool.query(`DROP INDEX IF EXISTS idx_google_reviews_ext`);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_google_reviews_ext_uniq
+                        ON google_reviews(external_id)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_google_reviews_paie
                         ON google_reviews(rep_name, period) WHERE status = 'approved'`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_google_reviews_statut ON google_reviews(status, review_date DESC)`);
