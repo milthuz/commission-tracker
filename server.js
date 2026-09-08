@@ -946,6 +946,7 @@ async function initializeDatabase() {
     `);
     // Un avis Google ne peut entrer qu'une fois — la garde anti-double-paiement cote base, pas
     // seulement cote ecran. Partielle : la saisie manuelle n'a pas d'identifiant Google.
+    await pool.query(`ALTER TABLE google_reviews ADD COLUMN IF NOT EXISTS review_text TEXT`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_google_reviews_ext
                         ON google_reviews(external_id) WHERE external_id IS NOT NULL`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_google_reviews_paie
@@ -13963,6 +13964,16 @@ function startAutoSync() {
   setTimeout(deltaSyncInvoices, 60 * 1000); // first delta after 1 min
   setInterval(deltaSyncInvoices, DELTA_SYNC_INTERVAL);
 
+  // Avis Google — toutes les 6 h. L'API ne rend que les 5 PLUS RECENTS et ne pagine pas : la
+  // frequence est la seule protection contre un avis manque. A moins de 5 avis par jour (le cas
+  // de Cluster), 4 passages par jour laissent une marge confortable. Sans effet et sans erreur
+  // tant que la cle Maps ou l'identifiant de fiche manquent.
+  const passeAvis = () => fetchGoogleReviews('planifie')
+    .then(r => { if (r.ok && r.inserted) console.log(`⭐ [AVIS] ${r.inserted} nouvel(s) avis sur ${r.seen} lus`); })
+    .catch(e => console.warn('[AVIS] echec:', e.message));
+  setTimeout(passeAvis, 3 * 60 * 1000);        // premier passage 3 min apres le demarrage
+  setInterval(passeAvis, 6 * 60 * 60 * 1000);
+
   // Recalc-v2 — runs on its own 6h cadence, offset 30 min from sync to avoid
   // overlapping with the heavy sync window. Skips if already running (guard
   // in runRecalcV2). Light job: just reads invoices + writes commission cols.
@@ -24913,6 +24924,101 @@ app.put('/api/salespeople/:name/review-bonus', authenticateToken, async (req, re
   } catch (e) {
     res.status(500).json({ error: 'Failed to update review bonus', details: e.message });
   }
+});
+
+// LECTURE AUTOMATIQUE DES AVIS — API Places (PAS Business Profile).
+//
+// Deux APIs Google donnent les avis d'une fiche, et le choix n'est pas neutre :
+//   - Places API (New) : identifiants d'avis stables, mais tri par PERTINENCE, sans option. Un
+//     avis tout neuf peut donc ne PAS figurer dans les 5 rendus.
+//   - Places API (Legacy) : `reviews_sort=newest`, donc les 5 PLUS RECENTS, garantis.
+// Les deux plafonnent a 5 avis et ne paginent pas. Avec de l'argent au bout, la garantie de
+// recence l'emporte sur la fraicheur de l'API : on prend la legacy, qui n'a pas de date d'arret
+// annoncee. Le plafond de 5 est sans effet ici — David recoit moins de 5 avis par jour et on
+// passe toutes les 6 h.
+//
+// Aucune demande d'acces : une simple cle Maps suffit, contrairement a Business Profile qui
+// exige un examen manuel de ~14 jours.
+async function fetchGoogleReviews(source = 'manual') {
+  const key = process.env.GOOGLE_MAPS_API_KEY;
+  if (!key) return { ok: false, reason: 'GOOGLE_MAPS_API_KEY absente' };
+  const placeId = (await pool.query(`SELECT value FROM app_settings WHERE key = 'google_place_id'`))
+    .rows[0]?.value;
+  const pid = typeof placeId === 'string' ? placeId : (placeId && placeId.id) || null;
+  if (!pid) return { ok: false, reason: 'identifiant de fiche Google non configure' };
+
+  const url = `https://maps.googleapis.com/maps/api/place/details/json`;
+  const r = await axios.get(url, {
+    params: { place_id: pid, fields: 'name,reviews', reviews_sort: 'newest', key },
+    validateStatus: () => true,
+  });
+  if (r.status !== 200 || (r.data && r.data.status !== 'OK')) {
+    return { ok: false, reason: `Google: ${r.data?.status || r.status} ${r.data?.error_message || ''}`.trim() };
+  }
+  const reviews = (r.data.result && r.data.result.reviews) || [];
+  let inserted = 0;
+  for (const rv of reviews) {
+    // Identifiant DETERMINISTE : la legacy n'en fournit pas. Auteur + horodatage suffisent —
+    // la meme personne ne peut pas publier deux avis a la meme seconde sur la meme fiche. Un
+    // hachage court garde la colonne lisible et l'index unique fait le reste.
+    const who = String(rv.author_url || rv.author_name || '');
+    const h = crypto.createHash('sha1').update(who).digest('hex').slice(0, 12);
+    const externalId = `g:${pid.slice(0, 40)}:${rv.time}:${h}`;
+    const res = await pool.query(
+      `INSERT INTO google_reviews (external_id, source, reviewer_name, rating, review_date, review_url, review_text, created_by)
+       VALUES ($1, 'google', $2, $3, to_timestamp($4)::date, $5, $6, 'google-places')
+       ON CONFLICT (external_id) DO NOTHING RETURNING id`,
+      [externalId, String(rv.author_name || '').slice(0, 255) || null,
+       rv.rating == null ? null : parseInt(rv.rating), rv.time,
+       rv.author_url || null, String(rv.text || '').slice(0, 4000) || null]
+    );
+    inserted += res.rowCount;
+  }
+  await pool.query(
+    `INSERT INTO sync_state (key, value, updated_at) VALUES ('google_reviews_last_sync', $1, CURRENT_TIMESTAMP)
+     ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = CURRENT_TIMESTAMP`,
+    [JSON.stringify({ at: new Date().toISOString(), seen: reviews.length, inserted, source })]
+  );
+  return { ok: true, seen: reviews.length, inserted };
+}
+
+// GET /api/reviews/place — la configuration de la fiche + le dernier passage.
+app.get('/api/reviews/place', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'reviews:manage'))) return;
+  try {
+    const pid = (await pool.query(`SELECT value FROM app_settings WHERE key = 'google_place_id'`)).rows[0]?.value;
+    const lastRaw = (await pool.query(`SELECT value FROM sync_state WHERE key = 'google_reviews_last_sync'`)).rows[0]?.value;
+    let last = null; try { last = lastRaw ? JSON.parse(lastRaw) : null; } catch { last = null; }
+    res.json({
+      placeId: typeof pid === 'string' ? pid : (pid && pid.id) || '',
+      hasKey: !!process.env.GOOGLE_MAPS_API_KEY,
+      lastSync: last || null,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/reviews/place { placeId }
+app.put('/api/reviews/place', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'reviews:manage'))) return;
+  const pid = String(req.body.placeId || '').trim().slice(0, 200);
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('google_place_id', $1::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [JSON.stringify(pid)]
+    );
+    res.json({ success: true, placeId: pid });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/reviews/fetch — declencher un passage tout de suite.
+app.post('/api/reviews/fetch', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'reviews:manage'))) return;
+  try {
+    const out = await fetchGoogleReviews('manuel');
+    if (!out.ok) return res.status(400).json({ error: out.reason });
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // GET /api/reviews?status=&rep=&period=YYYY-MM — la file d'attribution et l'historique.
