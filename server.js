@@ -1490,6 +1490,26 @@ async function initializeDatabase() {
       ) sub
       WHERE invoices.id = sub.id AND invoices.gross_line_total IS DISTINCT FROM sub.s
     `);
+    // Meme somme, mais SANS les lignes non commissionnables (livraison). C'est ce total-la qui
+    // sert de denominateur a la regle « remise >= 25 % => taux materiel de moitie ».
+    //
+    // Pourquoi une deuxieme colonne : `gross_line_total` compte la livraison a son TARIF, alors
+    // que `sub_total` ne compte que ce qui a ete FACTURE. Une livraison offerte creusait donc un
+    // ecart lu comme une remise. Cas reel INV-093837 : un lecteur de carte vendu 100 $ plein
+    // tarif, une livraison de 50 $ offerte -> 100/150 = « 33 % de remise » -> commission coupee
+    // de moitie, 5 $ au lieu de 10 $, alors que rien n'etait remise.
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS gross_commissionable NUMERIC(12,2)`);
+    await pool.query(`
+      UPDATE invoices SET gross_commissionable = sub.s
+      FROM (
+        SELECT id, ROUND(COALESCE(SUM((li->>'rate')::numeric * COALESCE((li->>'quantity')::numeric, 1))
+                                  FILTER (WHERE li->>'type' IS DISTINCT FROM 'noncommission'), 0), 2) AS s
+        FROM invoices, jsonb_array_elements(line_items) li
+        WHERE line_items IS NOT NULL AND jsonb_typeof(line_items) = 'array'
+        GROUP BY id
+      ) sub
+      WHERE invoices.id = sub.id AND invoices.gross_commissionable IS DISTINCT FROM sub.s
+    `);
     // Manual override of a deal's lead source group. Sync only writes lead_source_group, so this
     // override survives re-syncs. Effective source = COALESCE(override, lead_source_group).
     await pool.query(`ALTER TABLE crm_sold_deals ADD COLUMN IF NOT EXISTS lead_source_group_override VARCHAR(255)`);
@@ -12662,8 +12682,10 @@ app.get('/api/admin/too-late-audit', requireOpsSecret, async (req, res) => {
       SELECT invoice_number, customer_name, salesperson_name,
              date::date AS date, paid_date::date AS paid_date,
              total::float AS total, hardware_amount::float AS hardware_amount,
+             saas_amount::float AS saas_amount,
              sub_total::float AS sub_total, discount_total::float AS discount_total,
-             gross_line_total::float AS gross_line_total
+             gross_line_total::float AS gross_line_total,
+             gross_commissionable::float AS gross_commissionable
         FROM invoices
        WHERE organization_id = $1 AND commission_status = 'too_late'
        ORDER BY salesperson_name, date`, [process.env.ZOHO_ORG_ID])).rows;
@@ -12674,7 +12696,10 @@ app.get('/api/admin/too-late-audit', requireOpsSecret, async (req, res) => {
         const net = st - dt;
         if (net > 0 && net < gross) factor = net / gross;
       }
-      const discountPct = 1 - factor;
+      // Meme regle que recalc-v2, meme fonction : deux copies divergeraient, et l'ecart
+      // serait de l'argent.
+      const discountPct = commissionableDiscountPct(
+        (r.hardware_amount || 0) + (r.saas_amount || 0), r.gross_commissionable, r.sub_total);
       const rate = rateMap[r.salesperson_name] || 10;
       const hwRate = discountPct >= 0.25 ? rate / 2 : rate;
       const amountFactor = dt > 0 ? factor : 1;
@@ -20241,6 +20266,18 @@ app.post('/api/admin/backfill-subtotals', requireOpsSecret, async (req, res) => 
          ) sub
          WHERE invoices.id = sub.id AND invoices.gross_line_total IS DISTINCT FROM sub.s`
       );
+      // Idem sans les lignes non commissionnables — denominateur du demi-taux materiel.
+      await pool.query(
+        `UPDATE invoices SET gross_commissionable = sub.s
+         FROM (
+           SELECT id, ROUND(COALESCE(SUM((li->>'rate')::numeric * COALESCE((li->>'quantity')::numeric, 1))
+                                     FILTER (WHERE li->>'type' IS DISTINCT FROM 'noncommission'), 0), 2) AS s
+           FROM invoices, jsonb_array_elements(line_items) li
+           WHERE line_items IS NOT NULL AND jsonb_typeof(line_items) = 'array'
+           GROUP BY id
+         ) sub
+         WHERE invoices.id = sub.id AND invoices.gross_commissionable IS DISTINCT FROM sub.s`
+      );
 
       const rows = (await pool.query(
         `SELECT invoice_number FROM invoices
@@ -26687,6 +26724,10 @@ async function runEnrichInvoices({ onlyMissing = true, source = 'manual', extraW
         // would already be net of item-level discounts, silently hiding them from the ≥25%
         // discount-halves-the-hardware-rate rule (user decision 2026-07-08).
         const grossLineTotal = classified.reduce((s, l) => s + (parseFloat(l.rate) || 0) * (parseInt(l.quantity) || 1), 0); // incl. noncommission
+        // Le meme total SANS les lignes non commissionnables : denominateur de la regle du
+        // demi-taux materiel (voir commissionableDiscountPct).
+        const grossCommissionable = classified.reduce((s, l) =>
+          l.type === 'noncommission' ? s : s + (parseFloat(l.rate) || 0) * (parseInt(l.quantity) || 1), 0);
         const totalAmount = saasAmount + hardwareAmount;
         const paidDate = det.last_payment_date || (det.status === 'paid' ? det.date : null);
 
@@ -26715,10 +26756,12 @@ async function runEnrichInvoices({ onlyMissing = true, source = 'manual', extraW
             sub_total = $6,
             discount_total = $7,
             gross_line_total = $8,
+            gross_commissionable = $9,
             updated_at = CURRENT_TIMESTAMP
-          WHERE invoice_number = $9 AND organization_id = $10
+          WHERE invoice_number = $10 AND organization_id = $11
         `, [JSON.stringify(classified), hardwareAmount, saasAmount, subActivation, paidDate,
-            subTotal || null, discTotal, Math.round(grossLineTotal * 100) / 100, det.invoice_number, orgId]);
+            subTotal || null, discTotal, Math.round(grossLineTotal * 100) / 100,
+            Math.round(grossCommissionable * 100) / 100, det.invoice_number, orgId]);
 
         enrichJob.processed++;
         enrichJob.stats[type] = (enrichJob.stats[type] || 0) + 1;
@@ -26895,14 +26938,17 @@ app.post('/api/admin/reenrich-invoices', requireOpsSecret, async (req, res) => {
       const hardwareAmount = classified.filter(l => l.type === 'hardware').reduce((s, l) => s + l.amount, 0);
       // TRUE pre-discount total (rate × qty) — see runEnrichInvoices for why this can't use amount.
       const grossLineTotal = classified.reduce((s, l) => s + (parseFloat(l.rate) || 0) * (parseInt(l.quantity) || 1), 0);
+      const grossCommissionable = classified.reduce((s, l) =>
+        l.type === 'noncommission' ? s : s + (parseFloat(l.rate) || 0) * (parseInt(l.quantity) || 1), 0);
       const subTotal  = parseFloat(det.sub_total) || 0;
       const discTotal = det.discount_type === 'item_level' ? 0 : (parseFloat(det.discount_total) || 0);
       await pool.query(
         `UPDATE invoices SET line_items = $1::jsonb, hardware_amount = $2, saas_amount = $3,
-           sub_total = $4, discount_total = $5, gross_line_total = $6, updated_at = CURRENT_TIMESTAMP
-         WHERE invoice_number = $7 AND organization_id = $8`,
+           sub_total = $4, discount_total = $5, gross_line_total = $6, gross_commissionable = $7,
+           updated_at = CURRENT_TIMESTAMP
+         WHERE invoice_number = $8 AND organization_id = $9`,
         [JSON.stringify(classified), hardwareAmount, saasAmount, subTotal || null, discTotal,
-         Math.round(grossLineTotal * 100) / 100, number, orgId]
+         Math.round(grossLineTotal * 100) / 100, Math.round(grossCommissionable * 100) / 100, number, orgId]
       );
       out.push({ number, hardware_amount: hardwareAmount, saas_amount: saasAmount, gross: Math.round(grossLineTotal * 100) / 100, sub_total: subTotal });
     }
@@ -29702,6 +29748,34 @@ function formatPayDate(payDate, lang, { weekday = true } = {}) {
   });
 }
 
+// LA remise qui decide du demi-taux materiel (plan v7.7 : >= 25 % => 10 % devient 5 %).
+//
+// Mesuree sur les seules lignes COMMISSIONNABLES : ce qui a ete facture pour elles
+// (`hardware_amount + saas_amount`, deja net des remises par ligne) contre leur valeur de liste
+// (`gross_commissionable` = tarif x quantite). Une livraison offerte, non commissionnable, ne
+// doit pas entrer dans ce ratio — elle y creait une remise fantome qui coupait la commission de
+// moitie sur des articles vendus plein tarif (INV-093837, 2026-09-08).
+//
+// UN SEUL point de verite : recalc-v2 et le rapport « trop tard » appellent tous deux cette
+// fonction. Deux copies de la regle finiraient par diverger, et l'ecart serait de l'argent.
+//
+// Renvoie 0 (aucune remise) quand l'information manque — jamais un demi-taux par defaut.
+//
+// `subTotal` ne sert PAS au calcul : il ne sert que de garde, exactement comme dans l'ancienne
+// regle. Une facture sans sub_total n'a jamais ete enrichie depuis Zoho, et l'ancienne regle lui
+// donnait le taux plein. Le calcul ci-dessous, lui, n'a pas besoin de sub_total et VERRAIT leurs
+// remises reelles (30 a 34 % sur les cas mesures) : sans cette garde, 36 anciennes factures
+// basculeraient au demi-taux, soit 759,47 $ retires a des vendeurs. C'est un autre sujet — celui
+// des factures non enrichies — et il se tranche separement, pas en passant.
+function commissionableDiscountPct(netCommissionable, grossCommissionable, subTotal) {
+  if ((parseFloat(subTotal) || 0) <= 0) return 0;   // meme garde qu'avant : information absente
+  const net   = parseFloat(netCommissionable) || 0;
+  const gross = parseFloat(grossCommissionable) || 0;
+  if (net <= 0 || gross <= 0) return 0;
+  if (net >= gross) return 0;                       // rien de remise (ou bruit de donnees)
+  return 1 - net / gross;
+}
+
 async function getPayrollRecipients() {
   try {
     const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'payroll_recipients'`);
@@ -31024,7 +31098,8 @@ async function runRecalcV2(source = 'manual') {
         SELECT id, invoice_number, salesperson_name, customer_name, total, date,
                hardware_amount, saas_amount, subscription_activation_date,
                paid_date, commission_status, status, approval_status, commission,
-               sub_total, discount_total, gross_line_total, payable_override, commission_excluded
+               sub_total, discount_total, gross_line_total, gross_commissionable,
+               payable_override, commission_excluded
         FROM invoices
         WHERE organization_id = $1
         ORDER BY date ASC
@@ -31303,7 +31378,13 @@ async function runRecalcV2(source = 'manual') {
         // value, and the HARDWARE rate halves (10%→5%) when the discount is ≥ 25% — counting
         // BOTH item-level and entity-level discounts (user decision 2026-07-08).
         const factor = discountFactorOf(inv.sub_total, inv.discount_total, inv.gross_line_total);
-        const discountPct = 1 - factor;   // effective discount (0 when no discount captured)
+        // La remise qui HALVE le taux se mesure sur les seules lignes commissionnables : une
+        // livraison offerte n'est pas un rabais consenti au client sur ce qui porte commission.
+        // `factor` ci-dessus reste la base des MONTANTS (amountFactor) — deux questions
+        // distinctes, deux mesures distinctes.
+        const discountPct = commissionableDiscountPct(
+          (parseFloat(inv.hardware_amount) || 0) + (parseFloat(inv.saas_amount) || 0),
+          inv.gross_commissionable, inv.sub_total);
         const hwRate = discountPct >= 0.25 ? rate / 2 : rate;
         // hardware_amount/saas_amount are already NET when the discount is item-level (baked
         // in per line) — rescaling by `factor` again would double-discount. Only an
