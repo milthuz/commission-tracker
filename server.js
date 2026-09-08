@@ -921,6 +921,10 @@ async function initializeDatabase() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_payroll_sends ON payroll_sends(period, rep_name)`);
     // Record the $ amount sent per rep so the send-history can show totals as they were at send time.
     await pool.query(`ALTER TABLE payroll_sends ADD COLUMN IF NOT EXISTS total NUMERIC`);
+    // La PAIE sur laquelle le montant tombe (date de depot), figee au moment de l'envoi. Une
+    // colonne plutot qu'un recalcul a l'affichage : le calendrier de paie change d'une annee a
+    // l'autre, et un bulletin deja remis a un vendeur ne doit jamais changer de date apres coup.
+    await pool.query(`ALTER TABLE payroll_sends ADD COLUMN IF NOT EXISTS pay_date DATE`);
     // Its own send log for the bi-annual PROCESSING bonus — deliberately a separate table from
     // payroll_sends so the two "sent to payroll" histories never mix (2026-07-15).
     await pool.query(`
@@ -4425,6 +4429,7 @@ function sampleEmail(type, lang) {
       const inner = `<h1 style="margin:0 0 4px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">Amy Spicer</h1>
             <p style="margin:0 0 4px;color:#64748b;font-size:13px">Bulletin de paie / Pay Stub · 2026-05</p>
             <p style="margin:0;color:#64748b;font-size:13px">En attente d'approbation / Pending approval</p>
+            <p style="margin:6px 0 0;color:#1c2434;font-size:13px">Versé sur la paie du / Paid on the pay of <strong>19 juin 2026</strong></p>
             ${sectionLabel('Commissions')}<table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434;border-collapse:collapse">${lineRows}</table>
             ${sectionLabel('Bonus')}<table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434;border-collapse:collapse">${bonusRows}</table>
             <table width="100%" style="margin-top:20px;border-top:2px solid #0f1722"><tr><td style="padding-top:12px;font-size:14px;font-weight:700;color:#0f1722">Total</td><td style="padding-top:12px;text-align:right;font-size:20px;font-weight:700;color:#f97316">${money(750.50)}</td></tr></table>
@@ -4436,7 +4441,8 @@ function sampleEmail(type, lang) {
       const rows = [['Amy Spicer', 750.50], ['Gabriella Daly', 1240.00], ['Sophie Tremblay', 430.25]];
       const grand = rows.reduce((s, r) => s + r[1], 0);
       const rowsHtml = rows.map(([rep, tot]) => `<tr><td style="padding:6px 10px;border-top:1px solid #eef1f6">${rep}</td><td style="padding:6px 10px;border-top:1px solid #eef1f6;text-align:right">${money(tot)}</td></tr>`).join('');
-      const inner = `<h1 style="margin:0 0 14px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${T.emailSubject} — 2026-05</h1>
+      const inner = `<h1 style="margin:0 0 6px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${T.emailSubject} — 2026-05</h1>
+            <p style="margin:0 0 14px;color:#1c2434;font-size:13px">${T.payRunLabel} : <strong>${formatPayDate('2026-06-19', lang)}</strong></p>
             <table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434;border-collapse:collapse">
               <tr><th style="text-align:left;padding:6px 10px;color:#94a3b8;font-size:11px;letter-spacing:.4px">${T.rep}</th><th style="text-align:right;padding:6px 10px;color:#94a3b8;font-size:11px;letter-spacing:.4px">${T.amount}</th></tr>
               ${rowsHtml}
@@ -8113,7 +8119,7 @@ const HUB_VIEWS = {
     perm: 'report:view_paystub',
     path: '/api/commissions/pay-stub',
     params: (i) => ({ year: i.year, month: i.month }),
-    describe: 'Your pay stub for a month: invoices, bonuses, adjustments and the total.',
+    describe: 'Your pay stub for a month: invoices, bonuses, adjustments and the total. Also `payDate` — WHICH PAY RUN (deposit date) this month is paid on, set when the month was sent to payroll; null means it has not been sent yet, so say so rather than guessing a date.',
   },
   my_points: {
     perm: 'tracker:view_own',
@@ -28230,6 +28236,18 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
       return bonuses;
     };
 
+    // SUR QUELLE PAIE ce mois de commissions est verse. Figee dans payroll_sends au moment de
+    // l'envoi a la paie ; nulle tant que rien n'a ete envoye (le bulletin n'affiche alors rien
+    // plutot qu'une date devinee — annoncer une paie qui n'a pas ete demandee serait pire que
+    // se taire). Le dernier envoi gagne : un renvoi corrige la date d'un envoi precedent.
+    const paySend = (await pool.query(
+      `SELECT pay_date::text AS pay_date, sent_at FROM payroll_sends
+       WHERE rep_name = $1 AND period = $2::date ORDER BY sent_at DESC LIMIT 1`,
+      [targetRep, `${year}-${mm}-01`]
+    )).rows[0] || null;
+    const payDate   = paySend?.pay_date || null;
+    const paySentAt = paySend?.sent_at || null;
+
     // Prefer a historical import for this rep+period when one exists.
     const imp = (await pool.query(
       `SELECT * FROM commission_payment_imports
@@ -28280,6 +28298,7 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
         appGenerated: isAppGenerated,  // undoable via uncommit
         lines:       outLines,
         bonuses,
+        payDate, paySentAt,
         total:       parseFloat(imp.total_amount) || 0,
         missed:      canAudit ? missed : [],
         missedTotal: canAudit ? missed.reduce((a, l) => a + l.app_commission, 0) : 0,
@@ -28323,6 +28342,7 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
       period:      `${year}-${mm}`,
       lines,
       bonuses,
+      payDate, paySentAt,
       total,
       quota,
     });
@@ -28368,10 +28388,24 @@ app.post('/api/commissions/pay-stub/email', authenticateToken, async (req, res) 
       `<tr><td style="padding:6px 10px;border-top:1px solid #eef1f6">${esc(b.merchant_name) || 'Ajustement'}</td>
            <td style="padding:6px 10px;border-top:1px solid #eef1f6;text-align:right;${(Number(b.amount) || 0) < 0 ? 'color:#d34053' : ''}">${money(b.amount)}</td></tr>`).join('');
     const statusLabel = source === 'imported' ? 'Payé / Paid' : 'En attente d\'approbation / Pending approval';
+    // La paie de versement est relue en base, JAMAIS prise dans le corps de la requete : tout
+    // ce qui vient du client ici est deja considere comme falsifiable (voir la note de securite
+    // ci-dessus), et une fausse date de paie dans le gabarit officiel serait du meme ordre.
+    const payDate = /^\d{4}-\d{2}$/.test(String(period || ''))
+      ? ((await pool.query(
+          `SELECT pay_date::text AS pay_date FROM payroll_sends
+           WHERE rep_name = $1 AND period = $2::date ORDER BY sent_at DESC LIMIT 1`,
+          [repName, `${period}-01`]
+        )).rows[0]?.pay_date || null)
+      : null;
+    const payLine = payDate
+      ? `<p style="margin:6px 0 0;color:#1c2434;font-size:13px">Versé sur la paie du / Paid on the pay of <strong>${esc(formatPayDate(payDate, 'fr', { weekday: false }))}</strong></p>`
+      : '';
     const sectionLabel = (txt) => `<p style="margin:18px 0 6px;color:#94a3b8;font-size:11px;text-transform:uppercase;font-weight:700;letter-spacing:.4px">${txt}</p>`;
     const inner = `<h1 style="margin:0 0 4px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${esc(repName)}</h1>
             <p style="margin:0 0 4px;color:#64748b;font-size:13px">Bulletin de paie / Pay Stub · ${esc(period)}</p>
             <p style="margin:0;color:#64748b;font-size:13px">${statusLabel}</p>
+            ${payLine}
             ${lineRows ? sectionLabel('Commissions') + `<table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434;border-collapse:collapse">${lineRows}</table>` : ''}
             ${bonusRows ? sectionLabel('Bonus') + `<table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434;border-collapse:collapse">${bonusRows}</table>` : ''}
             ${adjustmentRows ? sectionLabel('Ajustements / Adjustments') + `<table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434;border-collapse:collapse">${adjustmentRows}</table>` : ''}
@@ -29620,6 +29654,54 @@ const PAY_CALENDAR = [
   ['2026-11-29','2026-12-12','2026-12-15'],['2026-12-13','2026-12-26','2026-12-29'],
 ];
 
+// DATE DE DEPOT d'une periode : le vendredi qui suit la fin de periode (samedi + 6 jours).
+// Le calendrier fourni ne portait que la date LIMITE d'envoi ; le depot arrive trois jours plus
+// tard. Calculee plutot que saisie en 4e colonne pour qu'un ajout de periode ne puisse pas
+// oublier la date. Arithmetique en UTC : `new Date('2026-09-05')` est deja minuit UTC, et un
+// decalage local ferait basculer le resultat d'un jour selon le fuseau du serveur.
+const PAY_DATE_OFFSET_DAYS = 6;
+function payDateForPeriodEnd(periodEnd) {
+  const d = new Date(`${periodEnd}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + PAY_DATE_OFFSET_DAYS);
+  return d.toISOString().slice(0, 10);
+}
+
+// Le calendrier enrichi : { start, end, dueBy, payDate }, une entree par periode.
+const PAY_RUNS = PAY_CALENDAR.map(([start, end, dueBy]) => ({
+  start, end, dueBy, payDate: payDateForPeriodEnd(end),
+}));
+
+// La paie par defaut pour un envoi fait aujourd'hui : la premiere dont la date limite n'est pas
+// encore passee. Si l'annee du calendrier est epuisee, on rend la derniere plutot que null —
+// un bulletin sans date de paie est pire qu'un bulletin avec la derniere connue, et l'admin
+// peut toujours corriger via le menu deroulant.
+function defaultPayRun(from = new Date()) {
+  const today = from.toISOString().slice(0, 10);
+  return PAY_RUNS.find(p => p.dueBy >= today) || PAY_RUNS[PAY_RUNS.length - 1] || null;
+}
+
+// Les paies proposables dans le menu deroulant de l'ecran d'envoi : la paie par defaut, les
+// suivantes, et les deux precedentes (un envoi en retard doit pouvoir pointer la paie deja
+// passee sur laquelle le montant est reellement tombe).
+function selectablePayRuns(from = new Date()) {
+  const def = defaultPayRun(from);
+  if (!def) return [];
+  const i = PAY_RUNS.indexOf(def);
+  return PAY_RUNS.slice(Math.max(0, i - 2));
+}
+
+// Libelle lisible d'une date de paie : « vendredi 11 septembre 2026 » / « Friday, September 11,
+// 2026 ». Toujours formate en UTC pour la meme raison que ci-dessus. `weekday: false` rend la
+// version courte (« 11 septembre 2026 ») pour la case etroite du bandeau PDF, ou la version
+// longue passerait sur deux lignes.
+function formatPayDate(payDate, lang, { weekday = true } = {}) {
+  if (!payDate) return '';
+  const en = String(lang || '').toLowerCase().startsWith('en');
+  return new Date(`${payDate}T00:00:00Z`).toLocaleDateString(en ? 'en-CA' : 'fr-CA', {
+    ...(weekday ? { weekday: 'long' } : {}), year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC',
+  });
+}
+
 async function getPayrollRecipients() {
   try {
     const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'payroll_recipients'`);
@@ -29744,6 +29826,7 @@ function payrollI18n(lang) {
     adjustments: 'ADJUSTMENTS', subtotalAdjustments: 'Adjustments subtotal',
     totalPaid: 'TOTAL PAID', grossNote: 'Gross amounts, before taxes and deductions.',
     blSignup: 'Signup bonus', blMonthly: 'Monthly bonus', blProcessing: 'Processing bonus', blAdjustment: 'Adjustment',
+    payRun: 'PAID ON', payRunLabel: 'Paid on the pay of',
   } : {
     emailSubject: 'Commissions à verser', emailFooter: 'Bulletins détaillés en pièce jointe (PDF). Montants bruts, avant impôts et retenues.',
     by: 'par',
@@ -29753,6 +29836,7 @@ function payrollI18n(lang) {
     adjustments: 'AJUSTEMENTS', subtotalAdjustments: 'Sous-total ajustements',
     totalPaid: 'TOTAL VERSÉ', grossNote: 'Montants bruts, avant impôts et retenues.',
     blSignup: "Bonus d'inscription", blMonthly: 'Bonus mensuel', blProcessing: 'Bonus de processing', blAdjustment: 'Ajustement',
+    payRun: 'VERSÉ SUR LA PAIE DU', payRunLabel: 'Versé sur la paie du',
   };
 }
 
@@ -29802,7 +29886,9 @@ function drawSalesHubLockup(doc, x, y, T) {
   doc.circle(tx + wBy + wCluster + 5.5, ly + 3.4, 2.3).fillColor('#F58345').fill();
 }
 
-function buildPayrollPdf(periodLabel, reps, lang) {
+// payDate (facultatif) : la paie sur laquelle le montant tombe. Imprimee dans le bandeau du
+// bulletin, a cote de la periode — c'est la question que le vendeur pose en premier.
+function buildPayrollPdf(periodLabel, reps, lang, payDate) {
   const T = payrollI18n(lang);
   return new Promise((resolve, reject) => {
     try {
@@ -29821,14 +29907,31 @@ function buildPayrollPdf(periodLabel, reps, lang) {
         drawSalesHubLockup(doc, L, 22, T);
         doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text(T.payStubTitle, L, 26, { width: W, align: 'right', characterSpacing: 1.5 });
         doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(17).text(periodLabel, L, 42, { width: W, align: 'right' });
-        // meta row
+        // meta row — 3 cases, ou 4 quand la paie de versement est connue.
         const my = 96;
         const meta = [[T.rep, r.rep], [T.period, periodLabel], [T.status, r.source === 'imported' ? T.paid : T.pending]];
-        const cw = W / 3;
+        // Le montant est mis en paiement sur une paie precise : sans elle, le vendeur lit
+        // « 2026-08 » et croit avoir ete paye en aout. Version courte (sans le jour de la
+        // semaine) : la case fait 133 pt de large et la version longue y passerait sur 2 lignes.
+        if (payDate) meta.push([T.payRun, formatPayDate(payDate, lang, { weekday: false })]);
+        // Largeurs MESUREES, pas des parts egales : a 4 cases, le quart fait 133 pt et la valeur
+        // « En attente d'approbation » en fait 129 + 8 de gouttiere — elle passait sur deux
+        // lignes pendant que « 2026-08 » laissait 90 pt de vide a cote. Chaque case prend donc
+        // ce que son contenu demande, et le reste de la largeur est reparti egalement pour que
+        // la rangee occupe toujours toute la bande.
+        const need = meta.map(m => Math.max(
+          (doc.font('Helvetica-Bold').fontSize(7),  doc.widthOfString(m[0], { characterSpacing: 1 })),
+          (doc.font('Helvetica-Bold').fontSize(11), doc.widthOfString(m[1]))
+        ) + 10);
+        const sum = need.reduce((a, b) => a + b, 0);
+        // Si le contenu deborde malgre tout (nom de vendeur tres long), on repartit au prorata :
+        // l'ellipse du libelle et le retour a la ligne de la valeur reprennent la main.
+        const widths = sum <= W ? need.map(n => n + (W - sum) / meta.length) : need.map(n => W * n / sum);
+        let x = L;
         meta.forEach((m, i) => {
-          const x = L + i * cw;
-          doc.fillColor(C.light).font('Helvetica-Bold').fontSize(7).text(m[0], x, my, { characterSpacing: 1 });
-          doc.fillColor(C.dark).font('Helvetica-Bold').fontSize(11).text(m[1], x, my + 11, { width: cw - 8 });
+          doc.fillColor(C.light).font('Helvetica-Bold').fontSize(7).text(m[0], x, my, { characterSpacing: 1, width: widths[i] - 8, lineBreak: false, ellipsis: true });
+          doc.fillColor(C.dark).font('Helvetica-Bold').fontSize(11).text(m[1], x, my + 11, { width: widths[i] - 8 });
+          x += widths[i];
         });
         doc.y = my + 40;
         doc.moveTo(L, doc.y).lineTo(R, doc.y).strokeColor(C.line).lineWidth(1).stroke();
@@ -30104,18 +30207,28 @@ app.get('/api/commissions/payroll/preview', authenticateToken, async (req, res) 
     // Deadline = the "commission due by" of the LAST pay period whose end falls in the month.
     const inMonth = PAY_CALENDAR.filter(p => p[1].startsWith(`${year}-${mm}`));
     const dueBy = inMonth.length ? inMonth[inMonth.length - 1][2] : null;
-    // Latest payroll-send timestamp per rep for this period (for the "Sent" badge).
-    const sentMap = new Map(
-      (await pool.query(
-        `SELECT rep_name, MAX(sent_at) AS sent_at FROM payroll_sends WHERE period = $1::date GROUP BY rep_name`,
-        [`${year}-${mm}-01`]
-      )).rows.map(r => [r.rep_name, r.sent_at])
-    );
+    // Latest payroll-send timestamp + pay date per rep for this period (the "Sent" badge).
+    const sentRows = (await pool.query(
+      `SELECT DISTINCT ON (rep_name) rep_name, sent_at, pay_date::text AS pay_date
+         FROM payroll_sends WHERE period = $1::date ORDER BY rep_name, sent_at DESC`,
+      [`${year}-${mm}-01`]
+    )).rows;
+    const sentMap = new Map(sentRows.map(r => [r.rep_name, r]));
+    // La paie proposee par defaut : celle deja utilisee pour ce mois si l'envoi a deja eu lieu
+    // (un 2e envoi partiel doit tomber sur la meme paie), sinon la prochaine du calendrier.
+    const already = sentRows.map(r => r.pay_date).filter(Boolean);
+    const def = defaultPayRun();
     res.json({
       year, month, dueBy,
+      payDate: already[0] || def?.payDate || null,
+      payRuns: selectablePayRuns().map(p => ({ payDate: p.payDate, start: p.start, end: p.end, dueBy: p.dueBy })),
       recipients: await getPayrollRecipients(),
       grandTotal: Math.round(reps.reduce((s, r) => s + r.total, 0) * 100) / 100,
-      reps: reps.map(r => ({ rep: r.rep, source: r.source, total: r.total, lineCount: r.lines.length, bonusCount: r.bonuses.length, sentAt: sentMap.get(r.rep) || null })),
+      reps: reps.map(r => ({
+        rep: r.rep, source: r.source, total: r.total, lineCount: r.lines.length, bonusCount: r.bonuses.length,
+        sentAt: sentMap.get(r.rep)?.sent_at || null,
+        payDate: sentMap.get(r.rep)?.pay_date || null,
+      })),
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -30162,6 +30275,13 @@ app.post('/api/commissions/payroll/send', authenticateToken, async (req, res) =>
     const repFilter = Array.isArray(req.body.reps) ? req.body.reps.map(s => String(s)) : null;
     if (repFilter && repFilter.length) reps = reps.filter(r => repFilter.includes(r.rep));
     if (!reps.length) return res.status(400).json({ error: 'nothing to send for this period' });
+    // SUR QUELLE PAIE le montant tombe. Par defaut la prochaine du calendrier ; l'admin peut en
+    // choisir une autre (envoi en retard). Validee contre le calendrier plutot que prise telle
+    // quelle : une date libre venue du corps de la requete finirait imprimee sur des bulletins.
+    const payDate = req.body.payDate
+      ? (PAY_RUNS.find(p => p.payDate === String(req.body.payDate))?.payDate || null)
+      : (defaultPayRun()?.payDate || null);
+    if (req.body.payDate && !payDate) return res.status(400).json({ error: 'unknown pay date (not in the pay calendar)' });
     const mm = String(month).padStart(2, '0');
     const periodLabel = `${year}-${mm}`;
     const T = payrollI18n(req.body.lang);   // language follows the admin's UI at send time
@@ -30170,7 +30290,11 @@ app.post('/api/commissions/payroll/send', authenticateToken, async (req, res) =>
     const rowsHtml = reps.map(r =>
       `<tr><td style="padding:6px 10px;border-top:1px solid #eef1f6">${r.rep}</td>
            <td style="padding:6px 10px;border-top:1px solid #eef1f6;text-align:right">${money(r.total)}</td></tr>`).join('');
-    const inner = `<h1 style="margin:0 0 14px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${T.emailSubject} — ${periodLabel}</h1>
+    const payLine = payDate
+      ? `<p style="margin:0 0 14px;color:#1c2434;font-size:13px">${T.payRunLabel} : <strong>${formatPayDate(payDate, req.body.lang)}</strong></p>`
+      : '';
+    const inner = `<h1 style="margin:0 0 6px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${T.emailSubject} — ${periodLabel}</h1>
+            ${payLine}
             <table width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;color:#1c2434;border-collapse:collapse">
               <tr><th style="text-align:left;padding:6px 10px;color:#94a3b8;font-size:11px;letter-spacing:.4px">${T.rep}</th><th style="text-align:right;padding:6px 10px;color:#94a3b8;font-size:11px;letter-spacing:.4px">${T.amount}</th></tr>
               ${rowsHtml}
@@ -30178,7 +30302,7 @@ app.post('/api/commissions/payroll/send', authenticateToken, async (req, res) =>
             </table>
             <p style="margin:18px 0 0;color:#94a3b8;font-size:11px">${T.emailFooter}</p>`;
     const html = mailChrome(inner, `${T.emailSubject} — ${periodLabel}`);
-    const pdf = await buildPayrollPdf(periodLabel, reps, req.body.lang);
+    const pdf = await buildPayrollPdf(periodLabel, reps, req.body.lang, payDate);
     const t = getMailer();
     if (!t) return res.status(502).json({ error: 'smtp_not_configured' });
     await t.sendMail({
@@ -30195,15 +30319,15 @@ app.post('/api/commissions/payroll/send', authenticateToken, async (req, res) =>
     const sentTo = recipients.join(', ');
     const values = [], params = [];
     reps.forEach((r, i) => {
-      const b = i * 5;
-      values.push(`($${b + 1}, $${b + 2}::date, $${b + 3}, $${b + 4}, $${b + 5})`);
-      params.push(r.rep, periodDate, sentTo, sentBy, Math.round((Number(r.total) || 0) * 100) / 100);
+      const b = i * 6;
+      values.push(`($${b + 1}, $${b + 2}::date, $${b + 3}, $${b + 4}, $${b + 5}, $${b + 6}::date)`);
+      params.push(r.rep, periodDate, sentTo, sentBy, Math.round((Number(r.total) || 0) * 100) / 100, payDate);
     });
     await pool.query(
-      `INSERT INTO payroll_sends (rep_name, period, sent_to, sent_by, total) VALUES ${values.join(', ')}`,
+      `INSERT INTO payroll_sends (rep_name, period, sent_to, sent_by, total, pay_date) VALUES ${values.join(', ')}`,
       params
     );
-    res.json({ sent: true, recipients: recipients.length, reps: reps.length, grandTotal: grand });
+    res.json({ sent: true, recipients: recipients.length, reps: reps.length, grandTotal: grand, payDate });
   } catch (e) {
     // Le motif part MAINTENANT dans les deux directions : le journal du serveur (avec la pile,
     // pour retrouver la ligne fautive) et le message rendu a l'admin. L'ancienne version ne
@@ -30372,6 +30496,7 @@ app.get('/api/commissions/payroll/sends', authenticateToken, async (req, res) =>
   try {
     const rows = (await pool.query(`
       SELECT period::date AS period, sent_at, sent_by, sent_to,
+             MAX(pay_date)::text AS pay_date,
              COUNT(*)::int AS rep_count,
              COALESCE(SUM(total), 0)::float AS total,
              ARRAY_AGG(rep_name ORDER BY rep_name) AS reps,
@@ -30387,6 +30512,7 @@ app.get('/api/commissions/payroll/sends', authenticateToken, async (req, res) =>
       month: new Date(r.period).getUTCMonth() + 1,
       sentAt: r.sent_at,
       sentBy: r.sent_by,
+      payDate: r.pay_date || null,                   // la paie sur laquelle ce lot est verse
       recipients: (r.sent_to || '').split(',').map(s => s.trim()).filter(Boolean),
       repCount: r.rep_count,
       total: r.total,
