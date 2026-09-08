@@ -1506,6 +1506,12 @@ async function initializeDatabase() {
     //    tombait a 7,45 $ au lieu de 14,90 $ alors que RIEN de facture n'etait remise.
     //    Les vrais rabais restent pris : El Tacos garde son demi-taux, son installation etant
     //    bel et bien a -50 %.
+    // RADIATION (« write-off »). Zoho ne donne PAS de statut distinct a une facture radiee :
+    // elle reste `status = "paid"` avec `balance = 0`, et la radiation n'existe que dans ce
+    // champ-la. On ne le lisait pas, donc une creance passee au passif payait commission comme
+    // une facture encaissee (INV-043181, Shawarma Royale-Burlington, 293,60 $ a Gabriella Daly).
+    // Le tampon « WRITTEN-OFF » du PDF Zoho, c'est exactement `write_off_amount > 0`.
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS write_off_amount NUMERIC(12,2) DEFAULT 0`);
     await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS gross_commissionable NUMERIC(12,2)`);
     await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS net_commissionable NUMERIC(12,2)`);
     // Le net est stocke plutot que deduit de hardware_amount + saas_amount : 21 lignes
@@ -13529,8 +13535,16 @@ async function autoSyncInvoices() {
       // at 0; the post-sync recalc-v2 fills the real value.
       const commission = 0;
       const invDate = new Date(inv.date || new Date());
+      // Zoho renvoie `write_off_amount` sur la LISTE, pas seulement sur le detail : la
+      // radiation se capte donc sans un appel de plus.
+      // `null` quand Zoho n'envoie PAS le champ (certaines charges utiles de webhook sont
+      // partielles) : le SQL fait alors COALESCE et laisse la valeur stockee tranquille. Sans ca,
+      // un webhook incomplet effacerait une radiation deja detectee. Un vrai 0 recu, lui, efface
+      // bien — une radiation annulee dans Zoho doit redevenir commissionnable.
+      const writeOff = inv.write_off_amount == null ? null : (parseFloat(inv.write_off_amount) || 0);
       upsertByNumber.set(inv.invoice_number, [
-        inv.invoice_number, salesperson, customerName, total, inv.status, invDate, commission, process.env.ZOHO_ORG_ID,
+        inv.invoice_number, salesperson, customerName, total, inv.status, invDate, commission,
+        process.env.ZOHO_ORG_ID, writeOff,
       ]);
     }
     // Now UPDATEs salesperson_name and date too — previously a rep reassignment or a date
@@ -13540,13 +13554,13 @@ async function autoSyncInvoices() {
     for (const part of chunk([...upsertByNumber.values()], 200)) {
       const vals = [];
       const tuples = part.map((row, k) => {
-        const b = k * 8;
+        const b = k * 9;
         vals.push(...row);
-        return `($${b+1}, $${b+2}, $${b+3}, $${b+4}, $${b+5}, $${b+6}, $${b+7}, $${b+8})`;
+        return `($${b+1}, $${b+2}, $${b+3}, $${b+4}, $${b+5}, $${b+6}, $${b+7}, $${b+8}, $${b+9})`;
       });
       await pool.query(
         `INSERT INTO invoices
-         (invoice_number, salesperson_name, customer_name, total, status, date, commission, organization_id)
+         (invoice_number, salesperson_name, customer_name, total, status, date, commission, organization_id, write_off_amount)
          VALUES ${tuples.join(', ')}
          ON CONFLICT (invoice_number) DO UPDATE SET
            salesperson_name = EXCLUDED.salesperson_name,
@@ -13554,6 +13568,7 @@ async function autoSyncInvoices() {
            total            = EXCLUDED.total,
            status           = EXCLUDED.status,
            date             = EXCLUDED.date,
+           write_off_amount = COALESCE(EXCLUDED.write_off_amount, invoices.write_off_amount),
            updated_at       = CURRENT_TIMESTAMP`,
         vals
       );
@@ -19879,18 +19894,27 @@ async function upsertInvoiceFromZoho(inv) {
   // on every 5-min delta poll / webhook. New rows start at 0; recalc-v2 fills the real value.
   const commission   = 0;
   const invDate      = new Date(inv.date || new Date());
+  // Radiation : Zoho laisse la facture a `status = "paid"`, seul ce champ la trahit. Il doit
+  // etre capte ICI aussi — c'est le chemin du webhook et du sondage de 5 min ; sans lui une
+  // creance radiee resterait commissionnable jusqu'a la synchro complete horaire.
+  // `null` quand Zoho n'envoie PAS le champ (certaines charges utiles de webhook sont
+  // partielles) : le SQL fait alors COALESCE et laisse la valeur stockee tranquille. Sans ca,
+  // un webhook incomplet effacerait une radiation deja detectee. Un vrai 0 recu, lui, efface
+  // bien — une radiation annulee dans Zoho doit redevenir commissionnable.
+  const writeOff     = inv.write_off_amount == null ? null : (parseFloat(inv.write_off_amount) || 0);
   await pool.query(
     `INSERT INTO invoices
-       (invoice_number, salesperson_name, customer_name, total, status, date, commission, organization_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       (invoice_number, salesperson_name, customer_name, total, status, date, commission, organization_id, write_off_amount)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      ON CONFLICT (invoice_number) DO UPDATE SET
        salesperson_name = $2,
        customer_name    = COALESCE($3, invoices.customer_name),
        total            = $4,
        status           = $5,
        date             = $6,
+       write_off_amount = COALESCE($9, invoices.write_off_amount),
        updated_at       = CURRENT_TIMESTAMP`,
-    [inv.invoice_number, salesperson, customerName, total, status, invDate, commission, process.env.ZOHO_ORG_ID]
+    [inv.invoice_number, salesperson, customerName, total, status, invDate, commission, process.env.ZOHO_ORG_ID, writeOff]
   );
 }
 
@@ -31136,7 +31160,7 @@ async function runRecalcV2(source = 'manual') {
                hardware_amount, saas_amount, subscription_activation_date,
                paid_date, commission_status, status, approval_status, commission,
                sub_total, discount_total, gross_line_total, gross_commissionable, net_commissionable,
-               payable_override, commission_excluded
+               write_off_amount, payable_override, commission_excluded
         FROM invoices
         WHERE organization_id = $1
         ORDER BY date ASC
@@ -31449,7 +31473,14 @@ async function runRecalcV2(source = 'manual') {
 
         // Voided/deleted invoices: never eligible. Catch this BEFORE the
         // generic 'pending_payment' branch so we don't mislabel them.
-        if (inv.status === 'void' || inv.status === 'deleted') {
+        //
+        // RADIEES aussi (decision de David, 2026-09-08 : « zero commission des qu'il y a
+        // radiation », meme partielle). Une creance passee au passif n'a pas ete encaissee ;
+        // elle ne peut pas payer de commission. Le test doit venir AVANT celui du statut :
+        // Zoho laisse la facture a `status = "paid"`, donc rien d'autre ne l'arreterait.
+        if ((parseFloat(inv.write_off_amount) || 0) > 0) {
+          bucket = 'not_eligible';
+        } else if (inv.status === 'void' || inv.status === 'deleted') {
           bucket = 'not_eligible';
         } else if (inv.status !== 'paid' || !invPaidDate) {
           bucket = 'pending_payment';
