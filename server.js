@@ -24743,7 +24743,8 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
     const result = await pool.query(
       `SELECT s.name, s.is_active, s.commission_rate, s.base_salary, s.invoice_count, s.aliases,
               s.signup_bonus_amount, s.signup_bonus_enabled, s.monthly_quota, s.team_id, s.email,
-              s.hire_date, s.quota_gate_enabled, s.processing_bonus_enabled, s.annual_bonus_enabled, t.name AS team_name,
+              s.hire_date, s.quota_gate_enabled, s.processing_bonus_enabled, s.annual_bonus_enabled,
+              s.review_bonus_enabled, s.review_bonus_amount, t.name AS team_name,
               (SELECT ut.email FROM user_tokens ut WHERE LOWER(ut.display_name) = LOWER(s.name) LIMIT 1) AS resolved_login_email
        FROM salespeople s LEFT JOIN teams t ON t.id = s.team_id
        ORDER BY s.name`
@@ -24765,6 +24766,11 @@ app.get('/api/salespeople/all', authenticateToken, async (req, res) => {
         quotaGateEnabled:   r.quota_gate_enabled !== false,
         processingBonusEnabled: r.processing_bonus_enabled !== false,
         annualBonusEnabled: r.annual_bonus_enabled !== false,
+        // Prime par avis Google (openers). Par defaut DESACTIVEE, contrairement aux autres
+        // primes : personne n'est opener tant qu'on ne l'a pas dit, alors que tout le monde
+        // touche le bonus d'inscription sauf exclusion.
+        reviewBonusEnabled: r.review_bonus_enabled === true,
+        reviewBonusAmount:  r.review_bonus_amount == null ? 0 : parseFloat(r.review_bonus_amount),
         resolvedLoginEmail: r.resolved_login_email || null,  // actual Zoho login (by name) when no manual override
         teamId:             r.team_id || null,
         teamName:           r.team_name || null,
