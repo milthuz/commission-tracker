@@ -33439,6 +33439,17 @@ app.get('/api/leads/meta/reps', authenticateToken, async (req, res) => {
 
 app.get('/api/leads', authenticateToken, async (req, res) => {
   const acc = await leadAccess(req);
+  // Quelqu'un qui n'a QUE le droit de saisir (le service a la clientele) doit pouvoir appeler
+  // cette liste, meme si elle lui revient vide : c'est ELLE qui porte le bloc `can`, et donc le
+  // bouton « nouvelle piste ». Un 403 ici faisait sortir l'ecran avant de lire `can`, qui restait
+  // a `intake: false` — la personne voyait la page sans aucun moyen de saisir, alors que le point
+  // d'acces de creation l'aurait acceptee. Signale par Samantha Samuels le 2026-09-09.
+  if (acc.intake && !acc.viewAll && !acc.viewOwn && !acc.review) {
+    return res.json({
+      leads: [], counts: {},
+      can: { review: acc.review, intake: acc.intake, viewAll: acc.viewAll, rules: acc.rules },
+    });
+  }
   if (!acc.viewAll && !acc.viewOwn && !acc.review) return res.status(403).json({ error: 'Permission required: leads:view_own' });
   const where = [];
   const params = [];
