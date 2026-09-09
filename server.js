@@ -17010,6 +17010,14 @@ function saasNewPeriodPrice(currentPeriod, type, value) {
   return r2Money(type === 'flat' ? c + v : c * (1 + v / 100));
 }
 
+// ⚠️ Cette fonction applique la hausse au prix MENSUEL, alors qu'une hausse fixe et un prix
+// cible s'expriment par PERIODE de facturation — c'est ainsi que l'interface les saisit, que Zoho
+// les recoit et que le marchand les lit. Sur un abonnement annuel, un « +280 $ » vaut 280 $ par an,
+// soit 23,33 $ par mois, et non 280 $ par mois.
+// Elle ne sert donc plus que de REPLI, quand le prix de periode d'un abonnement n'est pas encore
+// verifie par l'analyse. Le chemin normal passe par saasNewMonthlyFromPeriod ci-dessous.
+// Voir l'incident du 2026-09-09 : 70 abonnements annuels a +280 $ gonflaient le total du scenario
+// de 17 622,93 $ (59 750 $ affiches contre 42 127,27 $ reels).
 function saasIncreaseNewMonthly(current, type, value) {
   const c = Number(current) || 0;
   const v = Number(value) || 0;
@@ -17017,6 +17025,17 @@ function saasIncreaseNewMonthly(current, type, value) {
   // legacy price drift within a plan. A 0 means "not set", so keep the current price.
   if (type === 'target') return r2Money(v > 0 ? v : c);
   return r2Money(type === 'flat' ? c + v : c * (1 + v / 100));
+}
+
+// Le nouveau prix MENSUEL, deduit du prix de PERIODE — la seule source qui dit la verite, celle
+// que la poussee Zoho et le courriel au marchand utilisent deja. On garde le rapport entre les
+// deux prix de periode et on l'applique au mensuel courant, ce qui evite d'avoir a connaitre la
+// cadence : elle est deja contenue dans le rapport prix de periode / prix mensuel.
+function saasNewMonthlyFromPeriod(currentMonthly, currentPeriod, type, value) {
+  const cm = Number(currentMonthly) || 0;
+  const cp = Number(currentPeriod) || 0;
+  if (cp <= 0 || cm <= 0) return saasIncreaseNewMonthly(cm, type, value);
+  return r2Money(cm * (saasNewPeriodPrice(cp, type, value) / cp));
 }
 function serializeSaasIncreaseItem(row) {
   return {
@@ -17127,6 +17146,12 @@ app.post('/api/admin/saas-increase/scenarios/:id/items', authenticateToken, asyn
     // Normalize + dedupe first. A duplicate subscription_number inside one multi-row upsert makes
     // Postgres abort the whole statement ("ON CONFLICT DO UPDATE command cannot affect row a
     // second time"), so last-one-wins per subscription.
+    // Le prix reellement facture par periode, par organisation. Il transforme une hausse fixe ou
+    // un prix cible — tous deux exprimes par periode — en un vrai montant mensuel.
+    const periodByKey = new Map((await client.query(
+      `SELECT org_id, subscription_number, plan_price_period FROM saas_subscription_insights
+        WHERE plan_price_period IS NOT NULL`
+    )).rows.map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
     const byNumber = new Map();
     for (const it of items) {
       const subscriptionNumber = String(it.subscriptionNumber || '').trim();
@@ -17138,7 +17163,12 @@ app.post('/api/admin/saas-increase/scenarios/:id/items', authenticateToken, asyn
       byNumber.set(`${String(it.orgId || '')}||${subscriptionNumber}`, [
         req.params.id, String(it.orgId || ''), subscriptionNumber, it.customerId || null, it.customerName || null,
         it.merchantAccountId || null, it.planCode || null, it.planName || null, currentMonthly, increaseType,
-        increaseValue, saasIncreaseNewMonthly(currentMonthly, increaseType, increaseValue), skipped,
+        increaseValue,
+        saasNewMonthlyFromPeriod(
+          currentMonthly,
+          periodByKey.get(`${String(it.orgId || '')}||${subscriptionNumber}`) ?? null,
+          increaseType, increaseValue),
+        skipped,
       ]);
     }
     const toSave = Array.from(byNumber.values());
