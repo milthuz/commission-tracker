@@ -17478,15 +17478,20 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authentic
     // Effective date isn't stored on the item (it's Zoho's own next-renewal date, which can
     // shift) — looked up fresh from the same cached subscriptions list the main table uses.
     const liveSubs = await getSaasIncreaseSubscriptions();
-    const nextBillingBySub = new Map(liveSubs.map(s => [s.subscriptionNumber, s.nextBillingAt]));
+    // CLE (org, numero) et jamais le numero seul : 299 numeros d'abonnement existent dans
+    // plus d'une des trois organisations. Indexee sur le numero seul, cette table rendait la
+    // date de renouvellement du HOMONYME d'une autre org — une date d'effet fausse dans un
+    // avis de facturation envoye au marchand. Voir la meme correction deja faite sur
+    // saas_subscription_insights et saas_increase_items.
+    const nextBillingBySub = new Map(liveSubs.map(s => [`${s.orgId}||${s.subscriptionNumber}`, s.nextBillingAt]));
     const periodByKey = new Map((await pool.query(
       `SELECT org_id, subscription_number, plan_price_period FROM saas_subscription_insights
         WHERE plan_price_period IS NOT NULL`
     )).rows.map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
     const results = [];
     for (const it of items) {
-      const to = await resolveMerchantContactEmail(it.customer_id, it.customer_name);
-      const effectiveDate = nextBillingBySub.get(it.subscription_number) || null;
+      const to = await resolveMerchantContactEmail(it.customer_id, it.customer_name, it.org_id);
+      const effectiveDate = nextBillingBySub.get(`${it.org_id}||${it.subscription_number}`) || null;
       const liveSub = liveSubs.find(x => x.orgId === it.org_id && x.subscriptionNumber === it.subscription_number);
       // Quote exactly what the push will write, from the same source — otherwise the email and the
       // invoice could disagree by a few cents on annual plans.
@@ -17640,7 +17645,7 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
     let nextBillingBySub = new Map();
     try {
       const liveSubs = await getSaasIncreaseSubscriptions();
-      nextBillingBySub = new Map(liveSubs.map(x => [x.subscriptionNumber, x.nextBillingAt]));
+      nextBillingBySub = new Map(liveSubs.map(x => [`${x.orgId}||${x.subscriptionNumber}`, x.nextBillingAt]));
     } catch { /* Zoho unreachable: the stored facts are still worth showing */ }
 
     const results = rows.map(r => {
@@ -17654,7 +17659,7 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
         orgName: ZOHO_BILLING_ORG_NAMES[r.org_id] || r.org_id,
         planName: saasPlanLabel(r.plan_name),
         currentPrice: cur, newPrice: next,
-        effectiveDate: nextBillingBySub.get(r.subscription_number) || null,
+        effectiveDate: nextBillingBySub.get(`${r.org_id}||${r.subscription_number}`) || null,
         pushStatus: r.status,
         pushedAt: r.pushed_at,
         notifyStatus: r.notify_status,
@@ -17740,6 +17745,14 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
   // with the company's own support block — a rep's name and phone under it would invite thousands
   // of merchants to treat one person as their billing contact.
   const noticeHeading = req.body?.heading || saasIncreaseDraftCopy({ lang }).heading;
+  // Un envoi de masse est DECOUPE par l'ecran : 2 740 courriels dans une seule requete expirent
+  // a la passerelle bien avant la fin, en laissant un nombre inconnu de marchands avises sans
+  // rapport a l'ecran. Chaque tranche passe donc ici — et l'avis interne, lui, ne doit partir
+  // QU'UNE fois, sur la derniere. Par defaut true : un envoi unitaire se comporte comme avant.
+  const sendInternal = req.body?.sendInternal !== false;
+  // Sur la derniere tranche, le resume interne doit couvrir TOUT l'envoi, pas seulement les
+  // 50 derniers marchands — sinon la personne qui prend les appels lit un echantillon.
+  const internalScope = String(req.body?.internalScope || 'batch');
   const results = [];
   const sentRows = [];
   try {
@@ -17747,7 +17760,12 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
     // monthly figures instead would reintroduce exactly the rounding gap that made an annual
     // plan's email quote $799.92 for a $799.95 invoice.
     const liveSubs = await getSaasIncreaseSubscriptions();
-    const nextBillingBySub = new Map(liveSubs.map(x => [x.subscriptionNumber, x.nextBillingAt]));
+    // CLE (org, numero) et jamais le numero seul : 299 numeros d'abonnement existent dans
+    // plus d'une des trois organisations. Indexee sur le numero seul, cette table rendait la
+    // date de renouvellement du HOMONYME d'une autre org — une date d'effet fausse dans un
+    // avis de facturation envoye au marchand. Voir la meme correction deja faite sur
+    // saas_subscription_insights et saas_increase_items.
+    const nextBillingBySub = new Map(liveSubs.map(x => [`${x.orgId}||${x.subscriptionNumber}`, x.nextBillingAt]));
     const periodByKey = new Map((await pool.query(
       `SELECT org_id, subscription_number, plan_price_period FROM saas_subscription_insights
         WHERE plan_price_period IS NOT NULL`
@@ -17775,7 +17793,7 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
         const curPeriod = periodByKey.get(`${dbRow.org_id}||${dbRow.subscription_number}`) ?? null;
         if (curPeriod != null) {
           const nxtPeriod = saasNewPeriodPrice(curPeriod, dbRow.increase_type, dbRow.increase_value);
-          const effectiveDate = nextBillingBySub.get(dbRow.subscription_number) || null;
+          const effectiveDate = nextBillingBySub.get(`${dbRow.org_id}||${dbRow.subscription_number}`) || null;
           const liveSub = liveSubs.find(x => x.orgId === dbRow.org_id && x.subscriptionNumber === dbRow.subscription_number);
           change = {
             planName: dbRow.plan_name || '',
@@ -17813,10 +17831,35 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
     // list nobody filled in is exactly how the Pass credit notice went unnoticed for weeks.
     let internal = { sent: false, reason: 'not_attempted', recipients: 0 };
     try {
+      if (!sendInternal) {
+        internal = { sent: false, reason: 'deferred', recipients: 0 };
+      } else {
       const scenarioName = (await pool.query(
         `SELECT name FROM saas_increase_scenarios WHERE id = $1`, [req.params.id]
       )).rows[0]?.name || '';
-      internal = await sendSaasIncreaseInternalNotice({ sentRows, scenarioName, actor, frontendBase });
+      // Portee « scenario » : on relit en base tout ce qui est parti, tranches precedentes
+      // comprises. Les lignes de CETTE requete y sont deja (elles viennent d'etre marquees
+      // `sent`), donc on ne les ajoute pas deux fois.
+      // Les lignes relues en base n'ont ni date d'effet ni ecart mensuel — ce sont des valeurs
+      // calculees dans la boucle. On les recalcule avec les MEMES tables deja chargees plus haut,
+      // sinon le resume interne perdrait la fourchette de dates et annoncerait 0 $ de MRR.
+      const rows = internalScope === 'scenario'
+        ? (await pool.query(
+            `SELECT * FROM saas_increase_items
+              WHERE scenario_id = $1 AND notify_status = 'sent' ORDER BY id`, [req.params.id])).rows
+            .map((r) => {
+              const cur = periodByKey.get(`${r.org_id}||${r.subscription_number}`) ?? null;
+              const nxt = cur == null ? null : saasNewPeriodPrice(cur, r.increase_type, r.increase_value);
+              const live = liveSubs.find(x => x.orgId === r.org_id && x.subscriptionNumber === r.subscription_number);
+              return {
+                ...r,
+                effectiveDate: nextBillingBySub.get(`${r.org_id}||${r.subscription_number}`) || null,
+                monthlyDelta: cur == null ? 0 : subMonthlyAmount(nxt - cur, live?.interval, live?.intervalUnit),
+              };
+            })
+        : sentRows;
+      internal = await sendSaasIncreaseInternalNotice({ sentRows: rows, scenarioName, actor, frontendBase });
+      }
     } catch (e) {
       // The merchants HAVE been emailed by this point; a failed internal notice must not turn a
       // successful batch into an error the caller reads as "nothing was sent".
@@ -19472,12 +19515,19 @@ async function createCrmLead(o) {
 // same org, so a subscription's customer_id is tried directly as a Books contact_id), then the
 // CRM-by-name failover. Never throws; returns '' so the UI always leaves the "to" field editable
 // rather than blocking a draft on a missing email.
-async function resolveMerchantContactEmail(customerId, customerName) {
+// `orgId` N'EST PAS FACULTATIF EN PRATIQUE. Une fiche client n'existe que dans SON organisation :
+// demander un contact de Xperio ou des Etats-Unis a l'organisation canadienne renvoie un 404
+// « The Contact is not accessible », et la fonction retombait alors sur une recherche par nom
+// dans le CRM — le plus souvent bredouille. Sur la hausse de prix, cela laissait 552 abonnements
+// sans adresse, soit les deux organisations qui portent 28 369 $ des 59 771 $ de hausse.
+// Mesure du 2026-09-09 : avec l'organisation codee en dur, 404 sur les deux ; avec la vraie,
+// l'adresse sort. Le repli sur ZOHO_ORG_ID ne sert plus qu'aux appelants qui ignorent l'org.
+async function resolveMerchantContactEmail(customerId, customerName, orgId) {
   try {
     if (customerId) {
       const { accessToken, apiDomain } = await getAdminBooksAuth();
       const c = await axios.get(`${apiDomain}/books/v3/contacts/${customerId}`, {
-        params: { organization_id: process.env.ZOHO_ORG_ID },
+        params: { organization_id: orgId || process.env.ZOHO_ORG_ID },
         headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
       });
       if (c.status === 200) {
