@@ -17594,14 +17594,12 @@ async function sendSaasIncreaseInternalNotice({ sentRows, scenarioName, actor, f
   if (!to.length) return { sent: false, reason: 'no_recipients', recipients: 0 };
   if (!sentRows.length) return { sent: false, reason: 'nothing_sent', recipients: to.length };
 
-  const money = (n) => `$${(Number(n) || 0).toFixed(2)}`;
   const byPlan = new Map();
   for (const r of sentRows) {
     const k = `${ZOHO_BILLING_ORG_NAMES[r.org_id] || r.org_id} — ${saasPlanLabel(r.plan_name)}`;
     byPlan.set(k, (byPlan.get(k) || 0) + 1);
   }
   const dates = sentRows.map(r => r.effectiveDate).filter(Boolean).sort();
-  const mrrAdd = sentRows.reduce((sum, r) => sum + (Number(r.monthlyDelta) || 0), 0);
 
   const rows = Array.from(byPlan.entries()).sort((a, b) => b[1] - a[1]).map(([k, n]) => `
     <tr>
@@ -17612,36 +17610,48 @@ async function sendSaasIncreaseInternalNotice({ sentRows, scenarioName, actor, f
   const html = `<!doctype html><html><body style="margin:0;padding:0;background:#eef1f6;font-family:Arial,Helvetica,sans-serif">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f6;padding:32px 12px"><tr><td align="center">
       <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:100%;background:#fff;border-radius:14px;overflow:hidden">
-        <tr><td style="background:#1c2434;padding:20px 32px;color:#fff;font-size:15px;font-weight:700">Hausse de prix SaaS — avis interne</td></tr>
+        <tr><td style="background:#1c2434;padding:20px 32px;color:#fff;font-size:15px;font-weight:700">Hausse de prix SaaS — avis interne<br><span style="font-weight:400;color:#a9b4c6">SaaS price increase — internal notice</span></td></tr>
         <tr><td style="height:4px;background:#fe6523;font-size:0;line-height:0">&nbsp;</td></tr>
         <tr><td style="padding:26px 32px 0;font-size:14px;color:#1c2434;line-height:1.65">
-          <p style="margin:0 0 14px"><strong>${sentRows.length} marchand(s)</strong> viennent de recevoir un avis de hausse de prix pour la campagne « ${scenarioName} ».</p>
-          <p style="margin:0 0 6px">Prépare-toi à recevoir des appels. Les chiffres exacts de chaque marchand sont dans Sales Hub, sous <strong>Référence hausse SaaS</strong> — cherche le nom ou le numéro d'abonnement du client et tu verras son ancien prix, son nouveau prix, la date d'effet et le courriel exact qu'il a reçu.</p>
+          <p style="margin:0 0 12px">Veuillez prendre note qu'un avis de hausse de prix a été transmis à <strong>${sentRows.length} marchand(s)</strong> dans le cadre de la campagne « ${scenarioName} ».</p>
+          <p style="margin:0 0 12px">Toute demande de renseignements portant sur ces changements doit être traitée à partir de la section <strong>Référence hausse SaaS</strong> de Sales Hub. Une recherche par nom de marchand, par numéro d'abonnement ou par identifiant de compte y donne le prix actuel, le nouveau prix, la date d'entrée en vigueur ainsi que le contenu exact de l'avis reçu par ce marchand.</p>
+          <p style="margin:0 0 6px">Aucun montant ne doit être communiqué à partir d'une autre source.</p>
+        </td></tr>
+        <tr><td style="padding:20px 32px 0">
+          <div style="height:1px;background:#e6ebf2;font-size:0;line-height:0">&nbsp;</div>
+        </td></tr>
+        <tr><td style="padding:20px 32px 0;font-size:14px;color:#1c2434;line-height:1.65">
+          <p style="margin:0 0 12px">Please note that a price increase notice has been sent to <strong>${sentRows.length} merchant(s)</strong> under the &ldquo;${scenarioName}&rdquo; campaign.</p>
+          <p style="margin:0 0 12px">All enquiries regarding these changes are to be handled from the <strong>SaaS Increase Reference</strong> section of Sales Hub. A search by merchant name, subscription number or account identifier returns the current price, the new price, the effective date and the exact notice that merchant received.</p>
+          <p style="margin:0 0 6px">No amount is to be quoted from any other source.</p>
         </td></tr>
         <tr><td style="padding:18px 32px 0">
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e6ebf2;border-radius:8px;border-collapse:separate">
             <tr>
-              <th align="left" style="padding:10px 14px;background:#f8fafc;font-size:12px;color:#64748b">Organisation et forfait</th>
-              <th align="right" style="padding:10px 14px;background:#f8fafc;font-size:12px;color:#64748b">Marchands</th>
+              <th align="left" style="padding:10px 14px;background:#f8fafc;font-size:12px;color:#64748b;font-weight:600">Organisation et forfait <span style="font-weight:400;color:#94a3b8">/ Organization and plan</span></th>
+              <th align="right" style="padding:10px 14px;background:#f8fafc;font-size:12px;color:#64748b;font-weight:600">Marchands <span style="font-weight:400;color:#94a3b8">/ Merchants</span></th>
             </tr>
             ${rows}
           </table>
           <p style="margin:14px 0 0;font-size:13px;color:#64748b">
-            MRR additionnel : <strong style="color:#1c2434">${money(mrrAdd)}/mois</strong><br>
             Entrée en vigueur : ${dates.length ? `du ${formatSaasEffectiveDate(dates[0], 'fr')} au ${formatSaasEffectiveDate(dates[dates.length - 1], 'fr')}` : 'au prochain renouvellement de chaque abonnement'}<br>
-            Envoyé par : ${actor}
+            Effective : ${dates.length ? `${formatSaasEffectiveDate(dates[0], 'en')} to ${formatSaasEffectiveDate(dates[dates.length - 1], 'en')}` : "at each subscription's next renewal"}<br>
+            Transmis par / Sent by : ${actor}
           </p>
-          <p style="margin:16px 0 0;font-size:12px;color:#94a3b8">Rappel : personne ne peut accorder de rabais, d'exception ou d'annulation de la hausse au téléphone. Toute demande de ce genre s'escalade.</p>
+          <p style="margin:16px 0 0;font-size:12px;color:#94a3b8;line-height:1.6">
+            Aucun rabais, aucune exception et aucune annulation de la hausse ne peut être accordé par téléphone. Toute demande en ce sens doit être escaladée.<br>
+            No discount, exception or reversal of the increase may be granted by telephone. Any such request must be escalated.
+          </p>
         </td></tr>
         <tr><td style="padding:22px 32px 28px">
-          <a href="${frontendBase}/saas-increase/lookup" style="display:inline-block;background:#fe6523;color:#fff;text-decoration:none;font-size:14px;font-weight:700;padding:11px 20px;border-radius:8px">Ouvrir la référence</a>
+          <a href="${frontendBase}/saas-increase/lookup" style="display:inline-block;background:#fe6523;color:#fff;text-decoration:none;font-size:14px;font-weight:700;padding:11px 20px;border-radius:8px">Ouvrir la référence / Open the reference</a>
         </td></tr>
       </table>
     </td></tr></table></body></html>`;
 
   let ok = 0;
   for (const addr of to) {
-    const r = await sendMail(addr, `Hausse de prix SaaS — ${sentRows.length} marchand(s) avisé(s)`, html, {
+    const r = await sendMail(addr, `Hausse de prix SaaS — ${sentRows.length} marchand(s) avisé(s) / SaaS price increase — ${sentRows.length} merchant(s) notified`, html, {
       from: { name: 'Sales Hub', address: process.env.SMTP_FROM || process.env.SMTP_USER },
     });
     if (r.sent) ok++;
