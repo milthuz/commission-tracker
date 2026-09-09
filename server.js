@@ -17003,11 +17003,20 @@ function r2Money(n) { return Math.round((Number(n) || 0) * 100) / 100; }
 // Applies an increase directly to the amount Zoho bills per period. Working from the exact
 // per-period price means no monthly round-trip, so an annual plan lands on the cent instead of
 // drifting a few. 'flat' is per period by design: what you type is added to the amount displayed.
+//
+// Le resultat est arrondi au DOLLAR (David, 2026-09-09 : « mes augmentations ne devraient pas
+// avoir de decimale »). Un pourcentage produit sinon des prix comme 139,11 $ : un montant qu'aucun
+// humain n'a choisi, que le marchand lit sur sa facture et qu'un agent doit justifier au telephone.
+// L'arrondi se fait ICI, sur le prix de PERIODE, parce que c'est la seule valeur qui parte
+// reellement chez Zoho et dans l'avis — arrondir ailleurs laisserait l'ecran et la facture
+// diverger. Le prix MENSUEL qu'on en deduit garde ses decimales : c'est un chiffre de rapport, pas
+// un montant facturé (un annuel a 1 609 $ vaut 134,08 $/mois, et l'ecrire 134 $ serait faux).
+const saasRoundPrice = (n) => Math.round(Number(n) || 0);
 function saasNewPeriodPrice(currentPeriod, type, value) {
   const c = Number(currentPeriod) || 0;
   const v = Number(value) || 0;
-  if (type === 'target') return r2Money(v > 0 ? v : c);
-  return r2Money(type === 'flat' ? c + v : c * (1 + v / 100));
+  if (type === 'target') return saasRoundPrice(v > 0 ? v : c);
+  return saasRoundPrice(type === 'flat' ? c + v : c * (1 + v / 100));
 }
 
 // ⚠️ Cette fonction applique la hausse au prix MENSUEL, alors qu'une hausse fixe et un prix
