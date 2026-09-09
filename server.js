@@ -8234,6 +8234,22 @@ const HUB_VIEWS = {
   },
 };
 
+// Recherche d'une hausse de prix pour UN marchand. Le point d'acces est deja celui de la page
+// « Reference hausse SaaS » : meme permission, meme lecture seule, memes chiffres que ceux que le
+// marchand a recus par courriel. On ne recalcule rien ici — un agent qui lit un montant au
+// telephone doit lire EXACTEMENT ce qui est parti.
+async function toolSaasPriceLookup(scope, i) {
+  const q = String((i && i.query) || '').trim();
+  if (q.length < 2) return { error: 'Give at least two characters: a merchant name, a subscription number, or a merchant account id.' };
+  const r = await hubGet(scope, '/api/saas-increase/lookup', { q });
+  if (r.error) return { error: r.error };
+  const results = (r.data && r.data.results) || [];
+  if (!results.length) {
+    return { found: 0, note: 'No price change on record for that merchant. Say exactly that — do NOT quote a price from the Services & Pricing Guide, which is a catalogue, not this merchant\'s billing.' };
+  }
+  return { found: results.length, results };
+}
+
 async function toolHubRead(scope, i) {
   const view = HUB_VIEWS[i.view];
   if (!view) return { error: `view must be one of: ${Object.keys(HUB_VIEWS).join(', ')}` };
@@ -9800,6 +9816,20 @@ const SOFIA_TOOLS = [
     handler: toolHubRead,
   },
   {
+    name: 'saas_price_lookup',
+    perm: 'saas_increase:lookup',
+    write: false,
+    description: "Look up a MERCHANT's SaaS price increase: their current price, their new price, the date it takes effect, whether the notice was emailed and when, and the exact email they received. Search by merchant name, subscription number or merchant account id — a caller may give any of the three. Use this for EVERY question about what a specific merchant will pay. NEVER answer such a question from the Services & Pricing Guide: that is a catalogue of list prices, not this merchant's billing, and quoting it would commit Cluster to a price nobody agreed to. If nothing is found, say so plainly.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: "Merchant name, subscription number (e.g. SUB-01234) or merchant account id." },
+      },
+      required: ['query'],
+    },
+    handler: toolSaasPriceLookup,
+  },
+  {
     name: 'hub_list_estimates',
     perm: 'proposals:send',
     write: false,
@@ -10189,6 +10219,8 @@ THE APP'S SECTIONS (left sidebar):
 - Partners: the referral-partner program (Moneris and others). Partner staff submit merchant leads through their own portal; a Cluster partner manager reviews each one in the Opportunity Queue, and approving it creates a real Lead in Zoho CRM assigned to a chosen Cluster rep. Sub-tabs: Opportunity Queue (review/approve/reject), Manage Partners, Users, Payouts, Data import, and Statistics. Statistics has two halves — the deal PIPELINE (volume submitted, what is still open, won vs lost, win rate over decided records, and per-partner conversion) and portal USAGE (invitations, activations, logins, dormant accounts). A partner payout is triggered by the deposit date on the Zoho deal, not by a paid invoice.
 - Support (Soutien technique): high-level reports on Zoho Desk tickets — a local copy of ~126k tickets since 2022, refreshed hourly. Sub-tabs: Overview (monthly volume, resolution-time distribution, channels), Issues (Ticket Type, sub-categories, recurring words in subjects), Team (departments and agents), Merchants (who opens the most tickets), and Revenue & churn (tickets crossed with invoiced revenue, plus a churned-vs-active comparison). Two things to know when answering: the measured delay is creation-to-closure, because Zoho only exposes FIRST-RESPONSE time one ticket at a time; and the "Integration Emails" department is absent, because Zoho refuses to serve it to the reader account — it is automated lead email, not support.
   What the numbers actually say about churn, so you do not overclaim: ticket VOLUME barely separates merchants who left from those who stayed (8.2 vs 6.6 on average over 12 months). What does separate them is tickets that DRAGGED past 72 hours — 1.86 per merchant who left for a competitor and 2.17 for those who stopped using the system, against 0.84 for active merchants. And 61% of cancellations are a business closure or a change of owner, which support cannot influence at all. Point people at slow tickets, not at ticket counts.
+- SaaS price increase — Référence hausse SaaS (/saas-increase/lookup): the support desk's reference when a merchant calls about their bill going up. An agent searches one account by name, subscription number or merchant account id and reads back the old price, the new price, the effective date, and the exact notice that merchant received.
+  ⚠️ RULE THAT OVERRIDES EVERYTHING ELSE ABOUT PRICES. Cluster is raising SaaS prices on existing subscriptions. Each increase takes effect at THAT subscription's own next renewal, never on a single shared date. When anyone asks what a specific merchant pays now or will pay, you MUST call the saas_price_lookup tool and report only what it returns. You must NEVER answer from the Services & Pricing Guide: that guide is a CATALOGUE of list prices, and a merchant's bill is not the catalogue. Quoting it to someone on the phone with a customer would commit Cluster to a price nobody agreed to. If the tool finds nothing, or you do not have access to it, say plainly that you cannot see that merchant's change and that the agent should check Référence hausse SaaS or escalate — never estimate, never interpolate, never reason from the plan name.
 - The Pass (La Passe): the merchant referral program. A merchant refers another merchant; the credit is floored when the referral is submitted, capped at the tier when the new merchant goes live, then the final amount is confirmed by hand (its own permission) before accounting is notified.
 - What each user sees depends on their permissions — some sections may not be visible to everyone.
 
