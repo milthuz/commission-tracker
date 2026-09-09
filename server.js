@@ -2831,6 +2831,11 @@ async function initializeDatabase() {
     // title survives a reload and reaches the send — it was previously recomputed at send time
     // from the hardcoded default, which silently ignored the template's own heading.
     await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notify_heading VARCHAR(300)`);
+    // La date d'effet promise au marchand, FIGEE au moment de l'envoi de l'avis. Elle ne peut pas
+    // etre recalculee plus tard : le plancher de 30 jours se compte a partir de la date de l'avis,
+    // donc la meme formule appliquee un mois apres donnerait une date plus tardive que celle que le
+    // marchand a lue. C'est aussi elle qui autorise ou non la poussee vers Zoho.
+    await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS effective_date DATE`);
     // Widen scenario-item uniqueness to include the org. Zoho subscription numbers are per-ORG,
     // so (scenario_id, subscription_number) meant two different customers sharing a number could
     // not both be in one scenario — the second silently overwrote the first, losing a real
@@ -17025,6 +17030,8 @@ function serializeSaasIncreaseItem(row) {
     notifyTo: row.notify_to, notifySubject: row.notify_subject, notifyBody: row.notify_body,
     notifyStatus: row.notify_status, notifyError: row.notify_error, notifyHeading: row.notify_heading,
     notifiedBy: row.notified_by, notifiedAt: row.notified_at,
+    // La date promise au marchand, figee a l'envoi de l'avis. Nulle tant qu'il n'est pas avise.
+    effectiveDate: row.effective_date ? String(row.effective_date).slice(0, 10) : null,
   };
 }
 
@@ -17239,6 +17246,51 @@ app.get('/api/admin/saas-increase/scenarios/:id/export', authenticateToken, asyn
 // Cluster-branded chrome (buildProposalEmailHtml) rather than mailChrome/Sales Hub, since this
 // goes to an external merchant, not an internal Sales Hub user (same rule Proposal Builder
 // follows for quotes — see buildProposalEmailHtml's comment).
+// ---------------------------------------------------------------------------------------------
+// Plancher de preavis. Regle de David (2026-09-09) : un marchand dispose d'au moins 30 jours entre
+// l'avis et le changement de prix. La hausse prend donc effet au PREMIER renouvellement qui tombe
+// au moins 30 jours apres l'avis — le prochain s'il est assez loin, sinon celui d'apres.
+//
+// Sans ce plancher, un abonne mensuel dont la facturation tombe demain aurait un jour de preavis :
+// 78 % du scenario Q3 etait dans ce cas, dont 986 marchands a sept jours ou moins. Le prochain
+// renouvellement n'est pas un delai, c'est une date qui appartient au client.
+//
+// On avance par CADENCE REELLE de l'abonnement, jamais par mois calendaire suppose : sauter un
+// terme sur un abonnement annuel reporte d'un an, pas d'un mois.
+const SAAS_NOTICE_FLOOR_DAYS = 30;
+function saasCadenceMonths(interval, intervalUnit) {
+  const iv = Math.max(1, parseInt(interval) || 1);
+  const unit = String(intervalUnit || 'months').toLowerCase();
+  if (unit.startsWith('year')) return iv * 12;
+  if (unit.startsWith('week')) return (iv * 12) / 52;
+  if (unit.startsWith('day')) return (iv * 12) / 365;
+  return iv;
+}
+// Renvoie une date « AAAA-MM-JJ », ou null si Zoho ne nous a pas donne de prochain renouvellement.
+function saasFlooredEffectiveDate(nextBillingAt, interval, intervalUnit, noticeDate) {
+  if (!nextBillingAt) return null;
+  const ymd = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(nextBillingAt));
+  if (!ymd) return null;
+  // Dates de calendrier, construites de leurs propres morceaux : `new Date('2026-09-17')` est lu
+  // comme minuit UTC et se reformate au 16 septembre a l'ouest de Greenwich.
+  let d = new Date(Number(ymd[1]), Number(ymd[2]) - 1, Number(ymd[3]));
+  const base = noticeDate ? new Date(noticeDate) : new Date();
+  const plancher = new Date(base.getFullYear(), base.getMonth(), base.getDate() + SAAS_NOTICE_FLOOR_DAYS);
+  const cadence = saasCadenceMonths(interval, intervalUnit);
+  // Une cadence inferieure au mois (hebdomadaire, quotidienne) ne se compte pas en mois : on
+  // avance en jours pour ne pas boucler indefiniment ni sauter des termes entiers.
+  const parJours = cadence < 1 ? Math.max(1, Math.round(cadence * (365 / 12))) : 0;
+  let garde = 0;
+  while (d < plancher && garde++ < 400) {
+    d = parJours
+      ? new Date(d.getFullYear(), d.getMonth(), d.getDate() + parJours)
+      : new Date(d.getFullYear(), d.getMonth() + cadence, d.getDate());
+  }
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${mm}-${dd}`;
+}
+
 // Formats the {{effectiveDate}} placeholder in the merchant's language — falls back to the
 // generic "at your next renewal" phrasing (both languages) when the date isn't known yet
 // (e.g. Zoho hasn't returned next_billing_at for this subscription).
@@ -17507,8 +17559,9 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authentic
       `SELECT * FROM saas_increase_items WHERE scenario_id = $1 AND id = ANY($2::int[]) AND skipped = FALSE`,
       [req.params.id, itemIds]
     )).rows;
-    // Effective date isn't stored on the item (it's Zoho's own next-renewal date, which can
-    // shift) — looked up fresh from the same cached subscriptions list the main table uses.
+    // La date d'effet n'est pas la date de renouvellement brute de Zoho : c'est le premier
+    // renouvellement au moins 30 jours apres l'avis (voir saasFlooredEffectiveDate). Tant que
+    // l'avis n'est pas parti, elle se recalcule a chaque brouillon — elle ne se fige qu'a l'envoi.
     const liveSubs = await getSaasIncreaseSubscriptions();
     // CLE (org, numero) et jamais le numero seul : 299 numeros d'abonnement existent dans
     // plus d'une des trois organisations. Indexee sur le numero seul, cette table rendait la
@@ -17523,8 +17576,10 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authentic
     const results = [];
     for (const it of items) {
       const to = await resolveMerchantContactEmail(it.customer_id, it.customer_name, it.org_id);
-      const effectiveDate = nextBillingBySub.get(`${it.org_id}||${it.subscription_number}`) || null;
       const liveSub = liveSubs.find(x => x.orgId === it.org_id && x.subscriptionNumber === it.subscription_number);
+      const effectiveDate = saasFlooredEffectiveDate(
+        nextBillingBySub.get(`${it.org_id}||${it.subscription_number}`) || null,
+        liveSub?.interval, liveSub?.intervalUnit, null);
       // Quote exactly what the push will write, from the same source — otherwise the email and the
       // invoice could disagree by a few cents on annual plans.
       const curPeriod = periodByKey.get(`${it.org_id}||${it.subscription_number}`) ?? null;
@@ -17684,10 +17739,10 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
       `SELECT org_id, subscription_number, plan_price_period FROM saas_subscription_insights
         WHERE plan_price_period IS NOT NULL`
     )).rows.map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
-    let nextBillingBySub = new Map();
+    let liveByKey = new Map();
     try {
       const liveSubs = await getSaasIncreaseSubscriptions();
-      nextBillingBySub = new Map(liveSubs.map(x => [`${x.orgId}||${x.subscriptionNumber}`, x.nextBillingAt]));
+      liveByKey = new Map(liveSubs.map(x => [`${x.orgId}||${x.subscriptionNumber}`, x]));
     } catch { /* Zoho unreachable: the stored facts are still worth showing */ }
 
     const results = rows.map(r => {
@@ -17701,7 +17756,15 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
         orgName: ZOHO_BILLING_ORG_NAMES[r.org_id] || r.org_id,
         planName: saasPlanLabel(r.plan_name),
         currentPrice: cur, newPrice: next,
-        effectiveDate: nextBillingBySub.get(`${r.org_id}||${r.subscription_number}`) || null,
+        // Pour un marchand DEJA avise, la seule bonne reponse est la date que son courriel
+        // annonce. La recalculer donnerait une date plus tardive de jour en jour — un agent
+        // contredirait au telephone le courriel que le client a sous les yeux.
+        effectiveDate: r.effective_date
+          ? String(r.effective_date).slice(0, 10)
+          : saasFlooredEffectiveDate(
+              liveByKey.get(`${r.org_id}||${r.subscription_number}`)?.nextBillingAt || null,
+              liveByKey.get(`${r.org_id}||${r.subscription_number}`)?.interval,
+              liveByKey.get(`${r.org_id}||${r.subscription_number}`)?.intervalUnit, null),
         pushStatus: r.status,
         pushedAt: r.pushed_at,
         notifyStatus: r.notify_status,
@@ -17835,8 +17898,13 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
         const curPeriod = periodByKey.get(`${dbRow.org_id}||${dbRow.subscription_number}`) ?? null;
         if (curPeriod != null) {
           const nxtPeriod = saasNewPeriodPrice(curPeriod, dbRow.increase_type, dbRow.increase_value);
-          const effectiveDate = nextBillingBySub.get(`${dbRow.org_id}||${dbRow.subscription_number}`) || null;
           const liveSub = liveSubs.find(x => x.orgId === dbRow.org_id && x.subscriptionNumber === dbRow.subscription_number);
+          // Le plancher se compte a partir d'AUJOURD'HUI, c'est-a-dire du jour de l'avis. La date
+          // obtenue est ecrite en base juste apres l'envoi reussi : c'est une promesse faite au
+          // marchand par ecrit, elle ne doit plus jamais se recalculer.
+          const effectiveDate = saasFlooredEffectiveDate(
+            nextBillingBySub.get(`${dbRow.org_id}||${dbRow.subscription_number}`) || null,
+            liveSub?.interval, liveSub?.intervalUnit, null);
           change = {
             planName: dbRow.plan_name || '',
             currentPrice: `$${r2Money(curPeriod).toFixed(2)}`,
@@ -17856,8 +17924,8 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
         // MRR added are what the support desk needs, and they are only knowable per batch.
         if (dbRow) sentRows.push({ ...dbRow, effectiveDate: change?.effectiveDateRaw || null, monthlyDelta: change?.monthlyDelta || 0 });
         await pool.query(
-          `UPDATE saas_increase_items SET notify_to = $1, notify_subject = $2, notify_body = $3, notify_status = 'sent', notify_error = NULL, notified_by = $4, notified_at = NOW() WHERE id = $5 AND scenario_id = $6`,
-          [to, subject, bodyText, actor, itemId, req.params.id]
+          `UPDATE saas_increase_items SET notify_to = $1, notify_subject = $2, notify_body = $3, notify_status = 'sent', notify_error = NULL, notified_by = $4, notified_at = NOW(), effective_date = COALESCE($7::date, effective_date) WHERE id = $5 AND scenario_id = $6`,
+          [to, subject, bodyText, actor, itemId, req.params.id, change?.effectiveDateRaw || null]
         );
       } else {
         await pool.query(
@@ -17895,7 +17963,7 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
               const live = liveSubs.find(x => x.orgId === r.org_id && x.subscriptionNumber === r.subscription_number);
               return {
                 ...r,
-                effectiveDate: nextBillingBySub.get(`${r.org_id}||${r.subscription_number}`) || null,
+                effectiveDate: r.effective_date ? String(r.effective_date).slice(0, 10) : null,
                 monthlyDelta: cur == null ? 0 : subMonthlyAmount(nxt - cur, live?.interval, live?.intervalUnit),
               };
             })
@@ -18034,7 +18102,7 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
     // only stores the human-readable subscription_number), so this also naturally catches
     // subscriptions that no longer exist/changed since the scenario was built.
     const liveSubs = await getSaasIncreaseSubscriptions();
-    const liveBySub = new Map(liveSubs.map(s => [s.subscriptionNumber, s]));
+    const liveBySub = new Map(liveSubs.map(s => [`${s.orgId}||${s.subscriptionNumber}`, s]));
     const { accessToken, apiDomain } = await getAdminBooksAuth();
     // Which subscriptions have had their plan price separated from their addons by the insights
     // scan. Anything missing here cannot be pushed safely — see the per-item guard below.
@@ -18047,7 +18115,7 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
 
     const results = [];
     for (const item of items) {
-      const live = liveBySub.get(item.subscription_number);
+      const live = liveBySub.get(`${item.org_id}||${item.subscription_number}`);
       // The value we push becomes the PLAN price. If the plan/addon split was never verified for
       // this subscription, new_monthly may have been computed from plan + addons — pushing it
       // would set the plan to that combined figure and the addons would be re-charged on top of
@@ -18063,6 +18131,26 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
         const msg = 'Subscription no longer found in Zoho Billing';
         await pool.query(`UPDATE saas_increase_items SET status = 'push_failed', push_error = $1 WHERE id = $2`, [msg, item.id]);
         results.push({ itemId: item.id, ok: false, error: msg });
+        continue;
+      }
+      // Le plancher de 30 jours se tient ICI autant que dans le courriel. Zoho planifie la hausse
+      // en `end_of_term`, c'est-a-dire au PROCHAIN renouvellement : si celui-ci tombe avant la date
+      // promise dans l'avis, pousser maintenant facturerait le marchand un cycle trop tot et
+      // dementirait par ecrit ce qu'on vient de lui annoncer. On refuse, en disant quand la ligne
+      // redeviendra poussable — elle le redevient d'elle-meme une fois ce renouvellement passe,
+      // il suffit de relancer la poussee. C'est ce qui fait les deux vagues.
+      const promise = item.effective_date ? String(item.effective_date).slice(0, 10) : null;
+      if (!promise) {
+        const msg = "Notice not sent yet — the 30-day notice period starts when the merchant is emailed";
+        await pool.query(`UPDATE saas_increase_items SET status = 'deferred', push_error = $1 WHERE id = $2`, [msg, item.id]);
+        results.push({ itemId: item.id, ok: false, deferred: true, error: msg });
+        continue;
+      }
+      const nextTerm = live.nextBillingAt ? String(live.nextBillingAt).slice(0, 10) : null;
+      if (nextTerm && nextTerm < promise) {
+        const msg = `Too early: Zoho would apply this at the ${nextTerm} renewal, but the merchant was promised ${promise}. Push again after ${nextTerm}.`;
+        await pool.query(`UPDATE saas_increase_items SET status = 'deferred', push_error = $1 WHERE id = $2`, [msg, item.id]);
+        results.push({ itemId: item.id, ok: false, deferred: true, error: msg });
         continue;
       }
       const billing = new ZohoBillingService(accessToken, apiDomain, item.org_id);
