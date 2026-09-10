@@ -18806,6 +18806,29 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
     // reelle de l'abonnement, et on ajoute l'ecart de PERIODE a chacune. Ce que la direction
     // financiere obtient est le montant supplementaire qui sera reellement facture chaque mois
     // — irregulier, avec des pics aux anniversaires annuels, et c'est la realite.
+    // ── Le taux de resiliation ──────────────────────────────────────────────────────────────
+    // Mesure sur les VRAIS evenements des douze derniers mois, pas un chiffre choisi. David
+    // peut l'ecraser (?churn=0.02) pour eprouver un scenario plus dur.
+    //
+    // ⚠️ C'est la resiliation DE FOND : celle qui arrive de toute facon, hausse ou pas. Ce
+    // calcul ne modelise PAS la resiliation CAUSEE par la hausse — il n'existe aucun historique
+    // pour l'estimer, et l'heuristique de risque de l'outil n'est justement pas un modele.
+    // Un marchand qui part a cause du prix s'ajoute a ce qui suit, il ne s'y substitue pas.
+    let churnMensuel = 0, churnSource = 'measured', churn12 = 0, baseActive = liveSubs.length || 1;
+    try {
+      churn12 = Number((await pool.query(
+        `SELECT COUNT(*)::int n FROM saas_churn_events
+          WHERE cancelled_at IS NOT NULL AND cancelled_at >= NOW() - INTERVAL '12 months'`)).rows[0].n) || 0;
+      churnMensuel = churn12 / 12 / baseActive;
+    } catch { churnSource = 'unavailable'; }
+    if (req.query.churn != null && req.query.churn !== '') {
+      const v = Number(req.query.churn);
+      // Borne haute volontaire : au-dela de 20 % par mois on ne fait plus une prevision, on
+      // fait une hypothese de fermeture, et le tableau n'aurait plus de sens.
+      if (isFinite(v) && v >= 0 && v <= 0.2) { churnMensuel = v; churnSource = 'override'; }
+    }
+    const survie = (moisEcoules) => Math.pow(1 - churnMensuel, Math.max(0, moisEcoules));
+
     const HORIZON_MOIS = 24;
     const debutCal = new Date(); debutCal.setDate(1);
     const finCal = new Date(debutCal.getFullYear(), debutCal.getMonth() + HORIZON_MOIS, 1);
@@ -18813,7 +18836,8 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
     for (let k = 0; k < HORIZON_MOIS; k++) {
       const d = new Date(debutCal.getFullYear(), debutCal.getMonth() + k, 1);
       cash.set(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`,
-        { month: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`, billings: 0, amount: 0, monthlyPart: 0, annualPart: 0 });
+        { month: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`, billings: 0,
+          amount: 0, amountNet: 0, monthlyPart: 0, annualPart: 0, index: k });
     }
     for (const e of enrichies) {
       if (!e.effectiveDate || e.currentPeriod == null || e.newPeriod == null) continue;
@@ -18835,15 +18859,22 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
         const b = cash.get(cle);
         if (!b) continue;
         b.billings++; b.amount += ecart;
+        // Plus l'echeance est lointaine, moins le marchand a de chances d'etre encore la.
+        // Survie geometrique : (1 - taux) puissance le nombre de mois d'ici la.
+        b.amountNet += ecart * survie(b.index);
         if (cad >= 12) b.annualPart += ecart; else b.monthlyPart += ecart;
       }
     }
-    let cumulCash = 0;
+    let cumulCash = 0, cumulNet = 0;
     const billedByMonth = Array.from(cash.values()).map(b => {
-      cumulCash += b.amount;
+      cumulCash += b.amount; cumulNet += b.amountNet;
       return {
         month: b.month, billings: b.billings,
         amount: r2Money(b.amount), cumulative: r2Money(cumulCash),
+        amountNet: r2Money(b.amountNet), cumulativeNet: r2Money(cumulNet),
+        // Combien d'abonnements on suppose encore actifs a ce moment-la, pour que le lecteur
+        // voie l'hypothese plutot que de subir un chiffre plus petit sans explication.
+        survivalPct: Math.round(survie(b.index) * 1000) / 10,
         monthlyPart: r2Money(b.monthlyPart), annualPart: r2Money(b.annualPart),
       };
     });
@@ -18851,15 +18882,18 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
     const parAnnee = new Map();
     for (const b of billedByMonth) {
       const y = b.month.slice(0, 4);
-      parAnnee.set(y, r2Money((parAnnee.get(y) || 0) + b.amount));
+      const e = parAnnee.get(y) || { amount: 0, amountNet: 0 };
+      e.amount = r2Money(e.amount + b.amount);
+      e.amountNet = r2Money(e.amountNet + b.amountNet);
+      parAnnee.set(y, e);
     }
     const premierMois = billedByMonth[0]?.month || '';
     const dernierMois = billedByMonth[billedByMonth.length - 1]?.month || '';
     // Une annee civile n'est COMPLETE que si l'horizon la couvre de janvier a decembre. La
     // premiere et la derniere sont presque toujours partielles ; les lire comme des annees
     // pleines fausserait un budget de plusieurs centaines de milliers de dollars.
-    const billedByYear = Array.from(parAnnee.entries()).map(([year, amount]) => ({
-      year, amount,
+    const billedByYear = Array.from(parAnnee.entries()).map(([year, v]) => ({
+      year, amount: v.amount, amountNet: v.amountNet,
       partial: !(billedByMonth.some(b => b.month === `${year}-01`) && billedByMonth.some(b => b.month === `${year}-12`)),
       from: year === premierMois.slice(0, 4) ? premierMois : `${year}-01`,
       to: year === dernierMois.slice(0, 4) ? dernierMois : `${year}-12`,
@@ -19123,6 +19157,11 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
         pushed: enrichies.filter(e => e.pushStatus === 'pushed').length,
       },
       ramp,
+      churn: {
+        monthlyRate: Math.round(churnMensuel * 100000) / 100000,
+        annualRate: Math.round((1 - Math.pow(1 - churnMensuel, 12)) * 1000) / 10,
+        source: churnSource, cancellations12m: churn12, activeBase: baseActive,
+      },
       resellers: resellersOut,
       resellerCoverage,
       billedByMonth,
