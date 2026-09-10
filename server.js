@@ -18548,6 +18548,293 @@ async function runSaasIncreaseAutopilot() {
   }
 }
 
+// =============================================================================================
+// RAPPORT DE CAMPAGNE — trois lectures d'un meme scenario, une seule traversee des donnees.
+//   1. MONTEE  : combien de MRR entre chaque mois. La hausse tombe au renouvellement de chacun,
+//                donc la premiere annee ne vaut PAS douze fois le montant affiche. C'est ce que
+//                la direction financiere doit voir, et c'est le chiffre qu'on se trompe a citer.
+//   2. CHAINES : les comptes multi-succursales, regroupes. Un proprietaire de 43 restaurants
+//                compare ses factures entre elles ; deux taux differents dans le meme groupe
+//                sont un appel garanti.
+//   3. CONTROLES : ce qui merite un oeil AVANT l'envoi. Je ne connais pas la logique
+//                commerciale derriere chaque taux — ces controles ne jugent donc pas la
+//                decision, ils signalent ce qui DETONNE par rapport au reste du scenario.
+// =============================================================================================
+
+// Un mot vide en tete de nom ne dit rien de l'enseigne : « Restaurant Le Bidon » et « Restaurant
+// Le Sizzler » ne sont pas la meme chaine. On les saute pour trouver les mots qui portent
+// vraiment l'identite.
+const SAAS_CHAIN_STOPWORDS = new Set([
+  'restaurant', 'resto', 'le', 'la', 'les', 'l', 'du', 'de', 'des', 'chez', 'cafe', 'caf',
+  'bar', 'pub', 'club', 'the', 'inc', 'ltd', 'ltee', 'enr', 'groupe', 'group', 'les',
+]);
+function saasChainKey(name) {
+  const mots = String(name || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')      // accents
+    .toLowerCase().replace(/[^a-z0-9 ]/g, ' ')
+    .split(/\s+/).filter(Boolean);
+  const utiles = [];
+  for (const m of mots) {
+    if (!utiles.length && SAAS_CHAIN_STOPWORDS.has(m)) continue; // on ne saute qu'en TETE
+    utiles.push(m);
+    if (utiles.length === 2) break;
+  }
+  return utiles.length === 2 ? utiles.join(' ') : (utiles[0] || '');
+}
+
+// « Casse-croute X » et « Casse-croute Y » ne sont pas deux succursales, ce sont deux
+// casse-croute. Ces cles-la decrivent un metier, pas une enseigne.
+const SAAS_CHAIN_FALSE_KEYS = new Set([
+  'casse croute', 'casse crote', 'depanneur', 'boulangerie', 'patisserie', 'fromagerie',
+  'brasserie', 'taverne', 'buffet', 'cantine', 'pizzeria', 'rotisserie', 'creme glacee',
+]);
+const SAAS_CHAIN_MIN = 3;          // en deca, ce n'est pas une chaine, c'est une coincidence
+const SAAS_BIG_JUMP_PCT = 40;      // au-dela, le marchand appellera
+const SAAS_TINY_PRICE = 20;        // un prix de periode plus bas est un compte d'essai ou une relique
+const SAAS_RECENT_MONTHS = 12;     // deja augmente il y a moins d'un an
+
+app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  try {
+    const scenario = (await pool.query(
+      `SELECT * FROM saas_increase_scenarios WHERE id = $1`, [req.params.id])).rows[0];
+    if (!scenario) return res.status(404).json({ error: 'scenario not found' });
+
+    const items = (await pool.query(
+      `SELECT * FROM saas_increase_items WHERE scenario_id = $1 AND skipped = FALSE ORDER BY id`,
+      [req.params.id])).rows;
+    const liveSubs = await getSaasIncreaseSubscriptions();
+    const liveByKey = new Map(liveSubs.map(x => [`${x.orgId}||${x.subscriptionNumber}`, x]));
+    const insights = new Map((await pool.query(
+      `SELECT org_id, subscription_number, plan_price_period, addons_price_period, last_price_change_at
+         FROM saas_subscription_insights`)).rows
+      .map(r => [`${r.org_id}||${r.subscription_number}`, r]));
+
+    // ── Une passe : on enrichit chaque ligne une fois, les trois lectures s'en servent ────────
+    const enrichies = [];
+    for (const it of items) {
+      const key = `${it.org_id}||${it.subscription_number}`;
+      const live = liveByKey.get(key) || null;
+      const ins = insights.get(key) || null;
+      const cp = ins && ins.plan_price_period != null ? Number(ins.plan_price_period) : null;
+      const np = cp == null ? null : saasNewPeriodPrice(cp, it.increase_type, it.increase_value);
+      const cadence = live ? saasCadenceMonths(live.interval, live.intervalUnit) : 1;
+      // La date que le marchand verra : plancher de 30 jours, ou celle deja figee a l'envoi.
+      const eff = it.effective_date ? String(it.effective_date).slice(0, 10)
+        : (live ? saasFlooredEffectiveDate(live.nextBillingAt, live.interval, live.intervalUnit, null) : null);
+      enrichies.push({
+        id: it.id, org: ZOHO_BILLING_ORG_NAMES[it.org_id] || it.org_id, orgId: it.org_id,
+        sub: it.subscription_number, name: it.customer_name || '',
+        plan: saasPlanLabel(it.plan_name), planCode: it.plan_code,
+        type: it.increase_type, value: Number(it.increase_value),
+        currentPeriod: cp, newPeriod: np, cadence,
+        pct: cp && cp > 0 && np != null ? ((np - cp) / cp) * 100 : null,
+        mrrAdd: cp != null && np != null ? (np - cp) / Math.max(1, cadence) : 0,
+        effectiveDate: eff,
+        status: live ? live.status : null,
+        addonsPeriod: ins && ins.addons_price_period != null ? Number(ins.addons_price_period) : null,
+        lastChange: ins && ins.last_price_change_at ? String(ins.last_price_change_at).slice(0, 10) : null,
+        notifyStatus: it.notify_status, pushStatus: it.status,
+        chain: saasChainKey(it.customer_name),
+      });
+    }
+
+    // ── 1. La montee du MRR, mois par mois ───────────────────────────────────────────────────
+    // Cumulatif ET incremental. Le total du scenario est un REGIME DE CROISIERE atteint une fois
+    // que tout le monde a renouvele — pas un montant encaisse des le premier mois.
+    const parMois = new Map();
+    let sansDate = 0;
+    for (const e of enrichies) {
+      if (!e.effectiveDate) { sansDate++; continue; }
+      const m = e.effectiveDate.slice(0, 7);
+      if (!parMois.has(m)) parMois.set(m, { month: m, count: 0, mrrAdded: 0 });
+      const b = parMois.get(m); b.count++; b.mrrAdded += e.mrrAdd;
+    }
+    let cumul = 0;
+    const ramp = Array.from(parMois.values()).sort((a, b) => a.month.localeCompare(b.month))
+      .map(b => { cumul += b.mrrAdded; return { ...b, mrrAdded: r2Money(b.mrrAdded), cumulativeMrr: r2Money(cumul) }; });
+    // Ce que la campagne rapporte VRAIMENT sur douze mois glissants : chaque hausse ne compte
+    // que pour les mois qui restent apres sa date d'effet.
+    const debut = new Date();
+    let premiereAnnee = 0;
+    for (const e of enrichies) {
+      if (!e.effectiveDate) continue;
+      const d = new Date(e.effectiveDate);
+      const moisRestants = Math.max(0, 12 - Math.max(0,
+        (d.getFullYear() - debut.getFullYear()) * 12 + (d.getMonth() - debut.getMonth())));
+      premiereAnnee += e.mrrAdd * moisRestants;
+    }
+
+    // ── 2. Les chaines ───────────────────────────────────────────────────────────────────────
+    const groupes = new Map();
+    for (const e of enrichies) {
+      if (!e.chain) continue;
+      if (!groupes.has(e.chain)) groupes.set(e.chain, []);
+      groupes.get(e.chain).push(e);
+    }
+    const chains = Array.from(groupes.entries())
+      .filter(([cle, l]) => l.length >= SAAS_CHAIN_MIN && !SAAS_CHAIN_FALSE_KEYS.has(cle))
+      .map(([cle, l]) => {
+        const taux = [...new Set(l.map(x => `${x.type}:${x.value}`))];
+        const dates = [...new Set(l.map(x => x.effectiveDate).filter(Boolean))].sort();
+        // Des taux differents entre succursales ne sont PAS forcement une erreur : le scenario
+        // se regle par segment (organisation x forfait), donc une chaine repartie sur plusieurs
+        // forfaits herite naturellement de plusieurs taux, et c'est defendable. Ce qui ne l'est
+        // pas, c'est deux succursales sur LE MEME forfait a des taux differents.
+        const parPlan = new Map();
+        for (const x of l) {
+          const pc = x.planCode || '?';
+          if (!parPlan.has(pc)) parPlan.set(pc, new Set());
+          parPlan.get(pc).add(`${x.type}:${x.value}`);
+        }
+        const plansFautifs = Array.from(parPlan.entries()).filter(([, t]) => t.size > 1)
+          .map(([pc, t]) => ({ planCode: pc, rates: Array.from(t) }));
+        return {
+          key: cle,
+          label: l[0].name,
+          locations: l.length,
+          samePlanConflicts: plansFautifs,
+          orgs: [...new Set(l.map(x => x.org))],
+          currentPeriodTotal: r2Money(l.reduce((a, x) => a + (x.currentPeriod || 0), 0)),
+          mrrAdd: r2Money(l.reduce((a, x) => a + x.mrrAdd, 0)),
+          rates: taux,
+          // Le point qui compte : un proprietaire compare ses succursales entre elles.
+          consistent: taux.length === 1,
+          consistentWithinPlan: plansFautifs.length === 0,
+          firstEffective: dates[0] || null, lastEffective: dates[dates.length - 1] || null,
+          members: l.map(x => ({
+            sub: x.sub, name: x.name, org: x.org, plan: x.plan,
+            currentPeriod: x.currentPeriod, newPeriod: x.newPeriod,
+            pct: x.pct == null ? null : Math.round(x.pct * 10) / 10,
+            cadence: x.cadence, mrrAdd: r2Money(x.mrrAdd), effectiveDate: x.effectiveDate,
+          })).sort((a, b) => (b.mrrAdd) - (a.mrrAdd)),
+        };
+      })
+      .sort((a, b) => b.mrrAdd - a.mrrAdd);
+
+    // ── 3. Les controles ─────────────────────────────────────────────────────────────────────
+    // Chaque controle dit ce qu'il a vu, jamais ce qu'il faut faire : la logique commerciale
+    // derriere un taux ne m'appartient pas. Le mot « verifier » est volontaire.
+    const C = [];
+    const ajout = (code, severity, label, why, rows) => {
+      if (rows.length) C.push({ code, severity, label, why, count: rows.length, rows: rows.slice(0, 200) });
+    };
+    const brut = (e) => ({ sub: e.sub, name: e.name, org: e.org, plan: e.plan,
+      currentPeriod: e.currentPeriod, newPeriod: e.newPeriod, cadence: e.cadence,
+      pct: e.pct == null ? null : Math.round(e.pct * 10) / 10, mrrAdd: r2Money(e.mrrAdd),
+      status: e.status, effectiveDate: e.effectiveDate, detail: e.detail || null });
+
+    ajout('price_decrease', 'critical', 'Le nouveau prix est INFERIEUR au prix actuel',
+      "Une « hausse » qui baisse le prix. Presque toujours un prix cible saisi sous le prix courant.",
+      enrichies.filter(e => e.newPeriod != null && e.currentPeriod != null && e.newPeriod < e.currentPeriod).map(brut));
+
+    ajout('no_change', 'warning', 'Aucun changement de prix apres arrondi',
+      "Le marchand recevrait un avis de hausse annoncant le meme prix qu'aujourd'hui.",
+      enrichies.filter(e => e.newPeriod != null && e.currentPeriod != null && e.newPeriod === e.currentPeriod).map(brut));
+
+    ajout('not_verified', 'critical', 'Prix de base non verifie',
+      "La separation forfait/options n'a pas ete calculee. La poussee vers Zoho REFUSERA ces lignes.",
+      enrichies.filter(e => e.currentPeriod == null).map(brut));
+
+    ajout('tiny_price', 'warning', `Prix actuel sous ${SAAS_TINY_PRICE} $`,
+      "Comptes d'essai, ententes speciales ou reliques. Augmenter un abonnement a 1 $ n'a pas de sens.",
+      enrichies.filter(e => e.currentPeriod != null && e.currentPeriod < SAAS_TINY_PRICE).map(brut));
+
+    ajout('huge_jump', 'warning', `Hausse superieure a ${SAAS_BIG_JUMP_PCT} %`,
+      "Peut etre voulu (rattrapage d'un prix gele depuis des annees), mais ces marchands appelleront.",
+      enrichies.filter(e => e.pct != null && e.pct > SAAS_BIG_JUMP_PCT)
+        .sort((a, b) => b.pct - a.pct).map(brut));
+
+    const limite = new Date(); limite.setMonth(limite.getMonth() - SAAS_RECENT_MONTHS);
+    const limiteYmd = limite.toISOString().slice(0, 10);
+    ajout('recent_increase', 'warning', `Deja augmente il y a moins de ${SAAS_RECENT_MONTHS} mois`,
+      "Deux hausses rapprochees sur le meme compte. A confirmer avant l'envoi.",
+      enrichies.filter(e => e.lastChange && e.lastChange > limiteYmd)
+        .map(e => ({ ...brut(e), detail: `derniere hausse le ${e.lastChange}` })));
+
+    ajout('status_risk', 'warning', 'Abonnement en recouvrement, impaye ou en fin de vie',
+      "Augmenter le prix d'un marchand qui ne paie deja pas, ou qui part, se defend mal.",
+      enrichies.filter(e => e.status && ['dunning', 'unpaid', 'non_renewing'].includes(e.status))
+        .map(e => ({ ...brut(e), detail: e.status })));
+
+    ajout('addons_dominate', 'info', 'Les options coutent plus cher que le forfait',
+      "La hausse ne porte que sur le forfait. Sur ces comptes, l'effet sur la facture sera faible.",
+      enrichies.filter(e => e.addonsPeriod != null && e.currentPeriod != null
+        && e.currentPeriod > 0 && e.addonsPeriod > e.currentPeriod * 2)
+        .map(e => ({ ...brut(e), detail: `options ${r2Money(e.addonsPeriod)} $ vs forfait ${r2Money(e.currentPeriod)} $` })));
+
+    // Deux succursales d'une meme chaine, LE MEME forfait, deux taux. C'est celui-la qui ne
+    // se defend pas au telephone : le proprietaire a deux factures identiques a comparer.
+    const memePlan = [];
+    for (const ch of chains) {
+      if (ch.consistentWithinPlan) continue;
+      const codes = new Set(ch.samePlanConflicts.map(c => c.planCode));
+      for (const m of ch.members) {
+        const e = enrichies.find(x => x.sub === m.sub && x.name === m.name);
+        if (!e || !codes.has(e.planCode || '?')) continue;
+        memePlan.push({ ...brut(e),
+          detail: `${ch.label} — ${ch.locations} succursales ; sur ce forfait : `
+            + ch.samePlanConflicts.filter(c => c.planCode === (e.planCode || '?'))
+                .map(c => c.rates.join(' / ')).join(' | ') });
+      }
+    }
+    ajout('chain_same_plan_conflict', 'critical', 'Meme chaine, MEME forfait, taux differents',
+      "Le proprietaire a deux factures identiques a comparer. C'est le seul ecart de taux qui ne se defend pas au telephone.",
+      memePlan);
+
+    // Le cas large, purement informatif : une chaine repartie sur plusieurs forfaits herite
+    // naturellement de plusieurs taux. A regarder, pas a corriger d'office.
+    ajout('chain_mixed_rates', 'info', 'Meme chaine, taux differents selon le forfait',
+      "Consequence normale d'un scenario regle par segment. Verifier seulement si le proprietaire recoit une facture unique.",
+      chains.filter(c => !c.consistent && c.consistentWithinPlan).map(c => ({
+        sub: `${c.locations} succursales`, name: c.label, org: c.orgs.join(', '), plan: '—',
+        currentPeriod: c.currentPeriodTotal, newPeriod: null, cadence: 1, pct: null,
+        mrrAdd: c.mrrAdd, status: null, effectiveDate: c.firstEffective,
+        detail: c.rates.join(' / '),
+      })));
+
+    // Prix courant tres eloigne de la mediane de son forfait : derive tarifaire historique.
+    const parPlan = new Map();
+    for (const e of enrichies) {
+      if (e.currentPeriod == null || e.cadence !== 1) continue; // mediane par forfait MENSUEL
+      if (!parPlan.has(e.planCode)) parPlan.set(e.planCode, []);
+      parPlan.get(e.planCode).push(e.currentPeriod);
+    }
+    const medianes = new Map();
+    for (const [k, v] of parPlan) {
+      if (v.length < 10) continue;
+      const t = [...v].sort((a, b) => a - b);
+      medianes.set(k, t[Math.floor(t.length / 2)]);
+    }
+    ajout('price_outlier', 'info', 'Prix actuel tres eloigne de la mediane de son forfait',
+      "Derive tarifaire ancienne. Ni bon ni mauvais, mais c'est la que se cachent les ententes oubliees.",
+      enrichies.filter(e => {
+        const med = medianes.get(e.planCode);
+        return med && e.cadence === 1 && e.currentPeriod != null && med > 0
+          && (e.currentPeriod < med * 0.5 || e.currentPeriod > med * 2);
+      }).map(e => ({ ...brut(e), detail: `mediane du forfait : ${r2Money(medianes.get(e.planCode))} $` })));
+
+    const ordre = { critical: 0, warning: 1, info: 2 };
+    C.sort((a, b) => ordre[a.severity] - ordre[b.severity] || b.count - a.count);
+
+    res.json({
+      scenario: { id: scenario.id, name: scenario.name, targetMrr: Number(scenario.target_mrr) },
+      generatedAt: new Date().toISOString(),
+      totals: {
+        items: enrichies.length,
+        mrrAdd: r2Money(enrichies.reduce((a, e) => a + e.mrrAdd, 0)),
+        firstYearCash: r2Money(premiereAnnee),
+        withoutEffectiveDate: sansDate,
+        notified: enrichies.filter(e => e.notifyStatus === 'sent').length,
+        pushed: enrichies.filter(e => e.pushStatus === 'pushed').length,
+      },
+      ramp,
+      chains,
+      checks: C,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── SaaS Increase: nightly subscription insights (tenure + last price change) ──────────────
 // Both need a live per-subscription Zoho call, so — per a 2026-07 decision — they're
 // precomputed by this background job (registered on the worker dyno in startAutoSync) rather
