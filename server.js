@@ -17268,6 +17268,70 @@ app.delete('/api/admin/saas-increase/scenarios/:id/items/:itemId', authenticateT
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// =============================================================================================
+// FRAIS D'INTEGRATION DE PAIEMENT — GET /api/saas-increase/lookup/fees
+//
+// Un marchand qui n'a pas le paiement chez nous paie une option pour que sa caisse parle a son
+// processeur. En passant a notre paiement, ce frais DISPARAIT. C'est l'argument concret qu'un
+// agent peut donner a quelqu'un qui appelle justement pour se plaindre d'une hausse : « votre
+// abonnement monte de 20 $, mais vous economisez 45 $ en passant chez nous ».
+//
+// ⚠️ RECONNU PAR LE CODE, PAS PAR LE LIBELLE. Releve chez Zoho le 2026-09-10, les frais de
+// paiement portent tous le prefixe PAY-PRO-INT : PAY-PRO-INT-MON (20 $),
+// PAY-PRO-INT-MON-NEW (45 $), PAY-PRO-INT-CUST-MON (15 a 45 $, parfois en quantite 2).
+// Les autres integrations — UEAT, Datacandy, Deliverect, Piecemeal — ne disparaitraient PAS
+// en changeant de processeur : les inclure gonflerait l'economie annoncee au client.
+//
+// La donnee n'existe pas en base : `subscription_items` est vide et l'analyse ne stocke que le
+// TOTAL des options. On appelle donc Zoho en direct — acceptable ici, la recherche porte sur un
+// marchand a la fois.
+// =============================================================================================
+const SAAS_PAY_INTEGRATION_PREFIX = 'PAY-PRO-INT';
+
+app.get('/api/saas-increase/lookup/fees', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:lookup'))) return;
+  const orgId = String(req.query.org || '').trim();
+  const number = String(req.query.sub || '').trim();
+  if (!orgId || !number) return res.status(400).json({ error: 'org and sub required' });
+  try {
+    const live = (await getSaasIncreaseSubscriptions())
+      .find(x => x.orgId === orgId && x.subscriptionNumber === number);
+    if (!live?.subscriptionId) return res.status(404).json({ error: 'subscription not found' });
+
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    const r = await axios.get(`${apiDomain}/billing/v1/subscriptions/${live.subscriptionId}`, {
+      headers: { Authorization: `Zoho-oauthtoken ${accessToken}`,
+                 'X-com-zoho-subscriptions-organizationid': orgId },
+      validateStatus: () => true, timeout: 20000,
+    });
+    if (r.status !== 200) return res.status(502).json({ error: `Zoho HTTP ${r.status}` });
+
+    const sub = r.data?.subscription || {};
+    const cadence = saasCadenceMonths(sub.interval, sub.interval_unit);
+    const lignes = (Array.isArray(sub.addons) ? sub.addons : []).map(a => {
+      const parPeriode = (Number(a.price) || 0) * (Number(a.quantity) || 1);
+      return {
+        code: a.addon_code || '', name: a.name || '',
+        quantity: Number(a.quantity) || 1,
+        pricePeriod: r2Money(parPeriode),
+        // Ramene au mois pour que la comparaison avec la hausse ait un sens : un frais annuel
+        // de 540 $ ne se compare pas a une hausse de 20 $ par mois.
+        monthly: r2Money(parPeriode / Math.max(1, cadence)),
+        isPayment: String(a.addon_code || '').toUpperCase().startsWith(SAAS_PAY_INTEGRATION_PREFIX),
+      };
+    });
+    const paiement = lignes.filter(l => l.isPayment);
+    res.json({
+      cadenceMonths: cadence,
+      addons: lignes,
+      paymentFees: paiement,
+      // L'economie annoncable : ce qui tombe si le marchand passe a notre paiement.
+      monthlySaving: r2Money(paiement.reduce((a, l) => a + l.monthly, 0)),
+      yearlySaving: r2Money(paiement.reduce((a, l) => a + l.monthly, 0) * 12),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /api/admin/saas-increase/scenarios/:id/items/adjust
 // Corrige quelques lignes NOMMEMENT : les epargner, ou leur poser un autre taux.
 //
@@ -17971,6 +18035,7 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
         customerName: r.customer_name,
         subscriptionNumber: r.subscription_number,
         merchantAccountId: r.merchant_account_id,
+        orgId: r.org_id,
         orgName: ZOHO_BILLING_ORG_NAMES[r.org_id] || r.org_id,
         planName: saasPlanLabel(r.plan_name),
         currentPrice: cur, newPrice: next,
