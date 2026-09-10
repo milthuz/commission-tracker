@@ -18610,6 +18610,57 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
          FROM saas_subscription_insights`)).rows
       .map(r => [`${r.org_id}||${r.subscription_number}`, r]));
 
+    // ── Les revendeurs ──────────────────────────────────────────────────────────────────────
+    // DEUX sources, parce qu'aucune ne suffit :
+    //   • l'attribut Zentact, qui fait autorite mais ne couvre presque rien (mesure le
+    //     2026-09-10 : 79 des 2 794 lignes ont un lien marchand, 19 portent un revendeur) ;
+    //   • le NOM du client, large mais heuristique — Lirette, Sino et Jinctech marquent le nom
+    //     de compte de leurs marchands, ce qui en retrouve 208. Solutions Crisp ne le fait pas
+    //     et reste donc invisible par ce chemin.
+    // On prend l'union et on DIT par quel chemin chaque ligne a ete reconnue : un rapport qui
+    // melange une certitude et une devinette sans le dire ne vaut rien.
+    const revendeurs = (await pool.query(
+      `SELECT id, name, name_aliases FROM resellers WHERE active IS NOT FALSE ORDER BY name`)).rows;
+    // Comparaison par MOT ENTIER, jamais par sous-chaine : « Crisp » est contenu dans
+    // « Crispy Chicken », qui n'a rien a voir avec le revendeur Solutions Crisp.
+    const mots = (v) => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().split(' ').filter(Boolean);
+    // Un mot generique ne designe personne : « Solutions Crisp » et « Sino Technologies » se
+    // reconnaissent a Crisp et a Sino. On enleve aussi le pluriel, l'attribut Zentact ecrivant
+    // « Solution Crisp » la ou la fiche dit « Solutions Crisp ».
+    const GENERIQUES = new Set(['solution', 'technologie', 'technology', 'systeme', 'system',
+      'service', 'groupe', 'group', 'inc', 'ltd', 'ltee', 'enr', 'corp', 'company', 'pos', 'the']);
+    const racine = (m) => (m.length > 4 && m.endsWith('s') ? m.slice(0, -1) : m);
+    const distinctifs = (nom) => mots(nom).map(racine)
+      .filter(m => m.length >= 4 && !GENERIQUES.has(m));
+
+    // Deduplique « Sino » et « Sino Technologies » : c'est le meme partenaire saisi deux fois.
+    const parRevendeur = new Map();
+    for (const r of revendeurs) {
+      const alias = new Set();
+      // Du NOM on ne tire que des mots longs et non generiques : c'est une deduction, elle doit
+      // etre prudente. D'un alias SAISI A LA MAIN dans Gerer les partenaires, on accepte deux
+      // caracteres — un humain qui ecrit « SC » sait ce qu'il fait, et c'est justement la
+      // convention de nommage de Solutions Crisp (54 comptes « SC - … »).
+      distinctifs(r.name).forEach(a => alias.add(a));
+      for (const manuel of (Array.isArray(r.name_aliases) ? r.name_aliases : [])) {
+        mots(manuel).map(racine).filter(m => m.length >= 2).forEach(a => alias.add(a));
+      }
+      if (!alias.size) continue;
+      const cle = Array.from(alias).sort()[0];
+      if (!parRevendeur.has(cle)) parRevendeur.set(cle, { name: r.name, alias: new Set(), rows: [] });
+      const e = parRevendeur.get(cle);
+      // On garde le nom le plus complet comme libelle affiche.
+      if (r.name.length > e.name.length) e.name = r.name;
+      alias.forEach(a => e.alias.add(a));
+    }
+    const attribParSub = new Map((await pool.query(
+      `SELECT l.subscription_number, z.reseller_attribute
+         FROM merchant_saas_links l
+         JOIN zentact_merchants z ON z.merchant_account_id = l.merchant_account_id
+        WHERE z.reseller_attribute IS NOT NULL AND l.subscription_number IS NOT NULL`)).rows
+      .map(r => [String(r.subscription_number), String(r.reseller_attribute)]));
+
     // ── Une passe : on enrichit chaque ligne une fois, les trois lectures s'en servent ────────
     const enrichies = [];
     for (const it of items) {
@@ -18637,6 +18688,26 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
         notifyStatus: it.notify_status, pushStatus: it.status,
         chain: saasChainKey(it.customer_name),
       });
+      // L'attribut Zentact fait FOI et prime sur le nom, globalement : « SC - Bergeron » porte
+      // la convention de nommage de Solutions Crisp mais l'attribut dit Lirette, et c'est
+      // l'attribut qui a raison. Chercher d'abord partout par attribut, le nom seulement apres.
+      const e = enrichies[enrichies.length - 1];
+      const motsAttr = new Set(mots(attribParSub.get(String(it.subscription_number)) || '').map(racine));
+      const motsNom = new Set(mots(it.customer_name).map(racine));
+      let choisi = null, comment = null;
+      for (const [, rev] of parRevendeur) {
+        if ([...rev.alias].some(a => motsAttr.has(a))) { choisi = rev; comment = 'attribute'; break; }
+      }
+      if (!choisi) {
+        for (const [, rev] of parRevendeur) {
+          if ([...rev.alias].some(a => motsNom.has(a))) { choisi = rev; comment = 'name'; break; }
+        }
+      }
+      if (choisi) {
+        e.reseller = choisi.name;
+        e.resellerMatch = comment;
+        choisi.rows.push(e);
+      }
     }
 
     // ── 1. La montee du MRR, mois par mois ───────────────────────────────────────────────────
@@ -18653,6 +18724,74 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
     let cumul = 0;
     const ramp = Array.from(parMois.values()).sort((a, b) => a.month.localeCompare(b.month))
       .map(b => { cumul += b.mrrAdded; return { ...b, mrrAdded: r2Money(b.mrrAdded), cumulativeMrr: r2Money(cumul) }; });
+    // ── La FACTURATION reelle, mois de calendrier par mois de calendrier ────────────────────
+    // Le MRR est une mesure lissee : il repartit une hausse annuelle de 322 $ en 26,83 $ par
+    // mois. Un budget ne se construit pas comme ca. Le marchand annuel ne paie rien de plus
+    // pendant onze mois, puis 322 $ d'un coup au douzieme.
+    //
+    // On simule donc chaque echeance de facturation a partir de la date d'effet, a la cadence
+    // reelle de l'abonnement, et on ajoute l'ecart de PERIODE a chacune. Ce que la direction
+    // financiere obtient est le montant supplementaire qui sera reellement facture chaque mois
+    // — irregulier, avec des pics aux anniversaires annuels, et c'est la realite.
+    const HORIZON_MOIS = 24;
+    const debutCal = new Date(); debutCal.setDate(1);
+    const finCal = new Date(debutCal.getFullYear(), debutCal.getMonth() + HORIZON_MOIS, 1);
+    const cash = new Map();
+    for (let k = 0; k < HORIZON_MOIS; k++) {
+      const d = new Date(debutCal.getFullYear(), debutCal.getMonth() + k, 1);
+      cash.set(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`,
+        { month: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`, billings: 0, amount: 0, monthlyPart: 0, annualPart: 0 });
+    }
+    for (const e of enrichies) {
+      if (!e.effectiveDate || e.currentPeriod == null || e.newPeriod == null) continue;
+      const ecart = e.newPeriod - e.currentPeriod;
+      if (!ecart) continue;
+      const cad = Math.max(1, Math.round(e.cadence));
+      const [ey, em, ed] = e.effectiveDate.split('-').map(Number);
+      // On avance depuis la date d'ANCRAGE, jamais depuis l'echeance precedente, et on ramene
+      // le quantieme au dernier jour du mois quand il n'existe pas. Sinon un abonnement facture
+      // le 31 glisse : `new Date(2027, 1, 31)` vaut le 3 mars, l'echeance de fevrier disparait
+      // et toutes les suivantes derivent d'un cran. Mesure sur le scenario 6 : 142 $ evapores
+      // en fevrier 2027, et un calendrier faux pour toujours.
+      for (let n = 0; n < 400; n++) {
+        const cible = new Date(ey, em - 1 + n * cad, 1);
+        const dernier = new Date(cible.getFullYear(), cible.getMonth() + 1, 0).getDate();
+        const d = new Date(cible.getFullYear(), cible.getMonth(), Math.min(ed, dernier));
+        if (d >= finCal) break;
+        const cle = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        const b = cash.get(cle);
+        if (!b) continue;
+        b.billings++; b.amount += ecart;
+        if (cad >= 12) b.annualPart += ecart; else b.monthlyPart += ecart;
+      }
+    }
+    let cumulCash = 0;
+    const billedByMonth = Array.from(cash.values()).map(b => {
+      cumulCash += b.amount;
+      return {
+        month: b.month, billings: b.billings,
+        amount: r2Money(b.amount), cumulative: r2Money(cumulCash),
+        monthlyPart: r2Money(b.monthlyPart), annualPart: r2Money(b.annualPart),
+      };
+    });
+    // Par annee civile, parce qu'un budget se vote par annee.
+    const parAnnee = new Map();
+    for (const b of billedByMonth) {
+      const y = b.month.slice(0, 4);
+      parAnnee.set(y, r2Money((parAnnee.get(y) || 0) + b.amount));
+    }
+    const premierMois = billedByMonth[0]?.month || '';
+    const dernierMois = billedByMonth[billedByMonth.length - 1]?.month || '';
+    // Une annee civile n'est COMPLETE que si l'horizon la couvre de janvier a decembre. La
+    // premiere et la derniere sont presque toujours partielles ; les lire comme des annees
+    // pleines fausserait un budget de plusieurs centaines de milliers de dollars.
+    const billedByYear = Array.from(parAnnee.entries()).map(([year, amount]) => ({
+      year, amount,
+      partial: !(billedByMonth.some(b => b.month === `${year}-01`) && billedByMonth.some(b => b.month === `${year}-12`)),
+      from: year === premierMois.slice(0, 4) ? premierMois : `${year}-01`,
+      to: year === dernierMois.slice(0, 4) ? dernierMois : `${year}-12`,
+    }));
+
     // Ce que la campagne rapporte VRAIMENT sur douze mois glissants : chaque hausse ne compte
     // que pour les mois qui restent apres sa date d'effet.
     const debut = new Date();
@@ -18814,6 +18953,46 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
           && (e.currentPeriod < med * 0.5 || e.currentPeriod > med * 2);
       }).map(e => ({ ...brut(e), detail: `mediane du forfait : ${r2Money(medianes.get(e.planCode))} $` })));
 
+    // ── Les portefeuilles de revendeurs ─────────────────────────────────────────────────────
+    const resellersOut = Array.from(parRevendeur.values())
+      .filter(r => r.rows.length)
+      .map(r => ({
+        name: r.name,
+        merchants: r.rows.length,
+        byAttribute: r.rows.filter(x => x.resellerMatch === 'attribute').length,
+        byName: r.rows.filter(x => x.resellerMatch === 'name').length,
+        currentPeriodTotal: r2Money(r.rows.reduce((a, x) => a + (x.currentPeriod || 0), 0)),
+        mrrAdd: r2Money(r.rows.reduce((a, x) => a + x.mrrAdd, 0)),
+        rates: [...new Set(r.rows.map(x => `${x.type}:${x.value}`))],
+        orgs: [...new Set(r.rows.map(x => x.org))],
+        members: r.rows.map(x => ({
+          sub: x.sub, name: x.name, org: x.org, plan: x.plan,
+          currentPeriod: x.currentPeriod, newPeriod: x.newPeriod,
+          pct: x.pct == null ? null : Math.round(x.pct * 10) / 10,
+          cadence: x.cadence, mrrAdd: r2Money(x.mrrAdd),
+          effectiveDate: x.effectiveDate, match: x.resellerMatch,
+        })).sort((a, b) => b.mrrAdd - a.mrrAdd),
+      }))
+      .sort((a, b) => b.mrrAdd - a.mrrAdd);
+    const resellerCoverage = {
+      declared: parRevendeur.size,
+      attributedRows: enrichies.filter(e => e.reseller).length,
+      // Ce qu'on ne sait PAS, dit franchement : combien de lignes n'ont AUCUN lien marchand.
+      withoutMerchantLink: enrichies.filter(e => !attribParSub.has(String(e.sub))).length,
+      resellersWithNoMatch: Array.from(parRevendeur.values()).filter(r => !r.rows.length).map(r => r.name),
+    };
+
+    // Une « chaine » qui est en realite le portefeuille d'un revendeur n'est pas une chaine :
+    // ses marchands ne se parlent pas et ne comparent pas leurs factures.
+    for (const c of chains) {
+      const dedans = c.members.filter(m => {
+        const e = enrichies.find(x => x.sub === m.sub);
+        return e && e.reseller;
+      }).length;
+      c.resellerPortfolio = dedans > c.members.length / 2
+        ? (enrichies.find(x => x.sub === c.members[0].sub) || {}).reseller || null : null;
+    }
+
     const ordre = { critical: 0, warning: 1, info: 2 };
     C.sort((a, b) => ordre[a.severity] - ordre[b.severity] || b.count - a.count);
 
@@ -18829,6 +19008,10 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
         pushed: enrichies.filter(e => e.pushStatus === 'pushed').length,
       },
       ramp,
+      resellers: resellersOut,
+      resellerCoverage,
+      billedByMonth,
+      billedByYear,
       chains,
       checks: C,
     });
