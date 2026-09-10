@@ -17916,6 +17916,53 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
       liveByKey = new Map(liveSubs.map(x => [`${x.orgId}||${x.subscriptionNumber}`, x]));
     } catch { /* Zoho unreachable: the stored facts are still worth showing */ }
 
+    // ── Ce marchand traite-t-il deja ses paiements avec nous ? ──────────────────────────────
+    // Un marchand qui appelle pour contester sa hausse est au telephone, agace, et parle a
+    // quelqu'un qui a son dossier ouvert. S'il n'a pas le paiement chez nous, c'est le seul
+    // moment ou l'agent peut le lui proposer sans le deranger. Et s'il l'a deja, il ne faut
+    // SURTOUT PAS le lui vendre.
+    //
+    // Deux chemins, parce que le lien explicite ne couvre presque rien : mesure du 2026-09-10,
+    // 78 abonnements sur 2 767 ont un merchant_saas_links. Le rapprochement par NOM normalise
+    // (sh_norm_name, deja utilise pour joindre Desk a Books) en retrouve 246 de plus, et
+    // reconnait 456 des 513 marchands actifs de Zentact.
+    const paiementParSub = new Map();
+    try {
+      const numeros = rows.map(r => r.subscription_number);
+      const noms = rows.map(r => r.customer_name || '');
+      const pay = (await pool.query(`
+        SELECT i.subscription_number, z.merchant_account_id, z.business_name, z.status, z.activated_at,
+               CASE WHEN l.subscription_number IS NOT NULL THEN 'link' ELSE 'name' END AS matched_by
+          FROM saas_increase_items i
+          LEFT JOIN merchant_saas_links l
+            ON l.subscription_number = i.subscription_number AND l.merchant_account_id IS NOT NULL
+          JOIN zentact_merchants z
+            ON z.merchant_account_id = l.merchant_account_id
+            OR sh_norm_name(z.business_name) = sh_norm_name(i.customer_name)
+         WHERE i.subscription_number = ANY($1::text[]) OR i.customer_name = ANY($2::text[])`,
+        [numeros, noms])).rows;
+      for (const r of pay) {
+        const actuel = paiementParSub.get(r.subscription_number);
+        // Le lien explicite l'emporte sur le nom, et un compte ACTIF l'emporte sur un compte
+        // ferme : un marchand qui a resilie le paiement redevient une occasion de vente.
+        const mieux = !actuel
+          || (r.matched_by === 'link' && actuel.matchedBy === 'name')
+          || (String(r.status).toUpperCase() === 'ACTIVE' && actuel.status !== 'ACTIVE');
+        if (!mieux) continue;
+        paiementParSub.set(r.subscription_number, {
+          merchantAccountId: r.merchant_account_id,
+          businessName: r.business_name,
+          status: String(r.status || '').toUpperCase(),
+          since: r.activated_at ? String(r.activated_at).slice(0, 10) : null,
+          matchedBy: r.matched_by,
+        });
+      }
+    } catch (e) {
+      // Zentact injoignable ou requete en echec : on n'invente pas un statut. L'ecran affichera
+      // « inconnu », ce qui est la verite, plutot qu'une occasion de vente qui n'existe pas.
+      console.warn('[saas-lookup] statut paiement indisponible:', e.message);
+    }
+
     const results = rows.map(r => {
       const cur = periodByKey.get(`${r.org_id}||${r.subscription_number}`) ?? null;
       const next = cur == null ? null : saasNewPeriodPrice(cur, r.increase_type, r.increase_value);
@@ -17946,6 +17993,11 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
         notifySubject: r.notify_subject,
         notifyBody: r.notify_body,
         scenarioName: r.scenario_name,
+        // null = on n'a rien trouve. Ce n'est PAS la meme chose que « pas de paiement » :
+        // le rapprochement se fait par nom pour la plupart des lignes, et 57 marchands actifs
+        // de Zentact restent introuvables. L'ecran doit dire « aucun compte trouve », pas
+        // « ce client n'a pas le paiement ».
+        payments: paiementParSub.get(r.subscription_number) || null,
       };
     });
     res.json({ results });
