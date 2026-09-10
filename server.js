@@ -17369,15 +17369,49 @@ app.post('/api/saas-increase/lookup/deal', authenticateToken, async (req, res) =
 
     const scope = await sofiaCrmScope(req);
 
-    // Doublon d'abord : c'est l'erreur couteuse ici, pas l'echec de creation.
-    const dup = await checkCrmDuplicate({ businessName: item.customer_name });
-    if (dup.matches?.length && req.body?.createAnyway !== true) {
-      return res.json({
-        duplicate: true,
-        existing: dup.matches.slice(0, 5).map(m => ({
-          module: m.module, matchedOn: m.matchedOn, company: m.company, id: m.id,
-        })),
+    // ⚠️ checkCrmDuplicate ne convient PAS ici, et s'en servir etait une erreur : il cherche
+    // dans Accounts, Contacts et Leads, jamais dans Deals. Autrement dit il bloquait sur le
+    // compte du marchand — qui n'est pas un doublon mais precisement ce a quoi l'opportunite
+    // doit s'accrocher — et laissait passer le vrai doublon, une opportunite de paiement deja
+    // ouverte pour ce meme marchand.
+    //
+    // Deux recherches distinctes, donc :
+    //   1. le COMPTE, pour rattacher l'opportunite ;
+    //   2. les OPPORTUNITES de ce compte, pour ne pas en ouvrir une deuxieme.
+    const nom = String(item.customer_name || '').trim();
+    const crmToken = await ensureValidCrmToken();
+    const chercher = async (url) => {
+      const r = await axios.get(url, {
+        headers: { Authorization: `Zoho-oauthtoken ${crmToken}` },
+        validateStatus: () => true, timeout: 20000,
       });
+      return r.status === 200 ? (r.data?.data || []) : []; // 204 = aucun resultat
+    };
+
+    let accountId = null, accountName = null;
+    if (nom) {
+      const comptes = await chercher(
+        `${CRM_API}/Accounts/search?criteria=(Account_Name:equals:${encodeURIComponent(nom)})`);
+      if (comptes[0]) { accountId = comptes[0].id; accountName = comptes[0].Account_Name; }
+    }
+
+    // Le vrai doublon : une opportunite de paiement deja ouverte sur ce compte. On ne regarde
+    // que les NOTRES (prefixe « Paiement — ») et on ignore celles qui sont closes : un contrat
+    // gagne l'an dernier n'empeche pas d'en ouvrir un aujourd'hui.
+    if (accountName && req.body?.createAnyway !== true) {
+      const deals = await chercher(
+        `${CRM_API}/Deals/search?criteria=(Account_Name:equals:${encodeURIComponent(accountName)})`);
+      const ouvertes = deals.filter(d =>
+        /^paiement/i.test(String(d.Deal_Name || '')) &&
+        !/^closed/i.test(String(d.Stage || '')));
+      if (ouvertes.length) {
+        return res.json({
+          duplicate: true,
+          existing: ouvertes.slice(0, 5).map(d => ({
+            module: 'Deals', company: d.Deal_Name, id: d.id, stage: d.Stage || null,
+          })),
+        });
+      }
     }
 
     const owner = await ownerForNewRecord(scope);
@@ -17420,6 +17454,10 @@ app.post('/api/saas-increase/lookup/deal', authenticateToken, async (req, res) =
       Description: lignes.join('\n').slice(0, 32000),
     };
     if (owner.ownerId) fields.Owner = { id: owner.ownerId };
+    // Rattachee au compte du marchand quand il existe. Sans ce lien, l'opportunite flotte dans
+    // le pipeline et n'apparait pas sur la fiche du client — celui qui l'ouvre la retrouve, plus
+    // personne d'autre.
+    if (accountId) fields.Account_Name = { id: accountId };
 
     const r = await crmPost('/Deals', { data: [fields] });
     if (!r.ok) return res.status(502).json({ error: `Zoho a refuse l'opportunite : ${r.error}` });
@@ -17434,6 +17472,8 @@ app.post('/api/saas-increase/lookup/deal', authenticateToken, async (req, res) =
     ).catch(e2 => console.warn('[saas-deal] journal non ecrit:', e2.message));
 
     res.json({ ok: true, dealId: r.id, dealName: fields.Deal_Name, stage,
+               // Dit si l'opportunite est rattachee, pour que l'agent le sache tout de suite.
+               accountName: accountName || null,
                owner: scope.repName || req.user.name || null });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
