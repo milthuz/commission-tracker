@@ -2836,6 +2836,9 @@ async function initializeDatabase() {
     // donc la meme formule appliquee un mois apres donnerait une date plus tardive que celle que le
     // marchand a lue. C'est aussi elle qui autorise ou non la poussee vers Zoho.
     await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS effective_date DATE`);
+    // La date a partir de laquelle un ANNUEL peut etre avise (renouvellement effectif moins
+    // 30 jours). Nulle pour un mensuel, qu'on avise tout de suite.
+    await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notify_after DATE`);
     // Widen scenario-item uniqueness to include the org. Zoho subscription numbers are per-ORG,
     // so (scenario_id, subscription_number) meant two different customers sharing a number could
     // not both be in one scenario — the second silently overwrote the first, losing a real
@@ -17060,6 +17063,7 @@ function serializeSaasIncreaseItem(row) {
     notifiedBy: row.notified_by, notifiedAt: row.notified_at,
     // La date promise au marchand, figee a l'envoi de l'avis. Nulle tant qu'il n'est pas avise.
     effectiveDate: row.effective_date ? String(row.effective_date).slice(0, 10) : null,
+    notifyAfter: row.notify_after ? String(row.notify_after).slice(0, 10) : null,
   };
 }
 
@@ -17325,6 +17329,32 @@ function saasFlooredEffectiveDate(nextBillingAt, interval, intervalUnit, noticeD
       ? new Date(d.getFullYear(), d.getMonth(), d.getDate() + parJours)
       : new Date(d.getFullYear(), d.getMonth() + cadence, d.getDate());
   }
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${mm}-${dd}`;
+}
+
+// Quand un marchand doit-il etre avise ? Regle de David (2026-09-10) : un abonne ANNUEL se fait
+// aviser 30 jours avant son renouvellement, pas des aujourd'hui.
+//
+// Le mensuel et l'annuel n'ont pas le meme probleme. Un abonne mensuel se renouvelle de toute
+// facon dans les 31 jours : l'aviser aujourd'hui, c'est l'aviser a temps. Un abonne annuel dont
+// le renouvellement tombe en juin 2027 recevrait, lui, un preavis de neuf mois — et on lui
+// donnerait neuf mois pour magasiner la concurrence sur un compte a 2 000 $ par an. Un preavis de
+// 30 jours protege le client ; un preavis de neuf mois informe surtout le concurrent.
+//
+// On compte a rebours depuis la date d'effet REELLE (celle du plancher), pas depuis le prochain
+// renouvellement brut : un annuel qui se renouvelle dans deux semaines voit sa hausse reportee
+// d'un an, et c'est 30 jours avant CETTE date-la qu'il doit etre avise.
+//
+// Renvoie null quand il n'y a rien a attendre (mensuel, ou date inconnue).
+function saasNotifyNotBefore(nextBillingAt, interval, intervalUnit) {
+  if (!nextBillingAt) return null;
+  if (saasCadenceMonths(interval, intervalUnit) < 2) return null; // mensuel : on avise maintenant
+  const eff = saasFlooredEffectiveDate(nextBillingAt, interval, intervalUnit, null);
+  if (!eff) return null;
+  const d = new Date(Number(eff.slice(0, 4)), Number(eff.slice(5, 7)) - 1, Number(eff.slice(8, 10)));
+  d.setDate(d.getDate() - SAAS_NOTICE_FLOOR_DAYS);
   const mm = String(d.getMonth() + 1).padStart(2, '0');
   const dd = String(d.getDate()).padStart(2, '0');
   return `${d.getFullYear()}-${mm}-${dd}`;
@@ -17942,6 +17972,23 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
       if (dbRow && dbRow.notify_status === 'sent' && !resend) {
         results.push({ itemId, sent: false, alreadySent: true, reason: 'already_sent' });
         continue;
+      }
+      // Un annuel ne s'avise pas des aujourd'hui : voir saasNotifyNotBefore. La barriere est ICI
+      // et non a l'ecran, parce qu'un « tout selectionner » ne fait pas la difference entre un
+      // abonnement mensuel et un abonnement annuel — et qu'un courriel parti ne se rattrape pas.
+      if (dbRow) {
+        const ls = liveSubs.find(x => x.orgId === dbRow.org_id && x.subscriptionNumber === dbRow.subscription_number);
+        const pasAvant = saasNotifyNotBefore(
+          nextBillingBySub.get(`${dbRow.org_id}||${dbRow.subscription_number}`) || null,
+          ls?.interval, ls?.intervalUnit);
+        const auj = new Date().toISOString().slice(0, 10);
+        if (pasAvant && auj < pasAvant) {
+          await pool.query(
+            `UPDATE saas_increase_items SET notify_status = 'scheduled', notify_error = NULL, notify_after = $1 WHERE id = $2 AND scenario_id = $3`,
+            [pasAvant, itemId, req.params.id]);
+          results.push({ itemId, sent: false, scheduled: true, notifyOn: pasAvant, reason: 'annual_notify_later' });
+          continue;
+        }
       }
       let change = null;
       if (dbRow) {
