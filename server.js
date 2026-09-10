@@ -17881,6 +17881,8 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/test-send', authe
 app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:notify'))) return;
   const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  // Renvoi deliberé a un marchand deja avise. Jamais par defaut : voir la garde plus bas.
+  const resend = req.body?.resend === true;
   if (!items.length) return res.status(400).json({ error: 'items required' });
   const actor = req.user.realAdminEmail || req.user.email || 'unknown';
   const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
@@ -17932,6 +17934,15 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
         continue;
       }
       const dbRow = rowsById.get(itemId);
+      // ⚠️ UN COURRIEL NE SE RETIRE PAS. Si une tranche a lache au milieu d'un envoi de masse,
+      // le geste naturel est de tout reselectionner et de relancer — ce qui enverrait un
+      // deuxieme avis de hausse de prix aux marchands deja avises. On refuse par defaut, la
+      // page d'ou vient la demande n'ayant aucun moyen fiable de le savoir apres un plantage.
+      // `resend: true` reste possible pour un renvoi VOULU (adresse corrigee, par exemple).
+      if (dbRow && dbRow.notify_status === 'sent' && !resend) {
+        results.push({ itemId, sent: false, alreadySent: true, reason: 'already_sent' });
+        continue;
+      }
       let change = null;
       if (dbRow) {
         const curPeriod = periodByKey.get(`${dbRow.org_id}||${dbRow.subscription_number}`) ?? null;
