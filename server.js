@@ -165,6 +165,7 @@ const PERMISSION_CATALOG = [
   // Deliberately separate and read-only: support agents need to answer "what changed for THIS
   // merchant" without any ability to build, notify or push.
   { key: 'saas_increase:lookup',       label: 'Look up a merchant price change (support reference)',        category: 'SaaS Increase' },
+  { key: 'saas_increase:payment_deal', label: 'Open a payments opportunity from the support reference',    category: 'SaaS Increase' },
 
   // Partner Portal (internal staff side — manage partner companies + review submissions;
   // partner accounts themselves never touch this permission system, see partner_users)
@@ -17329,6 +17330,111 @@ app.get('/api/saas-increase/lookup/fees', authenticateToken, async (req, res) =>
       monthlySaving: r2Money(paiement.reduce((a, l) => a + l.monthly, 0)),
       yearlySaving: r2Money(paiement.reduce((a, l) => a + l.monthly, 0) * 12),
     });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// =============================================================================================
+// CREER UNE OPPORTUNITE DE PAIEMENT — POST /api/saas-increase/lookup/deal
+//
+// L'agent est au telephone avec un marchand qui conteste sa hausse et qui n'a pas le paiement
+// chez nous. Le geste utile tient en un bouton : ouvrir une opportunite dans Zoho CRM pour
+// qu'un vendeur rappelle. Sans ca l'occasion meurt avec l'appel.
+//
+// On REUTILISE tout ce qui existe pour Sofia plutot que d'ecrire un deuxieme chemin :
+//   • sofiaCrmScope   — qui est le demandeur et jusqu'ou il voit ;
+//   • checkCrmDuplicate — le detecteur du portail partenaire. Creer une deuxieme opportunite
+//     pour un marchand qui en a deja une coupe l'historique en deux et fausse l'attribution ;
+//   • ownerForNewRecord — le proprietaire est resolu AVANT la creation, sinon la fiche est
+//     filee a quelqu'un d'autre et son auteur ne la voit plus jamais ;
+//   • crmDealStages   — l'etape est une liste de choix propre a l'organisation ; une valeur
+//     devinee se fait rejeter.
+//
+// L'agent ne choisit RIEN d'autre que de cliquer : le nom, la description et les chiffres
+// viennent du dossier ouvert devant lui.
+// =============================================================================================
+app.post('/api/saas-increase/lookup/deal', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:payment_deal'))) return;
+  const orgId = String(req.body?.orgId || '').trim();
+  const number = String(req.body?.subscriptionNumber || '').trim();
+  if (!orgId || !number) return res.status(400).json({ error: 'orgId and subscriptionNumber required' });
+
+  try {
+    const item = (await pool.query(
+      `SELECT i.*, s.name AS scenario_name
+         FROM saas_increase_items i
+         JOIN saas_increase_scenarios s ON s.id = i.scenario_id
+        WHERE i.org_id = $1 AND i.subscription_number = $2
+        ORDER BY i.id DESC LIMIT 1`, [orgId, number])).rows[0];
+    if (!item) return res.status(404).json({ error: 'subscription not found in any scenario' });
+
+    const scope = await sofiaCrmScope(req);
+
+    // Doublon d'abord : c'est l'erreur couteuse ici, pas l'echec de creation.
+    const dup = await checkCrmDuplicate({ businessName: item.customer_name });
+    if (dup.matches?.length && req.body?.createAnyway !== true) {
+      return res.json({
+        duplicate: true,
+        existing: dup.matches.slice(0, 5).map(m => ({
+          module: m.module, matchedOn: m.matchedOn, company: m.company, id: m.id,
+        })),
+      });
+    }
+
+    const owner = await ownerForNewRecord(scope);
+    if (!owner.ok) return res.status(409).json({ error: owner.error });
+
+    const stages = await crmDealStages();
+    const stage = stages[0] || 'Qualification';
+
+    // Les chiffres du dossier, ecrits dans la fiche : le vendeur qui rappelle dans trois jours
+    // n'aura pas l'ecran de l'agent sous les yeux.
+    const argent = (n) => `$${(Number(n) || 0).toFixed(2)}`;
+    const frais = Array.isArray(req.body?.paymentFees) ? req.body.paymentFees : [];
+    const economie = Number(req.body?.monthlySaving) || 0;
+    const lignes = [
+      `Marchand : ${item.customer_name || number}`,
+      `Abonnement : ${number} (${ZOHO_BILLING_ORG_NAMES[orgId] || orgId})`,
+      `Forfait : ${saasPlanLabel(item.plan_name)}`,
+      `Hausse de prix en cours : ${argent(item.current_monthly)} -> ${argent(item.new_monthly)} par mois`
+        + ` (campagne ${item.scenario_name})`,
+      item.effective_date ? `En vigueur le ${String(item.effective_date).slice(0, 10)}` : null,
+      '',
+      frais.length
+        ? `Frais d'integration de paiement payes aujourd'hui : `
+          + frais.map(f => `${f.name} ${argent(f.monthly)}/mois`).join(', ')
+        : `Frais d'integration de paiement : non releves au moment de l'appel.`,
+      economie
+        ? `Economie annoncee au marchand : ${argent(economie)}/mois, soit ${argent(economie * 12)}/an.`
+        : null,
+      '',
+      `Ouvert depuis la Reference hausse SaaS par ${scope.actorLabel}, pendant un appel du marchand`
+        + ` au sujet de sa hausse de prix.`,
+    ].filter(l => l !== null);
+
+    const fields = {
+      Deal_Name: `Paiement — ${String(item.customer_name || number).slice(0, 160)}`,
+      Stage: stage,
+      // Zoho exige une date de cloture. Trente jours : la conversation est chaude, elle ne le
+      // restera pas. Le vendeur la corrigera.
+      Closing_Date: new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10),
+      Description: lignes.join('\n').slice(0, 32000),
+    };
+    if (owner.ownerId) fields.Owner = { id: owner.ownerId };
+
+    const r = await crmPost('/Deals', { data: [fields] });
+    if (!r.ok) return res.status(502).json({ error: `Zoho a refuse l'opportunite : ${r.error}` });
+
+    await pool.query(
+      `INSERT INTO activity_log (entity_type, entity_id, event_type, description, actor, metadata)
+       VALUES ('saas_increase', $1, 'payment_deal_created', $2, $3, $4::jsonb)`,
+      [String(item.id),
+       `Opportunite de paiement ouverte dans Zoho pour ${item.customer_name || number}`,
+       req.user.email || 'unknown',
+       JSON.stringify({ dealId: r.id, subscriptionNumber: number, orgId, monthlySaving: economie })]
+    ).catch(e2 => console.warn('[saas-deal] journal non ecrit:', e2.message));
+
+    res.json({ ok: true, dealId: r.id, dealName: fields.Deal_Name, stage,
+               owner: scope.repName || req.user.name || null });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
