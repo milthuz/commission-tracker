@@ -14116,6 +14116,16 @@ function startAutoSync() {
     }, 24 * 60 * 60 * 1000);
   }, 20 * 60 * 1000);
 
+  // Suite automatique de la campagne de hausse : avis annuels arrives a echeance, puis
+  // poussees devenues possibles. Quotidien — une date de renouvellement se mesure en jours.
+  // Premier passage 35 min apres le demarrage, pour ne pas concourir avec les deux scans.
+  setTimeout(() => {
+    const passage = () => runSaasIncreaseAutopilot()
+      .catch(e => console.warn('[saas-auto] passage echoue:', e.message));
+    passage();
+    setInterval(passage, 24 * 60 * 60 * 1000);
+  }, 35 * 60 * 1000);
+
   // SaaS Increase churn-history backfill (cancelled subscriptions) — weekly, not nightly;
   // this history barely changes day to day. First run ~30 min after boot, then every 7 days.
   setTimeout(() => {
@@ -17691,6 +17701,25 @@ async function getSaasIncreaseInternalRecipients() {
     return Array.isArray(v) ? v.filter(e => typeof e === 'string') : [];
   } catch { return []; }
 }
+// L'interrupteur du pilote automatique. Il envoie des courriels a des CLIENTS sans que personne
+// clique : il doit pouvoir etre arrete depuis l'ecran, par David, sans deploiement et sans moi.
+app.get('/api/admin/saas-increase/auto', authenticateToken, async (req, res) => {
+  if (!(await requirePermAny(req, res, ['saas_increase:manage', 'admin:notifications']))) return;
+  res.json({ enabled: await saasAutoEnabled() });
+});
+app.put('/api/admin/saas-increase/auto', authenticateToken, async (req, res) => {
+  if (!(await requirePermAny(req, res, ['saas_increase:manage', 'admin:notifications']))) return;
+  const enabled = req.body?.enabled !== false;
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('saas_increase_auto', $1::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [JSON.stringify(enabled)]);
+    console.log(`[saas-auto] interrupteur ${enabled ? 'OUVERT' : 'FERME'} par ${req.user.email}`);
+    res.json({ enabled });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/admin/saas-increase/internal-recipients', authenticateToken, async (req, res) => {
   if (!(await requirePermAny(req, res, ['saas_increase:manage', 'admin:notifications']))) return;
   res.json({ recipients: await getSaasIncreaseInternalRecipients() });
@@ -18271,6 +18300,253 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
     res.json({ results });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+// =============================================================================================
+// SUITE AUTOMATIQUE D'UNE CAMPAGNE DE HAUSSE (David, 2026-09-10 : « ca devrait etre automatique
+// completement sinon je vais oublier »).
+//
+// Deux gestes, tous les jours, dans cet ordre :
+//   1. Les avis ANNUELS arrives a echeance  — 30 jours avant le renouvellement vise.
+//   2. Les poussees Zoho devenues possibles — le renouvellement qui precedait la date promise
+//      est passe, donc `end_of_term` tombe enfin sur la bonne date.
+// Sans ca, 666 avis etales sur treize mois et ~2 100 poussees a cinq semaines n'arriveraient
+// jamais : personne ne se connecte treize mois de suite.
+//
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// CE QUE CET AUTOMATE NE PEUT PAS FAIRE, PAR CONSTRUCTION
+//
+// Il ne DEMARRE jamais une campagne. Il ne touche qu'a des lignes qu'un humain a deja mises en
+// mouvement :
+//   • un avis n'est envoye que si la ligne porte deja `notify_status = 'scheduled'`, etat qui
+//     n'existe que parce que David a lance l'envoi et que le serveur a differe cette ligne-la ;
+//   • une poussee n'a lieu que si le marchand a DEJA recu son avis et que `effective_date` est
+//     figee — c'est-a-dire qu'un prix et une date lui ont ete promis par ecrit.
+// Il ne choisit donc ni les clients, ni le prix, ni la date : tout cela est deja ecrit.
+//
+// C'est ce qui justifie qu'il se passe du NIP. Le NIP protege la DECISION de changer une
+// facturation ; ici la decision est prise, signee, et communiquee au client. L'automate ne fait
+// qu'honorer une promesse a la date convenue.
+//
+// L'interrupteur `saas_increase_auto` (app_settings) l'arrete sans deploiement.
+// =============================================================================================
+const SAAS_AUTO_MAX_PER_RUN = 200; // borne de securite : un passage qui derape reste petit
+
+async function saasAutoEnabled() {
+  try {
+    const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'saas_increase_auto'`);
+    // Absent = actif. L'automate est le comportement voulu ; il faut un geste pour l'eteindre.
+    return r.rows[0]?.value === false ? false : true;
+  } catch { return false; } // base injoignable : on n'envoie rien plutot que de deviner
+}
+
+// ── 1. Les avis annuels arrives a echeance ───────────────────────────────────────────────────
+async function runSaasScheduledNotices() {
+  if (!(await saasAutoEnabled())) return { skipped: 'disabled' };
+  const auj = new Date().toISOString().slice(0, 10);
+
+  // Un passage precedent tue en plein vol (deploiement, OOM) laisse des lignes en 'sending'.
+  // Ce travail est quotidien et ne se chevauche jamais avec lui-meme, donc tout 'sending'
+  // trouve au demarrage appartient a un passage mort : on le rend a la file.
+  const orphelines = (await pool.query(
+    `UPDATE saas_increase_items SET notify_status = 'scheduled'
+      WHERE notify_status = 'sending' RETURNING id`)).rowCount;
+  if (orphelines) console.warn(`[saas-auto] ${orphelines} ligne(s) reprises d'un passage interrompu`);
+
+  // RESERVATION ATOMIQUE. Un courriel ne se retire pas : si deux processus lisaient la meme
+  // file, le marchand recevrait deux avis. Le UPDATE ... RETURNING ne rend que les lignes que
+  // CE processus a reussi a faire passer de 'scheduled' a 'sending' — l'autre repart les mains
+  // vides au lieu de renvoyer. SKIP LOCKED evite qu'il attende sur les lignes verrouillees.
+  const due = (await pool.query(
+    `UPDATE saas_increase_items SET notify_status = 'sending'
+      WHERE id IN (
+        SELECT id FROM saas_increase_items
+         WHERE notify_status = 'scheduled' AND skipped = FALSE
+           AND notify_after IS NOT NULL AND notify_after <= $1::date
+         ORDER BY notify_after, id LIMIT $2
+         FOR UPDATE SKIP LOCKED)
+      RETURNING *`, [auj, SAAS_AUTO_MAX_PER_RUN])).rows;
+  if (!due.length) return { sent: 0, failed: 0 };
+
+  const template = (await pool.query(
+    `SELECT * FROM saas_increase_email_templates WHERE is_default = true ORDER BY id LIMIT 1`)).rows[0] || null;
+  const liveSubs = await getSaasIncreaseSubscriptions();
+  const liveByKey = new Map(liveSubs.map(x => [`${x.orgId}||${x.subscriptionNumber}`, x]));
+  const periodByKey = new Map((await pool.query(
+    `SELECT org_id, subscription_number, plan_price_period FROM saas_subscription_insights
+      WHERE plan_price_period IS NOT NULL`)).rows
+    .map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
+  const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+  const lang = 'fr';
+
+  let sent = 0, failed = 0;
+  const partis = [];
+  for (const it of due) {
+    const key = `${it.org_id}||${it.subscription_number}`;
+    const live = liveByKey.get(key);
+    const curPeriod = periodByKey.get(key) ?? null;
+    try {
+      // L'abonnement a pu disparaitre ou etre resilie depuis que la ligne a ete planifiee.
+      // On ne devine pas : la ligne repasse en 'not_sent' avec la raison, visible a l'ecran.
+      if (!live || curPeriod == null) {
+        await pool.query(
+          `UPDATE saas_increase_items SET notify_status = 'not_sent', notify_error = $1 WHERE id = $2`,
+          [!live ? 'Subscription no longer in Zoho at scheduled notice time'
+                 : 'Base plan price not verified at scheduled notice time', it.id]);
+        failed++; continue;
+      }
+      const to = await resolveMerchantContactEmail(it.customer_id, it.customer_name, it.org_id);
+      if (!to) {
+        await pool.query(
+          `UPDATE saas_increase_items SET notify_status = 'send_failed', notify_error = $1 WHERE id = $2`,
+          ['No contact email found', it.id]);
+        failed++; continue;
+      }
+      const nxtPeriod = saasNewPeriodPrice(curPeriod, it.increase_type, it.increase_value);
+      const effRaw = saasFlooredEffectiveDate(live.nextBillingAt, live.interval, live.intervalUnit, null);
+      const vars = saasTemplatePlaceholders({
+        customerName: it.customer_name, planName: it.plan_name,
+        currentMonthly: it.current_monthly, newMonthly: it.new_monthly,
+        currentPeriod: curPeriod, newPeriod: nxtPeriod, effectiveDate: effRaw,
+        interval: live.interval, intervalUnit: live.intervalUnit, lang,
+      });
+      const copie = saasIncreaseDraftCopy({ lang });
+      const subject = renderSaasTemplate(template ? template.subject_fr : copie.subject, vars);
+      const bodyText = renderSaasTemplate(template ? template.body_fr : copie.body, vars);
+      const heading = renderSaasTemplate((template ? template.heading_fr : null) || copie.heading, vars);
+      const html = buildSaasNoticeEmailHtml({
+        heading, bodyText, frontendBase, lang, toAddress: to,
+        change: {
+          planName: it.plan_name || '',
+          currentPrice: `$${r2Money(curPeriod).toFixed(2)}`,
+          newPrice: `$${r2Money(nxtPeriod).toFixed(2)}`,
+          effectiveDate: effRaw ? formatSaasEffectiveDate(effRaw, lang) : '',
+        },
+      });
+      const r = await sendMail(to, subject, html, {
+        from: { name: SAAS_NOTICE_FROM_NAME, address: SAAS_NOTICE_FROM }, replyTo: SAAS_NOTICE_FROM,
+      });
+      if (r.sent) {
+        await pool.query(
+          `UPDATE saas_increase_items SET notify_to = $1, notify_subject = $2, notify_body = $3,
+             notify_status = 'sent', notify_error = NULL, notified_by = 'auto', notified_at = NOW(),
+             effective_date = COALESCE($4::date, effective_date)
+           WHERE id = $5`, [to, subject, bodyText, effRaw, it.id]);
+        sent++;
+        partis.push({ n: it.subscription_number, nom: it.customer_name, eff: effRaw });
+      } else {
+        await pool.query(
+          `UPDATE saas_increase_items SET notify_status = 'send_failed', notify_error = $1 WHERE id = $2`,
+          [r.reason || 'send failed', it.id]);
+        failed++;
+      }
+    } catch (e) {
+      await pool.query(
+        `UPDATE saas_increase_items SET notify_status = 'send_failed', notify_error = $1 WHERE id = $2`,
+        [String(e.message).slice(0, 500), it.id]).catch(() => {});
+      failed++;
+    }
+    await new Promise(r2 => setTimeout(r2, 200));
+  }
+  return { sent, failed, partis };
+}
+
+// ── 2. Les poussees Zoho devenues possibles ──────────────────────────────────────────────────
+async function runSaasScheduledPushes() {
+  if (!(await saasAutoEnabled())) return { skipped: 'disabled' };
+  const attente = (await pool.query(
+    `SELECT * FROM saas_increase_items
+      WHERE skipped = FALSE AND notify_status = 'sent'
+        AND effective_date IS NOT NULL AND status IN ('pending', 'deferred')
+      ORDER BY effective_date, id LIMIT $1`, [SAAS_AUTO_MAX_PER_RUN])).rows;
+  if (!attente.length) return { pushed: 0, failed: 0, waiting: 0 };
+
+  const liveSubs = await getSaasIncreaseSubscriptions();
+  const liveByKey = new Map(liveSubs.map(x => [`${x.orgId}||${x.subscriptionNumber}`, x]));
+  const baseByKey = new Map((await pool.query(
+    `SELECT org_id, subscription_number, plan_price_period FROM saas_subscription_insights
+      WHERE plan_price_period IS NOT NULL`)).rows
+    .map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
+  const { accessToken, apiDomain } = await getAdminBooksAuth();
+
+  let pushed = 0, failed = 0, waiting = 0;
+  for (const item of attente) {
+    const key = `${item.org_id}||${item.subscription_number}`;
+    const live = liveByKey.get(key);
+    const currentPeriod = baseByKey.get(key);
+    if (!live || !live.subscriptionId || currentPeriod == null) { failed++; continue; }
+    const promise = String(item.effective_date).slice(0, 10);
+    const nextTerm = live.nextBillingAt ? String(live.nextBillingAt).slice(0, 10) : null;
+    // MEME barriere que la poussee manuelle : tant que le prochain terme precede la date
+    // promise, `end_of_term` l'appliquerait un cycle trop tot. On repasse demain.
+    if (nextTerm && nextTerm < promise) { waiting++; continue; }
+    try {
+      const billing = new ZohoBillingService(accessToken, apiDomain, item.org_id);
+      const prix = saasNewPeriodPrice(currentPeriod, item.increase_type, item.increase_value);
+      const r = await billing.scheduleSubscriptionPriceChange(live.subscriptionId, item.plan_code, prix);
+      if (r.ok) {
+        await pool.query(
+          `UPDATE saas_increase_items SET status = 'pushed', push_error = NULL, pushed_by = 'auto', pushed_at = NOW() WHERE id = $1`,
+          [item.id]);
+        pushed++;
+      } else {
+        const msg = typeof r.error === 'string' ? r.error : JSON.stringify(r.error || {}).slice(0, 500);
+        await pool.query(`UPDATE saas_increase_items SET status = 'push_failed', push_error = $1 WHERE id = $2`, [msg, item.id]);
+        failed++;
+      }
+    } catch (e) {
+      await pool.query(`UPDATE saas_increase_items SET status = 'push_failed', push_error = $1 WHERE id = $2`,
+        [String(e.message).slice(0, 500), item.id]).catch(() => {});
+      failed++;
+    }
+    await new Promise(r2 => setTimeout(r2, 250));
+  }
+  return { pushed, failed, waiting };
+}
+
+// ── Le passage quotidien, et son compte rendu ────────────────────────────────────────────────
+// Muet quand il n'y a rien eu : treize mois de courriels « 0 avis, 0 poussee » finiraient en
+// filtre, et le jour ou quelque chose casse, personne ne lirait plus.
+async function runSaasIncreaseAutopilot() {
+  const avis = await runSaasScheduledNotices();
+  const push = await runSaasScheduledPushes();
+  if (avis.skipped || push.skipped) { console.log('[saas-auto] interrupteur ferme, rien fait'); return; }
+  const rien = !avis.sent && !avis.failed && !push.pushed && !push.failed;
+  console.log(`[saas-auto] avis ${avis.sent}/${avis.failed} echecs · poussees ${push.pushed}/${push.failed} echecs · ${push.waiting} en attente`);
+  if (rien) return;
+
+  const to = await getSaasIncreaseInternalRecipients();
+  if (!to.length) return;
+  const l = (k, v, alerte) => `<tr><td style="padding:7px 14px;border-top:1px solid #e6ebf2;font-size:13px;color:#1c2434">${k}</td>`
+    + `<td style="padding:7px 14px;border-top:1px solid #e6ebf2;font-size:13px;text-align:right;color:${alerte && v ? '#dc2626' : '#64748b'};font-weight:${alerte && v ? 700 : 400}">${v}</td></tr>`;
+  const html = `<!doctype html><html><body style="margin:0;padding:0;background:#eef1f6;font-family:Arial,Helvetica,sans-serif">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f6;padding:32px 12px"><tr><td align="center">
+      <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:100%;background:#fff;border-radius:14px;overflow:hidden">
+        <tr><td style="background:#1c2434;padding:20px 32px;color:#fff;font-size:15px;font-weight:700">Hausse de prix SaaS &mdash; passage automatique<br><span style="font-weight:400;color:#a9b4c6">SaaS price increase &mdash; automated run</span></td></tr>
+        <tr><td style="height:4px;background:#fe6523;font-size:0;line-height:0">&nbsp;</td></tr>
+        <tr><td style="padding:24px 32px 0;font-size:14px;color:#1c2434;line-height:1.65">
+          <p style="margin:0 0 12px">Le passage quotidien a poursuivi la campagne de hausse de prix. Aucune intervention n'est requise, sauf si une ligne d'&eacute;chec appara&icirc;t ci-dessous.</p>
+          <p style="margin:0 0 6px">The daily run advanced the price increase campaign. No action is required unless a failure line appears below.</p>
+        </td></tr>
+        <tr><td style="padding:16px 32px 0">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e6ebf2;border-radius:8px;border-collapse:separate">
+            ${l('Avis envoy&eacute;s / Notices sent', avis.sent)}
+            ${l('&Eacute;checs d\'envoi / Send failures', avis.failed, true)}
+            ${l('Hausses appliqu&eacute;es chez Zoho / Pushed to Zoho', push.pushed)}
+            ${l('&Eacute;checs de pouss&eacute;e / Push failures', push.failed, true)}
+            ${l('En attente de leur renouvellement / Waiting for renewal', push.waiting)}
+          </table>
+        </td></tr>
+        <tr><td style="padding:22px 32px 28px">
+          <a href="${process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com'}/saas-increase" style="display:inline-block;background:#fe6523;color:#fff;text-decoration:none;font-size:14px;font-weight:700;padding:11px 20px;border-radius:8px">Ouvrir la campagne / Open the campaign</a>
+        </td></tr>
+      </table>
+    </td></tr></table></body></html>`;
+  for (const addr of to) {
+    await sendMail(addr, `Hausse de prix SaaS \u2014 ${avis.sent} avis, ${push.pushed} hausse(s) appliqu\u00e9e(s) / ${avis.sent} notices, ${push.pushed} pushed`, html, {
+      from: { name: 'Sales Hub', address: process.env.SMTP_FROM || process.env.SMTP_USER },
+    });
+  }
+}
 
 // ── SaaS Increase: nightly subscription insights (tenure + last price change) ──────────────
 // Both need a live per-subscription Zoho call, so — per a 2026-07 decision — they're
