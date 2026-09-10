@@ -18889,10 +18889,33 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
       .map(([cle, l]) => {
         const taux = [...new Set(l.map(x => `${x.type}:${x.value}`))];
         const dates = [...new Set(l.map(x => x.effectiveDate).filter(Boolean))].sort();
-        // Des taux differents entre succursales ne sont PAS forcement une erreur : le scenario
-        // se regle par segment (organisation x forfait), donc une chaine repartie sur plusieurs
-        // forfaits herite naturellement de plusieurs taux, et c'est defendable. Ce qui ne l'est
-        // pas, c'est deux succursales sur LE MEME forfait a des taux differents.
+        // Un proprietaire ne compare pas des TAUX, il compare des FACTURES. Le signalement
+        // porte donc sur le prix d'ARRIVEE, a prix de DEPART egal : deux succursales sur le
+        // meme forfait qui paient la meme chose aujourd'hui et paieront deux montants
+        // differents demain, voila ce qui ne s'explique pas au telephone.
+        //
+        // Mesure du 2026-09-10 qui a fait changer ce controle : sur 31 succursales signalees
+        // par l'ancienne version (taux differents), 19 etaient de FAUSSES alertes. Les Moulins
+        // Lafayette recevaient +10 $ et +20 $ — mais depuis 79,95 $ et 69 $, pour arriver tous
+        // a 89-90 $. Les taux differaient PRECISEMENT pour aligner les factures.
+        const parPrix = new Map();
+        for (const x of l) {
+          if (x.currentPeriod == null || x.newPeriod == null) continue;
+          const k = `${x.planCode || '?'}||${r2Money(x.currentPeriod)}`;
+          if (!parPrix.has(k)) parPrix.set(k, []);
+          parPrix.get(k).push(x);
+        }
+        const prixFautifs = Array.from(parPrix.entries())
+          .filter(([, xs]) => new Set(xs.map(x => r2Money(x.newPeriod))).size > 1)
+          .map(([k, xs]) => ({
+            planCode: k.split('||')[0],
+            currentPeriod: Number(k.split('||')[1]),
+            newPrices: [...new Set(xs.map(x => r2Money(x.newPeriod)))].sort((a, b) => a - b),
+            subs: xs.map(x => x.sub),
+          }));
+
+        // Le cas plus large, informatif : meme forfait, taux differents, mais des prix de
+        // depart differents aussi — c'est souvent un alignement volontaire, pas un defaut.
         const parPlan = new Map();
         for (const x of l) {
           const pc = x.planCode || '?';
@@ -18906,6 +18929,7 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
           label: l[0].name,
           locations: l.length,
           samePlanConflicts: plansFautifs,
+          samePriceConflicts: prixFautifs,
           orgs: [...new Set(l.map(x => x.org))],
           currentPeriodTotal: r2Money(l.reduce((a, x) => a + (x.currentPeriod || 0), 0)),
           mrrAdd: r2Money(l.reduce((a, x) => a + x.mrrAdd, 0)),
@@ -18913,6 +18937,8 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
           // Le point qui compte : un proprietaire compare ses succursales entre elles.
           consistent: taux.length === 1,
           consistentWithinPlan: plansFautifs.length === 0,
+          // Le seul qui compte vraiment.
+          consistentPrices: prixFautifs.length === 0,
           firstEffective: dates[0] || null, lastEffective: dates[dates.length - 1] || null,
           members: l.map(x => ({
             id: x.id, sub: x.sub, name: x.name, org: x.org, plan: x.plan,
@@ -18975,35 +19001,51 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
         && e.currentPeriod > 0 && e.addonsPeriod > e.currentPeriod * 2)
         .map(e => ({ ...brut(e), detail: `options ${r2Money(e.addonsPeriod)} $ vs forfait ${r2Money(e.currentPeriod)} $` })));
 
-    // Deux succursales d'une meme chaine, LE MEME forfait, deux taux. C'est celui-la qui ne
-    // se defend pas au telephone : le proprietaire a deux factures identiques a comparer.
-    const memePlan = [];
+    // MEME chaine, MEME forfait, MEME prix aujourd'hui, prix different demain. Il n'y a rien
+    // a repondre au proprietaire qui pose ses deux factures cote a cote.
+    const memePrix = [];
+    const parSub = new Map(enrichies.map(e => [e.sub, e]));
     for (const ch of chains) {
-      if (ch.consistentWithinPlan) continue;
-      const codes = new Set(ch.samePlanConflicts.map(c => c.planCode));
-      for (const m of ch.members) {
-        const e = enrichies.find(x => x.sub === m.sub && x.name === m.name);
-        if (!e || !codes.has(e.planCode || '?')) continue;
-        memePlan.push({ ...brut(e),
-          detail: `${ch.label} — ${ch.locations} succursales ; sur ce forfait : `
-            + ch.samePlanConflicts.filter(c => c.planCode === (e.planCode || '?'))
-                .map(c => c.rates.join(' / ')).join(' | ') });
+      for (const conflit of ch.samePriceConflicts) {
+        for (const sub of conflit.subs) {
+          const e = parSub.get(sub);
+          if (!e) continue;
+          memePrix.push({ ...brut(e),
+            detail: `${ch.label} — ${conflit.subs.length} succursales a ${r2Money(conflit.currentPeriod)} $ aujourd'hui, `
+              + `qui paieront ${conflit.newPrices.map(v => `${r2Money(v)} $`).join(' ou ')}` });
+        }
       }
     }
-    ajout('chain_same_plan_conflict', 'critical', 'Meme chaine, MEME forfait, taux differents',
-      "Le proprietaire a deux factures identiques a comparer. C'est le seul ecart de taux qui ne se defend pas au telephone.",
-      memePlan);
+    ajout('chain_same_price_conflict', 'critical',
+      'Meme chaine, meme prix aujourd\'hui, prix DIFFERENT demain',
+      "Le proprietaire pose ses deux factures cote a cote et voit deux montants. Aucune explication a lui donner.",
+      memePrix);
 
-    // Le cas large, purement informatif : une chaine repartie sur plusieurs forfaits herite
-    // naturellement de plusieurs taux. A regarder, pas a corriger d'office.
-    ajout('chain_mixed_rates', 'info', 'Meme chaine, taux differents selon le forfait',
-      "Consequence normale d'un scenario regle par segment. Verifier seulement si le proprietaire recoit une facture unique.",
-      chains.filter(c => !c.consistent && c.consistentWithinPlan).map(c => ({
-        id: null, sub: `${c.locations} succursales`, name: c.label, org: c.orgs.join(', '), plan: '—',
-        currentPeriod: c.currentPeriodTotal, newPeriod: null, cadence: 1, pct: null,
-        mrrAdd: c.mrrAdd, status: null, effectiveDate: c.firstEffective,
-        detail: c.rates.join(' / '),
-      })));
+    // Taux differents mais prix de depart differents : c'est presque toujours un ALIGNEMENT
+    // volontaire (+10 $ depuis 79,95 $ et +20 $ depuis 69 $ arrivent tous deux a ~89 $).
+    // Informatif, et on montre les prix d'arrivee pour qu'un coup d'oeil suffise a trancher.
+    const alignements = [];
+    for (const ch of chains) {
+      if (ch.consistentWithinPlan || !ch.consistentPrices) continue; // deja signale plus haut
+      const codes = new Set(ch.samePlanConflicts.map(c => c.planCode));
+      const concernes = ch.members.filter(m => {
+        const e = parSub.get(m.sub);
+        return e && codes.has(e.planCode || '?');
+      });
+      const arrivees = [...new Set(concernes.map(m => m.newPeriod).filter(v => v != null))].sort((a, b) => a - b);
+      alignements.push({
+        id: null, sub: `${concernes.length} succursales`, name: ch.label,
+        org: ch.orgs.join(', '), plan: '—',
+        currentPeriod: null, newPeriod: null, cadence: 1, pct: null,
+        mrrAdd: ch.mrrAdd, status: null, effectiveDate: ch.firstEffective,
+        detail: `taux ${ch.rates.join(' / ')} → prix d'arrivee `
+          + arrivees.map(v => `${r2Money(v)} $`).join(' / ')
+          + (arrivees.length === 1 ? ' (aligne)' : ''),
+      });
+    }
+    ajout('chain_rate_varies', 'info', 'Meme chaine, taux differents mais prix de depart differents',
+      "Souvent un alignement voulu : des taux differents amenent des prix differents au MEME endroit. Les prix d'arrivee sont affiches, un coup d'oeil suffit.",
+      alignements);
 
     // Prix courant tres eloigne de la mediane de son forfait : derive tarifaire historique.
     const parPlan = new Map();
