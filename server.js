@@ -17268,6 +17268,79 @@ app.delete('/api/admin/saas-increase/scenarios/:id/items/:itemId', authenticateT
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST /api/admin/saas-increase/scenarios/:id/items/adjust
+// Corrige quelques lignes NOMMEMENT : les epargner, ou leur poser un autre taux.
+//
+// Pourquoi un point d'acces separe de POST /items : celui-la recoit le scenario ENTIER et
+// supprime tout ce qu'il ne recoit pas. L'appeler depuis l'ecran des verifications, qui ne
+// connait qu'une poignee de lignes, viderait le scenario. Ici on ne touche QUE les
+// identifiants demandes.
+app.post('/api/admin/saas-increase/scenarios/:id/items/adjust', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  const itemIds = Array.isArray(req.body?.itemIds) ? req.body.itemIds.map(Number).filter(Boolean) : [];
+  if (!itemIds.length) return res.status(400).json({ error: 'itemIds required' });
+
+  const veutEpargner = typeof req.body?.skipped === 'boolean' ? req.body.skipped : null;
+  const type = ['percent', 'flat', 'target'].includes(req.body?.increaseType) ? req.body.increaseType : null;
+  const valeur = req.body?.increaseValue != null ? Number(req.body.increaseValue) : null;
+  if (veutEpargner === null && !type) return res.status(400).json({ error: 'nothing to change' });
+  if (type && (valeur == null || !isFinite(valeur))) return res.status(400).json({ error: 'increaseValue required' });
+
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const rows = (await client.query(
+      `SELECT * FROM saas_increase_items WHERE scenario_id = $1 AND id = ANY($2::int[]) FOR UPDATE`,
+      [req.params.id, itemIds])).rows;
+
+    // REGLE D'OR (voir la sauvegarde du scenario) : une ligne deja poussee vers Zoho ou dont
+    // l'avis est deja parti temoigne de quelque chose qui est ARRIVE a un client. On ne la
+    // reecrit pas depuis un ecran de verification — on le dit et on passe.
+    const proteges = rows.filter(r => r.status === 'pushed' || r.notify_status === 'sent');
+    const modifiables = rows.filter(r => !(r.status === 'pushed' || r.notify_status === 'sent'));
+
+    let periodByKey = new Map();
+    if (type) {
+      periodByKey = new Map((await client.query(
+        `SELECT org_id, subscription_number, plan_price_period FROM saas_subscription_insights
+          WHERE plan_price_period IS NOT NULL`)).rows
+        .map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
+    }
+
+    for (const r of modifiables) {
+      if (type) {
+        // new_monthly se RECALCULE, sinon la colonne ment des le prochain rapport — c'est
+        // exactement le defaut corrige le 2026-09-09 (17 622 $ de MRR fantome).
+        const nm = saasNewMonthlyFromPeriod(
+          Number(r.current_monthly),
+          periodByKey.get(`${r.org_id}||${r.subscription_number}`) ?? null,
+          type, valeur);
+        await client.query(
+          `UPDATE saas_increase_items
+              SET increase_type = $1, increase_value = $2, new_monthly = $3,
+                  status = CASE WHEN status = 'push_failed' THEN 'pending' ELSE status END,
+                  push_error = NULL
+            WHERE id = $4`, [type, valeur, nm, r.id]);
+      }
+      if (veutEpargner !== null) {
+        await client.query(`UPDATE saas_increase_items SET skipped = $1 WHERE id = $2`, [veutEpargner, r.id]);
+      }
+    }
+    await client.query('COMMIT');
+    console.log(`[saas-increase] ${modifiables.length} ligne(s) ajustee(s) par ${actor}`
+      + (proteges.length ? `, ${proteges.length} protegee(s)` : ''));
+    res.json({
+      changed: modifiables.length,
+      protected: proteges.map(r => ({ id: r.id, sub: r.subscription_number, name: r.customer_name,
+        reason: r.status === 'pushed' ? 'already_pushed' : 'already_notified' })),
+    });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ error: e.message });
+  } finally { client.release(); }
+});
+
 // GET /api/admin/saas-increase/scenarios/:id/export — CSV of the scenario's items, for
 // record-keeping or a manual fallback if a push ever needs to be actioned by hand.
 app.get('/api/admin/saas-increase/scenarios/:id/export', authenticateToken, async (req, res) => {
@@ -18842,7 +18915,7 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
           consistentWithinPlan: plansFautifs.length === 0,
           firstEffective: dates[0] || null, lastEffective: dates[dates.length - 1] || null,
           members: l.map(x => ({
-            sub: x.sub, name: x.name, org: x.org, plan: x.plan,
+            id: x.id, sub: x.sub, name: x.name, org: x.org, plan: x.plan,
             currentPeriod: x.currentPeriod, newPeriod: x.newPeriod,
             pct: x.pct == null ? null : Math.round(x.pct * 10) / 10,
             cadence: x.cadence, mrrAdd: r2Money(x.mrrAdd), effectiveDate: x.effectiveDate,
@@ -18858,7 +18931,7 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
     const ajout = (code, severity, label, why, rows) => {
       if (rows.length) C.push({ code, severity, label, why, count: rows.length, rows: rows.slice(0, 200) });
     };
-    const brut = (e) => ({ sub: e.sub, name: e.name, org: e.org, plan: e.plan,
+    const brut = (e) => ({ id: e.id, sub: e.sub, name: e.name, org: e.org, plan: e.plan,
       currentPeriod: e.currentPeriod, newPeriod: e.newPeriod, cadence: e.cadence,
       pct: e.pct == null ? null : Math.round(e.pct * 10) / 10, mrrAdd: r2Money(e.mrrAdd),
       status: e.status, effectiveDate: e.effectiveDate, detail: e.detail || null });
@@ -18926,7 +18999,7 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
     ajout('chain_mixed_rates', 'info', 'Meme chaine, taux differents selon le forfait',
       "Consequence normale d'un scenario regle par segment. Verifier seulement si le proprietaire recoit une facture unique.",
       chains.filter(c => !c.consistent && c.consistentWithinPlan).map(c => ({
-        sub: `${c.locations} succursales`, name: c.label, org: c.orgs.join(', '), plan: '—',
+        id: null, sub: `${c.locations} succursales`, name: c.label, org: c.orgs.join(', '), plan: '—',
         currentPeriod: c.currentPeriodTotal, newPeriod: null, cadence: 1, pct: null,
         mrrAdd: c.mrrAdd, status: null, effectiveDate: c.firstEffective,
         detail: c.rates.join(' / '),
