@@ -18661,6 +18661,14 @@ const SAAS_CHAIN_FALSE_KEYS = new Set([
   'casse croute', 'casse crote', 'depanneur', 'boulangerie', 'patisserie', 'fromagerie',
   'brasserie', 'taverne', 'buffet', 'cantine', 'pizzeria', 'rotisserie', 'creme glacee',
 ]);
+// Un compte que quelqu'un a marque a la main comme mort. Teste en JAVASCRIPT et non en SQL :
+// la meme expression ecrite en regex Postgres a perdu ses parentheses echappees en route et
+// s'est mise a reconnaitre « Golden Bakery » et « Old Port » comme des comptes morts.
+//
+// Le marqueur doit etre EXPLICITE. « old » seul ne suffit pas — Old Fitz Public House, Kwizinn
+// Old Port et Cafe Mercanti - Old Montreal sont de vrais commerces ; c'est « (OLD) » entre
+// parentheses qui signale une fiche remplacee. Verifie : 14 comptes reconnus, zero faux positif.
+const SAAS_DEAD_NAME = /do\s*not\s*use|ne\s+pas\s+utiliser|\(\s*old\s*\)|\(\s*ancien\s*\)|\bdoublon\b|\bduplicate\b/i;
 const SAAS_CHAIN_MIN = 3;          // en deca, ce n'est pas une chaine, c'est une coincidence
 const SAAS_BIG_JUMP_PCT = 40;      // au-dela, le marchand appellera
 const SAAS_TINY_PRICE = 20;        // un prix de periode plus bas est un compte d'essai ou une relique
@@ -19024,10 +19032,32 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
       enrichies.filter(e => e.lastChange && e.lastChange > limiteYmd)
         .map(e => ({ ...brut(e), detail: `derniere hausse le ${e.lastChange}` })));
 
-    ajout('status_risk', 'warning', 'Abonnement en recouvrement, impaye ou en fin de vie',
-      "Augmenter le prix d'un marchand qui ne paie deja pas, ou qui part, se defend mal.",
-      enrichies.filter(e => e.status && ['dunning', 'unpaid', 'non_renewing'].includes(e.status))
+    // ⚠️ Un RESILIE et un IMPAYE ne sont pas le meme probleme, et les melanger a coute cher :
+    // un impaye peut encore payer, un resilie non. `non_renewing` veut dire que le marchand a
+    // deja annonce son depart et que l'abonnement s'eteint a la fin du terme courant. Il n'y
+    // aura pas de prochaine facture : la hausse ne sera JAMAIS prelevee, la poussee ne servira
+    // a rien, et l'avis annonce une augmentation a quelqu'un qui vient de partir. Mesure du
+    // 2026-09-10 : 17 lignes, dont la date d'effet tombait systematiquement APRES leur derniere
+    // journee. Sorties du scenario.
+    ajout('cancelled_pending', 'critical', 'Le marchand a deja resilie',
+      "L'abonnement s'eteint a la fin du terme courant : aucune facture ne suivra, la hausse ne "
+      + "sera jamais prelevee, et l'avis annoncerait une augmentation a quelqu'un qui part.",
+      enrichies.filter(e => e.status === 'non_renewing')
+        .map(e => ({ ...brut(e), detail: 'non_renewing — dernier terme' })));
+
+    ajout('payment_risk', 'warning', 'Abonnement en recouvrement ou impaye',
+      "Celui-la peut encore payer, contrairement a un resilie. Augmenter le prix d'un marchand "
+      + "qui n'a pas regle sa derniere facture se defend mal, mais ce n'est pas perdu d'avance.",
+      enrichies.filter(e => e.status && ['dunning', 'unpaid'].includes(e.status))
         .map(e => ({ ...brut(e), detail: e.status })));
+
+    // Une fiche que quelqu'un a explicitement marquee comme a ne plus utiliser. Personne ne
+    // regarde ces noms au moment de construire un scenario, et rien d'autre ne les signale.
+    ajout('do_not_use', 'critical', 'Fiche marquee « ne plus utiliser »',
+      "Le nom du compte porte un marqueur pose a la main. Ce sont des fiches remplacees ou "
+      + "abandonnees : leur envoyer un avis de hausse revient a ecrire a un client qui n'existe plus.",
+      enrichies.filter(e => SAAS_DEAD_NAME.test(e.name || ''))
+        .map(e => ({ ...brut(e), detail: 'marqueur dans le nom' })));
 
     ajout('addons_dominate', 'info', 'Les options coutent plus cher que le forfait',
       "La hausse ne porte que sur le forfait. Sur ces comptes, l'effet sur la facture sera faible.",
