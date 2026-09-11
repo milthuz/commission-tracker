@@ -11118,8 +11118,15 @@ app.get('/api/auth/zoho-desk', authenticateToken, (req, res) => {
   // le compte qui lit les billets pour tous les rapports.
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin access required' });
   const back = req.query.back === 'partners' ? '/admin/partners' : '/admin/sync';
+  // Meme `as` que pour le CRM, et pour la meme raison : un compte de service n'a pas de session
+  // Sales Hub, donc sans ca sa subvention serait rangee — et le compte lecteur epingle juste en
+  // dessous — sous le nom de l'admin qui a clique. L'etiquette mentirait sur qui lit les billets.
+  const cible = String(req.query.as || '').trim().toLowerCase();
+  if (cible && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(cible)) {
+    return res.status(400).json({ error: 'as must be an email address' });
+  }
   const state = jwt.sign(
-    { email: req.user.realAdminEmail || req.user.email, k: 'desk-oauth', back },
+    { email: cible || req.user.realAdminEmail || req.user.email, k: 'desk-oauth', back },
     process.env.JWT_SECRET,
     { expiresIn: '15m' }
   );
