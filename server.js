@@ -11368,10 +11368,17 @@ async function crmProbeAccount(email) {
 }
 
 // La meme chose pour Books, avec une verification de plus qui n'a pas d'equivalent cote CRM :
-// LES TROIS ORGANISATIONS. Un compte Zoho ne voit que les organisations auxquelles on l'a
-// ajoute, et rien ne le signale — il repond 200, avec une liste plus courte. Epingler un compte
-// qui n'en voit que deux ferait disparaitre en silence tout un pays de la facturation et des
-// hausses de prix. On refuse donc tant que les trois n'y sont pas.
+// LES TROIS ORGANISATIONS. Un compte Zoho n'est associe qu'aux organisations ou on l'a ajoute,
+// et rien ne le signale a la connexion — le consentement passe, le jeton se rafraichit, et
+// c'est seulement au premier appel que Zoho repond 6041 « this user is not associated with the
+// CompanyID ». Epingler un compte comme ca ferait disparaitre en silence tout un pays de la
+// facturation et des hausses de prix.
+//
+// ⚠️ On interroge EXACTEMENT ce que l'application utilise, organisation par organisation. La
+// premiere version de cette sonde appelait `/books/v3/organizations` — un point d'acces dont la
+// portee n'a jamais ete demandee : il repondait 401 pour TOUT LE MONDE, y compris le compte qui
+// fonctionne en production. Une sonde qui refuse tout ne protege de rien ; elle empeche juste
+// de travailler. Verifie le 2026-09-11 contre les deux comptes.
 async function booksProbeAccount(email) {
   const r = await pool.query(
     `SELECT email, access_token, refresh_token, api_domain, expires_at
@@ -11385,24 +11392,51 @@ async function booksProbeAccount(email) {
   const token = typeof brut === 'string' ? brut : brut?.access_token;
   if (!token) return { ok: false, error: 'Aucun jeton d\'acces exploitable.' };
 
-  const domaine = r.rows[0].api_domain || 'https://www.zohoapis.com';
-  const o = await axios.get(`${domaine}/books/v3/organizations`, {
-    headers: { Authorization: `Zoho-oauthtoken ${token}` }, validateStatus: () => true, timeout: 25000 });
-  if (o.status !== 200) {
-    return { ok: false, error: `Zoho refuse ce jeton (HTTP ${o.status}${o.data?.code ? ' ' + o.data.code : ''}).`
-      + ` Portee insuffisante, ou ce compte n'a acces a aucune organisation Books.` };
+  const base = (r.rows[0].api_domain || 'https://www.zohoapis.com').replace(/\/$/, '');
+  const H = { Authorization: `Zoho-oauthtoken ${token}` };
+
+  // 1. Une organisation a la fois. C'est le seul moyen de savoir LAQUELLE manque.
+  const orgs = [];
+  for (const [id, nom] of Object.entries(ZOHO_BILLING_ORG_NAMES)) {
+    const o = await axios.get(`${base}/billing/v1/subscriptions`, {
+      params: { filter_by: 'SubscriptionStatus.LIVE', page: 1, per_page: 1 },
+      headers: { ...H, 'X-com-zoho-subscriptions-organizationid': id },
+      validateStatus: () => true, timeout: 25000,
+    });
+    orgs.push({
+      id, name: nom, ok: o.status === 200, status: o.status,
+      subscriptions: o.status === 200 ? (o.data?.page_context?.total ?? null) : null,
+      message: o.status === 200 ? null : String(o.data?.message || `HTTP ${o.status}`).slice(0, 200),
+    });
   }
-  const orgs = (o.data?.organizations || []).map(x => ({ id: String(x.organization_id), name: x.name }));
-  const vues = new Set(orgs.map(x => x.id));
-  const manquantes = Object.entries(ZOHO_BILLING_ORG_NAMES)
-    .filter(([id]) => !vues.has(id)).map(([id, nom]) => `${nom} (${id})`);
+
+  // 2. Et le cote Books lui-meme : les abonnements et les factures ne passent pas par la meme
+  //    portee, donc l'un peut marcher pendant que l'autre est refuse.
+  const inv = await axios.get(`${base}/books/v3/invoices`, {
+    params: { organization_id: Object.keys(ZOHO_BILLING_ORG_NAMES)[0], per_page: 1 },
+    headers: H, validateStatus: () => true, timeout: 25000,
+  });
+  const invoicesOk = inv.status === 200;
+
+  const manquantes = orgs.filter(o => !o.ok);
   if (manquantes.length) {
-    return { ok: false, orgs, missing: manquantes,
-      error: `Ce compte ne voit pas ${manquantes.length === 1 ? 'l\'organisation' : 'les organisations'} `
-        + `${manquantes.join(', ')}. Il faut l'y ajouter dans Zoho avant d'epingler, sinon toute`
-        + ` cette facturation disparaitrait en silence.` };
+    return {
+      ok: false, orgs, invoicesOk,
+      missing: manquantes.map(o => `${o.name} (${o.id})`),
+      error: `Ce compte n'est associe qu'a ${orgs.length - manquantes.length} organisation`
+        + `${orgs.length - manquantes.length > 1 ? 's' : ''} sur ${orgs.length}. Manque : `
+        + `${manquantes.map(o => o.name).join(', ')}. Il faut l'ajouter comme utilisateur dans`
+        + ` ces organisations Zoho avant d'epingler, sinon toute cette facturation disparaitrait`
+        + ` en silence.`,
+    };
   }
-  return { ok: true, orgs };
+  if (!invoicesOk) {
+    return { ok: false, orgs, invoicesOk,
+      error: `Les abonnements repondent, mais pas les factures (HTTP ${inv.status}`
+        + `${inv.data?.message ? ' — ' + String(inv.data.message).slice(0, 120) : ''}).`
+        + ` La portee accordee est incomplete : refaire le consentement.` };
+  }
+  return { ok: true, orgs, invoicesOk };
 }
 
 const ZOHO_SYSTEME = {
