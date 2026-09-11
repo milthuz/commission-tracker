@@ -130,6 +130,7 @@ const PERMISSION_CATALOG = [
   { key: 'sync:crm',                   label: 'Trigger Zoho CRM sync manually',              category: 'Syncs' },
   { key: 'sync:zentact',               label: 'Trigger Zentact merchant sync manually',      category: 'Syncs' },
   { key: 'sync:recalc',                label: 'Recalculate all commissions',                 category: 'Syncs' },
+  { key: 'sync:system_account',        label: 'Change the Zoho account the application writes under', category: 'Syncs' },
 
   // Reseller
   { key: 'reseller:view',              label: 'View the Reseller section (POS activations + residual payments)', category: 'Reseller' },
@@ -11066,8 +11067,19 @@ app.get('/api/auth/zoho-crm', authenticateToken, (req, res) => {
   // partenaires qui connecte SON compte Zoho doit revenir sur une page qu'il a le droit de voir,
   // sinon le retour le renvoie a l'accueil et il ne sait pas si ca a marche.
   const back = req.query.back === 'partners' ? '/admin/partners' : '/admin/sync';
+
+  // `as` : ranger la subvention sous une AUTRE adresse que celle de la personne connectee.
+  // Reserve aux admins, et pour une seule raison — brancher un compte de service. Laisser
+  // n'importe qui le passer reviendrait a laisser ecrire une subvention Zoho au nom d'un
+  // collegue, donc a usurper la paternite de tout ce que l'application ecrit ensuite.
+  const cible = String(req.query.as || '').trim().toLowerCase();
+  if (cible) {
+    if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin access required to connect another account' });
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(cible)) return res.status(400).json({ error: 'as must be an email address' });
+  }
+
   const state = jwt.sign(
-    { email: req.user.realAdminEmail || req.user.email, k: 'crm-oauth', back },
+    { email: cible || req.user.realAdminEmail || req.user.email, k: 'crm-oauth', back },
     process.env.JWT_SECRET,
     { expiresIn: '15m' }
   );
@@ -11257,6 +11269,108 @@ app.get('/api/auth/crm-status', authenticateToken, async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: 'Failed to check CRM status' });
   }
+});
+
+// =============================================================================================
+// LE COMPTE SOUS LEQUEL L'APPLICATION ECRIT — GET/POST /api/admin/crm-system-account
+//
+// Zoho estampille « Cree par » avec le proprietaire du JETON, jamais avec l'utilisateur de
+// l'application, et rien dans l'API ne permet de le corriger apres coup. Tant que le compte
+// epingle est celui d'une personne, tout ce que Sales Hub ecrit porte son nom — et surtout,
+// le jour ou son acces Zoho change, TOUT s'arrete d'un coup. D'ou un compte de service.
+//
+// L'epinglage n'etait jusqu'ici que SEME au demarrage, jamais modifiable : le changer exigeait
+// un acces a la base. Ces deux routes le rendent possible depuis l'interface, avec la seule
+// garde qui compte vraiment.
+//
+// ⚠️ CETTE GARDE : on ne fait PAS confiance a la presence d'un jeton. Vecu le 2026-09-03 —
+// Gabriella connecte son compte, le jeton s'enregistre, tout a l'air bon, et son profil Zoho
+// « Sales-Lead » repond 403 a absolument tout parce qu'il n'a pas le privilege d'acces a l'API.
+// Un jeton pareil, epingle, casserait toutes les ecritures de l'application en silence. On fait
+// donc une VRAIE lecture avant d'epingler, et on refuse si elle echoue.
+// =============================================================================================
+
+// Une vraie lecture, sous le jeton de ce compte precis. Deux appels parce qu'ils echouent pour
+// des raisons differentes : `users` tombe quand le profil n'a pas l'API, `settings/modules`
+// quand la portee accordee est trop etroite.
+async function crmProbeAccount(email) {
+  const r = await pool.query(
+    `SELECT email, crm_access_token, crm_refresh_token, crm_expires_at
+       FROM user_tokens WHERE LOWER(email) = LOWER($1)`, [String(email || '')]);
+  if (!r.rows.length) return { ok: false, error: 'Aucune autorisation Zoho enregistree sous cette adresse.' };
+  if (!r.rows[0].crm_refresh_token) return { ok: false, error: 'Autorisation sans jeton de rafraichissement : elle mourra dans l\'heure. Reconnecter.' };
+
+  let token;
+  try { token = await crmTokenFromRow(r.rows[0]); }
+  catch (e) { return { ok: false, error: `Le jeton ne se rafraichit pas : ${e.message}` }; }
+
+  const H = { Authorization: `Zoho-oauthtoken ${token}` };
+  const moi = await axios.get('https://www.zohoapis.com/crm/v2/users?type=CurrentUser', {
+    headers: H, validateStatus: () => true, timeout: 20000 });
+  if (moi.status !== 200) {
+    return { ok: false, error: `Zoho refuse ce jeton (HTTP ${moi.status}${moi.data?.code ? ' ' + moi.data.code : ''}).`
+      + ` Le profil Zoho de ce compte n'a probablement pas l'acces API.` };
+  }
+  const u = moi.data?.users?.[0] || {};
+  const mods = await axios.get('https://www.zohoapis.com/crm/v2/settings/modules', {
+    headers: H, validateStatus: () => true, timeout: 20000 });
+  if (mods.status !== 200) {
+    return { ok: false, error: `Lecture des modules refusee (HTTP ${mods.status}) : la portee accordee est incomplete.` };
+  }
+  return {
+    ok: true,
+    zohoUser: { name: u.full_name || null, email: u.email || null,
+                profile: u.profile?.name || null, role: u.role?.name || null,
+                admin: !!u.profile && /admin/i.test(u.profile.name || '') },
+    modules: (mods.data?.modules || []).length,
+  };
+}
+
+app.get('/api/admin/crm-system-account', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'sync:system_account'))) return;
+  try {
+    const epingle = await crmSystemAccount();
+    const comptes = (await pool.query(
+      `SELECT email, is_admin, updated_at, crm_refresh_token IS NOT NULL AS has_refresh
+         FROM user_tokens WHERE crm_access_token IS NOT NULL OR crm_refresh_token IS NOT NULL
+        ORDER BY updated_at DESC`)).rows;
+    // Une sonde sur demande seulement : chacune coute deux allers-retours chez Zoho.
+    const sonde = String(req.query.probe || '').trim();
+    res.json({
+      pinned: epingle,
+      accounts: comptes.map(c => ({ email: c.email, isAdmin: c.is_admin,
+                                    hasRefresh: c.has_refresh, updatedAt: c.updated_at })),
+      probe: sonde ? { email: sonde, ...(await crmProbeAccount(sonde)) } : null,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/crm-system-account', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'sync:system_account'))) return;
+  const cible = String(req.body?.email || '').trim();
+  if (!cible) return res.status(400).json({ error: 'email required' });
+  try {
+    // La sonde AVANT l'epinglage, toujours. C'est tout l'interet de cette route.
+    const p = await crmProbeAccount(cible);
+    if (!p.ok) return res.status(400).json({ error: p.error, probe: p });
+
+    const avant = await crmSystemAccount();
+    await pool.query(
+      `INSERT INTO sync_state (key, value) VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [CRM_SYSTEM_KEY, cible]);
+
+    await pool.query(
+      `INSERT INTO activity_log (entity_type, entity_id, event_type, description, actor, metadata)
+       VALUES ('integration', 'crm', 'system_account_changed', $1, $2, $3::jsonb)`,
+      [`Compte Zoho CRM de l'application : ${avant || '(aucun)'} -> ${cible}`,
+       req.user.email || 'unknown',
+       JSON.stringify({ from: avant, to: cible, zohoUser: p.zohoUser })]
+    ).catch(e2 => console.warn('[crm-system] journal non ecrit:', e2.message));
+
+    console.log(`[crm-system] compte epingle : ${avant || '(aucun)'} -> ${cible}`);
+    res.json({ ok: true, pinned: cible, previous: avant, probe: p });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ============================================================================
