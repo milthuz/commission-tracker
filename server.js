@@ -3780,7 +3780,13 @@ app.get('/api/auth/zoho', (req, res) => {
   const forceConsent = req.query.reconsent === '1' || req.query.prompt === 'consent';
 
   const authUrl = `${ZOHO_CONFIG.accounts_url}/oauth/v2/auth?` +
-    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE,ZohoBooks.estimates.READ,ZohoBooks.contacts.READ,ZohoSubscriptions.plans.READ,ZohoSubscriptions.products.READ,ZohoSubscriptions.subscriptions.READ,ZohoSubscriptions.subscriptions.UPDATE,ZohoSubscriptions.subscriptions.DELETE,AaaServer.profile.READ` +
+    // ⚠️ Zoho ne sait PAS ajouter une portee a une subvention existante : toute portee nouvelle
+    // exige un nouveau consentement. `creditnotes` est donc demandee MAINTENANT, pendant que le
+    // compte de service donne le sien, pour la note de credit automatique de La Passe — sinon il
+    // faudrait refaire consentir plus tard. READ accompagne CREATE : creer une note de credit
+    // sans pouvoir la relire empecherait de verifier ce qu'on vient d'ecrire.
+    // Les subventions DEJA accordees ne changent pas ; seul un nouveau consentement la porte.
+    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE,ZohoBooks.estimates.READ,ZohoBooks.contacts.READ,ZohoBooks.creditnotes.CREATE,ZohoBooks.creditnotes.READ,ZohoSubscriptions.plans.READ,ZohoSubscriptions.products.READ,ZohoSubscriptions.subscriptions.READ,ZohoSubscriptions.subscriptions.UPDATE,ZohoSubscriptions.subscriptions.DELETE,AaaServer.profile.READ` +
     `&client_id=${ZOHO_CONFIG.client_id}` +
     `&response_type=code` +
     `&redirect_uri=${ZOHO_CONFIG.redirect_uri}` +
