@@ -17436,10 +17436,11 @@ app.get('/api/saas-increase/lookup/fees', authenticateToken, async (req, res) =>
 //
 //     Deal_Name = le nom du COMPTE (et non « Paiement — X »)   Stage = New
 //     Account_Name = le compte        Contact_Name = son 1er contact lie
-//     Lead_Source = celle du compte   Preferred_Language = English
+//     Lead_Source = FIXE (voir plus bas)  Preferred_Language = English
+//     Customer_Type = Existing Customer
 //     Layout = 4322330000000091023    Owner = Jay Daoust (decision de David)
 //
-// Deux ecarts assumes, tous deux imposes par le terrain :
+// Trois ecarts assumes :
 //
 //  1. LE MODULE DEALS N'A PAS DE CHAMP `Description`. Verifie le 2026-09-11 : 74 champs, ni
 //     Description ni Amount. La version precedente en ecrivait un long — Zoho le jetait EN
@@ -17449,6 +17450,9 @@ app.get('/api/saas-increase/lookup/fees', authenticateToken, async (req, res) =>
 //     abonnement de facturation, donc il faut RETROUVER le compte par son nom. Sans compte,
 //     on ne cree rien : une opportunite orpheline ne remonte sur aucune fiche client et ne
 //     sera jamais retrouvee. On rend la main a l'agent avec ce qu'on a trouve.
+//  3. `Lead_Source` est FIXE a « Existing Customer - Payments Conversion » et `Customer_Type`
+//     a « Existing Customer » — demande de Jack le 2026-09-11. Deluge recopiait la provenance
+//     du compte ; c'etait la provenance du MARCHAND, pas celle de cette opportunite-ci.
 // =============================================================================================
 app.post('/api/saas-increase/lookup/deal', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:payment_deal'))) return;
@@ -17555,12 +17559,14 @@ app.post('/api/saas-increase/lookup/deal', authenticateToken, async (req, res) =
       Preferred_Language: 'English',
       Layout: { id: SAAS_DEAL_LAYOUT_ID },
       Owner: { id: proprio.id },
+      // ⚠️ Ecart VOULU par rapport a Deluge, demande par Jack le 2026-09-11 : la provenance
+      // est FIXE, elle ne suit plus celle du compte. Ce qui amene cette opportunite n'est pas
+      // ce qui a amene le marchand il y a trois ans — c'est la conversion au paiement. Sans
+      // ca, le rapport de campagne ne peut pas isoler ce que la hausse de prix a rapporte.
+      Lead_Source: 'Existing Customer - Payments Conversion',
+      Customer_Type: 'Existing Customer',
     };
     if (contactId) fields.Contact_Name = { id: contactId };
-    // La provenance suit le compte, comme dans Deluge. Le filet de crmCreateWithNet la retire
-    // si la valeur du compte n'existe pas dans la liste de choix des opportunites — perdre la
-    // provenance vaut mieux que perdre l'opportunite.
-    if (compte.Lead_Source) fields.Lead_Source = compte.Lead_Source;
 
     const r = await crmCreateWithNet('Deals', fields, ['Deal_Name', 'Stage', 'Account_Name']);
     if (!r.ok) return res.status(502).json({ error: `Zoho a refuse l'opportunite : ${r.error}` });
