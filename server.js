@@ -11457,16 +11457,21 @@ async function systemAccountGet(req, res) {
   try {
     const nom = lireService(req.query.service);
     const svc = ZOHO_SYSTEME[nom];
+    // ⚠️ Cote Books, l'autorisation EST la connexion a Sales Hub : tout le monde en a une, et
+    // la liste brute affichait donc les vingt-cinq comptes personnels des vendeurs, chacun avec
+    // un bouton « ecrire sous ce compte ». On renvoie de quoi trier : un compte qui porte un
+    // ROLE Sales Hub est une personne, pas un compte de service.
     const comptes = (await pool.query(
-      `SELECT email, is_admin, updated_at, (${svc.durable}) AS has_refresh
-         FROM user_tokens WHERE ${svc.comptes}
-        ORDER BY updated_at DESC`)).rows;
+      `SELECT t.email, t.is_admin, t.updated_at, (${svc.durable}) AS has_refresh,
+              EXISTS (SELECT 1 FROM user_roles ur WHERE LOWER(ur.user_email) = LOWER(t.email)) AS has_role
+         FROM user_tokens t WHERE ${svc.comptes}
+        ORDER BY t.updated_at DESC`)).rows;
     // Une sonde sur demande seulement : chacune coute des allers-retours chez Zoho.
     const cible = String(req.query.probe || '').trim();
     res.json({
       service: nom,
       pinned: await svc.lire(),
-      accounts: comptes.map(c => ({ email: c.email, isAdmin: c.is_admin,
+      accounts: comptes.map(c => ({ email: c.email, isAdmin: c.is_admin, hasRole: c.has_role,
                                     hasRefresh: c.has_refresh, updatedAt: c.updated_at })),
       probe: cible ? { email: cible, ...(await svc.sonde(cible)) } : null,
     });
