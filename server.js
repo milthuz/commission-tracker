@@ -8823,6 +8823,95 @@ async function crmDealStages() {
   return stages;
 }
 
+// Les etapes OUVERTES, au sens de Zoho lui-meme. Chaque valeur de la liste porte une
+// `record_category_value` (Open / Closed Won / Closed Lost) : c'est l'autorite, et elle evite
+// de deviner a partir du libelle — « Cancelled », « Withdrawn » et « Declined » ne commencent
+// pas par « Closed » et sont pourtant des fins de course.
+// Une etape inconnue est comptee OUVERTE : se tromper coute un avertissement de trop, l'inverse
+// coute une opportunite en double.
+let _dealOpenCache = { at: 0, open: null };
+async function crmOpenDealStages() {
+  if (Date.now() - _dealOpenCache.at < 30 * 60 * 1000 && _dealOpenCache.open) return _dealOpenCache.open;
+  const token = await ensureValidCrmToken();
+  const r = await axios.get('https://www.zohoapis.com/crm/v2/settings/fields', {
+    params: { module: 'Deals' },
+    headers: { Authorization: `Zoho-oauthtoken ${token}` }, validateStatus: () => true, timeout: 20000,
+  });
+  const st = r.status === 200 ? (r.data?.fields || []).find(f => f.api_name === 'Stage') : null;
+  if (!st) return null;                                  // metadonnees muettes : on n'invente pas
+  const open = new Set();
+  for (const v of (st.pick_list_values || [])) {
+    const cat = String(v.record_category_value?.api_name || '').toLowerCase();
+    if (!cat || cat === 'open') open.add(String(v.display_value || v.actual_value));
+  }
+  _dealOpenCache = { at: Date.now(), open };
+  return open;
+}
+
+// ---------------------------------------------------------------------------------------------
+// L'OPPORTUNITE DE PAIEMENT — les valeurs viennent de la fonction Deluge que l'equipe utilise
+// deja dans Zoho (bouton « Payment deal » sur la fiche de compte). Elles sont RECOPIEES, pas
+// redecidees : une opportunite creee d'ici doit etre indiscernable de celle creee la-bas,
+// sinon les vues, les regles d'affectation et les rapports ne la voient pas.
+//
+// Verifie contre l'organisation reelle le 2026-09-11 : la mise en page 4322330000000091023 est
+// bien celle que portent les 600 opportunites les plus recentes, et « New » est une etape
+// valide. Jay Daoust est un utilisateur actif (4322330000243684001) — il possede deja 35 des
+// 42 opportunites a l'etape « New », ce que le bouton Deluge produisait deja de fait.
+// ---------------------------------------------------------------------------------------------
+const SAAS_DEAL_LAYOUT_ID = process.env.SAAS_DEAL_LAYOUT_ID || '4322330000000091023';
+const SAAS_DEAL_OWNER_EMAIL = (process.env.SAAS_DEAL_OWNER_EMAIL || 'jay.daoust@clustersystems.com').toLowerCase();
+const SAAS_DEAL_OWNER_NAME = process.env.SAAS_DEAL_OWNER_NAME || 'Jay Daoust';
+const SAAS_DEAL_OWNER_ID = process.env.SAAS_DEAL_OWNER_ID || '4322330000243684001';
+
+// Le proprietaire par defaut de TOUTES les opportunites de paiement, decide par David. On le
+// resout par courriel plutot que de figer l'identifiant : si Jay change de compte Zoho, le
+// courriel suit et l'identifiant en dur ne sert plus que de dernier recours.
+async function saasDealOwner() {
+  try {
+    const users = await crmActiveUsers();
+    const hit = users.find(u => String(u.email || '').trim().toLowerCase() === SAAS_DEAL_OWNER_EMAIL)
+             || users.find(u => String(u.full_name || '').trim().toLowerCase() === SAAS_DEAL_OWNER_NAME.toLowerCase());
+    if (hit) return { id: hit.id, name: hit.full_name || SAAS_DEAL_OWNER_NAME };
+  } catch (e) { console.warn('[saas-deal] liste des utilisateurs CRM indisponible :', e.message); }
+  return { id: SAAS_DEAL_OWNER_ID, name: SAAS_DEAL_OWNER_NAME };
+}
+
+// Creation avec FILET. Zoho rejette la fiche ENTIERE des qu'un champ lui deplait, et il nomme
+// le coupable dans `details.api_name`. Plutot que de perdre l'opportunite pour une liste de
+// choix qui a bouge, on retire le champ qu'il designe et on rejoue — sauf s'il est essentiel,
+// auquel cas l'echec doit remonter tel quel.
+async function crmCreateWithNet(module, fields, essentiels = []) {
+  const token = await ensureValidCrmToken();
+  const champs = { ...fields };
+  const retires = [];
+  for (let essai = 0; essai < 4; essai++) {
+    const r = await axios.post(`${CRM_API}/${module}`, {
+      data: [champs],
+      // Deluge passe {"trigger":{"workflow"}} : seuls les workflows partent, pas les
+      // approbations ni les blueprints. Sans ce champ Zoho declenche TOUT.
+      trigger: ['workflow'],
+    }, {
+      headers: { Authorization: `Zoho-oauthtoken ${token}`, 'Content-Type': 'application/json' },
+      validateStatus: () => true, timeout: 25000,
+    });
+    const first = r.data?.data?.[0];
+    if (r.status >= 200 && r.status < 300 && first?.status === 'success') {
+      return { ok: true, id: first.details?.id || null, dropped: retires };
+    }
+    const coupable = first?.details?.api_name || first?.details?.expected_data_type_field || null;
+    const message = String(first?.message || r.data?.message || `HTTP ${r.status}`).slice(0, 300);
+    if (coupable && champs[coupable] !== undefined && !essentiels.includes(coupable)) {
+      console.warn(`[crm-net] ${module} : Zoho refuse « ${coupable} » (${message}), on le retire et on rejoue.`);
+      delete champs[coupable];
+      retires.push(coupable);
+      continue;
+    }
+    return { ok: false, error: message, field: coupable, dropped: retires };
+  }
+  return { ok: false, error: 'Zoho a refuse la fiche quatre fois de suite.', dropped: retires };
+}
+
 async function toolCrmCreateLead(scope, i) {
   const company = String(i.company || '').trim();
   if (!company) return { error: 'A lead needs a company/business name.' };
@@ -17340,17 +17429,26 @@ app.get('/api/saas-increase/lookup/fees', authenticateToken, async (req, res) =>
 // chez nous. Le geste utile tient en un bouton : ouvrir une opportunite dans Zoho CRM pour
 // qu'un vendeur rappelle. Sans ca l'occasion meurt avec l'appel.
 //
-// On REUTILISE tout ce qui existe pour Sofia plutot que d'ecrire un deuxieme chemin :
-//   • sofiaCrmScope   — qui est le demandeur et jusqu'ou il voit ;
-//   • checkCrmDuplicate — le detecteur du portail partenaire. Creer une deuxieme opportunite
-//     pour un marchand qui en a deja une coupe l'historique en deux et fausse l'attribution ;
-//   • ownerForNewRecord — le proprietaire est resolu AVANT la creation, sinon la fiche est
-//     filee a quelqu'un d'autre et son auteur ne la voit plus jamais ;
-//   • crmDealStages   — l'etape est une liste de choix propre a l'organisation ; une valeur
-//     devinee se fait rejeter.
+// ⚠️ CE CHEMIN EST UNE RECOPIE, PAS UNE INVENTION. L'equipe a deja un bouton « Payment deal »
+// en Deluge sur la fiche de compte Zoho ; David a demande exactement la meme fiche. Toute
+// difference se paierait plus tard : les vues de travail, les regles d'affectation et les
+// rapports de Zoho filtrent sur ces valeurs precises. Ce que Deluge ecrit, on l'ecrit :
 //
-// L'agent ne choisit RIEN d'autre que de cliquer : le nom, la description et les chiffres
-// viennent du dossier ouvert devant lui.
+//     Deal_Name = le nom du COMPTE (et non « Paiement — X »)   Stage = New
+//     Account_Name = le compte        Contact_Name = son 1er contact lie
+//     Lead_Source = celle du compte   Preferred_Language = English
+//     Layout = 4322330000000091023    Owner = Jay Daoust (decision de David)
+//
+// Deux ecarts assumes, tous deux imposes par le terrain :
+//
+//  1. LE MODULE DEALS N'A PAS DE CHAMP `Description`. Verifie le 2026-09-11 : 74 champs, ni
+//     Description ni Amount. La version precedente en ecrivait un long — Zoho le jetait EN
+//     SILENCE, et l'opportunite arrivait vide des chiffres de l'appel. Les chiffres partent
+//     donc en NOTE attachee a l'opportunite, ou ils sont visibles et cherchables.
+//  2. Deluge part d'une fiche de compte : l'identifiant lui est donne. Ici on part d'un
+//     abonnement de facturation, donc il faut RETROUVER le compte par son nom. Sans compte,
+//     on ne cree rien : une opportunite orpheline ne remonte sur aucune fiche client et ne
+//     sera jamais retrouvee. On rend la main a l'agent avec ce qu'on a trouve.
 // =============================================================================================
 app.post('/api/saas-increase/lookup/deal', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:payment_deal'))) return;
@@ -17368,16 +17466,6 @@ app.post('/api/saas-increase/lookup/deal', authenticateToken, async (req, res) =
     if (!item) return res.status(404).json({ error: 'subscription not found in any scenario' });
 
     const scope = await sofiaCrmScope(req);
-
-    // ⚠️ checkCrmDuplicate ne convient PAS ici, et s'en servir etait une erreur : il cherche
-    // dans Accounts, Contacts et Leads, jamais dans Deals. Autrement dit il bloquait sur le
-    // compte du marchand — qui n'est pas un doublon mais precisement ce a quoi l'opportunite
-    // doit s'accrocher — et laissait passer le vrai doublon, une opportunite de paiement deja
-    // ouverte pour ce meme marchand.
-    //
-    // Deux recherches distinctes, donc :
-    //   1. le COMPTE, pour rattacher l'opportunite ;
-    //   2. les OPPORTUNITES de ce compte, pour ne pas en ouvrir une deuxieme.
     const nom = String(item.customer_name || '').trim();
     const crmToken = await ensureValidCrmToken();
     const chercher = async (url) => {
@@ -17385,48 +17473,105 @@ app.post('/api/saas-increase/lookup/deal', authenticateToken, async (req, res) =
         headers: { Authorization: `Zoho-oauthtoken ${crmToken}` },
         validateStatus: () => true, timeout: 20000,
       });
-      return r.status === 200 ? (r.data?.data || []) : []; // 204 = aucun resultat
+      return r.status === 200 ? (r.data?.data || []) : [];   // 204 = aucun resultat
     };
 
-    let accountId = null, accountName = null;
-    if (nom) {
-      const comptes = await chercher(
+    // --- 1. LE COMPTE --------------------------------------------------------------------
+    // Rattacher l'opportunite au MAUVAIS marchand est pire que ne rien creer : le vendeur
+    // rappelle quelqu'un d'autre. On n'accepte donc qu'une correspondance certaine — un nom
+    // exact, ou un seul candidat par prefixe. Des qu'il y a un doute, l'agent tranche.
+    let compte = null, candidats = [];
+    const choisi = String(req.body?.accountId || '').trim();   // l'agent a leve l'ambiguite
+    if (choisi) {
+      const r = await chercher(`${CRM_API}/Accounts/${encodeURIComponent(choisi)}`);
+      compte = r[0] || null;
+    } else if (nom) {
+      const exact = await chercher(
         `${CRM_API}/Accounts/search?criteria=(Account_Name:equals:${encodeURIComponent(nom)})`);
-      if (comptes[0]) { accountId = comptes[0].id; accountName = comptes[0].Account_Name; }
+      if (exact.length === 1) compte = exact[0];
+      else if (exact.length > 1) candidats = exact;
+      else {
+        const proches = await chercher(
+          `${CRM_API}/Accounts/search?criteria=(Account_Name:starts_with:${encodeURIComponent(nom)})`);
+        if (proches.length === 1) compte = proches[0];
+        else if (proches.length > 1) candidats = proches;
+        else {
+          // Les deux recherches par critere rendent 400 des que le nom porte une parenthese
+          // ou une virgule — « Les Rotisseries St-Hubert (Laval), s.e.c. » par exemple. La
+          // recherche plein texte de Zoho, elle, les avale. Elle est trop large pour decider
+          // toute seule : elle ne sert qu'a PROPOSER des candidats a l'agent.
+          const mots = await chercher(
+            `${CRM_API}/Accounts/search?word=${encodeURIComponent(nom.slice(0, 60))}`);
+          candidats = mots;
+        }
+      }
+    }
+    if (!compte) {
+      return res.json({
+        noAccount: true, searched: nom,
+        candidates: candidats.slice(0, 6).map(a => ({
+          id: a.id, name: a.Account_Name, city: a.Billing_City || null })),
+      });
     }
 
-    // Le vrai doublon : une opportunite de paiement deja ouverte sur ce compte. On ne regarde
-    // que les NOTRES (prefixe « Paiement — ») et on ignore celles qui sont closes : un contrat
-    // gagne l'an dernier n'empeche pas d'en ouvrir un aujourd'hui.
-    if (accountName && req.body?.createAnyway !== true) {
+    // --- 2. LE DOUBLON -------------------------------------------------------------------
+    // Le vrai doublon, c'est une opportunite ENCORE OUVERTE sur ce compte : en ouvrir une
+    // deuxieme coupe l'historique et fausse l'attribution. Une affaire gagnee ou perdue l'an
+    // dernier, elle, n'empeche rien.
+    if (req.body?.createAnyway !== true) {
       const deals = await chercher(
-        `${CRM_API}/Deals/search?criteria=(Account_Name:equals:${encodeURIComponent(accountName)})`);
-      const ouvertes = deals.filter(d =>
-        /^paiement/i.test(String(d.Deal_Name || '')) &&
-        !/^closed/i.test(String(d.Stage || '')));
+        `${CRM_API}/Accounts/${encodeURIComponent(compte.id)}/Deals?per_page=100`);
+      const ouvertes0 = await crmOpenDealStages();
+      const ouvertes = deals.filter(d => {
+        const st = String(d.Stage || '');
+        return ouvertes0 ? ouvertes0.has(st) : !/^closed|^cancel|^withdraw|^declin/i.test(st);
+      });
       if (ouvertes.length) {
         return res.json({
-          duplicate: true,
+          duplicate: true, accountName: compte.Account_Name,
           existing: ouvertes.slice(0, 5).map(d => ({
             module: 'Deals', company: d.Deal_Name, id: d.id, stage: d.Stage || null,
+            owner: d.Owner?.name || null,
           })),
         });
       }
     }
 
-    const owner = await ownerForNewRecord(scope);
-    if (!owner.ok) return res.status(409).json({ error: owner.error });
+    // --- 3. LE PREMIER CONTACT LIE -------------------------------------------------------
+    // Deluge fait `getRelatedRecords("Contacts","Accounts",id).getJSON("id")`, c'est-a-dire
+    // le premier de la liste liee. Meme geste.
+    let contactId = null;
+    try {
+      const cs = await chercher(`${CRM_API}/Accounts/${encodeURIComponent(compte.id)}/Contacts?per_page=1`);
+      if (cs[0]) contactId = cs[0].id;
+    } catch (e) { console.warn('[saas-deal] contacts du compte illisibles :', e.message); }
 
-    const stages = await crmDealStages();
-    const stage = stages[0] || 'Qualification';
+    const proprio = await saasDealOwner();
 
-    // Les chiffres du dossier, ecrits dans la fiche : le vendeur qui rappelle dans trois jours
-    // n'aura pas l'ecran de l'agent sous les yeux.
+    const fields = {
+      Deal_Name: String(compte.Account_Name || nom || number).slice(0, 250),
+      Account_Name: { id: compte.id },
+      Stage: 'New',
+      Preferred_Language: 'English',
+      Layout: { id: SAAS_DEAL_LAYOUT_ID },
+      Owner: { id: proprio.id },
+    };
+    if (contactId) fields.Contact_Name = { id: contactId };
+    // La provenance suit le compte, comme dans Deluge. Le filet de crmCreateWithNet la retire
+    // si la valeur du compte n'existe pas dans la liste de choix des opportunites — perdre la
+    // provenance vaut mieux que perdre l'opportunite.
+    if (compte.Lead_Source) fields.Lead_Source = compte.Lead_Source;
+
+    const r = await crmCreateWithNet('Deals', fields, ['Deal_Name', 'Stage', 'Account_Name']);
+    if (!r.ok) return res.status(502).json({ error: `Zoho a refuse l'opportunite : ${r.error}` });
+
+    // --- 4. LES CHIFFRES DE L'APPEL, EN NOTE ---------------------------------------------
+    // Le module Deals n'a pas de Description : sans cette note, le vendeur qui rappelle dans
+    // trois jours n'a aucune trace de ce qui a ete dit ni du montant annonce.
     const argent = (n) => `$${(Number(n) || 0).toFixed(2)}`;
     const frais = Array.isArray(req.body?.paymentFees) ? req.body.paymentFees : [];
     const economie = Number(req.body?.monthlySaving) || 0;
     const lignes = [
-      `Marchand : ${item.customer_name || number}`,
       `Abonnement : ${number} (${ZOHO_BILLING_ORG_NAMES[orgId] || orgId})`,
       `Forfait : ${saasPlanLabel(item.plan_name)}`,
       `Hausse de prix en cours : ${argent(item.current_monthly)} -> ${argent(item.new_monthly)} par mois`
@@ -17441,40 +17586,41 @@ app.post('/api/saas-increase/lookup/deal', authenticateToken, async (req, res) =
         ? `Economie annoncee au marchand : ${argent(economie)}/mois, soit ${argent(economie * 12)}/an.`
         : null,
       '',
-      `Ouvert depuis la Reference hausse SaaS par ${scope.actorLabel}, pendant un appel du marchand`
-        + ` au sujet de sa hausse de prix.`,
+      `Ouvert depuis la Reference hausse SaaS par ${scope.actorLabel}, pendant un appel du`
+        + ` marchand au sujet de sa hausse de prix.`,
     ].filter(l => l !== null);
 
-    const fields = {
-      Deal_Name: `Paiement — ${String(item.customer_name || number).slice(0, 160)}`,
-      Stage: stage,
-      // Zoho exige une date de cloture. Trente jours : la conversation est chaude, elle ne le
-      // restera pas. Le vendeur la corrigera.
-      Closing_Date: new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10),
-      Description: lignes.join('\n').slice(0, 32000),
-    };
-    if (owner.ownerId) fields.Owner = { id: owner.ownerId };
-    // Rattachee au compte du marchand quand il existe. Sans ce lien, l'opportunite flotte dans
-    // le pipeline et n'apparait pas sur la fiche du client — celui qui l'ouvre la retrouve, plus
-    // personne d'autre.
-    if (accountId) fields.Account_Name = { id: accountId };
-
-    const r = await crmPost('/Deals', { data: [fields] });
-    if (!r.ok) return res.status(502).json({ error: `Zoho a refuse l'opportunite : ${r.error}` });
+    let noteOk = false;
+    try {
+      const rn = await crmPost('/Notes', {
+        data: [{
+          Note_Title: `Opportunite paiement — hausse SaaS ${number}`.slice(0, 120),
+          Note_Content: lignes.join('\n').slice(0, 32000),
+          Parent_Id: { id: r.id },
+          se_module: 'Deals',
+        }],
+      });
+      noteOk = !!rn.ok;
+      if (!rn.ok) console.warn('[saas-deal] note refusee :', rn.error);
+    } catch (e) { console.warn('[saas-deal] note non ecrite :', e.message); }
 
     await pool.query(
       `INSERT INTO activity_log (entity_type, entity_id, event_type, description, actor, metadata)
        VALUES ('saas_increase', $1, 'payment_deal_created', $2, $3, $4::jsonb)`,
       [String(item.id),
-       `Opportunite de paiement ouverte dans Zoho pour ${item.customer_name || number}`,
+       `Opportunite de paiement ouverte dans Zoho pour ${compte.Account_Name}`,
        req.user.email || 'unknown',
-       JSON.stringify({ dealId: r.id, subscriptionNumber: number, orgId, monthlySaving: economie })]
+       JSON.stringify({ dealId: r.id, accountId: compte.id, subscriptionNumber: number, orgId,
+                        owner: proprio.name, monthlySaving: economie, dropped: r.dropped })]
     ).catch(e2 => console.warn('[saas-deal] journal non ecrit:', e2.message));
 
-    res.json({ ok: true, dealId: r.id, dealName: fields.Deal_Name, stage,
-               // Dit si l'opportunite est rattachee, pour que l'agent le sache tout de suite.
-               accountName: accountName || null,
-               owner: scope.repName || req.user.name || null });
+    res.json({
+      ok: true, dealId: r.id, dealName: fields.Deal_Name, stage: 'New',
+      accountName: compte.Account_Name, owner: proprio.name,
+      noteOk,
+      // Ce que Zoho a refuse et qu'on a retire pour que la fiche passe quand meme.
+      dropped: r.dropped && r.dropped.length ? r.dropped : undefined,
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
