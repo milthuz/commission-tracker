@@ -17569,7 +17569,12 @@ app.post('/api/saas-increase/lookup/deal', authenticateToken, async (req, res) =
     // Le module Deals n'a pas de Description : sans cette note, le vendeur qui rappelle dans
     // trois jours n'a aucune trace de ce qui a ete dit ni du montant annonce.
     const argent = (n) => `$${(Number(n) || 0).toFixed(2)}`;
-    const frais = Array.isArray(req.body?.paymentFees) ? req.body.paymentFees : [];
+    // Trois etats, pas deux. La page n'envoie `paymentFees` QUE si l'agent a vu les frais ;
+    // une liste vide veut donc dire « verifie, il n'y en a pas », ce qui n'est pas la meme
+    // chose que « pas verifie ». Les confondre fait lire au vendeur qu'il reste une
+    // verification a faire alors qu'elle est faite.
+    const releve = Array.isArray(req.body?.paymentFees);
+    const frais = releve ? req.body.paymentFees : [];
     const economie = Number(req.body?.monthlySaving) || 0;
     const lignes = [
       `Abonnement : ${number} (${ZOHO_BILLING_ORG_NAMES[orgId] || orgId})`,
@@ -17581,7 +17586,9 @@ app.post('/api/saas-increase/lookup/deal', authenticateToken, async (req, res) =
       frais.length
         ? `Frais d'integration de paiement payes aujourd'hui : `
           + frais.map(f => `${f.name} ${argent(f.monthly)}/mois`).join(', ')
-        : `Frais d'integration de paiement : non releves au moment de l'appel.`,
+        : releve
+          ? `Frais d'integration de paiement : verifie pendant l'appel, ce marchand n'en paie aucun.`
+          : `Frais d'integration de paiement : non releves au moment de l'appel.`,
       economie
         ? `Economie annoncee au marchand : ${argent(economie)}/mois, soit ${argent(economie * 12)}/an.`
         : null,
