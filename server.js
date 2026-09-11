@@ -490,6 +490,11 @@ const CRM_SYSTEM_KEY = 'crm_system_account';
 // Meme raison d'etre, et meme raison d'etre declaree ICI : le compte sous lequel
 // l'application lit Zoho DESK. Voir la note de CRM_SYSTEM_KEY juste au-dessus.
 const DESK_SYSTEM_KEY = 'desk_system_account';
+// Et celui sous lequel l'application parle a Zoho BOOKS / BILLING. Ajoute le 2026-09-11 : les
+// douze points d'appel de Books choisissaient tous « le dernier compte admin mis a jour », le
+// classement mouvant que l'epinglage du CRM avait justement ete cree pour supprimer. Books est
+// celui qui POUSSE LES PRIX des abonnements : un detournement y serait silencieux et cher.
+const BOOKS_SYSTEM_KEY = 'books_system_account';
 
 // Declarees ICI et non dans le bloc « SOUTIEN » plus bas : initializeDatabase() tourne avant
 // la fin de l'evaluation du module, donc une const declaree apres serait en zone morte (TDZ).
@@ -2059,6 +2064,30 @@ async function initializeDatabase() {
         console.log(`📌 [crm] compte Zoho systeme epingle sur ${actuel}`);
       } else {
         console.log('📌 [crm] aucun jeton Zoho connecte : epinglage reporte au prochain demarrage');
+      }
+    }
+
+    // Meme semis pour Books, et pour la meme raison : figer l'etat present AVANT d'ouvrir la
+    // porte a une deuxieme autorisation. On reprend le detenteur que l'ancien classement
+    // designe aujourd'hui, en preferant une connexion saine — c'est exactement ce que
+    // getAdminBooksAuth() faisait, donc rien ne change maintenant.
+    if (!(await pool.query(`SELECT 1 FROM sync_state WHERE key = $1`, [BOOKS_SYSTEM_KEY])).rowCount) {
+      const actuelB = (await pool.query(
+        `SELECT email FROM user_tokens
+          WHERE is_admin = true AND COALESCE(books_connection_status, 'active') = 'active'
+          ORDER BY updated_at DESC LIMIT 1`)).rows[0]?.email
+        || (await pool.query(
+        `SELECT email FROM user_tokens WHERE is_admin = true
+          ORDER BY updated_at DESC LIMIT 1`)).rows[0]?.email || null;
+      if (actuelB) {
+        await pool.query(
+          `INSERT INTO sync_state (key, value, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP)
+           ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = CURRENT_TIMESTAMP`,
+          [BOOKS_SYSTEM_KEY, actuelB]
+        );
+        console.log(`📌 [books] compte Zoho Books epingle sur ${actuelB}`);
+      } else {
+        console.log('📌 [books] aucun compte admin connecte : epinglage reporte au prochain demarrage');
       }
     }
 
@@ -11297,14 +11326,14 @@ app.get('/api/auth/crm-status', authenticateToken, async (req, res) => {
 // donc une VRAIE lecture avant d'epingler, et on refuse si elle echoue.
 // =============================================================================================
 
-// Une vraie lecture, sous le jeton de ce compte precis. Deux appels parce qu'ils echouent pour
-// des raisons differentes : `users` tombe quand le profil n'a pas l'API, `settings/modules`
+// Une vraie lecture CRM, sous le jeton de ce compte precis. Deux appels parce qu'ils echouent
+// pour des raisons differentes : `users` tombe quand le profil n'a pas l'API, `settings/modules`
 // quand la portee accordee est trop etroite.
 async function crmProbeAccount(email) {
   const r = await pool.query(
     `SELECT email, crm_access_token, crm_refresh_token, crm_expires_at
        FROM user_tokens WHERE LOWER(email) = LOWER($1)`, [String(email || '')]);
-  if (!r.rows.length) return { ok: false, error: 'Aucune autorisation Zoho enregistree sous cette adresse.' };
+  if (!r.rows.length) return { ok: false, error: 'Aucune autorisation Zoho CRM enregistree sous cette adresse.' };
   if (!r.rows[0].crm_refresh_token) return { ok: false, error: 'Autorisation sans jeton de rafraichissement : elle mourra dans l\'heure. Reconnecter.' };
 
   let token;
@@ -11327,58 +11356,118 @@ async function crmProbeAccount(email) {
   return {
     ok: true,
     zohoUser: { name: u.full_name || null, email: u.email || null,
-                profile: u.profile?.name || null, role: u.role?.name || null,
-                admin: !!u.profile && /admin/i.test(u.profile.name || '') },
+                profile: u.profile?.name || null, role: u.role?.name || null },
     modules: (mods.data?.modules || []).length,
   };
 }
 
-app.get('/api/admin/crm-system-account', authenticateToken, async (req, res) => {
+// La meme chose pour Books, avec une verification de plus qui n'a pas d'equivalent cote CRM :
+// LES TROIS ORGANISATIONS. Un compte Zoho ne voit que les organisations auxquelles on l'a
+// ajoute, et rien ne le signale — il repond 200, avec une liste plus courte. Epingler un compte
+// qui n'en voit que deux ferait disparaitre en silence tout un pays de la facturation et des
+// hausses de prix. On refuse donc tant que les trois n'y sont pas.
+async function booksProbeAccount(email) {
+  const r = await pool.query(
+    `SELECT email, access_token, refresh_token, api_domain, expires_at
+       FROM user_tokens WHERE LOWER(email) = LOWER($1)`, [String(email || '')]);
+  if (!r.rows.length) return { ok: false, error: 'Aucune autorisation Zoho Books enregistree sous cette adresse.' };
+  if (!r.rows[0].refresh_token) return { ok: false, error: 'Autorisation sans jeton de rafraichissement : elle mourra dans l\'heure. Reconnecter avec l\'ecran de consentement.' };
+
+  let brut;
+  try { brut = await ensureValidToken(r.rows[0].email); }
+  catch (e) { return { ok: false, error: `Le jeton ne se rafraichit pas : ${e.message}` }; }
+  const token = typeof brut === 'string' ? brut : brut?.access_token;
+  if (!token) return { ok: false, error: 'Aucun jeton d\'acces exploitable.' };
+
+  const domaine = r.rows[0].api_domain || 'https://www.zohoapis.com';
+  const o = await axios.get(`${domaine}/books/v3/organizations`, {
+    headers: { Authorization: `Zoho-oauthtoken ${token}` }, validateStatus: () => true, timeout: 25000 });
+  if (o.status !== 200) {
+    return { ok: false, error: `Zoho refuse ce jeton (HTTP ${o.status}${o.data?.code ? ' ' + o.data.code : ''}).`
+      + ` Portee insuffisante, ou ce compte n'a acces a aucune organisation Books.` };
+  }
+  const orgs = (o.data?.organizations || []).map(x => ({ id: String(x.organization_id), name: x.name }));
+  const vues = new Set(orgs.map(x => x.id));
+  const manquantes = Object.entries(ZOHO_BILLING_ORG_NAMES)
+    .filter(([id]) => !vues.has(id)).map(([id, nom]) => `${nom} (${id})`);
+  if (manquantes.length) {
+    return { ok: false, orgs, missing: manquantes,
+      error: `Ce compte ne voit pas ${manquantes.length === 1 ? 'l\'organisation' : 'les organisations'} `
+        + `${manquantes.join(', ')}. Il faut l'y ajouter dans Zoho avant d'epingler, sinon toute`
+        + ` cette facturation disparaitrait en silence.` };
+  }
+  return { ok: true, orgs };
+}
+
+const ZOHO_SYSTEME = {
+  crm:   { cle: CRM_SYSTEM_KEY,   sonde: crmProbeAccount,
+           lire: () => crmSystemAccount(),
+           comptes: `crm_access_token IS NOT NULL OR crm_refresh_token IS NOT NULL`,
+           durable: `crm_refresh_token IS NOT NULL` },
+  books: { cle: BOOKS_SYSTEM_KEY, sonde: booksProbeAccount,
+           lire: () => booksSystemAccount(),
+           comptes: `access_token IS NOT NULL OR refresh_token IS NOT NULL`,
+           durable: `refresh_token IS NOT NULL` },
+};
+
+const lireService = (v) => (String(v || 'crm').toLowerCase() === 'books' ? 'books' : 'crm');
+
+async function systemAccountGet(req, res) {
   if (!(await requirePerm(req, res, 'sync:system_account'))) return;
   try {
-    const epingle = await crmSystemAccount();
+    const nom = lireService(req.query.service);
+    const svc = ZOHO_SYSTEME[nom];
     const comptes = (await pool.query(
-      `SELECT email, is_admin, updated_at, crm_refresh_token IS NOT NULL AS has_refresh
-         FROM user_tokens WHERE crm_access_token IS NOT NULL OR crm_refresh_token IS NOT NULL
+      `SELECT email, is_admin, updated_at, (${svc.durable}) AS has_refresh
+         FROM user_tokens WHERE ${svc.comptes}
         ORDER BY updated_at DESC`)).rows;
-    // Une sonde sur demande seulement : chacune coute deux allers-retours chez Zoho.
-    const sonde = String(req.query.probe || '').trim();
+    // Une sonde sur demande seulement : chacune coute des allers-retours chez Zoho.
+    const cible = String(req.query.probe || '').trim();
     res.json({
-      pinned: epingle,
+      service: nom,
+      pinned: await svc.lire(),
       accounts: comptes.map(c => ({ email: c.email, isAdmin: c.is_admin,
                                     hasRefresh: c.has_refresh, updatedAt: c.updated_at })),
-      probe: sonde ? { email: sonde, ...(await crmProbeAccount(sonde)) } : null,
+      probe: cible ? { email: cible, ...(await svc.sonde(cible)) } : null,
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
-});
+}
 
-app.post('/api/admin/crm-system-account', authenticateToken, async (req, res) => {
+async function systemAccountSet(req, res) {
   if (!(await requirePerm(req, res, 'sync:system_account'))) return;
+  const nom = lireService(req.body?.service || req.query.service);
+  const svc = ZOHO_SYSTEME[nom];
   const cible = String(req.body?.email || '').trim();
   if (!cible) return res.status(400).json({ error: 'email required' });
   try {
     // La sonde AVANT l'epinglage, toujours. C'est tout l'interet de cette route.
-    const p = await crmProbeAccount(cible);
-    if (!p.ok) return res.status(400).json({ error: p.error, probe: p });
+    const sonde = await svc.sonde(cible);
+    if (!sonde.ok) return res.status(400).json({ error: sonde.error, probe: sonde });
 
-    const avant = await crmSystemAccount();
+    const avant = await svc.lire();
     await pool.query(
-      `INSERT INTO sync_state (key, value) VALUES ($1, $2)
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-      [CRM_SYSTEM_KEY, cible]);
+      `INSERT INTO sync_state (key, value, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP)
+       ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = CURRENT_TIMESTAMP`,
+      [svc.cle, cible]);
 
     await pool.query(
       `INSERT INTO activity_log (entity_type, entity_id, event_type, description, actor, metadata)
-       VALUES ('integration', 'crm', 'system_account_changed', $1, $2, $3::jsonb)`,
-      [`Compte Zoho CRM de l'application : ${avant || '(aucun)'} -> ${cible}`,
+       VALUES ('integration', $1, 'system_account_changed', $2, $3, $4::jsonb)`,
+      [nom, `Compte Zoho ${nom.toUpperCase()} de l'application : ${avant || '(aucun)'} -> ${cible}`,
        req.user.email || 'unknown',
-       JSON.stringify({ from: avant, to: cible, zohoUser: p.zohoUser })]
-    ).catch(e2 => console.warn('[crm-system] journal non ecrit:', e2.message));
+       JSON.stringify({ service: nom, from: avant, to: cible, probe: sonde })]
+    ).catch(e2 => console.warn('[zoho-system] journal non ecrit:', e2.message));
 
-    console.log(`[crm-system] compte epingle : ${avant || '(aucun)'} -> ${cible}`);
-    res.json({ ok: true, pinned: cible, previous: avant, probe: p });
+    console.log(`[zoho-system] ${nom} : ${avant || '(aucun)'} -> ${cible}`);
+    res.json({ ok: true, service: nom, pinned: cible, previous: avant, probe: sonde });
   } catch (e) { res.status(500).json({ error: e.message }); }
-});
+}
+
+app.get('/api/admin/zoho-system-account', authenticateToken, systemAccountGet);
+app.post('/api/admin/zoho-system-account', authenticateToken, systemAccountSet);
+// L'ancien nom, garde vivant : une page deja ouverte dans un onglet continue de marcher.
+app.get('/api/admin/crm-system-account', authenticateToken, systemAccountGet);
+app.post('/api/admin/crm-system-account', authenticateToken, systemAccountSet);
 
 // ============================================================================
 // ZOHO CRM ROUTES
@@ -13707,9 +13796,7 @@ async function autoSyncInvoices() {
     console.log('🔄 [AUTO-SYNC] Starting automatic invoice sync...');
     
     // Get the most recent admin user (by updated_at) to use for syncing
-    const adminResult = await pool.query(
-      'SELECT email, access_token, refresh_token, api_domain, expires_at FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
-    );
+    const adminResult = await booksAdminResult();
 
     if (!adminResult.rows[0]) {
       console.log('⚠️ [AUTO-SYNC] No admin user found for sync');
@@ -16461,25 +16548,61 @@ app.post('/api/invoices/bulk-import', authenticateToken, async (req, res) => {
 //             Content-Disposition: inline so the browser renders in-place.
 //   /pdf:     standard Authorization header (axios fetches as blob),
 //             Content-Disposition: attachment for download.
-// Both go through the most-recently-used admin token (auto-refreshed if expired).
+// Both go through the PINNED Books account (auto-refreshed if expired) — voir booksAdminRow.
 // ============================================================================
+
+// Le compte epingle pour Zoho Books, s'il y en a un.
+async function booksSystemAccount() {
+  const r = await pool.query(`SELECT value FROM sync_state WHERE key = $1`, [BOOKS_SYSTEM_KEY]);
+  return r.rows[0]?.value || null;
+}
+
+// ⚠️ LE SEUL ENDROIT QUI CHOISIT LE COMPTE BOOKS. Il y en avait DOUZE, tous en train de
+// reprendre « le dernier compte admin mis a jour » — un classement qui bouge TOUT SEUL, chaque
+// rafraichissement de jeton reecrivant `updated_at`. Le jour ou un deuxieme compte se connecte
+// a Books, les douze basculent vers lui sans que personne l'ait demande, et repartent dans
+// l'autre sens au refresh suivant. C'est la meme faille que le CRM avait, sauf que Books est
+// celui qui POUSSE LES PRIX des abonnements.
+//
+// L'epinglage passe en premier ; le reste est conserve tel quel comme filet, pour le cas ou
+// l'epinglage pointerait vers un compte deconnecte depuis.
+//
+// Note : la recherche par compte epingle n'exige PAS `is_admin`. Un compte de service n'a
+// aucune raison d'etre administrateur de Sales Hub — c'est un compte ZOHO, pas un utilisateur.
+const BOOKS_COLS = 'email, access_token, refresh_token, api_domain, expires_at';
+async function booksAdminRow() {
+  const epingle = await booksSystemAccount();
+  if (epingle) {
+    const r = await pool.query(
+      `SELECT ${BOOKS_COLS} FROM user_tokens
+        WHERE LOWER(email) = LOWER($1)
+          AND (access_token IS NOT NULL OR refresh_token IS NOT NULL)`, [epingle]);
+    if (r.rows[0]) return r.rows[0];
+    console.warn(`[books] compte epingle « ${epingle} » sans autorisation exploitable — repli sur l'ancien choix.`);
+  }
+  let row = (await pool.query(
+    `SELECT ${BOOKS_COLS} FROM user_tokens
+      WHERE is_admin = true AND COALESCE(books_connection_status, 'active') = 'active'
+      ORDER BY updated_at DESC LIMIT 1`)).rows[0];
+  if (!row) {
+    row = (await pool.query(
+      `SELECT ${BOOKS_COLS} FROM user_tokens WHERE is_admin = true
+        ORDER BY updated_at DESC LIMIT 1`)).rows[0];
+  }
+  return row || null;
+}
+
+// Meme chose, dans la forme `{ rows: [...] }` qu'attendaient les appels existants : ils
+// testent `adminResult.rows[0]`, et les faire tous changer de forme aurait multiplie les
+// occasions de se tromper sur un fichier de cette taille.
+async function booksAdminResult() {
+  const r = await booksAdminRow();
+  return { rows: r ? [r] : [] };
+}
 
 // Returns a fresh admin access_token + api_domain. Auto-refreshes if expired.
 async function getAdminBooksAuth() {
-  // Prefer an admin whose Books connection is still healthy; only fall back to a
-  // flagged-disconnected row when there is nothing else to try.
-  let admin = (await pool.query(
-    `SELECT email, access_token, refresh_token, api_domain, expires_at
-     FROM user_tokens
-     WHERE is_admin = true AND COALESCE(books_connection_status, 'active') = 'active'
-     ORDER BY updated_at DESC LIMIT 1`
-  )).rows[0];
-  if (!admin) {
-    admin = (await pool.query(
-      `SELECT email, access_token, refresh_token, api_domain, expires_at
-       FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1`
-    )).rows[0];
-  }
+  let admin = await booksAdminRow();
   if (!admin) throw new Error('No admin Zoho account connected');
   // Refresh if token expired (or within 60s of expiry)
   if (admin.refresh_token && (!admin.expires_at || Date.now() > admin.expires_at - 60_000)) {
@@ -22104,9 +22227,7 @@ app.post('/api/admin/backfill-subtotals', requireOpsSecret, async (req, res) => 
   (async () => {
     subtotalBackfill = { status: 'running', processed: 0, total: 0, errors: 0, from };
     try {
-      const adminResult = await pool.query(
-        'SELECT email, api_domain FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
-      );
+      const adminResult = await booksAdminResult();
       const admin = adminResult.rows[0];
       const tokenData = await ensureValidToken(admin.email);
       const accessToken = typeof tokenData === 'string' ? tokenData : tokenData?.access_token;
@@ -26331,9 +26452,7 @@ async function deltaSyncInvoices() {
       ? new Date(lastRow.value)
       : new Date(Date.now() - 10 * 60 * 1000);
 
-    const adminResult = await pool.query(
-      'SELECT email, access_token, refresh_token, api_domain, expires_at FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
-    );
+    const adminResult = await booksAdminResult();
     let admin = adminResult.rows[0];
     if (!admin) return; // no admin connected → skip silently
     // Refresh token if expired
@@ -28382,9 +28501,7 @@ app.get('/api/billing/plans', authenticateToken, async (req, res) => {
 app.get('/api/billing/probe', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   try {
-    const adminResult = await pool.query(
-      'SELECT email, access_token, api_domain, expires_at FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
-    );
+    const adminResult = await booksAdminResult();
     const admin = adminResult.rows[0];
     if (!admin) return res.status(400).json({ error: 'No admin token' });
 
@@ -28585,9 +28702,7 @@ async function fetchSubActivation(subscriptionId, apiDomain, accessToken, cache)
 const ACTIVATION_BACKFILL_WINDOW_DAYS = 365;
 const ACTIVATION_BACKFILL_BATCH_LIMIT = 300;
 async function backfillActivationDates(onlyNumbers = null) {
-  const adminResult = await pool.query(
-    'SELECT email, access_token, api_domain FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
-  );
+  const adminResult = await booksAdminResult();
   const admin = adminResult.rows[0];
   if (!admin) return { checked: 0, updated: 0 };
   const tokenData = await ensureValidToken(admin.email);
@@ -28663,9 +28778,7 @@ app.post('/api/invoices/enrich/backfill-activation-dates', requireOpsSecretOrSes
 // quiet — only genuinely new customer_names show up in future runs.
 const CUSTOMER_FIRST_SALE_BATCH_LIMIT = 300;
 async function backfillCustomerFirstSale(onlyNames = null) {
-  const adminResult = await pool.query(
-    'SELECT email, access_token, api_domain FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
-  );
+  const adminResult = await booksAdminResult();
   const admin = adminResult.rows[0];
   if (!admin) return { checked: 0, resolved: 0 };
   const tokenData = await ensureValidToken(admin.email);
@@ -28741,9 +28854,7 @@ async function runEnrichInvoices({ onlyMissing = true, source = 'manual', extraW
     stats: { saas: 0, hardware: 0, unknown: 0, eligible: 0, pending_payment: 0, pending_saas: 0, skipped: 0 },
   };
   try {
-      const adminResult = await pool.query(
-        'SELECT email, access_token, api_domain FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
-      );
+      const adminResult = await booksAdminResult();
       const admin = adminResult.rows[0];
       if (!admin) throw new Error('No admin Zoho token');
       const tokenData = await ensureValidToken(admin.email);
@@ -28944,9 +29055,7 @@ app.get('/api/admin/zoho-invoice-raw', requireOpsSecret, async (req, res) => {
   const number = String(req.query.number || '').trim();
   if (!number) return res.status(400).json({ error: 'number required' });
   try {
-    const admin = (await pool.query(
-      'SELECT email, api_domain FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
-    )).rows[0];
+    const admin = (await booksAdminResult()).rows[0];
     if (!admin) return res.status(400).json({ error: 'No admin Zoho token' });
     const tokenData = await ensureValidToken(admin.email);
     const accessToken = typeof tokenData === 'string' ? tokenData : tokenData?.access_token;
@@ -29029,9 +29138,7 @@ app.post('/api/admin/reenrich-invoices', requireOpsSecret, async (req, res) => {
   const numbers = String(req.query.numbers || req.body?.numbers || '').split(',').map(s => s.trim()).filter(Boolean);
   if (!numbers.length) return res.status(400).json({ error: 'numbers required (comma-separated)' });
   try {
-    const admin = (await pool.query(
-      'SELECT email, api_domain FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
-    )).rows[0];
+    const admin = (await booksAdminResult()).rows[0];
     if (!admin) return res.status(400).json({ error: 'No admin Zoho token' });
     const tokenData = await ensureValidToken(admin.email);
     const accessToken = typeof tokenData === 'string' ? tokenData : tokenData?.access_token;
@@ -29132,9 +29239,7 @@ app.post('/api/admin/reenrich-discounted', requireOpsSecret, async (req, res) =>
 app.get('/api/invoices/enrich-preview/:invoiceNumber', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   try {
-    const adminResult = await pool.query(
-      'SELECT email, access_token, api_domain FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
-    );
+    const adminResult = await booksAdminResult();
     const admin = adminResult.rows[0];
     if (!admin) return res.status(400).json({ error: 'No admin Zoho token' });
     const tokenData = await ensureValidToken(admin.email);
@@ -29487,9 +29592,7 @@ app.post('/api/billing/sync', authenticateToken, async (req, res) => {
   if (!req.user.isAdmin) return res.status(403).json({ error: 'Admin required' });
   try {
     // Use the most recent admin's Zoho token (same pattern as autoSyncInvoices)
-    const adminResult = await pool.query(
-      'SELECT email, access_token, api_domain, expires_at FROM user_tokens WHERE is_admin = true ORDER BY updated_at DESC LIMIT 1'
-    );
+    const adminResult = await booksAdminResult();
     if (!adminResult.rows[0]) return res.status(400).json({ error: 'No admin Zoho token available' });
     const admin = adminResult.rows[0];
 
