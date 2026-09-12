@@ -17700,13 +17700,57 @@ app.get('/api/saas-increase/lookup/fees', authenticateToken, async (req, res) =>
       };
     });
     const paiement = lignes.filter(l => l.isPayment);
+    const fraisPeriode = paiement.reduce((a, l) => a + l.pricePeriod, 0);
+    const fraisMois = paiement.reduce((a, l) => a + l.monthly, 0);
+
+    // ── LE PRIX « AVEC LE PAIEMENT CLUSTER » ───────────────────────────────────────────────
+    // Decide par David le 2026-09-12 : le nouveau prix MOINS les frais d'integration que le
+    // marchand paie aujourd'hui. C'est le prix a lui annoncer s'il passe au paiement Cluster.
+    //
+    // ⚠️ Ce n'est PAS une neutralisation de la hausse : sur un forfait annuel a 2 471 $ avec
+    // 1 200 $ de frais, il tombe a 1 271 $, donc SOUS son prix actuel. C'est un vrai rabais,
+    // assume — on prefere le volume de paiement a la marge SaaS. Mais ca veut aussi dire que
+    // le resultat depend du marchand et peut passer sous zero quand ses frais depassent son
+    // forfait, ce qui arrive sur un Starter mensuel avec deux frais personnalises. On ne rend
+    // alors AUCUN prix : un agent qui lirait « 0 $ » l'annoncerait.
+    // Le prix par PERIODE ne vit pas sur la ligne du scenario : il vient de l'analyse
+    // (`saas_subscription_insights.plan_price_period`), et le nouveau prix s'en deduit par la
+    // MEME fonction que celle qui alimente l'ecran. Recalculer autrement ferait diverger les
+    // deux chiffres affiches cote a cote sur la meme fiche.
+    const item = (await pool.query(
+      `SELECT i.increase_type, i.increase_value, s.plan_price_period
+         FROM saas_increase_items i
+         LEFT JOIN saas_subscription_insights s
+           ON s.org_id = i.org_id AND s.subscription_number = i.subscription_number
+        WHERE i.org_id = $1 AND i.subscription_number = $2 AND i.skipped = FALSE
+        ORDER BY i.id DESC LIMIT 1`, [orgId, number])).rows[0] || null;
+
+    let avecPaiement = null;
+    const prixActuel = item?.plan_price_period != null ? Number(item.plan_price_period) : null;
+    if (prixActuel != null && prixActuel > 0 && fraisPeriode > 0) {
+      const nouveau = saasNewPeriodPrice(prixActuel, item.increase_type, item.increase_value);
+      const brut = nouveau - fraisPeriode;
+      avecPaiement = {
+        periodPrice: Math.round(brut),
+        monthlyPrice: Math.round(brut / Math.max(1, cadence)),
+        // Sous zero, la soustraction n'a plus de sens commercial : les frais coutent plus cher
+        // que le forfait. L'ecran doit le DIRE, pas afficher un prix — un agent qui lit « 0 $ »
+        // l'annonce.
+        belowZero: brut <= 0,
+        newPrice: r2Money(nouveau),
+        currentPrice: r2Money(prixActuel),
+        feesPeriod: r2Money(fraisPeriode),
+      };
+    }
+
     res.json({
       cadenceMonths: cadence,
       addons: lignes,
       paymentFees: paiement,
       // L'economie annoncable : ce qui tombe si le marchand passe a notre paiement.
-      monthlySaving: r2Money(paiement.reduce((a, l) => a + l.monthly, 0)),
-      yearlySaving: r2Money(paiement.reduce((a, l) => a + l.monthly, 0) * 12),
+      monthlySaving: r2Money(fraisMois),
+      yearlySaving: r2Money(fraisMois * 12),
+      withPayments: avecPaiement,
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -17871,6 +17915,8 @@ app.post('/api/saas-increase/lookup/deal', authenticateToken, async (req, res) =
     const releve = Array.isArray(req.body?.paymentFees);
     const frais = releve ? req.body.paymentFees : [];
     const economie = Number(req.body?.monthlySaving) || 0;
+    const avecPaiement = req.body?.withPayments && typeof req.body.withPayments === 'object'
+      ? req.body.withPayments : null;
     const lignes = [
       `Abonnement : ${number} (${ZOHO_BILLING_ORG_NAMES[orgId] || orgId})`,
       `Forfait : ${saasPlanLabel(item.plan_name)}`,
@@ -17886,6 +17932,12 @@ app.post('/api/saas-increase/lookup/deal', authenticateToken, async (req, res) =
           : `Frais d'integration de paiement : non releves au moment de l'appel.`,
       economie
         ? `Economie annoncee au marchand : ${argent(economie)}/mois, soit ${argent(economie * 12)}/an.`
+        : null,
+      // Le prix annonce au telephone doit suivre l'opportunite : sans lui, le vendeur qui
+      // rappelle proposerait autre chose que ce que le marchand a entendu.
+      avecPaiement && avecPaiement.periodPrice != null && !avecPaiement.belowZero
+        ? `Prix annonce s'il passe au paiement Cluster : ${argent(avecPaiement.periodPrice)}`
+          + ` par periode de facturation, au lieu de ${argent(avecPaiement.newPrice)}.`
         : null,
       '',
       `Ouvert depuis la Reference hausse SaaS par ${scope.actorLabel}, pendant un appel du`
