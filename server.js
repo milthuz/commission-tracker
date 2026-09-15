@@ -2862,6 +2862,9 @@ async function initializeDatabase() {
     // title survives a reload and reaches the send — it was previously recomputed at send time
     // from the hardcoded default, which silently ignored the template's own heading.
     await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notify_heading VARCHAR(300)`);
+    // La langue de l'avis, decidee par marchand a la redaction. Elle est FIGEE la, avec le sujet
+    // et le corps : le cadre du courriel doit parler la meme langue que le texte qu'on a relu.
+    await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notify_lang VARCHAR(2)`);
     // La date d'effet promise au marchand, FIGEE au moment de l'envoi de l'avis. Elle ne peut pas
     // etre recalculee plus tard : le plancher de 30 jours se compte a partir de la date de l'avis,
     // donc la meme formule appliquee un mois apres donnerait une date plus tardive que celle que le
@@ -17586,6 +17589,7 @@ function serializeSaasIncreaseItem(row) {
     pushedBy: row.pushed_by, pushedAt: row.pushed_at,
     notifyTo: row.notify_to, notifySubject: row.notify_subject, notifyBody: row.notify_body,
     notifyStatus: row.notify_status, notifyError: row.notify_error, notifyHeading: row.notify_heading,
+    notifyLang: row.notify_lang || null,
     notifiedBy: row.notified_by, notifiedAt: row.notified_at,
     // La date promise au marchand, figee a l'envoi de l'avis. Nulle tant qu'il n'est pas avise.
     effectiveDate: ymd(row.effective_date),
@@ -18328,6 +18332,34 @@ const SAAS_NOTICE_FROM = process.env.SAAS_NOTICE_FROM || 'hello@clustersystems.c
 const saasPlanLabel = (name) => String(name || '').trim().replace(/^\*+\s*/, '').trim();
 const SAAS_NOTICE_FROM_NAME = process.env.SAAS_NOTICE_FROM_NAME || 'Cluster Systems';
 
+// ⚠️ LA LANGUE D'UN AVIS SE DECIDE PAR MARCHAND, pas par lot. Regle de David (2026-09-15) :
+// organisation americaine → anglais ; Quebec → francais ; reste du Canada → anglais.
+//
+// La province vient de l'adresse de facturation Zoho, et elle est ecrite a la main : releve du
+// 2026-09-15 sur 75 marchands, on trouve « Quebec », « Québec », « Que », « Qc » et « quebec »
+// pour la meme province. Comparer la chaine telle quelle classerait la moitie du Quebec en
+// anglais. On normalise donc avant de comparer — accents retires, minuscules, ponctuation
+// jetee — et on accepte les quatre formes.
+//
+// 8 % des contacts de Cluster Canada n'ont AUCUNE province. Pour ceux-la seulement, on regarde
+// le code de langue du contact Zoho (« fr-ca » chez certains), puis on retombe sur le FRANCAIS :
+// c'est le marche d'origine et la majorite du parc. Ce choix est visible — `notify_lang` est
+// ecrit en base a la redaction, donc le partage se compte avant l'envoi.
+const SAAS_QC = new Set(['qc', 'que', 'quebec', 'pq']);
+const SAAS_US_ORG = '802470810';
+const saasNormProv = (v) => String(v || '')
+  .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+  .toLowerCase().replace(/[^a-z]/g, '');
+
+function saasNoticeLangFor({ orgId, state, languageCode }) {
+  if (String(orgId) === SAAS_US_ORG) return 'en';
+  const prov = saasNormProv(state);
+  if (prov) return SAAS_QC.has(prov) ? 'fr' : 'en';
+  // Province inconnue : le code de langue du contact, sinon le francais.
+  if (/^fr/i.test(String(languageCode || ''))) return 'fr';
+  return 'fr';
+}
+
 // En francais le symbole SUIT le montant et la decimale est une virgule : « 79,00 $ ». Ces avis
 // partent a des milliers de marchands quebecois ; « $79.00 » au milieu d'une phrase francaise se
 // lit comme une traduction batclee. Espace insecable avant le symbole, sinon le montant se coupe
@@ -18555,7 +18587,9 @@ app.delete('/api/admin/saas-increase/email-templates/:id', authenticateToken, as
 app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
   const itemIds = Array.isArray(req.body?.itemIds) ? req.body.itemIds.map(Number).filter(Number.isFinite) : [];
-  const lang = String(req.body?.lang || 'fr').toLowerCase() === 'en' ? 'en' : 'fr';
+  // `lang` n'est plus le choix par defaut mais une SURCHARGE : sans lui, chaque marchand recoit
+  // la langue de son adresse (voir saasNoticeLangFor). L'interface ne l'envoie pas.
+  const langForce = req.body?.lang ? (String(req.body.lang).toLowerCase() === 'en' ? 'en' : 'fr') : null;
   const templateId = req.body?.templateId != null ? Number(req.body.templateId) : null;
   if (!itemIds.length) return res.status(400).json({ error: 'itemIds required' });
   try {
@@ -18588,7 +18622,10 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authentic
     )).rows.map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
     const results = [];
     for (const it of items) {
-      const to = await resolveMerchantContactEmail(it.customer_id, it.customer_name, it.org_id);
+      const contact = await resolveMerchantContact(it.customer_id, it.customer_name, it.org_id);
+      const to = contact.email;
+      const lang = langForce || saasNoticeLangFor({
+        orgId: it.org_id, state: contact.state, languageCode: contact.languageCode });
       const liveSub = liveSubs.find(x => x.orgId === it.org_id && x.subscriptionNumber === it.subscription_number);
       const effectiveDate = saasFlooredEffectiveDate(
         nextBillingBySub.get(`${it.org_id}||${it.subscription_number}`) || null,
@@ -18613,9 +18650,9 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authentic
       }
       const row = (await pool.query(
         `UPDATE saas_increase_items SET notify_to = $1, notify_subject = $2, notify_body = $3, notify_heading = $4,
-           notify_status = 'drafted', notify_error = NULL
-         WHERE id = $5 RETURNING *`,
-        [to, subject, body, heading || null, it.id]
+           notify_lang = $5, notify_status = 'drafted', notify_error = NULL
+         WHERE id = $6 RETURNING *`,
+        [to, subject, body, heading || null, lang, it.id]
       )).rows[0];
       results.push(serializeSaasIncreaseItem(row));
     }
@@ -18936,10 +18973,10 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
   if (!items.length) return res.status(400).json({ error: 'items required' });
   const actor = req.user.realAdminEmail || req.user.email || 'unknown';
   const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
-  // ⚠️ Defaut FRANCAIS, comme `/notifications/draft`. Ces deux-la divergeaient : la redaction
-  // ecrivait en francais, l'envoi habillait le tout d'un cadre anglais. L'interface n'envoie pas
-  // ce champ, donc le defaut EST le comportement.
-  const lang = req.body?.lang === 'en' ? 'en' : 'fr';
+  // ⚠️ La langue vient de la LIGNE, figee a la redaction avec le texte qu'on a relu. Ce defaut
+  // ne sert plus qu'aux lignes redigees avant l'existence de `notify_lang`. Les deux divergeaient
+  // autrefois — la redaction ecrivait en francais, l'envoi habillait le tout d'un cadre anglais.
+  const langDefaut = req.body?.lang === 'en' ? 'en' : 'fr';
   // No personal signature. A billing change is sent by Cluster Systems, and the template closes
   // with the company's own support block — a rep's name and phone under it would invite thousands
   // of merchants to treat one person as their billing contact.
@@ -19013,6 +19050,7 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
           continue;
         }
       }
+      const lang = (dbRow && dbRow.notify_lang) || langDefaut;
       let change = null;
       if (dbRow) {
         const curPeriod = periodByKey.get(`${dbRow.org_id}||${dbRow.subscription_number}`) ?? null;
@@ -19370,7 +19408,8 @@ async function runSaasScheduledNotices() {
       WHERE plan_price_period IS NOT NULL`)).rows
     .map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
   const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
-  const lang = 'fr';
+  // Plus de francais code en dur : les avis differes suivent la meme regle que les autres.
+  // Decide ligne par ligne dans la boucle ci-dessous.
 
   let sent = 0, failed = 0;
   const partis = [];
@@ -19388,13 +19427,17 @@ async function runSaasScheduledNotices() {
                  : 'Base plan price not verified at scheduled notice time', it.id]);
         failed++; continue;
       }
-      const to = await resolveMerchantContactEmail(it.customer_id, it.customer_name, it.org_id);
+      const contact = await resolveMerchantContact(it.customer_id, it.customer_name, it.org_id);
+      const to = contact.email;
       if (!to) {
         await pool.query(
           `UPDATE saas_increase_items SET notify_status = 'send_failed', notify_error = $1 WHERE id = $2`,
           ['No contact email found', it.id]);
         failed++; continue;
       }
+      // La langue figee si la ligne a ete redigee, sinon decidee maintenant sur son adresse.
+      const lang = it.notify_lang || saasNoticeLangFor({
+        orgId: it.org_id, state: contact.state, languageCode: contact.languageCode });
       const nxtPeriod = saasNewPeriodPrice(curPeriod, it.increase_type, it.increase_value);
       const effRaw = saasFlooredEffectiveDate(live.nextBillingAt, live.interval, live.intervalUnit, null);
       const vars = saasTemplatePlaceholders({
@@ -19404,9 +19447,12 @@ async function runSaasScheduledNotices() {
         interval: live.interval, intervalUnit: live.intervalUnit, lang,
       });
       const copie = saasIncreaseDraftCopy({ lang });
-      const subject = renderSaasTemplate(template ? template.subject_fr : copie.subject, vars);
-      const bodyText = renderSaasTemplate(template ? template.body_fr : copie.body, vars);
-      const heading = renderSaasTemplate((template ? template.heading_fr : null) || copie.heading, vars);
+      const subject = renderSaasTemplate(
+        template ? (lang === 'en' ? template.subject_en : template.subject_fr) : copie.subject, vars);
+      const bodyText = renderSaasTemplate(
+        template ? (lang === 'en' ? template.body_en : template.body_fr) : copie.body, vars);
+      const heading = renderSaasTemplate(
+        (template ? (lang === 'en' ? template.heading_en : template.heading_fr) : null) || copie.heading, vars);
       const html = buildSaasNoticeEmailHtml({
         heading, bodyText, frontendBase, lang, toAddress: to,
         change: {
@@ -21600,7 +21646,9 @@ async function createCrmLead(o) {
 // sans adresse, soit les deux organisations qui portent 28 369 $ des 59 771 $ de hausse.
 // Mesure du 2026-09-09 : avec l'organisation codee en dur, 404 sur les deux ; avec la vraie,
 // l'adresse sort. Le repli sur ZOHO_ORG_ID ne sert plus qu'aux appelants qui ignorent l'org.
-async function resolveMerchantContactEmail(customerId, customerName, orgId) {
+// Le contact Zoho porte l'adresse ET le courriel. Les lire dans le MEME appel evite de payer
+// deux fois la meme requete pour choisir la langue de l'avis qu'on va lui envoyer.
+async function resolveMerchantContact(customerId, customerName, orgId) {
   try {
     if (customerId) {
       const { accessToken, apiDomain } = await getAdminBooksAuth();
@@ -21610,19 +21658,30 @@ async function resolveMerchantContactEmail(customerId, customerName, orgId) {
       });
       if (c.status === 200) {
         const ct = c.data.contact || {};
-        if (ct.email) return ct.email;
-        if (Array.isArray(ct.contact_persons)) {
-          const cp = ct.contact_persons.find(p => p.is_primary_contact && p.email) || ct.contact_persons.find(p => p.email);
-          if (cp) return cp.email;
+        const b = ct.billing_address || {}, sh = ct.shipping_address || {};
+        let email = ct.email || '';
+        if (!email && Array.isArray(ct.contact_persons)) {
+          const cp = ct.contact_persons.find(x => x.is_primary_contact && x.email)
+                  || ct.contact_persons.find(x => x.email);
+          if (cp) email = cp.email;
         }
+        return {
+          email,
+          // L'adresse de livraison sert de repli : certains contacts n'ont que celle-la.
+          state: (b.state || sh.state || '').trim(),
+          country: (b.country || sh.country || '').trim(),
+          languageCode: (ct.language_code || '').trim(),
+        };
       }
     }
-  } catch (e) { console.warn('[saas-increase] contact email lookup:', e.message); }
-  if (customerName) {
-    const em = await findCrmEmailByName(customerName);
-    if (em) return em;
-  }
-  return '';
+  } catch (e) { console.warn('[saas-increase] contact lookup:', e.message); }
+  let email = '';
+  if (customerName) email = (await findCrmEmailByName(customerName)) || '';
+  return { email, state: '', country: '', languageCode: '' };
+}
+
+async function resolveMerchantContactEmail(customerId, customerName, orgId) {
+  return (await resolveMerchantContact(customerId, customerName, orgId)).email;
 }
 
 // Ownership guard: non-admins (incl. impersonated reps) may only act on THEIR OWN estimates.
