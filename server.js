@@ -5009,7 +5009,11 @@ app.post('/api/partner-auth/invite/accept', async (req, res) => {
   if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
   try {
     const pu = (await pool.query(
-      `SELECT id, email, display_name, invite_expires_at, status FROM partner_users WHERE invite_token_hash = $1`,
+      // partner_id est INDISPENSABLE ici : la verification partnerIsActive() juste en dessous
+      // le lit, et sans lui elle interroge la table avec NULL, ne trouve rien, et refuse
+      // TOUTE invitation avec « votre organisation n'a plus acces au portail ».
+      `SELECT id, email, display_name, invite_expires_at, status, partner_id
+         FROM partner_users WHERE invite_token_hash = $1`,
       [sha256hex(raw)]
     )).rows[0];
     if (!pu || pu.status !== 'invited') return res.status(404).json({ error: 'Invalid invitation' });
