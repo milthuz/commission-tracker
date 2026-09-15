@@ -5129,10 +5129,38 @@ app.post('/api/partner-auth/forgot-password', async (req, res) => {
     // deliberement le meme que pour une adresse inconnue — la reponse ne doit pas reveler
     // quels comptes existent.
     const pu = (await pool.query(
-      `SELECT pu.id, pu.display_name, pu.locale
+      `SELECT pu.id, pu.display_name, pu.locale, pu.status
          FROM partner_users pu JOIN partners p ON p.id = pu.partner_id
-        WHERE pu.email = $1 AND pu.status = 'active' AND p.active`, [email]
+        WHERE pu.email = $1 AND pu.status IN ('active', 'invited') AND p.active`, [email]
     )).rows[0];
+
+    // Un compte encore « invited » n'a PAS de mot de passe a reinitialiser : un lien de
+    // reinitialisation ne menerait nulle part, et ne RIEN envoyer le laissait attendre un
+    // courriel qui ne partirait jamais (cas rapporte par Moneris le 2026-09-15). On lui
+    // renvoie donc son INVITATION, qui est le lien dont il a reellement besoin.
+    if (pu && pu.status === 'invited') {
+      const ctx = (await pool.query(
+        `SELECT pu.partner_id, pu.migration_source, p.name partenaire
+           FROM partner_users pu JOIN partners p ON p.id = pu.partner_id WHERE pu.id = $1`,
+        [pu.id])).rows[0];
+      const brut = newRawToken();
+      await pool.query(
+        `UPDATE partner_users SET invite_token_hash = $2, invite_expires_at = $3,
+                invited_at = NOW(), invite_opened_at = NULL, updated_at = CURRENT_TIMESTAMP
+           WHERE id = $1`,
+        [pu.id, sha256hex(brut), new Date(Date.now() + PARTNER_INVITE_TTL_DAYS * 24 * 3600 * 1000)]);
+      const lien = `${PARTNER_WEB_BASE(pu.locale)}/partner-portal/accept-invite?token=${brut}`;
+      const reprise = !!ctx?.migration_source;
+      const courriel = partnerInviteMail({
+        locale: pu.locale, name: pu.display_name, partnerName: ctx?.partenaire || null, reprise,
+        dossiers: reprise ? await partnerRecordCount(ctx.partner_id) : 0,
+        contact: PARTNER_SUPPORT_EMAIL, url: lien,
+      });
+      await sendMail(email, courriel.subject, courriel.html);
+      logActivity('partner_user', email, 'invited',
+        `${email} asked to reset a password but had no password yet — invitation resent`, email);
+      return res.json({ success: true });
+    }
     if (pu) {
       const raw = newRawToken();
       await pool.query(
@@ -6610,6 +6638,29 @@ app.delete('/api/partner-portal/team/:id', authenticatePartnerToken, async (req,
 // l'echec PARTIEL exploitable — on sait exactement qui a recu quoi. L'interface envoie par
 // tranches et cumule le rapport.
 const PARTNER_INVITE_BATCH_MAX = 50;
+// POST /api/admin/partner-users/:id/clear-2fa — retirer le second facteur d'un usager
+// partenaire. C'est la SEULE porte de sortie quand l'authentificateur ne repond plus :
+// /api/partner-portal/2fa/disable exige d'etre deja connecte, ce que la personne bloquee
+// n'arrive justement pas a faire. Depuis que la 2FA est optionnelle, la personne se reconnecte
+// ensuite avec son seul mot de passe, et peut la reactiver depuis son profil.
+app.post('/api/admin/partner-users/:id/clear-2fa', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'partners:manage'))) return;
+  try {
+    const r = await pool.query(
+      `UPDATE partner_users SET totp_enabled = false, totp_secret = NULL, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1 RETURNING email, display_name`, [req.params.id]);
+    if (!r.rowCount) return res.status(404).json({ error: 'not_found' });
+    const u = r.rows[0];
+    // Les appareils de confiance n'ont plus d'objet une fois le second facteur retire.
+    await revokeTrustedDevices(u.email, 'partner');
+    logActivity('partner_user', u.email, 'clear_2fa',
+      `${req.user.email} removed two-step verification from ${u.display_name || u.email}`, req.user.email);
+    res.json({ success: true, email: u.email });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/api/admin/partner-users/invite', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'partners:manage'))) return;
   const ids = Array.isArray(req.body.ids) ? req.body.ids.map((x) => parseInt(x, 10)).filter((n) => !isNaN(n)) : [];
@@ -6841,7 +6892,7 @@ app.get('/api/admin/partner-invites', authenticateToken, async (req, res) => {
     const rows = (await pool.query(
       `SELECT pu.id, pu.email, pu.display_name, pu.role, pu.status, pu.locale,
               pu.invited_by, pu.invited_at, pu.first_invited_at, pu.invite_opened_at, pu.activated_at,
-              pu.invite_expires_at, pu.last_login_at, p.name AS partner_name
+              pu.invite_expires_at, pu.last_login_at, pu.totp_enabled, p.name AS partner_name
          FROM partner_users pu JOIN partners p ON p.id = pu.partner_id
         ORDER BY COALESCE(pu.invited_at, pu.created_at) DESC NULLS LAST, pu.id DESC`
     )).rows;
@@ -6851,6 +6902,9 @@ app.get('/api/admin/partner-invites', authenticateToken, async (req, res) => {
       invitedAt: r.invited_at, firstInvitedAt: r.first_invited_at,
       openedAt: r.invite_opened_at, activatedAt: r.activated_at,
       expiresAt: r.invite_expires_at, lastLoginAt: r.last_login_at,
+      // Expose pour que l'ecran admin puisse proposer de RETIRER le second facteur a
+      // quelqu'un dont l'authentificateur ne repond plus — sa seule porte de sortie.
+      totpEnabled: r.totp_enabled === true,
     })) });
   } catch (e) {
     res.status(500).json({ error: e.message });
