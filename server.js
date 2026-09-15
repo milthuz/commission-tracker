@@ -7117,16 +7117,20 @@ app.post('/api/admin/partners/:id/invite-admin', authenticateToken, async (req, 
     // le compte : la reinitialisation de mot de passe, plus tard, n'a personne a qui la
     // demander.
     const locale = isFrLocale(req.body.locale) ? 'fr' : 'en';
+    // Le role est un PARAMETRE depuis le 2026-09-15 : le meme point d'acces sert a inviter
+    // un administrateur de partenaire et un simple usager. Deux chemins paralleles auraient
+    // fini par diverger. Par defaut 'admin', pour que l'appel existant ne change pas.
+    const role = req.body.role === 'standard' ? 'standard' : 'admin';
     const partnerName = partner.name || null;
     await pool.query(
       `INSERT INTO partner_users (partner_id, email, display_name, role, status, invite_token_hash, invite_expires_at, invited_by, locale, invited_at, first_invited_at, invite_opened_at, activated_at)
-       VALUES ($1,$2,$3,'admin','invited',$4,$5,$6,$7,NOW(),NOW(),NULL,NULL)
+       VALUES ($1,$2,$3,$8,'invited',$4,$5,$6,$7,NOW(),NOW(),NULL,NULL)
        ON CONFLICT (email) DO UPDATE SET
-         partner_id = $1, display_name = $3, role = 'admin', status = 'invited', invite_token_hash = $4,
+         partner_id = $1, display_name = $3, role = $8, status = 'invited', invite_token_hash = $4,
          invite_expires_at = $5, invited_by = $6, locale = $7,
          invited_at = NOW(), first_invited_at = COALESCE(partner_users.first_invited_at, NOW()),
              invite_opened_at = NULL, activated_at = NULL, updated_at = CURRENT_TIMESTAMP`,
-      [partnerId, email, name || null, sha256hex(raw), expires, actor, locale]
+      [partnerId, email, name || null, sha256hex(raw), expires, actor, locale, role]
     );
     const inviteUrl = `${PARTNER_WEB_BASE(locale)}/partner-portal/accept-invite?token=${raw}`;
     // Ce point d'acces CREE normalement un compte, mais son upsert peut retomber sur une ligne
@@ -7138,7 +7142,7 @@ app.post('/api/admin/partners/:id/invite-admin', authenticateToken, async (req, 
       contact: PARTNER_SUPPORT_EMAIL, url: inviteUrl,
     });
     const mail = await sendMail(email, courriel.subject, courriel.html);
-    logActivity('partner_user', email, 'invited', `${email}${name ? ` (${name})` : ''} invited as Partner Admin for ${partner.name} by ${actor}`, actor);
+    logActivity('partner_user', email, 'invited', `${email}${name ? ` (${name})` : ''} invited as ${role === 'admin' ? 'Partner Admin' : 'user'} for ${partner.name} by ${actor}`, actor);
     res.json({ success: true, inviteUrl, emailSent: mail.sent, emailError: mail.sent ? null : mail.reason });
   } catch (e) {
     res.status(500).json({ error: e.message });
