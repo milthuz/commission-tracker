@@ -18328,6 +18328,15 @@ const SAAS_NOTICE_FROM = process.env.SAAS_NOTICE_FROM || 'hello@clustersystems.c
 const saasPlanLabel = (name) => String(name || '').trim().replace(/^\*+\s*/, '').trim();
 const SAAS_NOTICE_FROM_NAME = process.env.SAAS_NOTICE_FROM_NAME || 'Cluster Systems';
 
+// En francais le symbole SUIT le montant et la decimale est une virgule : « 79,00 $ ». Ces avis
+// partent a des milliers de marchands quebecois ; « $79.00 » au milieu d'une phrase francaise se
+// lit comme une traduction batclee. Espace insecable avant le symbole, sinon le montant se coupe
+// en fin de ligne.
+const saasMoney = (n, lang) => {
+  const v = Number(n) || 0;
+  return lang === 'en' ? `$${v.toFixed(2)}` : `${v.toFixed(2).replace('.', ',')}\u00a0$`;
+};
+
 // The notice's own shell. It reuses the Cluster-branded frame the proposals use, then adds the one
 // thing a price-change notice needs and prose cannot do as well: the change itself, laid out so it
 // can be read at a glance and checked against the invoice that follows. Table-based and
@@ -18415,7 +18424,7 @@ function buildSaasNoticeEmailHtml({ heading, bodyText, frontendBase, change, toA
 }
 
 function saasIncreaseDraftCopy({ customerName, planName, currentMonthly, newMonthly, currentPeriod, newPeriod, effectiveDate, interval, intervalUnit, lang }) {
-  const money = (n) => `$${Number(n || 0).toFixed(2)}`;
+  const money = (n) => saasMoney(n, lang);
   const greeting = customerName ? ` ${customerName}` : '';
   const plan = saasPlanLabel(planName) || (lang === 'en' ? 'subscription' : 'abonnement');
   // Quote what the customer is actually billed. The tool reasons in monthly figures, but an annual
@@ -18426,7 +18435,12 @@ function saasIncreaseDraftCopy({ customerName, planName, currentMonthly, newMont
   const w = saasBillingPeriodWords(interval, intervalUnit, lang);
   const whenEn = effectiveDate ? `on ${formatSaasEffectiveDate(effectiveDate, 'en')}` : 'at your next renewal';
   const whenFr = effectiveDate ? `le ${formatSaasEffectiveDate(effectiveDate, 'fr')}` : 'à votre prochain renouvellement';
-  const subject = lang === 'en' ? `A change to your ${plan} pricing` : `Changement au prix de votre ${plan}`;
+  // « Changement au prix de votre Cluster OS Starter Monthly » : le nom du forfait est un nom
+  // propre, mais sans « abonnement » devant, la phrase francaise n'en est plus une. L'anglais
+  // n'a pas ce probleme.
+  const subject = lang === 'en'
+    ? `A change to your ${plan} pricing`
+    : `Changement au prix de votre abonnement ${plan}`;
   const heading = lang === 'en' ? 'A change to your Cluster subscription pricing.' : 'Changement au prix de votre abonnement Cluster.';
   // No "Best regards," sign-off: the notice is signed by the company in the template's own
   // closing block, and a dangling salutation with nothing under it reads as a broken email.
@@ -18459,7 +18473,7 @@ function renderSaasTemplate(str, vars) {
   return String(str || '').replace(/\{\{(\w+)\}\}/g, (m, key) => (key in vars ? String(vars[key]) : m));
 }
 function saasTemplatePlaceholders({ customerName, planName, currentMonthly, newMonthly, currentPeriod, newPeriod, effectiveDate, interval, intervalUnit, lang }) {
-  const money = (n) => `$${Number(n || 0).toFixed(2)}`;
+  const money = (n) => saasMoney(n, lang);
   // Per-BILLING-PERIOD amounts, not monthly: these go to a customer and must match the invoice
   // they will receive. {{currentMonthly}}/{{newMonthly}} are kept as aliases so templates written
   // before this don't break — their names are now a misnomer, which is why the correctly named
@@ -18860,9 +18874,11 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/preview', authent
   const bodyText = String(req.body?.body || '');
   try {
     const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
-    const lang = req.body?.lang === 'fr' ? 'fr' : 'en';
+    // Defaut FRANCAIS, comme la redaction. Voir la note du 2026-09-15 : les deux divergeaient.
+    const lang = req.body?.lang === 'en' ? 'en' : 'fr';
     const change = req.body?.change || {
-      planName: 'Cluster OS — Business', currentPrice: '$119.00', newPrice: '$129.00',
+      planName: 'Cluster OS — Business',
+      currentPrice: saasMoney(119, lang), newPrice: saasMoney(129, lang),
       effectiveDate: formatSaasEffectiveDate(new Date(Date.now() + 45 * 86400000).toISOString().slice(0, 10), lang),
     };
     const html = buildSaasNoticeEmailHtml({
@@ -18890,9 +18906,11 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/test-send', authe
     const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
     // A test with no change panel would not show the half of the email most worth checking, so a
     // representative one is supplied unless the caller sends real figures.
-    const lang = req.body?.lang === 'fr' ? 'fr' : 'en';
+    // Defaut FRANCAIS, comme la redaction. Voir la note du 2026-09-15 : les deux divergeaient.
+    const lang = req.body?.lang === 'en' ? 'en' : 'fr';
     const change = req.body?.change || {
-      planName: 'Cluster OS — Business', currentPrice: '$119.00', newPrice: '$129.00',
+      planName: 'Cluster OS — Business',
+      currentPrice: saasMoney(119, lang), newPrice: saasMoney(129, lang),
       effectiveDate: formatSaasEffectiveDate(new Date(Date.now() + 45 * 86400000).toISOString().slice(0, 10), lang),
     };
     const html = buildSaasNoticeEmailHtml({
@@ -18918,7 +18936,10 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
   if (!items.length) return res.status(400).json({ error: 'items required' });
   const actor = req.user.realAdminEmail || req.user.email || 'unknown';
   const frontendBase = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
-  const lang = req.body?.lang === 'fr' ? 'fr' : 'en';
+  // ⚠️ Defaut FRANCAIS, comme `/notifications/draft`. Ces deux-la divergeaient : la redaction
+  // ecrivait en francais, l'envoi habillait le tout d'un cadre anglais. L'interface n'envoie pas
+  // ce champ, donc le defaut EST le comportement.
+  const lang = req.body?.lang === 'en' ? 'en' : 'fr';
   // No personal signature. A billing change is sent by Cluster Systems, and the template closes
   // with the company's own support block — a rep's name and phone under it would invite thousands
   // of merchants to treat one person as their billing contact.
@@ -19006,8 +19027,8 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
             liveSub?.interval, liveSub?.intervalUnit, null);
           change = {
             planName: dbRow.plan_name || '',
-            currentPrice: `$${r2Money(curPeriod).toFixed(2)}`,
-            newPrice: `$${r2Money(nxtPeriod).toFixed(2)}`,
+            currentPrice: saasMoney(r2Money(curPeriod), lang),
+            newPrice: saasMoney(r2Money(nxtPeriod), lang),
             effectiveDate: effectiveDate ? formatSaasEffectiveDate(effectiveDate, lang) : '',
             effectiveDateRaw: effectiveDate || null,
             monthlyDelta: subMonthlyAmount(nxtPeriod - curPeriod, liveSub?.interval, liveSub?.intervalUnit),
@@ -19390,8 +19411,8 @@ async function runSaasScheduledNotices() {
         heading, bodyText, frontendBase, lang, toAddress: to,
         change: {
           planName: it.plan_name || '',
-          currentPrice: `$${r2Money(curPeriod).toFixed(2)}`,
-          newPrice: `$${r2Money(nxtPeriod).toFixed(2)}`,
+          currentPrice: saasMoney(r2Money(curPeriod), lang),
+          newPrice: saasMoney(r2Money(nxtPeriod), lang),
           effectiveDate: effRaw ? formatSaasEffectiveDate(effRaw, lang) : '',
         },
       });
