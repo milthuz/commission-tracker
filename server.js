@@ -4951,28 +4951,46 @@ app.post('/api/partner-auth/signup', async (req, res) => {
       return res.status(403).json({ error: 'email_domain_not_allowed' });
     }
 
-    const existant = (await pool.query(`SELECT id, status FROM partner_users WHERE email = $1`, [email])).rows[0];
-    // La personne a prouve qu'elle connait le code de son organisation : lui dire que son compte
-    // existe deja est une aide, pas une fuite.
-    if (existant) return res.status(409).json({ error: 'account_exists' });
+    const existant = (await pool.query(
+      `SELECT id, status, password_hash, partner_id FROM partner_users WHERE email = $1`, [email])).rows[0];
 
-    // Cree DIRECTEMENT avec mot de passe et secret 2FA, puis on rejoint le parcours d'activation
-    // existant (`/invite/verify-2fa`), qui basculera le statut a « active ». Un second parcours
-    // parallele finirait par diverger de celui-ci.
-    const secret = authenticator.generateSecret();
-    await pool.query(
+    // REPRISE D'UNE INVITATION EN SOUFFRANCE.
+    // Une ligne « invited » sans mot de passe est une invitation envoyee et jamais menee a bout —
+    // souvent parce que le lien a expire. Refuser la personne ici fermait la DEUXIEME porte apres
+    // la premiere : lien peri d'un cote, « un compte existe deja » de l'autre, et plus aucun
+    // moyen d'entrer. Elle vient de prouver qu'elle connait le code de son organisation et son
+    // adresse est dans un domaine autorise ; c'est au moins aussi solide qu'un lien par courriel.
+    const reprenable = existant && existant.status === 'invited' && !existant.password_hash
+      && existant.partner_id === p.id;
+    if (existant && !reprenable) return res.status(409).json({ error: 'account_exists' });
+    if (reprenable) {
+      const repris = (await pool.query(
+        `UPDATE partner_users SET display_name = $2, password_hash = $3, locale = $4,
+                status = 'active', activated_at = NOW(), invite_token_hash = NULL,
+                invite_expires_at = NULL, last_login_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+           WHERE id = $1 RETURNING *`,
+        [existant.id, name, await bcrypt.hash(password, 10), isFrLocale(req.body.locale) ? 'fr' : 'en']
+      )).rows[0];
+      logActivity('partner_user', email, 'activated',
+        `${name} (${email}) claimed their pending ${p.name} invitation with the organization code`, email);
+      return res.json({ success: true, partnerName: p.name, token: signPartnerJwt(repris) });
+    }
+
+    // Le compte est ACTIF des la creation : la double authentification n'est plus imposee,
+    // elle s'active depuis le profil (voir /api/partner-portal/2fa/reset). Elle bloquait
+    // l'entree de representants qui n'arrivaient pas au bout du parcours d'enrolement.
+    const cree = (await pool.query(
       `INSERT INTO partner_users (partner_id, email, display_name, role, status, password_hash,
-                                  totp_secret, locale, created_at)
-       VALUES ($1, $2, $3, 'standard', 'invited', $4, $5, $6, CURRENT_TIMESTAMP)`,
-      [p.id, email, name, await bcrypt.hash(password, 10), secret, isFrLocale(req.body.locale) ? 'fr' : 'en']
-    );
+                                  locale, activated_at, last_login_at, created_at)
+       VALUES ($1, $2, $3, 'standard', 'active', $4, $5, NOW(), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       RETURNING *`,
+      [p.id, email, name, await bcrypt.hash(password, 10), isFrLocale(req.body.locale) ? 'fr' : 'en']
+    )).rows[0];
     logActivity('partner_user', email, 'self_signup',
       `${name} (${email}) joined ${p.name} with the organization code`, email);
 
-    const otpauth = authenticator.keyuri(email, PARTNER_TOTP_ISSUER, secret);
-    const qrDataUrl = await QRCode.toDataURL(otpauth, { margin: 1, width: 220 });
-    res.json({ success: true, partnerName: p.name, qrDataUrl, secret,
-               setupToken: signMfaJwt(email, 'partner-2fa-setup') });
+    res.json({ success: true, partnerName: p.name, token: signPartnerJwt(cree) });
   } catch (e) {
     // Course entre deux inscriptions simultanees sur la meme adresse : l'unicite tranche.
     if (e.code === '23505') return res.status(409).json({ error: 'account_exists' });
@@ -4994,15 +5012,25 @@ app.post('/api/partner-auth/invite/accept', async (req, res) => {
     if (!pu || pu.status !== 'invited') return res.status(404).json({ error: 'Invalid invitation' });
     if (new Date(pu.invite_expires_at) < new Date()) return res.status(410).json({ error: 'Invitation expired' });
 
-    const secret = authenticator.generateSecret();
-    await pool.query(
-      `UPDATE partner_users SET password_hash = $2, totp_secret = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
-      [pu.id, await bcrypt.hash(password, 10), secret]
-    );
-    // Libellé DISTINCT de celui des comptes Sales Hub — voir PASS/PARTNER_TOTP_ISSUER.
-    const otpauth = authenticator.keyuri(pu.email, PARTNER_TOTP_ISSUER, secret);
-    const qrDataUrl = await QRCode.toDataURL(otpauth, { margin: 1, width: 220 });
-    res.json({ success: true, qrDataUrl, secret, setupToken: signMfaJwt(pu.email, 'partner-2fa-setup') });
+    // L'invitation ouvre le compte DIRECTEMENT : mot de passe pose, compte actif, jeton emis.
+    // L'enrolement 2FA obligatoire etait ici, et il barrait la porte — il se fait desormais
+    // depuis le profil, a l'initiative de la personne.
+    // Au passage, ce chemin regenerait un secret A CHAQUE appel : un representant qui rouvrait
+    // son lien d'invitation apres avoir scanne le code QR gardait dans son telephone une entree
+    // devenue morte, et lisait « code invalide » sans aucun indice.
+    if (!(await partnerIsActive(pu.partner_id))) {
+      return res.status(403).json({ error: 'partner_inactive' });
+    }
+    const actif = (await pool.query(
+      `UPDATE partner_users SET password_hash = $2, status = 'active', activated_at = NOW(),
+              invite_token_hash = NULL, invite_expires_at = NULL, last_login_at = CURRENT_TIMESTAMP,
+              updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1 RETURNING *`,
+      [pu.id, await bcrypt.hash(password, 10)]
+    )).rows[0];
+    logActivity('partner_user', pu.email, 'activated',
+      `${pu.display_name || pu.email} activated their Partner Portal account`, pu.email);
+    res.json({ success: true, token: signPartnerJwt(actif) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -5045,7 +5073,9 @@ app.post('/api/partner-auth/login', async (req, res) => {
     const fail = () => res.status(401).json({ error: 'Invalid email or password' });
     if (!pu || !pu.password_hash || pu.status === 'disabled') return fail();
     if (!(await bcrypt.compare(password, pu.password_hash))) return fail();
-    if (pu.status !== 'active' || !pu.totp_enabled) {
+    // La 2FA n'est plus exigee pour entrer : un compte actif avec un mot de passe suffit.
+    // On garde le refus pour un compte dont le mot de passe n'a jamais ete pose.
+    if (pu.status !== 'active') {
       return res.status(403).json({ error: 'Account setup incomplete — use your invitation link' });
     }
     // Message DISTINCT de « identifiants invalides » : le compte est bon, c'est l'organisation
@@ -5053,9 +5083,12 @@ app.post('/api/partner-auth/login', async (req, res) => {
     if (!(await partnerIsActive(pu.partner_id))) {
       return res.status(403).json({ error: 'partner_inactive' });
     }
-    if (await checkTrustedDevice(pu.email, 'partner', req.body.deviceToken)) {
+    // Pas de second facteur active, ou appareil deja reconnu : on ouvre la session.
+    const sansCode = !pu.totp_enabled || !pu.totp_secret
+      || await checkTrustedDevice(pu.email, 'partner', req.body.deviceToken);
+    if (sansCode) {
       await pool.query(`UPDATE partner_users SET last_login_at = CURRENT_TIMESTAMP WHERE id = $1`, [pu.id]);
-      logActivity('partner_user', pu.email, 'login', `${pu.display_name || pu.email} logged in to the Partner Portal (trusted device)`, pu.email);
+      logActivity('partner_user', pu.email, 'login', `${pu.display_name || pu.email} logged in to the Partner Portal`, pu.email);
       return res.json({ success: true, token: signPartnerJwt(pu) });
     }
     res.json({ mfaRequired: true, mfaToken: signMfaJwt(pu.email, 'partner-2fa-login') });
@@ -5548,6 +5581,30 @@ app.post('/api/partner-portal/2fa/confirm', authenticatePartnerToken, async (req
     // Changing the second factor invalidates any device that was allowed to SKIP it.
     await revokeTrustedDevices(req.partnerUser.email, 'partner');
     logActivity('partner_user', req.partnerUser.email, 'reset_2fa', `${req.partnerUser.email} replaced their authenticator device`, req.partnerUser.email);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/partner-portal/2fa/disable — retirer la double authentification de SON compte.
+// Exige le mot de passe courant, exactement comme /2fa/reset : un jeton vole ne doit pas
+// pouvoir baisser la protection du compte.
+app.post('/api/partner-portal/2fa/disable', authenticatePartnerToken, async (req, res) => {
+  if (rateLimited(`p2fadisable:${req.partnerUser.email}`)) return res.status(429).json({ error: 'Too many attempts — try again later' });
+  const currentPassword = String(req.body.currentPassword || '');
+  try {
+    const me = (await pool.query(`SELECT password_hash FROM partner_users WHERE id = $1`, [req.partnerUser.id])).rows[0];
+    if (!me?.password_hash || !(await bcrypt.compare(currentPassword, me.password_hash))) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+    await pool.query(
+      `UPDATE partner_users SET totp_enabled = false, totp_secret = NULL, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1`, [req.partnerUser.id]);
+    // Les appareils de confiance n'ont plus d'objet une fois le second facteur retire.
+    await revokeTrustedDevices(req.partnerUser.email, 'partner');
+    logActivity('partner_user', req.partnerUser.email, 'disable_2fa',
+      `${req.partnerUser.email} turned off two-step verification`, req.partnerUser.email);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
