@@ -17404,6 +17404,28 @@ function r2Money(n) { return Math.round((Number(n) || 0) * 100) / 100; }
 // diverger. Le prix MENSUEL qu'on en deduit garde ses decimales : c'est un chiffre de rapport, pas
 // un montant facturé (un annuel a 1 609 $ vaut 134,08 $/mois, et l'ecrire 134 $ serait faux).
 const saasRoundPrice = (n) => Math.round(Number(n) || 0);
+// 💀 `String(x).slice(0, 10)` sur une colonne DATE rend « Thu Sep 10 » — pas « 2026-09-10 ».
+// node-postgres rend un type `date` sous forme d'objet Date, et `String(uneDate)` donne la forme
+// anglaise complete : les dix premiers caracteres en gardent le jour et le mois, et PERDENT
+// L'ANNEE. Le navigateur, a qui on envoie ca, la reconstruit alors a 2001 — d'ou les marchands
+// « clients du paiement depuis le 20 juin 2001 » vus le 2026-09-15.
+//
+// Le motif etait a NEUF endroits, dont la date d'effet promise au marchand, celle du garde-fou
+// de poussee et celle de la note d'opportunite. Un seul point de passage desormais.
+//
+// On lit les composantes LOCALES et non `toISOString()` : pg construit la Date a partir du
+// AAAA-MM-JJ stocke, a minuit LOCAL. Passer par UTC decalerait la date d'un jour partout ou le
+// serveur tourne a l'est de Greenwich.
+const ymd = (v) => {
+  if (!v) return null;
+  if (v instanceof Date) {
+    if (isNaN(v.getTime())) return null;
+    const d2 = (n) => String(n).padStart(2, '0');
+    return `${v.getFullYear()}-${d2(v.getMonth() + 1)}-${d2(v.getDate())}`;
+  }
+  return String(v).slice(0, 10);   // deja une chaine 'AAAA-MM-JJ'
+};
+
 function saasNewPeriodPrice(currentPeriod, type, value) {
   const c = Number(currentPeriod) || 0;
   const v = Number(value) || 0;
@@ -17451,8 +17473,8 @@ function serializeSaasIncreaseItem(row) {
     notifyStatus: row.notify_status, notifyError: row.notify_error, notifyHeading: row.notify_heading,
     notifiedBy: row.notified_by, notifiedAt: row.notified_at,
     // La date promise au marchand, figee a l'envoi de l'avis. Nulle tant qu'il n'est pas avise.
-    effectiveDate: row.effective_date ? String(row.effective_date).slice(0, 10) : null,
-    notifyAfter: row.notify_after ? String(row.notify_after).slice(0, 10) : null,
+    effectiveDate: ymd(row.effective_date),
+    notifyAfter: ymd(row.notify_after),
   };
 }
 
@@ -17922,7 +17944,7 @@ app.post('/api/saas-increase/lookup/deal', authenticateToken, async (req, res) =
       `Forfait : ${saasPlanLabel(item.plan_name)}`,
       `Hausse de prix en cours : ${argent(item.current_monthly)} -> ${argent(item.new_monthly)} par mois`
         + ` (campagne ${item.scenario_name})`,
-      item.effective_date ? `En vigueur le ${String(item.effective_date).slice(0, 10)}` : null,
+      item.effective_date ? `En vigueur le ${ymd(item.effective_date)}` : null,
       '',
       frais.length
         ? `Frais d'integration de paiement payes aujourd'hui : `
@@ -18663,7 +18685,7 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
           merchantAccountId: r.merchant_account_id,
           businessName: r.business_name,
           status: String(r.status || '').toUpperCase(),
-          since: r.activated_at ? String(r.activated_at).slice(0, 10) : null,
+          since: ymd(r.activated_at),
           matchedBy: r.matched_by,
         });
       }
@@ -18689,7 +18711,7 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
         // annonce. La recalculer donnerait une date plus tardive de jour en jour — un agent
         // contredirait au telephone le courriel que le client a sous les yeux.
         effectiveDate: r.effective_date
-          ? String(r.effective_date).slice(0, 10)
+          ? ymd(r.effective_date)
           : saasFlooredEffectiveDate(
               liveByKey.get(`${r.org_id}||${r.subscription_number}`)?.nextBillingAt || null,
               liveByKey.get(`${r.org_id}||${r.subscription_number}`)?.interval,
@@ -18925,7 +18947,7 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
               const live = liveSubs.find(x => x.orgId === r.org_id && x.subscriptionNumber === r.subscription_number);
               return {
                 ...r,
-                effectiveDate: r.effective_date ? String(r.effective_date).slice(0, 10) : null,
+                effectiveDate: ymd(r.effective_date),
                 monthlyDelta: cur == null ? 0 : subMonthlyAmount(nxt - cur, live?.interval, live?.intervalUnit),
               };
             })
@@ -19101,14 +19123,14 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
       // dementirait par ecrit ce qu'on vient de lui annoncer. On refuse, en disant quand la ligne
       // redeviendra poussable — elle le redevient d'elle-meme une fois ce renouvellement passe,
       // il suffit de relancer la poussee. C'est ce qui fait les deux vagues.
-      const promise = item.effective_date ? String(item.effective_date).slice(0, 10) : null;
+      const promise = ymd(item.effective_date);
       if (!promise) {
         const msg = "Notice not sent yet — the 30-day notice period starts when the merchant is emailed";
         await pool.query(`UPDATE saas_increase_items SET status = 'deferred', push_error = $1 WHERE id = $2`, [msg, item.id]);
         results.push({ itemId: item.id, ok: false, deferred: true, error: msg });
         continue;
       }
-      const nextTerm = live.nextBillingAt ? String(live.nextBillingAt).slice(0, 10) : null;
+      const nextTerm = live.nextBillingAt ? ymd(live.nextBillingAt) : null;
       if (nextTerm && nextTerm < promise) {
         const msg = `Too early: Zoho would apply this at the ${nextTerm} renewal, but the merchant was promised ${promise}. Push again after ${nextTerm}.`;
         await pool.query(`UPDATE saas_increase_items SET status = 'deferred', push_error = $1 WHERE id = $2`, [msg, item.id]);
@@ -19310,8 +19332,8 @@ async function runSaasScheduledPushes() {
     const live = liveByKey.get(key);
     const currentPeriod = baseByKey.get(key);
     if (!live || !live.subscriptionId || currentPeriod == null) { failed++; continue; }
-    const promise = String(item.effective_date).slice(0, 10);
-    const nextTerm = live.nextBillingAt ? String(live.nextBillingAt).slice(0, 10) : null;
+    const promise = ymd(item.effective_date);
+    const nextTerm = live.nextBillingAt ? ymd(live.nextBillingAt) : null;
     // MEME barriere que la poussee manuelle : tant que le prochain terme precede la date
     // promise, `end_of_term` l'appliquerait un cycle trop tot. On repasse demain.
     if (nextTerm && nextTerm < promise) { waiting++; continue; }
@@ -19515,7 +19537,7 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
       const np = cp == null ? null : saasNewPeriodPrice(cp, it.increase_type, it.increase_value);
       const cadence = live ? saasCadenceMonths(live.interval, live.intervalUnit) : 1;
       // La date que le marchand verra : plancher de 30 jours, ou celle deja figee a l'envoi.
-      const eff = it.effective_date ? String(it.effective_date).slice(0, 10)
+      const eff = it.effective_date ? ymd(it.effective_date)
         : (live ? saasFlooredEffectiveDate(live.nextBillingAt, live.interval, live.intervalUnit, null) : null);
       enrichies.push({
         id: it.id, org: ZOHO_BILLING_ORG_NAMES[it.org_id] || it.org_id, orgId: it.org_id,
