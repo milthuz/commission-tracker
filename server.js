@@ -18652,11 +18652,18 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authentic
           interval: liveSub?.interval, intervalUnit: liveSub?.intervalUnit, lang,
         }));
       }
+      // Lecture ratee ET aucune adresse trouvee ailleurs : la ligne RESTE a faire, avec la
+      // raison. Elle repart donc toute seule au prochain « rediger tout ce qui reste », au lieu
+      // de se faire passer pour un marchand sans courriel.
+      const lectureRatee = contact.lookupFailed && !to;
       const row = (await pool.query(
         `UPDATE saas_increase_items SET notify_to = $1, notify_subject = $2, notify_body = $3, notify_heading = $4,
-           notify_lang = $5, notify_status = 'drafted', notify_error = NULL
-         WHERE id = $6 RETURNING *`,
-        [to, subject, body, heading || null, lang, it.id]
+           notify_lang = $5, notify_status = $6, notify_error = $7
+         WHERE id = $8 RETURNING *`,
+        [to, subject, body, heading || null, lang,
+         lectureRatee ? 'not_sent' : 'drafted',
+         lectureRatee ? `Zoho n'a pas repondu pour ce client (${contact.lookupError}) — a reprendre` : null,
+         it.id]
       )).rows[0];
       results.push(serializeSaasIncreaseItem(row));
     }
@@ -21652,15 +21659,37 @@ async function createCrmLead(o) {
 // l'adresse sort. Le repli sur ZOHO_ORG_ID ne sert plus qu'aux appelants qui ignorent l'org.
 // Le contact Zoho porte l'adresse ET le courriel. Les lire dans le MEME appel evite de payer
 // deux fois la meme requete pour choisir la langue de l'avis qu'on va lui envoyer.
+//
+// 💀 2026-09-15 : rediger 2 760 avis a fait 2 760 appels a la file, et Zoho a fini par repondre
+// « HTTP 429 — for security reasons you have been blocked ». La fonction avalait l'erreur et
+// rendait un courriel VIDE : 18 marchands se sont donc retrouves marques « sans adresse » alors
+// qu'Amanda en voyait une a l'ecran de Zoho pour le premier qu'elle a ouvert.
+//
+// Deux corrections, et la seconde compte plus que la premiere :
+//   1. on REESSAIE, avec une pause qui s'allonge — un 429 est temporaire par nature ;
+//   2. on DISTINGUE « ce marchand n'a pas d'adresse » de « je n'ai pas pu regarder ». Les
+//      confondre est ce qui a produit une liste de 18 faux negatifs presentee comme un fait.
 async function resolveMerchantContact(customerId, customerName, orgId) {
+  let echec = null;
   try {
     if (customerId) {
       const { accessToken, apiDomain } = await getAdminBooksAuth();
-      const c = await axios.get(`${apiDomain}/books/v3/contacts/${customerId}`, {
-        params: { organization_id: orgId || process.env.ZOHO_ORG_ID },
-        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
-      });
-      if (c.status === 200) {
+      let c = null;
+      for (let essai = 0; essai < 3; essai++) {
+        c = await axios.get(`${apiDomain}/books/v3/contacts/${customerId}`, {
+          params: { organization_id: orgId || process.env.ZOHO_ORG_ID },
+          headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
+        });
+        // 429 = quota; 43 = le code maison de Zoho pour le meme refus, parfois rendu en 400.
+        const limite = c.status === 429 || c.data?.code === 43;
+        if (!limite) break;
+        if (essai < 2) await new Promise(r2 => setTimeout(r2, 3000 * (essai + 1)));
+      }
+      if (c && c.status !== 200) {
+        echec = `HTTP ${c.status}${c.data?.code ? ' code ' + c.data.code : ''}`;
+        console.warn(`[saas-increase] contact ${customerId} (org ${orgId}) : ${echec}`);
+      }
+      if (c && c.status === 200) {
         const ct = c.data.contact || {};
         const b = ct.billing_address || {}, sh = ct.shipping_address || {};
         let email = ct.email || '';
@@ -21675,13 +21704,19 @@ async function resolveMerchantContact(customerId, customerName, orgId) {
           state: (b.state || sh.state || '').trim(),
           country: (b.country || sh.country || '').trim(),
           languageCode: (ct.language_code || '').trim(),
+          lookupFailed: false,
         };
       }
     }
-  } catch (e) { console.warn('[saas-increase] contact lookup:', e.message); }
+  } catch (e) {
+    echec = e.message;
+    console.warn('[saas-increase] contact lookup:', e.message);
+  }
   let email = '';
   if (customerName) email = (await findCrmEmailByName(customerName)) || '';
-  return { email, state: '', country: '', languageCode: '' };
+  // `lookupFailed` ne vaut que pour l'ECHEC DE LECTURE. Un contact lu sans adresse n'est pas un
+  // echec : c'est un fait, et il se traite autrement.
+  return { email, state: '', country: '', languageCode: '', lookupFailed: !!echec, lookupError: echec };
 }
 
 async function resolveMerchantContactEmail(customerId, customerName, orgId) {
