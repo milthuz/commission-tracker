@@ -18808,17 +18808,33 @@ async function sendSaasIncreaseInternalNotice({ sentRows, scenarioName, actor, f
 // give any of the three and an agent should not have to know which one the tool wants.
 app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:lookup'))) return;
+  // ⚠️ Sans terme de recherche, cet ecran rendait une page VIDE : l'agent devait deviner quoi
+  // taper pour voir quoi que ce soit. Il rend desormais la LISTE des marchands, par ordre
+  // alphabetique, et la recherche ne fait que la reduire. Signale par David le 2026-09-16.
+  //
+  // Le chargement automatique des frais d'integration reste borne a cinq resultats : une liste
+  // de cinquante ne declenche donc aucun appel Zoho tant qu'on n'a pas cherche. C'est ce qui
+  // rend cette page sure a ouvrir — l'inverse nous a valu un blocage de quota le 2026-09-15.
   const q = String(req.query.q || '').trim();
-  if (q.length < 2) return res.json({ results: [] });
+  const recherche = q.length >= 2;
+  const limite = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+  const decalage = Math.max(0, parseInt(req.query.offset) || 0);
   try {
+    const filtre = recherche
+      ? `AND (i.customer_name ILIKE $1 OR i.subscription_number ILIKE $1 OR i.merchant_account_id ILIKE $1)`
+      : '';
+    const params = recherche ? [`%${q}%`] : [];
+    const total = parseInt((await pool.query(`
+      SELECT COUNT(*)::int AS n FROM saas_increase_items i
+       WHERE i.skipped = FALSE ${filtre}`, params)).rows[0].n) || 0;
+
     const rows = (await pool.query(`
       SELECT i.*, s.name AS scenario_name, s.status AS scenario_status
         FROM saas_increase_items i
         JOIN saas_increase_scenarios s ON s.id = i.scenario_id
-       WHERE i.skipped = FALSE
-         AND (i.customer_name ILIKE $1 OR i.subscription_number ILIKE $1 OR i.merchant_account_id ILIKE $1)
-       ORDER BY i.notified_at DESC NULLS LAST, i.customer_name
-       LIMIT 50`, [`%${q}%`])).rows;
+       WHERE i.skipped = FALSE ${filtre}
+       ORDER BY ${recherche ? 'i.notified_at DESC NULLS LAST, ' : ''}i.customer_name, i.subscription_number
+       LIMIT ${limite} OFFSET ${decalage}`, params)).rows;
 
     // Per-period prices and the effective date come from the same two sources the notice quoted,
     // so what an agent reads back to a merchant matches the email that merchant received.
@@ -18917,7 +18933,7 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
         payments: paiementParSub.get(r.subscription_number) || null,
       };
     });
-    res.json({ results });
+    res.json({ results, total, offset: decalage, limit: limite });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
