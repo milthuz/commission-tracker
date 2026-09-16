@@ -20187,9 +20187,42 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
     const ordre = { critical: 0, warning: 1, info: 2 };
     C.sort((a, b) => ordre[a.severity] - ordre[b.severity] || b.count - a.count);
 
+    // ── OU EN EST LA CAMPAGNE ────────────────────────────────────────────────────────────────
+    // Le rapport decrivait le PLAN — ce que la hausse rapportera. Une fois la campagne lancee,
+    // la premiere question devient « ou en est-on » : combien d'avis sont partis, combien de
+    // hausses sont reellement appliquees chez Zoho, combien attendent leur renouvellement.
+    // Les deux etapes sont distinctes et se suivent a des rythmes differents : un avis part le
+    // jour meme, sa hausse s'applique des semaines plus tard, au renouvellement du marchand.
+    const parEtat = (liste, champ, valeur) => liste.filter(e => e[champ] === valeur);
+    const mrrDe = (liste) => r2Money(liste.reduce((a, e) => a + e.mrrAdd, 0));
+    const avises = parEtat(enrichies, 'notifyStatus', 'sent');
+    const programmes = parEtat(enrichies, 'notifyStatus', 'scheduled');
+    const aAviser = enrichies.filter(e => e.notifyStatus !== 'sent' && e.notifyStatus !== 'scheduled');
+    const poussees = parEtat(enrichies, 'pushStatus', 'pushed');
+    const differees = parEtat(enrichies, 'pushStatus', 'deferred');
+    const echecsPoussee = parEtat(enrichies, 'pushStatus', 'push_failed');
+    const echecsAvis = parEtat(enrichies, 'notifyStatus', 'send_failed');
+    const horodatages = (await pool.query(
+      `SELECT MAX(notified_at) AS avis, MAX(pushed_at) AS poussee
+         FROM saas_increase_items WHERE scenario_id = $1 AND skipped = FALSE`,
+      [req.params.id])).rows[0] || {};
+
     res.json({
       scenario: { id: scenario.id, name: scenario.name, targetMrr: Number(scenario.target_mrr) },
       generatedAt: new Date().toISOString(),
+      // Deux etapes, comptees separement — un avis parti n'est pas une hausse appliquee.
+      progress: {
+        total: enrichies.length,
+        notified: avises.length, notifyScheduled: programmes.length, toNotify: aAviser.length,
+        notifyFailed: echecsAvis.length,
+        mrrNotified: mrrDe(avises), mrrScheduled: mrrDe(programmes), mrrToNotify: mrrDe(aAviser),
+        pushed: poussees.length, deferred: differees.length, pushFailed: echecsPoussee.length,
+        toPush: enrichies.length - poussees.length,
+        mrrPushed: mrrDe(poussees), mrrToPush: r2Money(
+          enrichies.reduce((a, e) => a + e.mrrAdd, 0) - poussees.reduce((a, e) => a + e.mrrAdd, 0)),
+        lastNotifiedAt: horodatages.avis || null,
+        lastPushedAt: horodatages.poussee || null,
+      },
       totals: {
         items: enrichies.length,
         mrrAdd: r2Money(enrichies.reduce((a, e) => a + e.mrrAdd, 0)),
