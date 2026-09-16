@@ -18329,7 +18329,14 @@ function saasBillingPeriodWords(interval, intervalUnit, lang) {
 // personal address on a billing change to thousands of merchants invites replies into one inbox
 // and reads as a personal decision rather than a company one. Replies land in the same shared
 // inbox, which is what the copy ("just reply to this email") promises.
-const SAAS_NOTICE_FROM = process.env.SAAS_NOTICE_FROM || 'hello@clustersystems.com';
+// `notifications@` depuis le 2026-09-16 (decision de David) : l'adresse dit ce qu'elle envoie,
+// et elle separe les avis automatiques de `hello@`, qui recoit deja tout le reste.
+// ⚠️ Verifie avant de changer : SendGrid n'accepte une adresse d'expediteur que si le domaine
+// est authentifie. Un envoi reel a passe le 2026-09-16 (« 250 Ok: queued »), sinon les 2 742
+// avis auraient echoue d'un coup.
+// ⚠️ Cette adresse sert AUSSI de Reply-To, et le corps de l'avis promet « repondez a ce
+// courriel » — elle doit donc etre surveillee, ce n'est pas une boite no-reply.
+const SAAS_NOTICE_FROM = process.env.SAAS_NOTICE_FROM || 'notifications@clustersystems.com';
 // Zoho plan names literally start with asterisks — "**Cluster OS - Business Yearly". They are
 // stripped internally for plan matching, but the customer-facing copy quoted them verbatim, so a
 // merchant would have read "**Cluster OS" as bold markup that failed to render.
