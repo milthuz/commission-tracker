@@ -18998,7 +18998,12 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
   // No personal signature. A billing change is sent by Cluster Systems, and the template closes
   // with the company's own support block — a rep's name and phone under it would invite thousands
   // of merchants to treat one person as their billing contact.
-  const noticeHeading = req.body?.heading || saasIncreaseDraftCopy({ lang }).heading;
+  // 💥 Ce `lang` etait la variable que j'ai renommee en `langDefaut` : la ligne referencait donc
+  // un identifiant inexistant, et TOUT l'envoi de masse mourait en « lang is not defined » avant
+  // d'ecrire quoi que ce soit. Invisible a `node --check`, invisible en revue, visible seulement
+  // au premier vrai envoi — David a vu une barre de progres immobile a 0/129.
+  // Ce titre n'est qu'un REPLI de toute facon : chaque ligne porte le sien depuis la redaction.
+  const noticeHeading = req.body?.heading || saasIncreaseDraftCopy({ lang: langDefaut }).heading;
   // Un envoi de masse est DECOUPE par l'ecran : 2 740 courriels dans une seule requete expirent
   // a la passerelle bien avant la fin, en laissant un nombre inconnu de marchands avises sans
   // rapport a l'ecran. Chaque tranche passe donc ici — et l'avis interne, lui, ne doit partir
