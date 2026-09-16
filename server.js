@@ -19400,7 +19400,13 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
 //
 // L'interrupteur `saas_increase_auto` (app_settings) l'arrete sans deploiement.
 // =============================================================================================
-const SAAS_AUTO_MAX_PER_RUN = 200; // borne de securite : un passage qui derape reste petit
+// Borne de securite : un passage qui derape reste petit. Relevee de 200 a 600 le 2026-09-16 —
+// la campagne Q3 met 1 248 lignes a echeance sur le seul mois de septembre, et a 200 par jour
+// il aurait fallu une semaine pour les ecouler, donc une semaine de hausses appliquees en
+// retard sur la date promise au marchand.
+// 600 reste prudent : les poussees sont espacees de 250 ms, soit ~3 minutes d'appels Zoho par
+// passage. C'est le rythme qui protege du quota, pas le plafond.
+const SAAS_AUTO_MAX_PER_RUN = parseInt(process.env.SAAS_AUTO_MAX_PER_RUN) || 600;
 
 async function saasAutoEnabled() {
   try {
