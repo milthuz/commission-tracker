@@ -9030,9 +9030,57 @@ async function saasDealOwner() {
     const users = await crmActiveUsers();
     const hit = users.find(u => String(u.email || '').trim().toLowerCase() === SAAS_DEAL_OWNER_EMAIL)
              || users.find(u => String(u.full_name || '').trim().toLowerCase() === SAAS_DEAL_OWNER_NAME.toLowerCase());
-    if (hit) return { id: hit.id, name: hit.full_name || SAAS_DEAL_OWNER_NAME };
+    // Le courriel sert a le PREVENIR : une opportunite qui atterrit dans son pipeline sans qu'il
+    // le sache attend qu'il pense a regarder. Demande de Jay Daoust le 2026-09-16.
+    if (hit) return { id: hit.id, name: hit.full_name || SAAS_DEAL_OWNER_NAME, email: hit.email || SAAS_DEAL_OWNER_EMAIL };
   } catch (e) { console.warn('[saas-deal] liste des utilisateurs CRM indisponible :', e.message); }
-  return { id: SAAS_DEAL_OWNER_ID, name: SAAS_DEAL_OWNER_NAME };
+  return { id: SAAS_DEAL_OWNER_ID, name: SAAS_DEAL_OWNER_NAME, email: SAAS_DEAL_OWNER_EMAIL };
+}
+
+// ⚠️ L'avis part APRES la creation et ne peut jamais la faire echouer : l'opportunite existe
+// deja dans Zoho quand on arrive ici. Un courriel qui ne part pas est un ennui ; une erreur 500
+// rendue a l'agent apres une creation reussie lui ferait recliquer et creer un doublon.
+async function envoyerAvisOpportunite({ owner, item, dealId, accountName, lignes, orgId, number, actorLabel }) {
+  const to = String(owner.email || '').trim();
+  if (!to) { console.warn('[saas-deal] proprietaire sans courriel, avis non envoye'); return false; }
+  const NAVY = '#1c2434', ORANGE = '#fe6523', MUTED = '#64748b';
+  const esc = (v) => String(v == null ? '' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const lien = dealId ? `https://crm.zoho.com/crm/tab/Potentials/${encodeURIComponent(dealId)}` : null;
+  const html = `<!doctype html><html><body style="margin:0;padding:0;background:#eef1f6;font-family:Arial,Helvetica,sans-serif">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f6;padding:32px 12px"><tr><td align="center">
+    <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:100%;background:#fff;border-radius:14px;overflow:hidden">
+      <tr><td style="background:${NAVY};padding:18px 32px;color:#fff;font-size:15px;font-weight:700">Sales Hub</td></tr>
+      <tr><td style="height:3px;background:${ORANGE};font-size:0;line-height:0">&nbsp;</td></tr>
+      <tr><td style="padding:26px 32px 0">
+        <h1 style="margin:0;font-size:19px;line-height:1.35;color:${NAVY}">Nouvelle opportunit&eacute; de paiement</h1>
+        <p style="margin:10px 0 0;font-size:14px;color:${NAVY};line-height:1.6">
+          <strong>${esc(accountName || item.customer_name || number)}</strong> vient d'&ecirc;tre ouverte &agrave; votre nom
+          par ${esc(actorLabel)}, pendant un appel du marchand au sujet de sa hausse de prix.
+        </p>
+      </td></tr>
+      <tr><td style="padding:18px 32px 0">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e6ebf2;border-radius:8px;border-collapse:separate;overflow:hidden">
+          ${lignes.filter(Boolean).map(l => `<tr><td style="padding:9px 14px;border-top:1px solid #e6ebf2;font-size:13px;color:${MUTED};line-height:1.55">${esc(l)}</td></tr>`).join('')}
+        </table>
+      </td></tr>
+      ${lien ? `<tr><td style="padding:20px 32px 28px">
+        <a href="${lien}" style="display:inline-block;background:${ORANGE};color:#fff;text-decoration:none;font-size:14px;font-weight:700;padding:11px 20px;border-radius:8px">Ouvrir dans Zoho CRM</a>
+      </td></tr>` : '<tr><td style="padding:8px 32px 28px">&nbsp;</td></tr>'}
+      <tr><td style="background:${NAVY};padding:14px 32px">
+        <p style="margin:0;color:#8f9aad;font-size:11px">Envoy&eacute; par Sales Hub &middot; Cluster Systems</p>
+      </td></tr>
+    </table>
+  </td></tr></table>
+  </body></html>`;
+  try {
+    const r = await sendMail(to, `Nouvelle opportunite de paiement — ${accountName || item.customer_name || number}`, html);
+    if (!r.sent) console.warn('[saas-deal] avis au proprietaire non parti :', r.reason);
+    return !!r.sent;
+  } catch (e) {
+    console.warn('[saas-deal] avis au proprietaire en echec :', e.message);
+    return false;
+  }
 }
 
 // Creation avec FILET. Zoho rejette la fiche ENTIERE des qu'un champ lui deplait, et il nomme
@@ -18113,9 +18161,17 @@ app.post('/api/saas-increase/lookup/deal', authenticateToken, async (req, res) =
                         owner: proprio.name, monthlySaving: economie, dropped: r.dropped })]
     ).catch(e2 => console.warn('[saas-deal] journal non ecrit:', e2.message));
 
+    // Le proprietaire est prevenu. Sans ca, l'opportunite attend dans son pipeline qu'il pense
+    // a regarder — et l'appel du marchand, lui, est deja termine.
+    const avisOk = await envoyerAvisOpportunite({
+      owner: proprio, item, dealId: r.id, accountName: compte.Account_Name,
+      lignes, orgId, number, actorLabel: scope.actorLabel,
+    });
+
     res.json({
       ok: true, dealId: r.id, dealName: fields.Deal_Name, stage: 'New',
       accountName: compte.Account_Name, owner: proprio.name,
+      ownerNotified: avisOk,
       noteOk,
       // Ce que Zoho a refuse et qu'on a retire pour que la fiche passe quand meme.
       dropped: r.dropped && r.dropped.length ? r.dropped : undefined,
