@@ -19651,12 +19651,30 @@ async function runSaasScheduledPushes() {
     .map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
   const { accessToken, apiDomain } = await getAdminBooksAuth();
 
-  let pushed = 0, failed = 0, waiting = 0;
+  let pushed = 0, failed = 0, waiting = 0, incomplets = 0;
   for (const item of attente) {
     const key = `${item.org_id}||${item.subscription_number}`;
     const live = liveByKey.get(key);
     const currentPeriod = baseByKey.get(key);
-    if (!live || !live.subscriptionId || currentPeriod == null) { failed++; continue; }
+    // ⚠️ Ce cas comptait un ECHEC sans rien ecrire : le compte rendu annoncait « 1 echec » et
+    // aucune ligne en base ne portait de raison — impossible de savoir laquelle, ni pourquoi.
+    // Vecu le 2026-09-17.
+    //
+    // Et ce n'est pas un echec : c'est une DONNEE MANQUANTE, presque toujours temporaire — le
+    // cache des abonnements Zoho peut etre partiel au moment du passage (voir l'incident des
+    // fausses suppressions de la synchro). On garde donc `pending` pour que la ligne reparte
+    // d'elle-meme demain, et on ecrit la raison pour qu'un manque QUI DURE se voie.
+    if (!live || !live.subscriptionId || currentPeriod == null) {
+      const raison = !live ? 'Abonnement absent du cache Zoho au moment du passage'
+                   : !live.subscriptionId ? 'Abonnement sans identifiant chez Zoho'
+                   : 'Prix de base pas encore verifie par l analyse';
+      await pool.query(
+        `UPDATE saas_increase_items SET push_error = $1 WHERE id = $2 AND status = 'pending'`,
+        [`${raison} (${new Date().toISOString().slice(0, 10)}) — reessai automatique demain`, item.id]
+      ).catch(() => {});
+      incomplets++;
+      continue;
+    }
     const promise = ymd(item.effective_date);
     const nextTerm = live.nextBillingAt ? ymd(live.nextBillingAt) : null;
     // MEME barriere que la poussee manuelle : tant que le prochain terme precede la date
@@ -19683,7 +19701,7 @@ async function runSaasScheduledPushes() {
     }
     await new Promise(r2 => setTimeout(r2, 250));
   }
-  return { pushed, failed, waiting };
+  return { pushed, failed, waiting, incomplets };
 }
 
 // ── Le passage quotidien, et son compte rendu ────────────────────────────────────────────────
@@ -19693,8 +19711,9 @@ async function runSaasIncreaseAutopilot() {
   const avis = await runSaasScheduledNotices();
   const push = await runSaasScheduledPushes();
   if (avis.skipped || push.skipped) { console.log('[saas-auto] interrupteur ferme, rien fait'); return; }
-  const rien = !avis.sent && !avis.failed && !push.pushed && !push.failed;
-  console.log(`[saas-auto] avis ${avis.sent}/${avis.failed} echecs · poussees ${push.pushed}/${push.failed} echecs · ${push.waiting} en attente`);
+  const rien = !avis.sent && !avis.failed && !push.pushed && !push.failed && !push.incomplets;
+  console.log(`[saas-auto] avis ${avis.sent}/${avis.failed} echecs · poussees ${push.pushed}/${push.failed} echecs`
+    + ` · ${push.incomplets || 0} incomplets · ${push.waiting} en attente`);
   if (rien) return;
 
   const to = await getSaasIncreaseInternalRecipients();
@@ -19716,6 +19735,7 @@ async function runSaasIncreaseAutopilot() {
             ${l('&Eacute;checs d\'envoi / Send failures', avis.failed, true)}
             ${l('Hausses appliqu&eacute;es chez Zoho / Pushed to Zoho', push.pushed)}
             ${l('&Eacute;checs de pouss&eacute;e / Push failures', push.failed, true)}
+            ${push.incomplets ? l('Donn&eacute;e incompl&egrave;te, r&eacute;essai demain / Incomplete data, retried tomorrow', push.incomplets) : ''}
             ${l('En attente de leur renouvellement / Waiting for renewal', push.waiting)}
           </table>
         </td></tr>
