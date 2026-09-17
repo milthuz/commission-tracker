@@ -18787,6 +18787,26 @@ app.put('/api/admin/saas-increase/auto', authenticateToken, async (req, res) => 
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Interrupteur de l'avis au representant Cluster (piste partenaire assignee).
+app.get('/api/admin/partner-rep-notify', authenticateToken, async (req, res) => {
+  if (!(await requirePermAny(req, res, ['partners:manage', 'admin:notifications']))) return;
+  res.json({ enabled: await avisRepActif() });
+});
+app.put('/api/admin/partner-rep-notify', authenticateToken, async (req, res) => {
+  if (!(await requirePermAny(req, res, ['partners:manage', 'admin:notifications']))) return;
+  const enabled = req.body?.enabled !== false;
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('partner_rep_notify', $1::jsonb, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [JSON.stringify(enabled)]);
+    console.log(`[partenaires] avis au representant ${enabled ? 'ACTIVE' : 'COUPE'} par ${req.user.email}`);
+    logActivity('partner_opportunity', 'settings', 'rep_notify_toggle',
+      `Avis au représentant ${enabled ? 'activé' : 'coupé'}`, req.user.email);
+    res.json({ enabled });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/admin/saas-increase/internal-recipients', authenticateToken, async (req, res) => {
   if (!(await requirePermAny(req, res, ['saas_increase:manage', 'admin:notifications']))) return;
   res.json({ recipients: await getSaasIncreaseInternalRecipients() });
@@ -35344,8 +35364,19 @@ function partnerLeadAssignedEmail(op, crmLeadId) {
 // Previent le representant Cluster qu'une opportunite partenaire vient de lui etre assignee.
 // NE JETTE JAMAIS : un courriel qui echoue ne doit pas faire echouer une approbation, ni le
 // bouton « reessayer ». Le resultat part dans le journal, ou on peut le retrouver.
+// Absent = actif. Prevenir le representant est le comportement voulu ; il faut un geste
+// pour l'eteindre. Base injoignable : on N'ENVOIE PAS — un courriel est irreversible, et
+// mieux vaut un avis manquant qu'un avis parti sur une supposition.
+async function avisRepActif() {
+  try {
+    const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'partner_rep_notify'`);
+    return r.rows[0]?.value === false ? false : true;
+  } catch { return false; }
+}
+
 async function notifierRepOpportunite(opportuniteId) {
   try {
+    if (!(await avisRepActif())) return { sent: false, reason: 'avis_desactive' };
     const op = (await pool.query(
       `SELECT o.id, o.business_name, o.contact_first_name, o.contact_last_name, o.contact_phone,
               o.contact_email, o.rep_first_name, o.rep_last_name, o.rep_phone, o.rep_email,
