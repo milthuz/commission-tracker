@@ -4476,7 +4476,7 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // sampleEmail(), dans TEMPLATE_TYPES de EmailPreview.tsx, et dans les libellés i18n.
 // Les quatre `pass_*` sont les courriels du programme La Passe ; ils sont les seuls de la
 // liste à partir d'une adresse et d'une enveloppe qui ne sont pas celles de Sales Hub.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder', 'lead_review', 'lead_assigned', 'lead_welcome'];
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder', 'lead_review', 'lead_assigned', 'lead_welcome', 'partner_lead_assigned'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -4525,6 +4525,19 @@ function sampleEmail(type, lang) {
     if (type === 'lead_review') return leadReviewEmail(lead, `${lead.suggested_rep_name} — règle « ${lead.suggested_rule_name} »`);
     if (type === 'lead_assigned') return leadAssignedEmail(lead, rep, callbackAt, null);
     if (type === 'lead_welcome') return leadWelcomeEmail(lead, rep, callbackAt, LEAD_SETTINGS_DEFAULTS);
+  }
+
+  // L'avis au representant Cluster passe par son VRAI constructeur, avec une opportunite
+  // fictive : un apercu recopie a cote finit toujours par montrer autre chose que ce qui part.
+  if (type === 'partner_lead_assigned') {
+    return partnerLeadAssignedEmail({
+      business_name: 'Café Merlebleu', partner_name: 'Moneris',
+      contact_first_name: 'Julie', contact_last_name: 'Tremblay',
+      contact_phone: '(514) 555-0142', contact_email: 'julie@cafemerlebleu.ca',
+      rep_first_name: 'Marc', rep_last_name: 'Bélanger',
+      rep_phone: '(416) 555-0199', rep_email: 'marc.belanger@moneris.com',
+      notes: 'Le client ouvre une 2e succursale en octobre et veut changer de terminal.',
+    }, '4876000001234567');
   }
 
   // Les courriels du PORTAIL PARTENAIRE passent par leur vrai texte (PARTNER_EMAIL_COPY) et
@@ -7535,6 +7548,10 @@ app.put('/api/admin/partner-opportunities/:id', authenticateToken, async (req, r
          full.crm_owner_id ? ownerName : null, full.crm_owner_id || null]
       );
       crmLead = result.success ? { leadId: result.leadId } : { error: result.error };
+      // Le representant est prevenu par courriel. Seulement si la fiche Zoho existe : sans
+      // elle, le lien du courriel ne menerait nulle part et l'avis serait une fausse piste.
+      // L'attente est volontaire — la reponse dit ainsi si l'avis est parti ou non.
+      if (result.success) crmLead.repNotified = (await notifierRepOpportunite(id)).sent;
     }
     res.json({ success: true, crmLead });
   } catch (e) {
@@ -7602,7 +7619,12 @@ app.post('/api/admin/partner-opportunities/:id/retry-lead', authenticateToken, a
        full.crm_owner_id || null]);
     logActivity('partner_opportunity', String(id), 'retry_lead',
       `${full.business_name} — nouvelle tentative de creation du Lead : ${result.success ? 'reussie' : result.error}`, actor);
-    res.json(result.success ? { success: true, leadId: result.leadId } : { success: false, error: result.error });
+    // Meme avis au representant qu'a l'approbation : une piste rattrapee par ce bouton lui est
+    // tout autant assignee, et c'est souvent PAR ce chemin qu'elle finit par exister.
+    const avis = result.success ? await notifierRepOpportunite(id) : { sent: false };
+    res.json(result.success
+      ? { success: true, leadId: result.leadId, repNotified: avis.sent }
+      : { success: false, error: result.error });
   } catch (e) {
     console.error('[retry-lead] echec:', e.stack || e.message);
     res.status(500).json({ error: e.message });
@@ -35273,6 +35295,92 @@ function leadAssignedEmail(lead, rep, callbackAt, crmLeadId) {
       crmLeadId ? `https://crm.zoho.com/crm/tab/Leads/${crmLeadId}` : `${base}/leads?ref=${encodeURIComponent(lead.ref_code)}`
     ),
   };
+}
+
+// ── Au representant Cluster : une opportunite partenaire vient de lui etre assignee ─────────
+// Voisin de leadAssignedEmail (flux des pistes) mais DISTINCT, et volontairement : ce qu'un
+// representant doit lire ici, c'est QUEL PARTENAIRE l'a refere et qui contacter chez lui. Les
+// champs de l'autre gabarit (rappel promis, langue du client, interet) n'existent pas cote
+// partenaire et s'afficheraient vides. Meme enveloppe mailShell, donc meme allure.
+function partnerLeadAssignedEmail(op, crmLeadId) {
+  const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+  const contact = [op.contact_first_name, op.contact_last_name].filter(Boolean).join(' ').trim();
+  const refere = [op.rep_first_name, op.rep_last_name].filter(Boolean).join(' ').trim();
+  const tel = (v) => `<a href="tel:${leadEsc(String(v).replace(/[^\d+]/g, ''))}" style="color:#3c50e0;text-decoration:none">${leadEsc(v)}</a>`;
+  const courriel = (v) => `<a href="mailto:${leadEsc(v)}" style="color:#3c50e0;text-decoration:none">${leadEsc(v)}</a>`;
+
+  const lignes = [
+    `<strong>${leadEsc(op.business_name)}</strong>`,
+    `Référé par / Referred by : <strong>${leadEsc(op.partner_name)}</strong>`,
+    contact ? `Contact : ${leadEsc(contact)}` : null,
+    op.contact_phone ? `Tél. : ${tel(op.contact_phone)}` : null,
+    op.contact_email ? `Courriel : ${courriel(op.contact_email)}` : null,
+    op.notes ? `<br>Notes du partenaire / Partner notes :<br><em>${leadEsc(op.notes).replace(/\n/g, '<br>')}</em>` : null,
+  ].filter(Boolean).join('<br>');
+
+  // Le representant du PARTENAIRE : c'est lui qui connait le marchand et qui attend des
+  // nouvelles. Sans son nom, le representant Cluster ne sait pas a qui parler cote partenaire.
+  const cote = (refere || op.rep_email || op.rep_phone)
+    ? `<br><br><div style="border-left:3px solid #f97316;padding:10px 0 10px 14px;color:#0f1722;font-size:14px">`
+      + `<strong>Votre contact chez ${leadEsc(op.partner_name)}</strong><br>`
+      + [refere ? leadEsc(refere) : null,
+         op.rep_phone ? tel(op.rep_phone) : null,
+         op.rep_email ? courriel(op.rep_email) : null].filter(Boolean).join('<br>')
+      + `<br><span style="color:#64748b">Your contact at ${leadEsc(op.partner_name)} — they referred this merchant and are waiting to hear how it goes.</span>`
+      + `</div>`
+    : '';
+
+  return {
+    subject: `Nouvelle piste partenaire — ${op.business_name}`,
+    html: mailShell(
+      `Une piste partenaire vous est assignée / A partner lead is yours`,
+      `${lignes}${cote}`,
+      'Voir la piste dans Zoho / View the lead in Zoho',
+      crmLeadId ? `https://crm.zoho.com/crm/tab/Leads/${crmLeadId}` : `${base}/admin/partners`
+    ),
+  };
+}
+
+// Previent le representant Cluster qu'une opportunite partenaire vient de lui etre assignee.
+// NE JETTE JAMAIS : un courriel qui echoue ne doit pas faire echouer une approbation, ni le
+// bouton « reessayer ». Le resultat part dans le journal, ou on peut le retrouver.
+async function notifierRepOpportunite(opportuniteId) {
+  try {
+    const op = (await pool.query(
+      `SELECT o.id, o.business_name, o.contact_first_name, o.contact_last_name, o.contact_phone,
+              o.contact_email, o.rep_first_name, o.rep_last_name, o.rep_phone, o.rep_email,
+              o.notes, o.crm_lead_id, o.crm_owner_id, o.crm_owner_name, p.name AS partner_name
+         FROM partner_opportunities o JOIN partners p ON p.id = o.partner_id
+        WHERE o.id = $1`, [opportuniteId])).rows[0];
+    if (!op) return { sent: false, reason: 'introuvable' };
+    // Personne n'a ete choisi : il n'y a personne a prevenir. Ce n'est pas une erreur.
+    if (!op.crm_owner_id && !op.crm_owner_name) return { sent: false, reason: 'aucun_rep_assigne' };
+
+    // L'identifiant Zoho d'abord — c'est ce que l'humain a choisi, et il ne bouge pas. Le nom
+    // ensuite, qui reste la seule piste quand l'annuaire CRM est momentanement indisponible.
+    let dest = null;
+    const annuaire = await crmRepDirectory();
+    if (op.crm_owner_id) dest = annuaire.find((r) => String(r.id) === String(op.crm_owner_id)) || null;
+    if (!dest?.email && op.crm_owner_name) dest = await leadRepContact(op.crm_owner_name);
+    if (!dest?.email) {
+      console.warn(`[partenaires] avis au rep impossible pour l'opportunite ${opportuniteId} : aucun courriel pour ${op.crm_owner_name || op.crm_owner_id}`);
+      logActivity('partner_opportunity', String(opportuniteId), 'rep_notify_failed',
+        `Aucun courriel trouvé pour ${op.crm_owner_name || op.crm_owner_id} — le représentant n'a pas été prévenu`, 'system');
+      return { sent: false, reason: 'courriel_introuvable' };
+    }
+
+    const { subject, html } = partnerLeadAssignedEmail(op, op.crm_lead_id);
+    const envoi = await sendMail(dest.email, subject, html);
+    logActivity('partner_opportunity', String(opportuniteId), envoi.sent ? 'rep_notified' : 'rep_notify_failed',
+      envoi.sent
+        ? `${dest.name || dest.email} prévenu par courriel de la piste ${op.business_name}`
+        : `Avis au représentant ${dest.email} non envoyé : ${envoi.reason}`,
+      'system');
+    return { sent: envoi.sent, to: dest.email, reason: envoi.sent ? null : envoi.reason };
+  } catch (e) {
+    console.warn('[partenaires] avis au rep echoue :', e.message);
+    return { sent: false, reason: e.message };
+  }
 }
 
 // 3. Au marchand — remerciement + nom de son representant. UNILINGUE, dans la langue de la
