@@ -23,9 +23,11 @@ const pdf = require('./pdf');
 const pdfLines = require('./pdfLines');
 const rateTables = require('./rateTables');
 const notes = require('./notes');
+const ratesStore = require('./ratesStore');
 
 const PERM_USE = 'icplus:use';
 const PERM_MARGIN = 'icplus:margin';
+const PERM_RATES = 'icplus:rates';
 
 // Cap the posted payload: a statement is a few hundred lines, and anything far past that is
 // either a mistake or an attempt to make the server chew on nothing useful.
@@ -34,7 +36,11 @@ const MAX_LINE_LEN = 2000;
 const MAX_JSON_CHARS = 2_000_000;
 
 function registerIcplusRoutes(app, deps) {
-  const { authenticateToken, requirePerm, hasPerm } = deps;
+  const { authenticateToken, requirePerm, hasPerm, pool, logActivity } = deps;
+
+  // Charge les taux depuis la base au démarrage; sans base, les valeurs du code tiennent lieu
+  // de repli et le serveur démarre quand même.
+  if (pool) ratesStore.init(pool);
 
   // Did this caller earn the internal margin panel?
   async function canSeeMargin(req) {
@@ -192,6 +198,60 @@ function registerIcplusRoutes(app, deps) {
   });
 
   // ---------------------------------------------------------------------------
+  // GET /api/icplus/rates — les huit tables, pour l'écran Admin.
+  // ---------------------------------------------------------------------------
+  app.get('/api/icplus/rates', authenticateToken, async (req, res) => {
+    if (!(await requirePerm(req, res, PERM_RATES))) return;
+    if (!pool) return res.status(503).json({ error: 'base indisponible' });
+    try {
+      const entries = await ratesStore.listAll(pool);
+      const byTable = Object.fromEntries(ratesStore.TABLE_NAMES.map((n) => [n, []]));
+      for (const e of entries) if (byTable[e.table_name]) byTable[e.table_name].push(e);
+      res.json({
+        ok: true,
+        tables: byTable,
+        tableNames: ratesStore.TABLE_NAMES,
+        // Les sources autorisées : une entrée sans provenance traçable est refusée, donc
+        // l'écran doit proposer la liste plutôt que laisser saisir du texte libre.
+        sources: rateTables.SOURCES,
+        version: rateTables.DATA_VERSION,
+        limits: { maxRate: ratesStore.MAX_RATE, minRate: ratesStore.MIN_RATE },
+      });
+    } catch (e) {
+      console.error('[icplus] lecture des taux impossible:', e.message);
+      res.status(500).json({ error: 'lecture impossible' });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // PUT /api/icplus/rates/:table — remplace le contenu d'UNE table.
+  //
+  // ⚠️ Tout ou rien. Une entrée invalide et rien n'est écrit : une table de taux à moitié
+  // remplacée produirait des verdicts « Conforme » sur une moitié et « À vérifier » sur
+  // l'autre, sans que personne ne sache laquelle est à jour.
+  // ---------------------------------------------------------------------------
+  app.put('/api/icplus/rates/:table', authenticateToken, async (req, res) => {
+    if (!(await requirePerm(req, res, PERM_RATES))) return;
+    if (!pool) return res.status(503).json({ error: 'base indisponible' });
+
+    const table = String(req.params.table || '');
+    if (!ratesStore.TABLE_NAMES.includes(table)) return res.status(400).json({ error: 'table inconnue' });
+
+    const entries = (req.body && req.body.entries) || [];
+    if (!Array.isArray(entries)) return res.status(400).json({ error: 'entries[] requis' });
+    if (entries.length > 2000) return res.status(413).json({ error: 'trop d’entrées' });
+
+    try {
+      const out = await ratesStore.replaceTable(pool, table, entries, req.user && req.user.email, logActivity);
+      if (!out.ok) return res.status(400).json({ ok: false, problems: out.problems });
+      res.json({ ok: true, count: out.count, incomplete: rateTables.tablesIncomplete(), unsourced: rateTables.unsourcedTables() });
+    } catch (e) {
+      console.error('[icplus] écriture des taux impossible:', e.message);
+      res.status(500).json({ error: 'écriture impossible', detail: e.message });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
   // POST /api/icplus/pdf — the two exports (§6).
   //
   // ⚠️ The server recomputes from the posted state before rendering, so the document can
@@ -245,4 +305,4 @@ function registerIcplusRoutes(app, deps) {
   });
 }
 
-module.exports = { registerIcplusRoutes, PERM_USE, PERM_MARGIN };
+module.exports = { registerIcplusRoutes, PERM_USE, PERM_MARGIN, PERM_RATES };

@@ -214,6 +214,9 @@ const PERMISSION_CATALOG = [
   // statement has no reason to see. The detailed internal PDF is gated on it too.
   { key: 'icplus:use',                 label: 'Use the IC+ fee comparison calculator (read a statement, build a savings comparison)', category: 'IC+ Calculator' },
   { key: 'icplus:margin',              label: 'See the internal margin panel and export the detailed internal PDF (Cluster costs)', category: 'IC+ Calculator' },
+  // Les taux de référence décident si un frais est « Conforme » ou « SUSPECT » sur un document
+  // remis a un client : les modifier est un geste de maintenance, pas d'usage courant.
+  { key: 'icplus:rates',               label: 'Edit the IC+ reference rate tables (Visa/MC/Interac published rates)', category: 'IC+ Calculator' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -3787,7 +3790,7 @@ function applyDemoGuards(req, res) {
 // hundred. Everything it needs — rate tables, the shared classifier, the seven parsers, the
 // calc engine, both PDF exporters — lives under services/icplus/.
 require('./services/icplus/routes').registerIcplusRoutes(app, {
-  authenticateToken, requirePerm, hasPerm,
+  authenticateToken, requirePerm, hasPerm, pool, logActivity,
 });
 
 // ============================================================================

@@ -7,7 +7,8 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const { registerIcplusRoutes, PERM_USE, PERM_MARGIN } = require('../routes');
+const { registerIcplusRoutes, PERM_USE, PERM_MARGIN, PERM_RATES } = require('../routes');
+let PGlite; try { ({ PGlite } = require('@electric-sql/pglite')); } catch { PGlite = null; }
 
 let fail = 0;
 const ok = (n, c, x) => { console.log((c ? 'PASS ' : 'FAIL ') + n + (!c && x !== undefined ? '  -> ' + JSON.stringify(x) : '')); if (!c) fail++; };
@@ -15,7 +16,7 @@ const near = (a, b, e = 0.005) => Math.abs(a - b) <= e;
 
 // A caller's permissions come from the x-test-perms header, so one server can stand in for
 // every role the real app has.
-function makeApp() {
+function makeApp(pool, logActivity) {
   const app = express();
   app.use(express.json({ limit: '8mb' }));
 
@@ -29,6 +30,7 @@ function makeApp() {
       return false;
     },
     hasPerm: async (req, perm) => permsOf(req).has(perm),
+    pool, logActivity,
   });
   return app;
 }
@@ -36,7 +38,16 @@ function makeApp() {
 const lines = fs.readFileSync(path.join(__dirname, 'fixtures', 'global-fr.lines.txt'), 'utf8').split('\n').filter((l) => l.length);
 
 (async () => {
-  const app = makeApp();
+  // Un vrai Postgres en mémoire pour les endpoints de taux; sans lui ils répondent 503, ce qui
+  // est un comportement correct mais ne prouve rien.
+  const db = PGlite ? new PGlite() : null;
+  const pool = db ? {
+    query: (sql, params) => db.query(sql, params),
+    connect: async () => ({ query: (sql, params) => db.query(sql, params), release() {} }),
+  } : null;
+  const logged = [];
+  const app = makeApp(pool, async (...a) => { logged.push(a); });
+  if (pool) await require('../ratesStore').init(pool);
   const server = await new Promise((resolve) => { const s = app.listen(0, () => resolve(s)); });
   const base = `http://127.0.0.1:${server.address().port}`;
 
@@ -157,7 +168,56 @@ const lines = fs.readFileSync(path.join(__dirname, 'fixtures', 'global-fr.lines.
   ok('the two documents differ', clientPdf.body.length !== allowedDetail.body.length,
     [clientPdf.body.length, allowedDetail.body.length]);
 
+  // ---------------------------------------------------------------------------
+  // Tables de taux (écran Admin)
+  // ---------------------------------------------------------------------------
+  if (!pool) {
+    ok('PGlite requis pour tester les endpoints de taux', false, 'npm install --no-save @electric-sql/pglite');
+  } else {
+    // ⚠️ Permission DISTINCTE de icplus:use : modifier un taux de référence n'est pas un geste
+    // d'usage courant, c'est de la maintenance qui change les verdicts de TOUS les relevés.
+    const r1 = await call('GET', '/api/icplus/rates', { perms: [PERM_USE] });
+    ok('lire les taux refusé avec icplus:use seul', r1.status === 403, r1.status);
+    const r2 = await call('PUT', '/api/icplus/rates/visaDomestic', { perms: [PERM_USE], body: { entries: [] } });
+    ok('écrire les taux refusé avec icplus:use seul', r2.status === 403, r2.status);
+
+    const got = await call('GET', '/api/icplus/rates', { perms: [PERM_RATES] });
+    ok('lecture autorisée avec icplus:rates', got.status === 200 && got.body.ok, got.status);
+    ok('les huit tables sont renvoyées', got.body.tableNames.length === 8, got.body.tableNames);
+    ok('la liste des sources est fournie', Object.keys(got.body.sources).length > 0, Object.keys(got.body.sources).length);
+    ok('networkFees est amorcée', (got.body.tables.networkFees || []).length === 6, (got.body.tables.networkFees || []).length);
+
+    // ⚠️ Le piège de cet écran : un pourcentage non converti. Refusé, jamais divisé en douce.
+    const bad = await call('PUT', '/api/icplus/rates/visaDomestic', {
+      perms: [PERM_RATES], body: { entries: [{ cat: 'Visa — Test', rate: 1.42, src: 'visa_published' }] },
+    });
+    ok('un taux > 100 % est refusé', bad.status === 400 && !!bad.body.problems, bad.body);
+    ok('et le motif est explicite', bad.body.problems[0].errors.some((e) => e.code === 'looksLikePercent'), bad.body.problems);
+
+    const noSrc = await call('PUT', '/api/icplus/rates/visaDomestic', {
+      perms: [PERM_RATES], body: { entries: [{ cat: 'Visa — Test', rate: 0.0142 }] },
+    });
+    ok('une entrée sans source est refusée', noSrc.status === 400, noSrc.body);
+
+    const good = await call('PUT', '/api/icplus/rates/visaDomestic', {
+      perms: [PERM_RATES], body: { entries: [{ cat: 'Visa — Electronic Standard', rate: 0.0142, src: 'visa_published' }] },
+    });
+    ok('une entrée valide est acceptée', good.status === 200 && good.body.ok, good.body);
+    ok('la modification est journalisée', logged.length > 0, logged.length);
+
+    // ⚠️ L'EFFET QUI COMPTE : un taux saisi dans Admin change le verdict rendu par /parse
+    // IMMÉDIATEMENT, sans redéploiement. C'est toute la raison d'être de cet écran.
+    const after = await call('POST', '/api/icplus/parse', { body: { lines } });
+    const cats = after.body.state.lineAudit.interchange.map((r) => r.cat).filter(Boolean);
+    ok('le nouveau taux est actif dans le classificateur sans redéploiement',
+      cats.some((c) => /Electronic Standard/.test(c)), cats.slice(0, 5));
+
+    const unknownTable = await call('PUT', '/api/icplus/rates/inventee', { perms: [PERM_RATES], body: { entries: [] } });
+    ok('table inconnue rejetée', unknownTable.status === 400, unknownTable.status);
+  }
+
   server.close();
+  if (db) await db.close();
   console.log(fail ? `\n${fail} FAILING` : '\nall green');
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error('ERR', e); process.exit(1); });
