@@ -208,6 +208,12 @@ const PERMISSION_CATALOG = [
   { key: 'assistant:hub',              label: "Sofia can read the user's own Sales Hub data (commission, pay stub, points)", category: 'Assistant' },
   { key: 'assistant:governance',       label: 'Turn Sofia\'s CRM access on/off and review what she did',        category: 'Assistant' },
   { key: 'assistant:support_read',     label: 'Sofia can read support tickets and merchant support history (read-only)', category: 'Assistant' },
+
+  // IC+ fee comparison calculator. `icplus:margin` is SEPARATE on purpose: it exposes
+  // Cluster's own costs and the per-line profitability, which a rep comparing a merchant
+  // statement has no reason to see. The detailed internal PDF is gated on it too.
+  { key: 'icplus:use',                 label: 'Use the IC+ fee comparison calculator (read a statement, build a savings comparison)', category: 'IC+ Calculator' },
+  { key: 'icplus:margin',              label: 'See the internal margin panel and export the detailed internal PDF (Cluster costs)', category: 'IC+ Calculator' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -443,6 +449,17 @@ function userHasPermission(permSet, requiredPerm) {
     if (permSet.has(wildcard)) return true;
   }
   return false;
+}
+
+// Non-throwing permission test, for the cases that need to BRANCH on a permission rather
+// than reject the request — e.g. deciding whether a response may carry the internal margin
+// panel. requirePerm() answers the request on failure, which is wrong when the answer is
+// simply "show less".
+async function hasPerm(req, perm) {
+  if (req.user && req.user.isAdmin === true) return true;
+  const email = req.user && req.user.email;
+  if (!email) return false;
+  return userHasPermission(await getUserPermissions(email), perm);
 }
 
 // ============================================================================
@@ -3731,7 +3748,14 @@ function demoScramble(node, keyHint) {
 }
 
 // Endpoints a demo user may still POST to (pure computation / no data written that matters).
-const DEMO_POST_ALLOW = new Set(['/api/assistant/chat']);
+// The IC+ calculator's three compute endpoints are POSTs that store nothing: the rep pastes
+// or uploads a statement and gets arithmetic back. Blocking them would make the tool look
+// broken in a demo for no protective gain. Its /pdf endpoint is deliberately NOT here — a
+// PDF is an export, and exports stay blocked in demo mode.
+const DEMO_POST_ALLOW = new Set([
+  '/api/assistant/chat',
+  '/api/icplus/parse', '/api/icplus/import', '/api/icplus/calculate',
+]);
 // GET endpoints that stream real data OUT of the scrambler (files/exports) → blocked.
 const DEMO_BLOCKED_GET_RE = /(excel|export|dump|download|\.xlsx?|\/pdf)/i;
 
@@ -3754,6 +3778,17 @@ function applyDemoGuards(req, res) {
   };
   return true;
 }
+
+// ============================================================================
+// IC+ FEE COMPARISON CALCULATOR
+// ============================================================================
+// Mounted from its own module rather than inlined here: this file is already ~36k lines and
+// several sessions edit it at once, so the calculator contributes one line instead of two
+// hundred. Everything it needs — rate tables, the shared classifier, the seven parsers, the
+// calc engine, both PDF exporters — lives under services/icplus/.
+require('./services/icplus/routes').registerIcplusRoutes(app, {
+  authenticateToken, requirePerm, hasPerm,
+});
 
 // ============================================================================
 // ZOHO OAUTH CONFIG

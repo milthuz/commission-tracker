@@ -1,0 +1,277 @@
+Relevé du Marchand
+Date du relevé: 31/05/26
+Total de pages 09
+No de chaîne: 000-00-000-000-000
+COMMERCE EXEMPLE INC
+0000 0000 QUEBEC INC
+No de marchand: 0000000000000000
+1 RUE EXEMPLE
+MONTREAL, QC H0H 0H0 Nom de marchand: COMMERCE EXEMPLE INC
+No de magasin:
+Pour obtenir de l’aide
+Á titre indicatif seulement
+QUESTIONS? COMPOSEZ 1 800 000-0000
+Votre compte a été débité de la somme de 717.38 $
+Sommaire par carte
+American
+Date Visa Débit Mastercard Discover Autres
+Express
+01/05 2,508.12 66.18 36.06 0.00 0.00 0.00
+03/05 1,724.53 1,459.87 1,571.59 0.00 0.00 0.00
+04/05 448.32 306.27 862.41 0.00 0.00 0.00
+05/05 473.82 134.00 538.24 0.00 0.00 0.00
+06/05 427.81 2,498.79 411.62 0.00 0.00 0.00
+07/05 421.10 199.17 405.05 0.00 0.00 0.00
+08/05 976.04 393.74 560.32 0.00 0.00 0.00
+10/05 2,568.31 1,577.28 1,513.09 0.00 0.00 0.00
+11/05 122.96 408.66 446.15 0.00 0.00 0.00
+12/05 323.07 385.01 156.05 0.00 0.00 0.00
+13/05 427.67 236.96 337.91 0.00 0.00 0.00
+14/05 312.92 409.91 426.21 0.00 0.00 0.00
+15/05 939.61 551.86 676.45 0.00 0.00 0.00
+17/05 2,701.87 1,628.28 1,396.07 0.00 0.00 0.00
+18/05 753.24 618.69 648.51 0.00 0.00 0.00
+19/05 545.87 484.35 472.80 0.00 0.00 0.00
+1/9
+Relevé du Marchand
+Date du relevé: 31/05/26
+No de marchand: 0000000000000000
+Sommaire par carte - suite
+American
+Date Visa Débit Mastercard Discover Autres
+Express
+20/05 821.44 187.48 299.61 0.00 0.00 0.00
+21/05 502.78 243.77 317.20 0.00 0.00 0.00
+22/05 555.52 573.50 572.51 0.00 0.00 0.00
+24/05 1,761.38 1,286.28 2,002.35 0.00 0.00 0.00
+25/05 326.20 193.22 317.98 0.00 0.00 0.00
+26/05 669.26 630.45 123.51 0.00 0.00 0.00
+28/05 430.79 345.64 355.51 0.00 0.00 0.00
+30/05 719.31 602.81 668.67 0.00 0.00 0.00
+31/05 2,015.20 1,580.64 1,898.96 0.00 0.00 0.00
+Total 23,477.14 17,002.81 17,014.83 0.00 0.00 0.00
+Dépôts
+Numéro Payé
+Date Opérations Ventes $ Retours $ Escompte $ Dépôt
+de référence par un tiers $
+01/05 00000000000 9 2,610.36 0.00 0.00 0.00 2,610.36
+03/05 00000000000 22 1,459.87 0.00 0.00 0.00 1,459.87
+03/05 00000000000 55 3,296.12 0.00 0.00 0.00 3,296.12
+04/05 00000000000 35 1,617.00 0.00 0.00 0.00 1,617.00
+05/05 00000000000 18 1,146.06 0.00 0.00 0.00 1,146.06
+06/05 00000000000 7 2,498.79 0.00 0.00 0.00 2,498.79
+06/05 00000000000 16 839.43 0.00 0.00 0.00 839.43
+07/05 00000000000 19 1,025.32 0.00 0.00 0.00 1,025.32
+08/05 00000000000 8 532.20 0.00 0.00 0.00 532.20
+08/05 00000000000 20 1,397.90 0.00 0.00 0.00 1,397.90
+10/05 00000000000 107 5,658.68 0.00 0.00 0.00 5,658.68
+11/05 00000000000 17 977.77 0.00 0.00 0.00 977.77
+12/05 00000000000 16 864.13 0.00 0.00 0.00 864.13
+2/9
+Relevé du Marchand
+Date du relevé: 31/05/26
+No de marchand: 0000000000000000
+Dépôts - suite
+Numéro Payé
+Date Opérations Ventes $ Retours $ Escompte $ Dépôt
+de référence par un tiers $
+13/05 00000000000 17 1,002.54 0.00 0.00 0.00 1,002.54
+14/05 00000000000 20 1,149.04 0.00 0.00 0.00 1,149.04
+15/05 00000000000 37 2,167.92 0.00 0.00 0.00 2,167.92
+17/05 00000000000 95 5,726.22 0.00 0.00 0.00 5,726.22
+18/05 00000000000 45 2,020.44 0.00 0.00 0.00 2,020.44
+19/05 00000000000 29 1,503.02 0.00 0.00 0.00 1,503.02
+20/05 00000000000 27 1,308.53 0.00 0.00 0.00 1,308.53
+21/05 00000000000 24 1,063.75 0.00 0.00 0.00 1,063.75
+22/05 00000000000 36 1,701.53 0.00 0.00 0.00 1,701.53
+24/05 00000000000 88 5,050.01 0.00 0.00 0.00 5,050.01
+25/05 00000000000 15 837.40 0.00 0.00 0.00 837.40
+26/05 00000000000 29 1,423.22 0.00 0.00 0.00 1,423.22
+28/05 00000000000 26 1,131.94 0.00 0.00 0.00 1,131.94
+30/05 00000000000 37 1,990.79 0.00 0.00 0.00 1,990.79
+31/05 00000000000 103 5,494.80 0.00 0.00 0.00 5,494.80
+Total 28 57,494.78 0.00 0.00 0.00 57,494.78
+Sommaire des dépôts
+Opérations Montant $ Opérations Montant $
+Ventes 977 57,494.78 Ajustement Débit 0.00
+Retours 0.00 Ajustement Crédit 0.00
+Total 977 57,494.78 Total 0.00
+Escompte
+Achat
+Taux Coût Montant
+Description Opérations Montant $ moyen $ esc. % opér. $ des frais $
+IDP IDP 300 0.00 0.00 0.0000 0.0400 12.00
+VISA VISA 300 15,877.47 52.92 0.1800 0.0000 28.57
+3/9
+Relevé du Marchand
+Date du relevé: 31/05/26
+No de marchand: 0000000000000000
+Escompte - suite
+Achat
+Taux Coût Montant
+Description Opérations Montant $ moyen $ esc. % opér. $ des frais $
+VIBS VISA BUSINESS CARD 11 3,207.15 291.56 0.1800 0.0000 5.77
+VINF VISA INFINITE CARD 59 4,252.65 72.08 0.1800 0.0000 7.66
+VIPP VISA PREPAID CARD 2 139.87 69.94 0.1800 0.0000 0.25
+MCPP MC PREPAID CONSUMER 13 585.94 45.07 0.1800 0.0000 1.05
+MCHV MASTERCARD HIGH VALUE 99 5,534.27 55.90 0.1800 0.0000 9.96
+MC MASTERCARD 125 6,561.96 52.50 0.1800 0.0000 11.81
+MCBS MASTERCARD BUSINESS CARD 1 136.99 136.99 0.1800 0.0000 0.25
+MCEC MASTERCARD ENHANCED CONSU 67 4,195.67 62.62 0.1800 0.0000 7.55
+MC LICENSE FEE 305 17,014.83 55.79 0.0140 0.0060 4.21
+MC ASMTS 305 17,014.83 55.79 0.0900 0.0000 15.32
+VISA INFRASTRUCTURE 372 23,477.14 63.11 0.0100 0.0000 2.35
+TAX REIMBURSEMENT CH 677 40,491.97 59.81 0.0200 0.0000 8.10
+MCCLEARMIN 86 0.00 0.00 0.0000 0.0075 0.65
+MCCLEARMAX 219 0.00 0.00 0.0000 0.0300 6.57
+IDP NETWORK FEE 300 0.00 0.00 0.0000 0.0172 5.16
+VISA ASMTS 372 23,477.14 63.11 0.0900 0.0000 21.14
+VISA XB CDN 26 1,737.97 66.85 0.6000 0.0000 10.43
+MC XB CDN 16 885.61 55.35 0.6000 0.0000 5.31
+Total 164.11
+Frais de transaction non qualifiée (FTNQ)
+Description Opérations Montant $ Montant des frais $
+IDP FLASH 248 10,714.46 8.68
+IDP FLASH T4 9 1,062.02 0.50
+VISA CDN ELC SME 238 12,264.66 94.44
+VISA FGN SPRM 12 761.06 15.07
+4/9
+Relevé du Marchand
+Date du relevé: 31/05/26
+No de marchand: 0000000000000000
+Frais de transaction non qualifiée (FTNQ) - suite
+Description Opérations Montant $ Montant des frais $
+VISA FGN ELC 11 630.48 6.94
+VISA CDN EDS ELC 36 1,874.84 20.62
+VISA FGN PREM 3 346.43 6.41
+VIBS CDN STD 10 2,993.47 59.87
+VIBS CDN HI-NET STD 1 213.68 5.02
+VINF CDN ELC SME 33 2,047.82 20.27
+VINF CDN HI-NET ELC SME 19 1,633.22 29.40
+VINF CDN EDS ELC 3 115.35 1.38
+VINF CDN HI-NET OTHR 4 456.26 8.90
+VIPP CDN EMV 2 139.87 1.99
+MCPP ELC 13 585.94 8.44
+MCHV DOM CP SME 99 5,534.27 65.86
+MC DOM CP SME 109 5,676.35 39.73
+MC FGN ELC 7 391.28 4.30
+MC FGN PRM STD 2 120.66 2.23
+MC FGN SPRM STD 7 373.67 7.40
+MCBS DOM WE 1 136.99 3.22
+MCEC DOM CP SME 66 4,159.61 38.68
+MCEC DOM CP 1 36.06 0.44
+Total
+449.79
+Taux en vigueur
+Description Montant $ Montant des frais $ Taux en vigueur %
+MCPP 585.94 9.13 1.5582
+MCHV 5,534.27 72.20 1.3046
+CHGB 456,476.29 1.59 0.0003
+5/9
+Relevé du Marchand
+Date du relevé: 31/05/26
+No de marchand: 0000000000000000
+Taux en vigueur - suite
+Description Montant $ Montant des frais $ Taux en vigueur %
+MC 6,561.96 81.87 1.2476
+VISA 15,877.47 168.20 1.0594
+XBA1 6,688.28 0.32 0.0048
+MCBS 136.99 3.37 2.4600
+VIBS 3,207.15 67.78 2.1134
+XBA4 8,505.30 0.43 0.0051
+VINF 4,252.65 63.78 1.4998
+XBA5 8,671.08 0.01 0.0001
+MCEC 4,195.67 43.89 1.0461
+VIPP 139.87 2.12 1.5157
+Sommaire de facturation
+Description Montant $
+MONTANT DE L'ESCOMPTE 164.11
+Frais de trans non qualifiée 449.79
+Total 613.90
+Frais d’équipement
+Montant
+Description Type de frais Opérations/Montant Taux des frais $
+LOCATION TERMINAL MOVE5000 42A2 2 45.0000 90.00
+TOTAL 90.00
+QST 8.98
+GST 4.50
+FRAIS PLUS TAXES
+103.48
+Paiements Globaux Canada SENC
+Numéro d’enregistrement TPS/TVH: R000000000
+Numéro d’enregistrement TVQ: 0000000000
+6/9
+Relevé du Marchand
+Date du relevé: 31/05/26
+No de marchand: 0000000000000000
+Votre compte a été débité de la somme de 717.38 $
+Avis
+Des questions? Nous pouvons vous aider! Communiquez avec le Service d'aide en composant le numéro qui apparaît au haut
+de votre relevé.
+Frais d'interchange du réseau de paiement
+Pour obtenir une liste détaillée des frais d'interchange du réseau de paiement, veuillez consulter le site Web suivant :
+https://go.globalpayments.com/fr-ca/taux_interchange.
+Rappel important
+Veuillez noter que vous devez nous aviser des erreurs, des frais incorrects ou d'autres problèmes liés à votre relevé dans un
+délai de 60 jours suivant la date du relevé.
+Meilleures pratiques de prévention contre la fraude de PDV
+Vous pouvez réduire votre risque de fraude et de vol en protégeant votre terminal de point de vente (PDV). Nous vous
+recommandons de suivre les meilleures pratiques ci-dessous.
+Meilleures pratiques quant à la sécurité des mots de passe de PDV :
+• Choisissez des mots de passe uniques de 8 caractères ou plus
+• Ne donnez l'accès aux mots de passe qu'aux gestionnaires
+• Modifiez les mots de passe lorsque vous changez de personnel
+• Connaissez votre limite de remboursement; contactez-nous si vous désirez la réduire ou la supprimer
+• Si vous avez plusieurs dispositifs, restreignez la fonction de remboursement à un seul appareil
+Meilleures pratiques pour éviter le vol d'un PDV :
+• Placez votre dispositif en lieu sûr lorsqu'il n'est pas utilisé et à la fin de la journée
+• Conservez une liste de vos dispositifs et de leurs numéros de série (ou prenez-les en photo) et vérifiez tous vos dispositifs
+chaque jour
+• Assurez-vous que vos employés restent avec le client au moment de la transaction sur le PDV
+• Informez votre personnel sur les risques liés au vol d'un dispositif et le processus de signalement d'un appareil volé
+Pour en savoir plus sur les meilleures pratiques en matière de protection contre la fraude, veuillez consulter notre site web à :
+https://go.globalpayments.com/fr-ca/prevention-de-la-fraude
+Protéger les données des détenteurs de carte ' Programme Protection PCI
+Tous les marchands et fournisseurs de services qui stockent, traitent ou transmettent des données de détenteurs de carte
+doivent se conformer aux normes relatives à la sécurité des données de l'industrie des cartes de paiement (PCI DSS).
+Chez Global Payments, nous savons que le processus menant à la conformité PCI DSS peut sembler décourageant. C'est
+pourquoi nous offrons le programme PCI Protect EZ. Dans le cadre de ce programme, Global Payments s'est associée avec
+7/9
+Relevé du Marchand
+Date du relevé: 31/05/26
+No de marchand: 0000000000000000
+Avis - suite
+Aperia, un fournisseur de services d'analyse qualifié (ASV) et évaluateur de sécurité qualifié (QSA). Par le biais du programme
+PCI Protect EZ, Aperia travaillera avec vous pour évaluer votre conformité, en plus de vous fournir les ressources nécessaires
+pour adopter les normes PCI et valider votre conformité PCI DSS de manière efficace et rentable.
+Si vous utilisez les services d'un ASV ou d'un QSA autre qu'Aperia, vous pouvez continuer à le faire ou choisir de recourir aux
+services de notre ASV/QSA privilégié pour valider votre conformité.
+Pour retenir les services de notre ASV/QSA privilégié, composez le 1.844.204.0598.
+Modifications de frais
+Depuis le 1er mai 2026, un nouveau taux maximum pour les frais d'activation numérique applicables aux autorisations sans la
+carte est imposé par Mastercard. Ces frais figureront dans la section Autres frais de votre relevé mensuel.
+Si vous avez des questions, veuillez contacter votre représentant(e) de compte Global Payments.
+Glossaire
+Le glossaire suivant vous donne la signification des principaux acronymes qui apparaissent sur votre relevé du marchand :
+AMEX - American Express
+CDN - Canada
+DISC - Discover
+ELC - Opérations électroniques
+FGN - Autres pays / International
+IDP - Paiement direct Interac
+MC - MasterCard Consommateur
+Rtn - Retour
+STD - Opérations standard
+VISA - Visa Consommateur
+Pour obtenir des renseignements sur d'autres termes, veuillez consulter : https://go.globalpayments.com/fr-ca/glossaire
+8/9
+Relevé du Marchand
+Date du relevé: 31/05/26
+No de marchand: 0000000000000000
+TOUT LITIGE RELATIF À LA FACTURATION DOIT ÊTRE TRANSMIS PAR ÉCRIT DANS LES 60 JOURS SUIVANT LA DATE
+D'ÉMISSION DU RELEVÉ OU DE L’AVIS.
+Global Payments et le logo Global Payments sont des marques de commerce de Global Payments Inc. et ne peuvent être ni copiés, ni imités, ni
+utilisés, en tout ou en partie, sans consentement écrit préalable à cet effet.
+Le traitement des paiements et les approbations de tarification sont soumis par Global Payments Direct Inc.
+Les terminaux et les services de terminaux sont soumis par Paiements Globaux Canada SENC.
+9/9
