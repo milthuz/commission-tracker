@@ -14661,6 +14661,15 @@ function startAutoSync() {
     setInterval(passage, 24 * 60 * 60 * 1000);
   }, 35 * 60 * 1000);
 
+  // Le bilan quotidien part APRES le pilote — sinon il rapporterait l'etat d'avant son passage,
+  // et David lirait chaque matin les chiffres de la veille.
+  setTimeout(() => {
+    const bilan = () => runSaasCampaignDigest()
+      .catch(e => console.warn('[saas-bilan] echoue:', e.message));
+    bilan();
+    setInterval(bilan, 24 * 60 * 60 * 1000);
+  }, 50 * 60 * 1000);
+
   // SaaS Increase churn-history backfill (cancelled subscriptions) — weekly, not nightly;
   // this history barely changes day to day. First run ~30 min after boot, then every 7 days.
   setTimeout(() => {
@@ -19702,6 +19711,138 @@ async function runSaasScheduledPushes() {
     await new Promise(r2 => setTimeout(r2, 250));
   }
   return { pushed, failed, waiting, incomplets };
+}
+
+// ── LE BILAN QUOTIDIEN DE LA CAMPAGNE ────────────────────────────────────────────────────────
+//
+// Le compte rendu du pilote ne part QUE s'il a fait quelque chose, et il va aux treize personnes
+// de la liste interne. Ce bilan-ci est different : il part tous les matins tant que la campagne
+// n'est pas terminee, meme un jour ou rien n'a bouge, et il va a David seul. C'est le « ou en
+// est-on » qu'il demandait — un silence n'est pas une reponse quand on attend deux mois.
+//
+// Il s'arrete tout seul : plus une ligne en attente, un dernier courriel, puis plus rien.
+const SAAS_DIGEST_KEY = 'saas_increase_digest_to';
+const SAAS_DIGEST_FINI = 'saas_increase_digest_done';
+
+async function saasDigestRecipients() {
+  try {
+    const r = await pool.query(`SELECT value FROM app_settings WHERE key = $1`, [SAAS_DIGEST_KEY]);
+    const v = r.rows[0]?.value;
+    if (Array.isArray(v) && v.length) return v.map(String);
+  } catch (e) { console.warn('[saas-bilan] destinataires illisibles :', e.message); }
+  return ['david@clustersystems.com'];
+}
+
+async function runSaasCampaignDigest() {
+  const sc = (await pool.query(`SELECT id, name FROM saas_increase_scenarios ORDER BY id DESC LIMIT 1`)).rows[0];
+  if (!sc) return { skipped: 'no_scenario' };
+  const OU = `FROM saas_increase_items WHERE skipped = FALSE AND scenario_id = ${Number(sc.id)}`;
+
+  const chiffres = (await pool.query(`SELECT
+      COUNT(*)::int AS lignes,
+      COUNT(*) FILTER (WHERE notify_status = 'sent')::int AS avises,
+      COUNT(*) FILTER (WHERE notify_status = 'scheduled')::int AS programmes,
+      COUNT(*) FILTER (WHERE status = 'pushed')::int AS poussees,
+      COUNT(*) FILTER (WHERE status = 'pending')::int AS attente,
+      COUNT(*) FILTER (WHERE status = 'push_failed')::int AS echecs,
+      ROUND(SUM(new_monthly - current_monthly) FILTER (WHERE status = 'pushed')::numeric, 2) AS mrr_applique,
+      ROUND(SUM(new_monthly - current_monthly)::numeric, 2) AS mrr_total,
+      MAX(pushed_at) AS derniere_poussee ${OU}`)).rows[0];
+
+  // La campagne est finie quand plus rien n'attend. On envoie un dernier bilan, puis on se tait.
+  const fini = Number(chiffres.attente) === 0;
+  if (fini) {
+    const deja = (await pool.query(`SELECT value FROM app_settings WHERE key = $1`, [SAAS_DIGEST_FINI])).rows[0];
+    if (deja && String(deja.value) === String(sc.id)) return { skipped: 'campaign_done' };
+  }
+
+  const hier = new Date(Date.now() - 24 * 3600 * 1000).toISOString().slice(0, 10);
+  const veille = (await pool.query(`SELECT COUNT(*)::int AS n,
+      ROUND(SUM(new_monthly - current_monthly)::numeric, 2) AS mrr
+      ${OU} AND status = 'pushed' AND pushed_at >= $1::date`, [hier])).rows[0];
+
+  const echecs = (await pool.query(
+    `SELECT customer_name, subscription_number, push_error ${OU} AND status = 'push_failed'
+      ORDER BY customer_name LIMIT 15`)).rows;
+  // Une donnee manquante qui DURE est un vrai signal ; une seule journee, c'est le cache.
+  const incomplets = (await pool.query(
+    `SELECT customer_name, subscription_number, push_error ${OU}
+        AND status = 'pending' AND push_error IS NOT NULL ORDER BY customer_name LIMIT 15`)).rows;
+  const parMois = (await pool.query(
+    `SELECT to_char(effective_date, 'YYYY-MM') AS mois, COUNT(*)::int AS n ${OU}
+        AND status = 'pending' AND effective_date IS NOT NULL GROUP BY 1 ORDER BY 1 LIMIT 8`)).rows;
+
+  const to = await saasDigestRecipients();
+  if (!to.length) return { skipped: 'no_recipients' };
+
+  const NAVY = '#1c2434', ORANGE = '#fe6523', LINE = '#e6ebf2', MUTED = '#64748b';
+  const esc = (v) => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const argent = (n) => `${(Number(n) || 0).toFixed(2).replace('.', ',')}\u00a0$`;
+  const l = (k, v, alerte) => `<tr>`
+    + `<td style="padding:8px 14px;border-top:1px solid ${LINE};font-size:13px;color:${NAVY}">${k}</td>`
+    + `<td style="padding:8px 14px;border-top:1px solid ${LINE};font-size:13px;text-align:right;`
+    + `color:${alerte && Number(v) ? '#dc2626' : MUTED};font-weight:${alerte && Number(v) ? 700 : 400}">${esc(v)}</td></tr>`;
+  const liste = (titre, lignes, couleur) => !lignes.length ? '' : `
+    <tr><td style="padding:20px 32px 0">
+      <p style="margin:0 0 6px;font-size:13px;font-weight:700;color:${couleur}">${titre}</p>
+      ${lignes.map(x => `<p style="margin:0 0 4px;font-size:12px;color:${MUTED};line-height:1.5">`
+        + `<strong style="color:${NAVY}">${esc(x.customer_name)}</strong> (${esc(x.subscription_number)}) — `
+        + `${esc(String(x.push_error || '').slice(0, 200))}</p>`).join('')}
+    </td></tr>`;
+
+  const html = `<!doctype html><html><body style="margin:0;padding:0;background:#eef1f6;font-family:Arial,Helvetica,sans-serif">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f6;padding:32px 12px"><tr><td align="center">
+    <table role="presentation" width="640" cellpadding="0" cellspacing="0" style="width:640px;max-width:100%;background:#fff;border-radius:14px;overflow:hidden">
+      <tr><td style="background:${NAVY};padding:18px 32px;color:#fff;font-size:15px;font-weight:700">
+        Hausse de prix SaaS — bilan du jour<br>
+        <span style="font-weight:400;color:#a9b4c6;font-size:13px">${esc(sc.name)}</span></td></tr>
+      <tr><td style="height:3px;background:${ORANGE};font-size:0;line-height:0">&nbsp;</td></tr>
+
+      <tr><td style="padding:24px 32px 0;font-size:14px;color:${NAVY};line-height:1.6">
+        ${fini
+          ? `<p style="margin:0"><strong>La campagne est termin&eacute;e.</strong> Toutes les hausses sont appliqu&eacute;es chez Zoho. C'est le dernier bilan.</p>`
+          : Number(veille.n)
+            ? `<p style="margin:0"><strong>${veille.n} hausse(s) appliqu&eacute;e(s)</strong> depuis hier, soit ${argent(veille.mrr)} de MRR de plus.</p>`
+            : `<p style="margin:0">Aucune hausse appliqu&eacute;e depuis hier. Les prochaines attendent le renouvellement de leur marchand.</p>`}
+      </td></tr>
+
+      <tr><td style="padding:16px 32px 0">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid ${LINE};border-radius:8px;border-collapse:separate">
+          ${l('Hausses appliqu&eacute;es chez Zoho', `${chiffres.poussees} / ${chiffres.lignes}`)}
+          ${l('MRR r&eacute;ellement appliqu&eacute;', `${argent(chiffres.mrr_applique)} sur ${argent(chiffres.mrr_total)}`)}
+          ${l('En attente de leur renouvellement', chiffres.attente)}
+          ${l('Avis envoy&eacute;s', chiffres.avises)}
+          ${l('Avis annuels &agrave; venir', chiffres.programmes)}
+          ${l('&Eacute;checs de pouss&eacute;e', chiffres.echecs, true)}
+        </table>
+      </td></tr>
+
+      ${parMois.length ? `<tr><td style="padding:20px 32px 0">
+        <p style="margin:0 0 6px;font-size:13px;font-weight:700;color:${NAVY}">Reste &agrave; appliquer, par mois</p>
+        ${parMois.map(m => `<p style="margin:0 0 3px;font-size:12px;color:${MUTED}">${esc(m.mois)} &mdash; ${m.n} abonnement(s)</p>`).join('')}
+      </td></tr>` : ''}
+
+      ${liste('&Eacute;checs — Zoho a refus&eacute;, une action est requise', echecs, '#dc2626')}
+      ${liste('Donn&eacute;e incompl&egrave;te — repris automatiquement, &agrave; surveiller si la m&ecirc;me ligne revient', incomplets, '#b45309')}
+
+      <tr><td style="padding:22px 32px 28px">
+        <a href="${process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com'}/saas-increase" style="display:inline-block;background:${ORANGE};color:#fff;text-decoration:none;font-size:14px;font-weight:700;padding:11px 20px;border-radius:8px">Ouvrir la campagne</a>
+      </td></tr>
+      <tr><td style="background:${NAVY};padding:14px 32px">
+        <p style="margin:0;color:#8f9aad;font-size:11px">Envoy&eacute; par Sales Hub &middot; s'arr&ecirc;te tout seul quand la campagne est termin&eacute;e</p>
+      </td></tr>
+    </table>
+  </td></tr></table></body></html>`;
+
+  const r = await sendMail(to, `Hausse de prix SaaS — ${chiffres.poussees}/${chiffres.lignes} appliquees`, html);
+  if (fini) {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [SAAS_DIGEST_FINI, JSON.stringify(String(sc.id))]);
+  }
+  console.log(`[saas-bilan] envoye a ${to.length} destinataire(s) : ${chiffres.poussees}/${chiffres.lignes} appliquees`);
+  return { sent: !!r.sent, recipients: to.length, done: fini };
 }
 
 // ── Le passage quotidien, et son compte rendu ────────────────────────────────────────────────
