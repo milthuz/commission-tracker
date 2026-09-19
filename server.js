@@ -3790,7 +3790,7 @@ function applyDemoGuards(req, res) {
 // hundred. Everything it needs — rate tables, the shared classifier, the seven parsers, the
 // calc engine, both PDF exporters — lives under services/icplus/.
 require('./services/icplus/routes').registerIcplusRoutes(app, {
-  authenticateToken, requirePerm, hasPerm, pool, logActivity,
+  authenticateToken, requirePerm, hasPerm, pool, logActivity, getAnthropic,
 });
 
 // ============================================================================

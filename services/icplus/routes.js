@@ -24,6 +24,8 @@ const pdfLines = require('./pdfLines');
 const rateTables = require('./rateTables');
 const notes = require('./notes');
 const ratesStore = require('./ratesStore');
+const rateCardExtract = require('./rateCardExtract');
+const multer = require('multer');
 
 const PERM_USE = 'icplus:use';
 const PERM_MARGIN = 'icplus:margin';
@@ -36,7 +38,7 @@ const MAX_LINE_LEN = 2000;
 const MAX_JSON_CHARS = 2_000_000;
 
 function registerIcplusRoutes(app, deps) {
-  const { authenticateToken, requirePerm, hasPerm, pool, logActivity } = deps;
+  const { authenticateToken, requirePerm, hasPerm, pool, logActivity, getAnthropic } = deps;
 
   // Charge les taux depuis la base au démarrage; sans base, les valeurs du code tiennent lieu
   // de repli et le serveur démarre quand même.
@@ -248,6 +250,51 @@ function registerIcplusRoutes(app, deps) {
     } catch (e) {
       console.error('[icplus] écriture des taux impossible:', e.message);
       res.status(500).json({ error: 'écriture impossible', detail: e.message });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // POST /api/icplus/rates/extract — lire une carte de taux déposée en PDF.
+  //
+  // ⚠️ N'ÉCRIT RIEN. Renvoie des lignes PROPOSÉES que l'écran affiche en brouillon dans
+  // l'éditeur ; c'est l'humain qui revoit puis enregistre, par le même PUT que la saisie
+  // manuelle — donc même validation, même transaction, même trace. Une extraction
+  // automatique se trompe (une colonne mal lue, une note de bas de page prise pour une
+  // ligne), et un taux erroné produit une accusation fausse sur un document client.
+  // ---------------------------------------------------------------------------
+  const uploadRateCard = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: rateCardExtract.MAX_PDF_BYTES },
+  });
+
+  app.post('/api/icplus/rates/extract', authenticateToken, uploadRateCard.single('file'), async (req, res) => {
+    if (!(await requirePerm(req, res, PERM_RATES))) return;
+
+    const anthropic = typeof getAnthropic === 'function' ? getAnthropic() : null;
+    if (!anthropic) return res.status(503).json({ ok: false, reason: 'ai_not_configured' });
+    if (!req.file || !req.file.buffer) return res.status(400).json({ ok: false, reason: 'no_file' });
+    if (req.file.mimetype && !/pdf/i.test(req.file.mimetype)) {
+      return res.status(400).json({ ok: false, reason: 'not_a_pdf', mimetype: req.file.mimetype });
+    }
+
+    try {
+      const out = await rateCardExtract.extractRateCard({
+        anthropic,
+        pdfBase64: req.file.buffer.toString('base64'),
+        filename: req.file.originalname,
+        src: req.body && req.body.src,
+      });
+      // La lecture d'une carte de taux est tracée même si rien n'est enregistré : elle
+      // coûte un appel payant et elle est le point de départ d'un changement de taux.
+      if (out.ok && typeof logActivity === 'function') {
+        await logActivity('icplus_rates', 'extract', 'rate_card_read',
+          `Carte de taux lue : ${req.file.originalname || 'sans nom'} — ${out.summary.total} ligne(s) proposée(s), ${out.summary.flagged} à revoir.`,
+          req.user && req.user.email, { metadata: { filename: req.file.originalname, ...out.summary, network: out.network } });
+      }
+      res.json(out);
+    } catch (e) {
+      console.error('[icplus] extraction impossible:', e.message);
+      res.status(500).json({ ok: false, reason: 'error', detail: e.message });
     }
   });
 
