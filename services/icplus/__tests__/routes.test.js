@@ -85,8 +85,13 @@ const lines = fs.readFileSync(path.join(__dirname, 'fixtures', 'global-fr.lines.
     cfg.body.processors.filter((p) => p.verified).map((p) => p.key));
   // ⚠️ Without this the page looks broken: every interchange line reads "À vérifier" and
   // nothing on screen explains that the reference tables are still empty.
-  ok('config admits the rate data is incomplete', cfg.body.rateData.incomplete === true, cfg.body.rateData);
-  ok('config names the unsourced tables', cfg.body.rateData.unsourced.length > 0, cfg.body.rateData.unsourced);
+  // ⚠️ Les huit tables ont été remplies le 2026-09-21 depuis le calculateur de référence.
+  // La config doit désormais annoncer l'inverse — un « incomplete » resté à true ferait
+  // afficher à l'écran un avertissement que les données démentent.
+  ok('config annonce des tables complètes', cfg.body.rateData.incomplete === false, cfg.body.rateData);
+  ok('aucune table sans source', cfg.body.rateData.unsourced.length === 0, cfg.body.rateData.unsourced);
+  ok('et les huit portent des entrées',
+    Object.values(cfg.body.rateData.status).every((t) => t.entries > 0), cfg.body.rateData.status);
 
   // ---------------------------------------------------------------------------
   // parse
@@ -185,7 +190,7 @@ const lines = fs.readFileSync(path.join(__dirname, 'fixtures', 'global-fr.lines.
     ok('lecture autorisée avec icplus:rates', got.status === 200 && got.body.ok, got.status);
     ok('les huit tables sont renvoyées', got.body.tableNames.length === 8, got.body.tableNames);
     ok('la liste des sources est fournie', Object.keys(got.body.sources).length > 0, Object.keys(got.body.sources).length);
-    ok('networkFees est amorcée', (got.body.tables.networkFees || []).length === 8, (got.body.tables.networkFees || []).length);
+    ok('networkFees est amorcée', (got.body.tables.networkFees || []).length === 9, (got.body.tables.networkFees || []).length);
 
     // ⚠️ Le piège de cet écran : un pourcentage non converti. Refusé, jamais divisé en douce.
     const bad = await call('PUT', '/api/icplus/rates/visaDomestic', {
@@ -214,6 +219,81 @@ const lines = fs.readFileSync(path.join(__dirname, 'fixtures', 'global-fr.lines.
 
     const unknownTable = await call('PUT', '/api/icplus/rates/inventee', { perms: [PERM_RATES], body: { entries: [] } });
     ok('table inconnue rejetée', unknownTable.status === 400, unknownTable.status);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Dépôt d'un classeur de correspondance (multipart).
+  //
+  // Ce que cette couche doit prouver, et que le test du module ne peut pas : la permission
+  // exigée, le refus d'un fichier qui n'est pas un classeur, et surtout que les heurts sont
+  // mesurés contre les taux DE LA BASE et non contre ceux du code — sinon l'écran annonce
+  // « aucun heurt » à quelqu'un qui vient justement de saisir l'entrée qui heurte.
+  // ---------------------------------------------------------------------------
+  {
+    const XLSX = require('xlsx');
+    const wbBuf = XLSX.write((() => {
+      const w = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(w, XLSX.utils.aoa_to_sheet([
+        ['titre'], [''],
+        ['Card Brand', 'Moneris Code', 'Moneris Description (as printed, FR)', 'English Reading',
+          'Moneris Rate %', 'Moneris Rate $/txn', 'Adyen Equivalent Fee Name', 'Adyen Rate %',
+          'Adyen Rate $/txn', 'Delta % (Mon − Adyen)', 'Delta $/txn', 'Match Confidence', 'Notes'],
+        ['Visa', 'CAN-Z1', 'Visa — Electronic Standard', 'Electronic standard', 0.0142, '', 'x', 0.0142, '', '', '', 'High', ''],
+        ['Visa', 'CAN-Z2', 'LIGNE EN DÉSACCORD', 'Disagreeing row', 0.0200, '', 'x', 0.0180, '', '', '', 'Low', ''],
+        ['Visa', 'CAN-Z3', 'LIGNE PROPRE', 'Clean row', 0.0171, '', 'x', 0.0171, '', '', '', 'High', ''],
+      ]), 'Interchange Mapping');
+      return w;
+    })(), { type: 'buffer', bookType: 'xlsx' });
+
+    const post = async (name, buf, perms) => {
+      const B = '----icplustest';
+      // multipart exige des CRLF : avec un LF seul, multer ne voit aucun champ.
+      const CRLF = String.fromCharCode(13) + String.fromCharCode(10);
+      const head = Buffer.from(
+        `--${B}${CRLF}Content-Disposition: form-data; name="file"; filename="${name}"${CRLF}`
+        + `Content-Type: application/octet-stream${CRLF}${CRLF}`, 'utf8');
+      const tail = Buffer.from(`${CRLF}--${B}--${CRLF}`, 'utf8');
+      const res = await fetch(base + '/api/icplus/rates/import-workbook', {
+        method: 'POST',
+        headers: { 'content-type': `multipart/form-data; boundary=${B}`, 'x-test-perms': perms.join(',') },
+        body: Buffer.concat([head, buf, tail]),
+      });
+      return { status: res.status, body: await res.json() };
+    };
+
+    const denied = await post('c.xlsx', wbBuf, [PERM_USE]);
+    ok("le dépôt d'un classeur exige icplus:rates", denied.status === 403, denied.status);
+
+    const notWb = await post('releve.pdf', Buffer.from('%PDF-1.4'), [PERM_RATES]);
+    ok("un fichier qui n'est pas un classeur est refusé",
+      notWb.status === 400 && notWb.body.reason === 'not_a_workbook', notWb.body);
+
+    const got = await post('classeur.xlsx', wbBuf, [PERM_RATES]);
+    ok('le classeur est lu', got.status === 200 && got.body.ok, got.body);
+    ok("rien n'est écrit en base : la réponse ne contient que des propositions",
+      !!got.body.proposals && got.body.summary.proposed === 3, got.body.summary);
+
+    const byCat = (frag) => got.body.proposals.visaDomestic.find((p) => p.cat.indexOf(frag) >= 0);
+    ok('une ligne concordante et sans heurt arrive COCHÉE',
+      byCat('PROPRE').accept === true && byCat('PROPRE').flags.length === 0, byCat('PROPRE'));
+    ok('une ligne où les deux acquéreurs divergent arrive DÉCOCHÉE',
+      byCat('DÉSACCORD').accept === false && byCat('DÉSACCORD').flags.indexOf('acquirersDisagree') >= 0,
+      byCat('DÉSACCORD').flags);
+    ok('la lecture est journalisée', logged.some((a) => String(a[1]) === 'import_workbook'),
+      logged.map((a) => a[1]));
+
+    if (pool) {
+      // ⚠️ L'assertion qui vaut le détour. « Visa — Electronic Standard » à 0,0142 vient
+      // d'être ENREGISTRÉ plus haut par le PUT. Le classeur propose le même libellé au même
+      // taux : la route doit donc le reconnaître comme déjà présent — ce qu'elle ne peut
+      // faire qu'en lisant les tables de la BASE. Si elle comparait contre le code (table
+      // Visa vide), la ligne passerait pour neuve.
+      const dup = got.body.proposals.visaDomestic.find((p) => /Electronic Standard/.test(p.cat));
+      ok('les heurts sont mesurés contre la BASE, pas contre le code',
+        !!dup && dup.flags.includes('valueCollision'), dup && dup.flags);
+      ok('et le heurt DÉSIGNE l’entrée existante',
+        !!dup && dup.collidesWith.some((c) => /Electronic Standard/.test(c.cat)), dup && dup.collidesWith);
+    }
   }
 
   server.close();

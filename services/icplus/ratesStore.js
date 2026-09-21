@@ -37,6 +37,15 @@ const SEED = JSON.parse(JSON.stringify(
 const MAX_RATE = 1;
 const MIN_RATE = 0;
 
+// ⚠️ Certaines entrées sont un MONTANT FIXE par transaction, pas un pourcentage du volume :
+// Interac Flash à 0,035 $ et 0,055 $, l'évaluation Interac à 0,015803 $, le débit Visa à
+// 0,03 $. Le débit Interac est le plus gros volume des relevés québécois, donc sans ce
+// champ la table la plus utile reste inchargeable.
+//
+// Un frais réseau par transaction se compte en cents. 10 $ laisse une marge confortable et
+// attrape quand même une colonne de montants facturés saisie par erreur à cet endroit.
+const MAX_PER_ITEM = 10;
+
 async function ensureSchema(pool) {
   // ⚠️ La table existait-elle AVANT cet appel ? C'est la seule question qui permette
   // d'amorcer une fois et une seule. Tester « la table est-elle vide ? » ne marche pas : un
@@ -50,6 +59,7 @@ async function ensureSchema(pool) {
       table_name VARCHAR(40)  NOT NULL,
       cat        TEXT         NOT NULL,
       rate       NUMERIC(14,8) NOT NULL,
+      per_item   NUMERIC(14,8) DEFAULT 0,
       weak       BOOLEAN      DEFAULT false,
       src        VARCHAR(60)  NOT NULL,
       note       TEXT         DEFAULT '',
@@ -58,15 +68,22 @@ async function ensureSchema(pool) {
     );
   `);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_icplus_rates_key ON icplus_rates(table_name, cat)`);
+  // La table existe déjà en production sans cette colonne — ajoutée après coup.
+  await pool.query(`ALTER TABLE icplus_rates ADD COLUMN IF NOT EXISTS per_item NUMERIC(14,8) DEFAULT 0`);
 
   // Amorce unique : seulement à la toute première création de la table.
   if (!existed) {
     for (const name of TABLE_NAMES) {
       for (const e of SEED[name] || []) {
         await pool.query(
-          `INSERT INTO icplus_rates (table_name, cat, rate, weak, src, updated_by)
-           VALUES ($1,$2,$3,$4,$5,'seed') ON CONFLICT (table_name, cat) DO NOTHING`,
-          [name, e.cat, e.rate, !!e.weak, e.src || 'statement_obs']
+          // ⚠️ `per_item` DOIT figurer ici. L'amorce ne le portait pas : les 15 entrées en
+          // dollars par transaction (Interac Flash et réseau, lignes « USD/txn ») seraient
+          // parties en base à zéro, en silence, et l'écran aurait affiché « 0 » pour un
+          // palier Flash à 0,035 $. Le plantage sur la contrainte NOT NULL de `rate` — une
+          // entrée par transaction n'a pas de taux — est ce qui a révélé le trou.
+          `INSERT INTO icplus_rates (table_name, cat, rate, per_item, weak, src, updated_by)
+           VALUES ($1,$2,$3,$4,$5,$6,'seed') ON CONFLICT (table_name, cat) DO NOTHING`,
+          [name, e.cat, Number(e.rate) || 0, Number(e.perItem) || 0, !!e.weak, e.src || 'statement_obs']
         );
       }
     }
@@ -80,6 +97,7 @@ function applyRows(rows) {
   for (const r of rows) {
     if (!byTable[r.table_name]) continue;
     const entry = { cat: r.cat, rate: Number(r.rate), src: r.src };
+    if (Number(r.per_item) > 0) entry.perItem = Number(r.per_item);
     if (r.weak) entry.weak = true;
     if (r.note) entry.note = r.note;
     byTable[r.table_name].push(entry);
@@ -92,7 +110,7 @@ function applyRows(rows) {
 }
 
 async function load(pool) {
-  const { rows } = await pool.query(`SELECT table_name, cat, rate, weak, src, note FROM icplus_rates ORDER BY table_name, cat`);
+  const { rows } = await pool.query(`SELECT table_name, cat, rate, per_item, weak, src, note FROM icplus_rates ORDER BY table_name, cat`);
   applyRows(rows);
   return rows.length;
 }
@@ -124,6 +142,18 @@ function validate(entry) {
   // Le message distingue ce cas des autres : c'est presque toujours un pourcentage non divisé.
   else if (rate > MAX_RATE) errors.push({ field: 'rate', code: 'looksLikePercent', value: rate });
 
+  const perItem = entry.perItem === undefined || entry.perItem === null || entry.perItem === ''
+    ? 0 : Number(entry.perItem);
+  if (!Number.isFinite(perItem)) errors.push({ field: 'perItem', code: 'notANumber' });
+  else if (perItem < 0) errors.push({ field: 'perItem', code: 'negative' });
+  else if (perItem > MAX_PER_ITEM) errors.push({ field: 'perItem', code: 'perItemTooLarge', value: perItem });
+
+  // ⚠️ Une entrée sans taux NI montant par transaction ne peut correspondre à rien : elle
+  // encombrerait la table en donnant l'illusion qu'un palier est couvert.
+  if (Number.isFinite(rate) && Number.isFinite(perItem) && rate === 0 && perItem === 0) {
+    errors.push({ field: 'rate', code: 'noValue' });
+  }
+
   if (!entry.src || !rateTables.SOURCES[entry.src]) errors.push({ field: 'src', code: 'unknownSource' });
 
   return errors;
@@ -148,7 +178,7 @@ async function replaceTable(pool, tableName, entries, actor, logActivity) {
   });
   if (problems.length) return { ok: false, problems };
 
-  const before = await pool.query(`SELECT cat, rate, src, weak FROM icplus_rates WHERE table_name = $1`, [tableName]);
+  const before = await pool.query(`SELECT cat, rate, per_item, src, weak FROM icplus_rates WHERE table_name = $1`, [tableName]);
   const beforeMap = new Map(before.rows.map((r) => [r.cat, r]));
 
   const client = await pool.connect();
@@ -157,9 +187,10 @@ async function replaceTable(pool, tableName, entries, actor, logActivity) {
     await client.query(`DELETE FROM icplus_rates WHERE table_name = $1`, [tableName]);
     for (const e of list) {
       await client.query(
-        `INSERT INTO icplus_rates (table_name, cat, rate, weak, src, note, updated_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [tableName, String(e.cat).trim(), Number(e.rate), !!e.weak, e.src, String(e.note || '').slice(0, 500), actor || 'inconnu']
+        `INSERT INTO icplus_rates (table_name, cat, rate, per_item, weak, src, note, updated_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [tableName, String(e.cat).trim(), Number(e.rate) || 0, Number(e.perItem) || 0,
+         !!e.weak, e.src, String(e.note || '').slice(0, 500), actor || 'inconnu']
       );
     }
     await client.query('COMMIT');
@@ -179,11 +210,19 @@ async function replaceTable(pool, tableName, entries, actor, logActivity) {
     const changes = [];
     for (const e of list) {
       const old = beforeMap.get(String(e.cat).trim());
-      if (!old) changes.push(`+ ${e.cat} = ${fmtPct(e.rate)} (${e.src})`);
-      else if (Number(old.rate) !== Number(e.rate)) changes.push(`~ ${e.cat} : ${fmtPct(old.rate)} → ${fmtPct(e.rate)}`);
+      // ⚠️ fmtVal et non fmtPct : une entrée en dollars par transaction consignée avec
+      // fmtPct apparaît « 0,0000 % » dans le journal. La trace est ce qui permet de
+      // reconstituer un changement de taux six mois plus tard — une trace fausse est pire
+      // qu'absente. Et la comparaison doit porter sur les DEUX composantes, sinon une
+      // modification de montant par transaction ne laisse aucune trace du tout.
+      if (!old) changes.push(`+ ${e.cat} = ${fmtVal(e)} (${e.src})`);
+      else if (Number(old.rate) !== Number(e.rate || 0)
+        || Number(old.per_item || 0) !== Number(e.perItem || 0)) {
+        changes.push(`~ ${e.cat} : ${fmtVal(old)} → ${fmtVal(e)}`);
+      }
       beforeMap.delete(String(e.cat).trim());
     }
-    for (const [cat, old] of beforeMap) changes.push(`− ${cat} (était ${fmtPct(old.rate)})`);
+    for (const [cat, old] of beforeMap) changes.push(`− ${cat} (était ${fmtVal(old)})`);
 
     if (changes.length) {
       await logActivity('icplus_rates', tableName, 'rates_updated',
@@ -195,15 +234,19 @@ async function replaceTable(pool, tableName, entries, actor, logActivity) {
   return { ok: true, count: list.length };
 }
 
-// Virgule décimale : le reste de la note est en français.
+// Virgule décimale : le reste de la note est en français. Une entrée par transaction se
+// décrit en dollars — l'afficher en pourcentage donnerait « 3,5000 % » pour 0,035 $.
 const fmtPct = (v) => `${(Number(v) * 100).toFixed(4).replace('.', ',')} %`;
+const fmtVal = (e) => (Number(e && e.per_item) > 0 || Number(e && e.perItem) > 0
+  ? `${Number(e.per_item || e.perItem).toFixed(6).replace('.', ',')} $/trans.`
+  : fmtPct(e && e.rate !== undefined ? e.rate : e));
 
 async function listAll(pool) {
   const { rows } = await pool.query(
-    `SELECT table_name, cat, rate, weak, src, note, updated_by, updated_at
+    `SELECT table_name, cat, rate, per_item, weak, src, note, updated_by, updated_at
        FROM icplus_rates ORDER BY table_name, cat`
   );
-  return rows.map((r) => ({ ...r, rate: Number(r.rate) }));
+  return rows.map((r) => ({ ...r, rate: Number(r.rate), perItem: Number(r.per_item) || 0 }));
 }
 
 module.exports = {

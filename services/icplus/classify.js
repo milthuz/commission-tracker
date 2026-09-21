@@ -175,6 +175,11 @@ function matchByRate(rate, tables, epsilon = DEFAULT_EPSILON, desc = '') {
 
   for (const entry of rows) {
     if (!entry || !Number.isFinite(entry.rate)) continue;
+    // ⚠️ A PER-ITEM entry carries rate 0 (Interac Flash is $0.035 a transaction, not a
+    // percentage of volume). Left in, every statement row whose rate is 0 — and there are
+    // many — would match it exactly, and the audit would confidently label an unrelated
+    // fee as "Interac Flash tier 3". Per-item entries are matched by matchByPerItem.
+    if (entry.rate === 0 && Number.isFinite(entry.perItem) && entry.perItem > 0) continue;
     const delta = Math.abs(entry.rate - rate);
     if (delta > epsilon) continue;
     if (brandConflict(desc, entry.cat)) continue;
@@ -182,6 +187,30 @@ function matchByRate(rate, tables, epsilon = DEFAULT_EPSILON, desc = '') {
     if (!best || delta < best.delta) best = { entry, delta };
   }
   return best ? { ...best.entry, matchedBy: 'rate', distance: best.delta } : null;
+}
+
+// The same search against the $/item component.
+//
+// ⚠️ Kept separate from matchByRate rather than folded into it. The two are different
+// units — a fraction of volume versus dollars per transaction — and one epsilon cannot
+// serve both: 0.00006 is a sane tolerance on a rate and absurd on a fee where the real
+// values run 0.015 to 0.055. A tenth of a cent is the right granularity here.
+const DEFAULT_PER_ITEM_EPSILON = 0.0001;
+
+function matchByPerItem(perItem, tables, epsilon = DEFAULT_PER_ITEM_EPSILON, desc = '') {
+  if (!Number.isFinite(perItem) || perItem <= 0) return null;
+  const rows = tableList(tables);
+  let best = null;
+
+  for (const entry of rows) {
+    if (!entry || !Number.isFinite(entry.perItem) || entry.perItem <= 0) continue;
+    const delta = Math.abs(entry.perItem - perItem);
+    if (delta > epsilon) continue;
+    if (brandConflict(desc, entry.cat)) continue;
+    if (entry.weak && !keywordOverlap(desc, entry.cat)) continue;
+    if (!best || delta < best.delta) best = { entry, delta };
+  }
+  return best ? { ...best.entry, matchedBy: 'perItem', distance: best.delta } : null;
 }
 
 // Fuzzy description match against each table entry's category label. Requires BOTH a
@@ -281,19 +310,35 @@ function decide(item, match, opts = {}) {
     };
   }
 
-  const publishedRate = Number.isFinite(match.rate) ? match.rate : null;
-  const theoretical   = publishedRate != null ? publishedRate * volume : null;
-  const delta         = theoretical != null ? total - theoretical : null;
+  const count = Number.isFinite(item.count) ? item.count : 0;
 
-  // "Conforme" requires the rate itself to line up. A name match alone means we believe we
-  // know WHAT the fee is, not that the amount is right — that is exactly "À vérifier".
-  const rateAgrees = publishedRate != null && rate != null
-    && Math.abs(publishedRate - rate) <= (opts.epsilon || DEFAULT_EPSILON);
+  // ⚠️ A per-item entry is priced in dollars per TRANSACTION, so its expected amount is
+  // fee × count, not rate × volume. Running it through the volume formula would compare a
+  // $0.035 Interac fee against a percentage of tens of thousands of dollars and report an
+  // enormous, meaningless delta.
+  const isPerItem = Number.isFinite(match.perItem) && match.perItem > 0
+    && (match.matchedBy === 'perItem' || !Number.isFinite(match.rate) || match.rate === 0);
+
+  const publishedRate     = Number.isFinite(match.rate) && match.rate > 0 ? match.rate : null;
+  const publishedPerItem  = isPerItem ? match.perItem : null;
+  const theoretical = isPerItem
+    ? publishedPerItem * count
+    : (publishedRate != null ? publishedRate * volume : null);
+  const delta = theoretical != null ? total - theoretical : null;
+
+  // "Conforme" requires the figure itself to line up. A name match alone means we believe
+  // we know WHAT the fee is, not that the amount is right — that is exactly "À vérifier".
+  const rateAgrees = isPerItem
+    ? (Number.isFinite(item.perItem)
+      && Math.abs(publishedPerItem - item.perItem) <= (opts.perItemEpsilon || DEFAULT_PER_ITEM_EPSILON))
+    : (publishedRate != null && rate != null
+      && Math.abs(publishedRate - rate) <= (opts.epsilon || DEFAULT_EPSILON));
 
   return {
     ...item,
     cat: match.cat,
     publishedRate,
+    publishedPerItem,
     theoretical,
     delta,
     status: rateAgrees ? STATUS.CONFORME : STATUS.A_VERIFIER,
@@ -316,7 +361,10 @@ function classifyInterchangeLine(item, opts = {}) {
     RATE_TABLES.visaInternational, RATE_TABLES.mcInternational,
   ];
   const byName = matchByName(item.desc, tables, opts.minRatio, item.rate, opts.minWords);
-  const match  = byName || matchByRate(item.rate, tables, opts.epsilon, item.desc);
+  const match  = byName || matchByRate(item.rate, tables, opts.epsilon, item.desc)
+    // Une ligne facturée au montant fixe par transaction (Interac Flash, débit Visa)
+    // ne peut pas correspondre par taux : son taux est nul.
+    || matchByPerItem(item.perItem, tables, opts.perItemEpsilon, item.desc);
   return decide(item, match, opts);
 }
 
@@ -326,7 +374,10 @@ function classifyBrandLine(item, opts = {}) {
 
   const tables = opts.tables || [RATE_TABLES.networkFees, RATE_TABLES.schemeFeesCA];
   const byName = matchByName(item.desc, tables, opts.minRatio, item.rate, opts.minWords);
-  const match  = byName || matchByRate(item.rate, tables, opts.epsilon, item.desc);
+  const match  = byName || matchByRate(item.rate, tables, opts.epsilon, item.desc)
+    // Une ligne facturée au montant fixe par transaction (Interac Flash, débit Visa)
+    // ne peut pas correspondre par taux : son taux est nul.
+    || matchByPerItem(item.perItem, tables, opts.perItemEpsilon, item.desc);
   return decide(item, match, opts);
 }
 
@@ -338,7 +389,10 @@ function classifyInteracLine(item, opts = {}) {
   const tier   = interacTier(item.desc);
 
   const byName = matchByName(item.desc, tables, opts.minRatio, item.rate, opts.minWords);
-  const match  = byName || matchByRate(item.rate, tables, opts.epsilon, item.desc);
+  const match  = byName || matchByRate(item.rate, tables, opts.epsilon, item.desc)
+    // Une ligne facturée au montant fixe par transaction (Interac Flash, débit Visa)
+    // ne peut pas correspondre par taux : son taux est nul.
+    || matchByPerItem(item.perItem, tables, opts.perItemEpsilon, item.desc);
   if (match) return { ...decide(item, match, opts), tier };
 
   // A recognized tier with no table hit is still a real Interac pass-through row — it must
@@ -448,7 +502,8 @@ module.exports = {
   DEFAULT_EPSILON, DEFAULT_MIN_RATIO, DEFAULT_MIN_WORDS,
   norm, significantWords, similarity, keywordOverlap,
   brandsIn, brandConflict,
-  matchByRate, matchByName,
+  matchByRate, matchByPerItem, matchByName,
+  DEFAULT_PER_ITEM_EPSILON,
   suspectLabel, interacTier, INTERAC_TIER_RE,
   classifyInterchangeLine, classifyBrandLine, classifyInteracLine,
   classifyGlobalInterchangeLine, classifyMonerisBrandLine,

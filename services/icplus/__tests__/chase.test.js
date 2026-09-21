@@ -105,11 +105,11 @@ ok('Discover folded into Amex', r.volume.amex_count === 300 && near(r.volume.ame
 const rowTotal = [...r.line_audit.interchange, ...r.line_audit.brand, ...r.line_audit.interac]
   .reduce((s, x) => s + x.total, 0);
 ok('interchange total = the sum of its rows', near(cp.interchange, rowTotal), [cp.interchange, rowTotal]);
-ok('interchange 2,969.07', near(cp.interchange, 2969.07), cp.interchange);
+ok('interchange 2,977.19', near(cp.interchange, 2977.19), cp.interchange);
 
 const out = K.recalc(K.populate(r, {}));
 ok('markup comes only from Amex', near(out.current.markup, 20850 * 0.023 + 300 * 0.10), out.current.markup);
-ok('pretax = Amex markup + pass-through', near(out.current.pretax, out.current.markup + 2969.07), out.current.pretax);
+ok('pretax = Amex markup + pass-through', near(out.current.pretax, out.current.markup + 2977.19), out.current.pretax);
 ok('no fixed fees on this layout', out.current.fixed === 0, out.current.fixed);
 
 console.log(fail ? `\n${fail} FAILING` : '\nall green');

@@ -34,8 +34,18 @@ const weakWithDesc = C.matchByRate(0.0012, nf, undefined, 'AMEX ASSESSMENT');
 ok('weak entry accepted with keyword overlap', !!weakWithDesc, weakWithDesc);
 
 // --- empty tables fail toward "A verifier", never Conforme/SUSPECT
-const r = C.classifyInterchangeLine({ desc: 'VIBS CDN HI-NET STD', rate: 0.0155, volume: 1000, total: 15.5 });
-ok('empty interchange table -> A verifier', r.status === C.STATUS.A_VERIFIER, r.status);
+//
+// ⚠️ Ce test lisait les VRAIES tables, qui étaient vides pendant tout le portage. Elles
+// ont été remplies le 2026-09-21 depuis le calculateur de référence, et 1,55 % y trouve
+// désormais une correspondance — l'assertion passait donc à la faveur d'un état de fait,
+// pas d'un comportement. On lui donne une table explicitement vide : c'est le repli
+// qu'on veut vérifier, pas le contenu des tables du jour.
+const rEmpty = C.classifyInterchangeLine(
+  { desc: 'VIBS CDN HI-NET STD', rate: 0.0155, volume: 1000, total: 15.5 },
+  { tables: { visaDomestic: [], mcDomestic: [], visaInternational: [], mcInternational: [] } });
+ok('empty interchange table -> A verifier', rEmpty.status === C.STATUS.A_VERIFIER, rEmpty.status);
+ok('and never Conforme or SUSPECT',
+  rEmpty.status !== C.STATUS.CONFORME && rEmpty.status !== C.STATUS.SUSPECT, rEmpty.status);
 
 // --- Moneris VS-ASSESSMENT override, and its containment
 const mon = C.classifyMonerisBrandLine({ desc: 'VS - ASSESSMENT', rate: 0.001017, volume: 10000, total: 10.17 });

@@ -37,10 +37,26 @@ function adapt(db) {
   // ---------------------------------------------------------------------------
   await store.ensureSchema(pool);
   const seeded = await store.listAll(pool);
-  ok('la table est amorcée depuis le code', seeded.length === 8, seeded.length);
-  ok('les entrées amorcées sont toutes des frais réseau',
-    seeded.every((r) => r.table_name === 'networkFees'), [...new Set(seeded.map((r) => r.table_name))]);
+  // Les huit tables ont été remplies dans le code le 2026-09-21 (121 entrées) ; l'amorce
+  // les porte donc toutes, là où elle ne semait que les 8 frais de réseau auparavant.
+  ok('la table est amorcée depuis le code', seeded.length === 121, seeded.length);
+  ok('les huit tables sont amorcées',
+    new Set(seeded.map((r) => r.table_name)).size === 8, [...new Set(seeded.map((r) => r.table_name))]);
   ok('chaque entrée amorcée porte une source', seeded.every((r) => !!r.src), seeded.filter((r) => !r.src));
+
+  // ⚠️ L'ASSERTION QUI COMPTE ICI. L'amorce n'écrivait pas `per_item` : les 15 entrées en
+  // dollars par transaction seraient arrivées en base à ZÉRO, en silence, et l'écran
+  // aurait affiché « 0 » pour un palier Interac Flash à 0,035 $. Seule la contrainte
+  // NOT NULL sur `rate` a fait tomber le masque — une entrée par transaction n'a pas de
+  // taux. Ce test tient la porte fermée.
+  const flash = seeded.filter((r) => r.table_name === 'interacFlash');
+  ok('les paliers Flash sont amorcés', flash.length === 4, flash.length);
+  ok('et leurs montants PAR TRANSACTION ont survécu à l\'amorce',
+    flash.every((r) => Number(r.per_item) > 0 && Number(r.rate) === 0),
+    flash.map((r) => ({ cat: String(r.cat).slice(0, 24), rate: r.rate, per_item: r.per_item })));
+  ok('le palier 3 vaut bien 0,035 $ et non 3,5 %',
+    flash.some((r) => Math.abs(Number(r.per_item) - 0.035) < 1e-9 && /Palier 3/.test(r.cat)),
+    flash.map((r) => r.per_item));
 
   // ⚠️ L'amorce ne doit se produire QU'UNE FOIS. Une table vidée volontairement par un admin
   // ne doit pas se repeupler toute seule au prochain déploiement.

@@ -14,15 +14,30 @@ const brand = (desc, pct, volume, total) =>
   C.classifyBrandLine({ desc, rate: pct / 100, volume, total }, { processor: 'global' });
 
 // ---- brand guard.
-// Visa and Mastercard publish the SAME 0.0900 % domestic assessment, so rate proximity
-// cannot separate them and the first table entry wins. This is exactly how "MC ASMTS" came
-// back labelled as a Visa fee.
+// ⚠️ Ce relevé RÉEL facture les deux évaluations à 0,0900 %. Tant que la table portait
+// 0,0900 % pour les deux réseaux, la proximité de taux ne pouvait pas les séparer et la
+// première entrée gagnait : c'est ainsi que « MC ASMTS » est ressorti étiqueté frais VISA,
+// et c'est ce qui a fait naître brandConflict().
+//
+// ⚠️⚠️ Depuis le 2026-09-21 la table porte Visa 0,0900 % et **Mastercard 0,1000 %**
+// (Christine). La garde de marque en devient PLUS nécessaire, pas moins : la ligne
+// « MC ASMTS » facturée 0,0900 % tombe désormais pile sur l'entrée VISA, et seule la garde
+// l'empêche d'être déclarée conforme à un taux qui n'est pas celui de sa marque.
 const visaAsmts = brand('VISA ASMTS', 0.0900, 23477.14, 21.14);
 const mcAsmts   = brand('MC ASMTS',   0.0900, 17014.83, 15.32);
 ok('VISA ASMTS -> Conforme', visaAsmts.status === C.STATUS.CONFORME, visaAsmts.status);
 ok('VISA ASMTS -> Visa category', /^Visa/.test(visaAsmts.cat || ''), visaAsmts.cat);
-ok('MC ASMTS -> Conforme', mcAsmts.status === C.STATUS.CONFORME, mcAsmts.status);
-ok('MC ASMTS -> MASTERCARD category, not Visa', /^Mastercard/.test(mcAsmts.cat || ''), mcAsmts.cat);
+
+// ⚠️ C'est le fait à retenir de ce relevé : Global facture l'évaluation Mastercard à
+// 0,0900 % alors que le réseau publie 0,1000 %. Le marchand paie donc MOINS que le tarif
+// publié sur cette ligne — l'outil n'a rien à dénoncer, mais il n'a pas non plus de
+// catégorie où la loger, et il le dit : « À vérifier ». C'est le repli voulu ; le silence
+// ou un « Conforme » de complaisance seraient tous deux des mensonges.
+ok('MC ASMTS -> À vérifier (0,0900 % facturé contre 0,1000 % publié)',
+  mcAsmts.status === C.STATUS.A_VERIFIER, mcAsmts.status);
+ok('MC ASMTS n\'emprunte PAS la catégorie Visa qui porte le même 0,0900 %',
+  !/^Visa/.test(mcAsmts.cat || ''), mcAsmts.cat);
+ok('et sous-facturé n\'est jamais signalé SUSPECT', mcAsmts.status !== C.STATUS.SUSPECT, mcAsmts.status);
 
 ok('brand conflict detected', C.brandConflict('MC ASMTS', 'Visa — Frais d\'évaluation') === true);
 ok('same brand does not conflict', C.brandConflict('MC ASMTS', 'Mastercard — Frais d\'évaluation') === false);

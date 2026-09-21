@@ -31,7 +31,11 @@ const SOURCES = {
   amex_published:    'Amex published rate card (Canada)',
   visa_intl_irf:     'Visa "International Interchange Reimbursement Fees" table',
   adyen_report:      'Adyen "Interchange & Scheme Fee" report, Canada, June 2026 — ACTUAL OBSERVED network billing, not an official published rate card',
-  adyen_mapping:     'Internal "Adyen vs Global Payments — Fee Mapping" workbook, cross-checked against the Adyen report',
+  // ⚠️ Ce qu'une entrée portant cette source vaut, exactement : un chiffre sur lequel DEUX
+  // acquéreurs indépendants facturent la même somme au cent près. C'est une corroboration
+  // forte d'un transfert réseau, ce n'est pas une carte publiée. Une ligne du même classeur
+  // où les deux chiffres DIFFÈRENT n'a rien à faire ici — voir rateCardExcel.js.
+  adyen_mapping:     'Internal "Adyen vs <acquirer> — Fee Mapping" workbook — a figure BOTH acquirers bill identically, i.e. corroborated pass-through, not a published rate card',
   moneris_notice:    'Fee-change notice printed on a real Moneris statement',
   interac_published: 'Interac published fee schedule (Switch / Mobile Service Fee, Flash contactless tiers)',
   terminology_dict:  'Internal "Fee Terminology Dictionary" (Adyen naming vs each processor\'s own)',
@@ -53,28 +57,125 @@ const SOURCES = {
 // evidence of anything. matchByRate() refuses to accept a weak entry on rate proximity
 // alone — see classify.js.
 //
-// ⚠️ ON THE EMPTY TABLES BELOW. The scope document (§2) names eight tables and pins down
-// their shape, but the rate VALUES themselves live in the reference implementation
-// (Cluster_IC_Calculateur.html), which was not available when this was ported. Rather
-// than seed them with invented numbers, the unsourced tables ship empty and say so
-// (tableStatus / tablesIncomplete). The consequence is honest and fails in the right
-// direction: with an empty table nothing can match, so those lines land on "À vérifier"
-// — never a false "Conforme", never a false "SUSPECT". SUSPECT still fires normally,
-// because it comes from the hard-coded label lists at the bottom of this file, which the
-// scope document does specify in full.
+// ✅ LES TABLES SONT REMPLIES DEPUIS LE 2026-09-21. Pendant tout le portage elles étaient
+// VIDES : le devis (§2) nommait les huit tables et fixait leur forme, mais les VALEURS
+// vivaient dans l'implémentation de référence (Cluster_IC_Calculateur.html), introuvable
+// à l'époque. Plutôt que de les amorcer avec des nombres inventés, elles ont voyagé vides
+// — un échec dans la bonne direction : rien ne correspond, donc tout tombe sur
+// « À vérifier », jamais un faux « Conforme » ni un faux « SUSPECT ».
+//
+// Le fichier de référence a fini par être fourni. Les 113 valeurs qu'il portait sont ici,
+// recoupées contre le classeur « Adyen vs Moneris » : 35 des 36 taux du classeur s'y
+// retrouvent À L'IDENTIQUE, aucun « proche mais différent ».
+//
+// ⚠️ UNE ENTRÉE PORTE UN TAUX **OU** UN MONTANT PAR TRANSACTION, jamais les deux. Le
+// fichier de référence rangeait ses dollars par transaction dans un champ nommé `rate` —
+// il s'en tirait parce que ses appelants lui passaient un montant par transaction, mais
+// il imprimait « 3,500 % » pour 0,035 $ dans une note destinée au client. Les 15 entrées
+// concernées (Interac Flash et réseau, et les lignes « USD/txn » d'Adyen) sont ici en
+// `perItem`. Le classeur Moneris confirme l'unité de son côté : CAN-ZTI3 = 0,035 $/item.
+//
+// SUSPECT ne dépend toujours pas de ces tables : il vient des listes de libellés en bas
+// de ce fichier, et fonctionnait déjà quand tout était vide.
 // ---------------------------------------------------------------------------
 
 // Visa domestic interchange (Canada), by qualifying category.
-const visaDomestic = [];
+// ⚠️ Chargées le 2026-09-21 depuis le calculateur HTML de référence
+// (Cluster_IC_Calculateur.html), enfin retrouvé — c'est la source dont le devis
+// d'ingénierie avait été rétro-conçu et où ces valeurs vivaient.
+//
+// Recoupées contre le classeur « Adyen vs Moneris » : 35 des 36 taux qu'il porte se
+// retrouvent ICI À L'IDENTIQUE, et aucun « proche mais différent ». La seule absente
+// est Discover, qui n'a pas de table dans ce modèle.
+const visaDomestic = [
+  { cat: 'Visa Crédit conso. — Petit commerçant CP', rate: 0.0077, src: 'visa_published' },
+  { cat: 'Visa Crédit conso. — Électronique (Classic/Gold/Platinum)', rate: 0.0125, src: 'visa_published' },
+  { cat: 'Visa Crédit conso. — Électronique (Infinite)', rate: 0.0157, src: 'visa_published' },
+  { cat: 'Visa Crédit conso. — Électronique (Infinite+)', rate: 0.016, src: 'visa_published' },
+  { cat: 'Visa Crédit conso. — Électronique (Infinite Privilege)', rate: 0.0208, src: 'visa_published' },
+  { cat: 'Visa Crédit conso. — Programme industrie (Besoins courants)', rate: 0.011, src: 'visa_published' },
+  { cat: 'Visa Crédit conso. — Programme industrie (Essence)', rate: 0.0107, src: 'visa_published' },
+  { cat: 'Visa Crédit conso. — Programme industrie (Épicerie)', rate: 0.0095, src: 'visa_published' },
+  { cat: 'Visa Crédit conso. — Programme Performance CP', rate: 0.012, src: 'visa_published' },
+  { cat: 'Visa Crédit conso. — Petit commerçant CNP', rate: 0.013, src: 'visa_published' },
+  { cat: 'Visa Crédit conso. — Carte non présente', rate: 0.014, src: 'visa_published' },
+  { cat: 'Visa Crédit conso. — Paiements récurrents', rate: 0.0125, src: 'visa_published' },
+  { cat: 'Visa Crédit conso. — Standard (non qualifiée)', rate: 0.0145, src: 'visa_published' },
+  { cat: 'Visa Crédit conso. — Segments émergents', rate: 0.0098, src: 'visa_published' },
+  { cat: 'Visa Affaires — Standard (Business)', rate: 0.02, src: 'visa_published' },
+  { cat: 'Visa Affaires — Standard (Infinite Business)', rate: 0.0235, src: 'visa_published' },
+  { cat: 'Visa Corporatif/Achat — Électronique', rate: 0.019, src: 'visa_published' },
+  { cat: 'Visa Corporatif/Achat — Standard (Corporate/Purchasing)', rate: 0.02, src: 'visa_published' },
+  { cat: 'Visa Corporatif/Achat — Données enrichies Essence (Fuel)', rate: 0.018, src: 'visa_published' },
+  { cat: 'Visa Corporatif/Achat — Données enrichies Niveau 2', rate: 0.016, src: 'visa_published' },
+  { cat: 'Visa Corporatif/Achat — Données enrichies Niveau 3', rate: 0.014, src: 'visa_published' },
+  { cat: 'Visa Corporatif/Achat — Gros achat Palier 1 (100 000$-249 999$)', rate: 0.013, src: 'visa_published' },
+  { cat: 'Visa Corporatif/Achat — Gros achat Palier 2 (250 000$+)', rate: 0.01, src: 'visa_published' },
+  { cat: 'Visa Prépayée conso. — Électronique', rate: 0.0142, src: 'visa_published' },
+  { cat: 'Visa Prépayée conso. — Standard', rate: 0.0152, src: 'visa_published' },
+  { cat: 'Visa Prépayée commerciale — Standard', rate: 0.02, src: 'visa_published' },
+  { cat: 'Visa Débit — Standard', rate: 0.0115, src: 'visa_published' },
+  { cat: 'Visa Débit — Paiements récurrents', rate: 0.006, src: 'visa_published' },
+];
 
 // Mastercard domestic interchange (Canada), by qualifying category.
-const mcDomestic = [];
+const mcDomestic = [
+  { cat: 'Mastercard Crédit conso. — Carte présente EMV — PME (Core)', rate: 0.007, src: 'mc_published' },
+  { cat: 'Mastercard Crédit conso. — Carte présente EMV (Core)', rate: 0.0092, src: 'mc_published' },
+  { cat: 'Mastercard Crédit conso. — Carte présente EMV (World)', rate: 0.0122, src: 'mc_published' },
+  { cat: 'Mastercard Crédit conso. — Carte présente EMV (World Elite)', rate: 0.0156, src: 'mc_published' },
+  { cat: 'Mastercard Crédit conso. — Carte présente EMV (World Legend)', rate: 0.0195, src: 'mc_published' },
+  { cat: 'Mastercard Crédit conso. — Contactless (Core)', rate: 0.0092, src: 'mc_published' },
+  { cat: 'Mastercard Crédit conso. — Contactless (World)', rate: 0.0122, src: 'mc_published' },
+  { cat: 'Mastercard Crédit conso. — Contactless (World Elite)', rate: 0.0156, src: 'mc_published' },
+  { cat: 'Mastercard Crédit conso. — Commerce numérique (Core)', rate: 0.0167, src: 'mc_published' },
+  { cat: 'Mastercard Crédit conso. — Standard (Core, non qualifiée)', rate: 0.0196, src: 'mc_published' },
+  { cat: 'Mastercard Crédit conso. — Standard (World)', rate: 0.0219, src: 'mc_published' },
+  { cat: 'Mastercard Crédit conso. — Remboursement CP (Core)', rate: 0.0055, src: 'mc_published' },
+  { cat: 'Mastercard Crédit conso. — Remboursement CNP (Core)', rate: 0.0106, src: 'mc_published' },
+  { cat: 'Mastercard Prépayée conso. — Électronique', rate: 0.0144, src: 'mc_published' },
+  { cat: 'Mastercard Prépayée conso. — Standard', rate: 0.0155, src: 'mc_published' },
+  { cat: 'Mastercard Commercial Standard — PME/Prépayée', rate: 0.02, src: 'mc_published' },
+  { cat: 'Mastercard Commercial Standard — Large Market', rate: 0.02, src: 'mc_published' },
+  { cat: 'Mastercard Commercial Standard — World Elite for Business', rate: 0.0235, src: 'mc_published' },
+  { cat: 'Mastercard Commercial Charity', rate: 0.018, src: 'mc_published' },
+  { cat: 'Mastercard Commercial — Data Rate 1 (Large Market)', rate: 0.018, src: 'mc_published' },
+  { cat: 'Mastercard Commercial — Data Rate 2 (Large Market)', rate: 0.014, src: 'mc_published' },
+  { cat: 'Mastercard Commercial — Large Ticket (Large Market)', rate: 0.012, src: 'mc_published' },
+  { cat: 'Mastercard Débit — Standard', rate: 0.0115, src: 'mc_published' },
+  { cat: 'Mastercard Débit — Paiements récurrents', rate: 0.006, src: 'mc_published' },
+];
 
 // Visa international / cross-border interchange.
-const visaInternational = [];
+const visaInternational = [
+  { cat: 'Visa International — Carte présente (Base) — Classic/Gold/Platinum/Electron', rate: 0.011, src: 'visa_intl_irf' },
+  { cat: 'Visa International — Carte présente (Base) — Signature/Premium', rate: 0.0185, src: 'visa_intl_irf' },
+  { cat: 'Visa International — Carte présente (Base) — Signature Preferred/Infinite', rate: 0.0198, src: 'visa_intl_irf' },
+  { cat: 'Visa International — Carte présente (Base) — Tous produits commerciaux', rate: 0.02, src: 'visa_intl_irf' },
+  { cat: 'Visa International — Carte absente (Alternative) — Classic/Gold/Platinum/Electron', rate: 0.016, src: 'visa_intl_irf' },
+  { cat: 'Visa International — Carte absente (Alternative) — Signature/Premium', rate: 0.0185, src: 'visa_intl_irf' },
+  { cat: 'Visa International — Carte absente (Alternative) — Signature Preferred/Infinite', rate: 0.0198, src: 'visa_intl_irf' },
+  { cat: 'Visa International — Carte absente (Alternative) — Tous produits commerciaux', rate: 0.02, src: 'visa_intl_irf' },
+  { cat: 'Visa International — Déclassé (Downgrade) — Classic/Gold/Platinum/Electron', rate: 0.0165, src: 'visa_intl_irf' },
+  { cat: 'Visa International — Déclassé (Downgrade) — Signature/Premium', rate: 0.019, src: 'visa_intl_irf' },
+  { cat: 'Visa International — Déclassé (Downgrade) — Signature Preferred/Infinite', rate: 0.0203, src: 'visa_intl_irf' },
+  { cat: 'Visa International — Déclassé (Downgrade) — Tous produits commerciaux', rate: 0.0205, src: 'visa_intl_irf' },
+  { cat: 'Visa International — Bon de crédit (Credit Voucher) — Classic/Gold/Platinum/Electron', rate: 0.01, src: 'visa_intl_irf' },
+  { cat: 'Visa International — Bon de crédit (Credit Voucher) — Signature/Premium', rate: 0.01, src: 'visa_intl_irf' },
+  { cat: 'Visa International — Bon de crédit (Credit Voucher) — Signature Preferred/Infinite', rate: 0.01, src: 'visa_intl_irf' },
+  { cat: 'Visa International — Bon de crédit (Credit Voucher) — Tous produits commerciaux', rate: 0.018, src: 'visa_intl_irf' },
+];
 
 // Mastercard international / cross-border interchange.
-const mcInternational = [];
+const mcInternational = [
+  { cat: 'Mastercard International — Consumer Rate II CP (Core)', rate: 0.011, src: 'mc_published' },
+  { cat: 'Mastercard International — Consumer Rate II CP (Premium)', rate: 0.0185, src: 'mc_published' },
+  { cat: 'Mastercard International — Consumer Rate II CP (Super Premium)', rate: 0.0198, src: 'mc_published' },
+  { cat: 'Mastercard International — Consumer Rate I Commerce numérique (Core)', rate: 0.016, src: 'mc_published' },
+  { cat: 'Mastercard International — Consumer Rate III Base (Core)', rate: 0.0165, src: 'mc_published' },
+  { cat: 'Mastercard International — Commercial Standard', rate: 0.02, src: 'mc_published' },
+  { cat: 'Mastercard International — Commercial Electronic Product', rate: 0.0185, src: 'mc_published' },
+];
 
 // Network fees that are neither interchange nor a scheme fee — assessments, access and
 // licence fees the acquirer passes straight through.
@@ -86,7 +187,18 @@ const networkFees = [
   // not real rates, and adding them would let an inflated charge match as "Conforme".
   // They belong in the help text instead (HELP.assessmentInflation).
   { cat: 'Visa — Frais d\'évaluation (assessment, domestique)',       rate: 0.0009,  src: 'visa_published' },
-  { cat: 'Mastercard — Frais d\'évaluation (assessment, domestique)', rate: 0.0009,  src: 'mc_published'   },
+
+  // ⚠️ CORRIGÉ le 2026-09-21 : Mastercard est à 0,1000 %, pas 0,0900 %. Les deux réseaux
+  // avaient été saisis à la même valeur ; ils diffèrent. (Christine, tranché en séance.)
+  //
+  // Ce qui l'a levé : dans le classeur de correspondance, Adyen facture 0,0900 % pour Visa
+  // et 0,1000 % pour Mastercard — DEUX valeurs distinctes — alors que Moneris aplatit les
+  // deux à 0,1017 %. Un acquéreur qui distingue là où l'autre uniformise, c'est celui qui
+  // distingue qui suit la carte publiée.
+  //
+  // Conséquence sur les verdicts : le 0,1017 % facturé reste une inflation sur les DEUX
+  // réseaux, mais d'ampleur très différente — ×1,13 sur Visa, seulement ×1,017 sur MC.
+  { cat: 'Mastercard — Frais d\'évaluation (assessment, domestique)', rate: 0.0010,  src: 'mc_published'   },
 
   // ⚠️ CORRIGÉ le 2026-09-21 à partir des pages publiées de Visa et de Mastercard, fournies
   // par Christine. Ces entrées portaient 0,678 % et 1,13 %, valeurs tirées d'un avis de
@@ -113,17 +225,58 @@ const networkFees = [
   // Amex's assessment column as disclosed on Clover/Fiserv statements. Approximate by
   // nature (the column prints rounded), hence `weak`.
   { cat: 'Amex — Assessment',                                         rate: 0.0012,  weak: true, src: 'statement_obs' },
+  { cat: 'Amex — Frais transaction non présentée (CNP)',               rate: 0.0030,  src: 'amex_published' },
 ];
 
 // Scheme fees (Canada) — what the networks charge the acquirer for running the
 // transaction, distinct from both interchange and assessments.
-const schemeFeesCA = [];
+const schemeFeesCA = [
+  { cat: 'Visa — CA Domestic Assessment Fee (Adyen, TPS incluse)', rate: 0.0009, weak: true, src: 'adyen_report' },
+  { cat: 'Visa — CA Commercial Solutions Fee (Adyen, TPS incluse)', rate: 0.0001, weak: true, src: 'adyen_report' },
+  { cat: 'Visa — CA Domestic Card-Present Token Fee (Adyen)', rate: 0.0001, weak: true, src: 'adyen_report' },
+  { cat: 'Visa — CA Cross-Border Card-Present Token Fee (Adyen)', rate: 0.0005, weak: true, src: 'adyen_report' },
+  { cat: 'Visa — CA International Assessment Fee, réglé en CAD (Adyen, TPS incluse)', rate: 0.0063, weak: true, src: 'adyen_report' },
+  { cat: 'Visa — CA International Assessment CP Fee, réglé hors CAD (Adyen, TPS incluse)', rate: 0.0105, weak: true, src: 'adyen_report' },
+  { cat: 'Visa — CA Domestic Digital Commerce Services Fee (Adyen, TPS incluse)', rate: 0.0002, weak: true, src: 'adyen_report' },
+  { cat: 'Visa — CA International Digital Commerce Services Fee (Adyen, TPS incluse)', rate: 0.0004, weak: true, src: 'adyen_report' },
+  { cat: 'Visa — CA Address Verification Service (AVS) Fee, USD/txn (Adyen, TPS incluse)', perItem: 0.00105, weak: true, src: 'adyen_report' },
+  { cat: 'Visa — CA CVV2 Transaction Fee, USD/txn (Adyen, TPS incluse)', perItem: 0.002625, weak: true, src: 'adyen_report' },
+  { cat: 'Visa — CA Domestic Account Verifications Fee, USD/txn (Adyen)', perItem: 0.01, weak: true, src: 'adyen_report' },
+  { cat: 'Visa — Misuse of Authorisation Fee, USD/txn (Adyen)', perItem: 0.05, weak: true, src: 'adyen_report' },
+  { cat: 'Mastercard — CA Domestic Assessment Fee (Adyen, TPS incluse)', rate: 0.001, weak: true, src: 'adyen_report' },
+  { cat: 'Mastercard — CA International Assessment Fee (Adyen, TPS incluse)', rate: 0.001, weak: true, src: 'adyen_report' },
+  { cat: 'Mastercard — CA Mastercard License Fee (Adyen, TPS incluse)', rate: 0.0001, weak: true, src: 'adyen_report' },
+  { cat: 'Mastercard — CA Digital Enablement Fee (Adyen, TPS incluse)', rate: 0.0002, weak: true, src: 'adyen_report' },
+  { cat: 'Mastercard — CA MO/TO Fee (Adyen, TPS incluse)', rate: 0.0002, weak: true, src: 'adyen_report' },
+  { cat: 'Mastercard — CA Global Wholesale Program Fee (Adyen, TPS incluse)', rate: 0.0079, weak: true, src: 'adyen_report' },
+  { cat: 'Mastercard — CA Cross-Border Purchase Local Currency Fee, réglé en CAD (Adyen, TPS incluse)', rate: 0.0063, weak: true, src: 'adyen_report' },
+  { cat: 'Mastercard — CA Cross-Border Purchase Local Currency Fee, réglé hors CAD (Adyen, TPS incluse)', rate: 0.0105, weak: true, src: 'adyen_report' },
+  { cat: 'Mastercard — CA Connectivity Fee, USD/txn (Adyen, TPS incluse)', perItem: 0.009765, weak: true, src: 'adyen_report' },
+  { cat: 'Mastercard — CA Acquirer Clearing Fee, petit montant, USD/txn (Adyen, TPS incluse)', perItem: 0.00525, weak: true, src: 'adyen_report' },
+  { cat: 'Mastercard — CA Acquirer Clearing Fee, gros montant, USD/txn (Adyen, TPS incluse)', perItem: 0.02, weak: true, src: 'adyen_report' },
+  { cat: 'Mastercard — CA Decline Reason Code Service Pricing, USD/txn (Adyen)', perItem: 0.02, weak: true, src: 'adyen_report' },
+  { cat: 'Amex — Inbound Fee CAD, international (Adyen)', rate: 0.006, weak: true, src: 'adyen_report' },
+  { cat: 'Discover — Acquirer Assessment Fee (Adyen, TPS incluse)', rate: 0.0007, weak: true, src: 'adyen_report' },
+  { cat: 'Discover — International Processing Fee (Adyen, TPS incluse)', rate: 0.0042, weak: true, src: 'adyen_report' },
+  { cat: 'Diners Club — Acquirer Assessment Fee (Adyen, TPS incluse)', rate: 0.0007, weak: true, src: 'adyen_report' },
+  { cat: 'Diners Club — International Processing Fee (Adyen, TPS incluse)', rate: 0.0042, weak: true, src: 'adyen_report' },
+  { cat: 'UnionPay — International POS Scheme Fees (Adyen)', rate: 0.001, weak: true, src: 'adyen_report' },
+];
 
 // Interac Switch / Mobile Service Fee.
-const interacNetwork = [];
+const interacNetwork = [
+  { cat: 'Interac — Frais de commutation (retrait GAB)', perItem: 0.015881, src: 'interac_published' },
+  { cat: 'Interac — Frais de commutation (Puce et NIP / sans contact)', perItem: 0.013985, src: 'interac_published' },
+  { cat: 'Interac — Frais de service mobile (sans contact mobile)', perItem: 0.013985, src: 'interac_published' },
+];
 
 // Interac Flash contactless interchange, by tier.
-const interacFlash = [];
+const interacFlash = [
+  { cat: 'Interac Flash — Palier 1 (petits commerçants admissibles, ≤100$)', perItem: 0.02, src: 'interac_published' },
+  { cat: 'Interac Flash — Palier 2 (haut volume ≥20M txn/an, ≤100$)', perItem: 0.025, src: 'interac_published' },
+  { cat: 'Interac Flash — Palier 3 (tous les autres commerçants, ≤100$)', perItem: 0.035, src: 'interac_published' },
+  { cat: 'Interac Flash — Palier 4 (100,01$-250$, tous commerçants)', perItem: 0.055, src: 'interac_published' },
+];
 
 const RATE_TABLES = {
   visaDomestic, mcDomestic, visaInternational, mcInternational,

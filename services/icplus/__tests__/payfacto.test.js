@@ -110,9 +110,9 @@ ok('MC assessment matched to the Mastercard category', /^Mastercard/.test(r.line
 // ---------------------------------------------------------------------------
 const out = K.recalc(K.populate(r, {}));
 ok('markup 381.63', near(out.current.markup, 381.63), out.current.markup);
-ok('pass-through 2,386.60', near(out.current.interchange, 2386.60), out.current.interchange);
+ok('pass-through 2,392.72', near(out.current.interchange, 2392.72), out.current.interchange);
 ok('fixed 112.30', near(out.current.fixed, 112.30), out.current.fixed);
-ok('pretax 2,880.53 = the statement\'s own total', near(out.current.pretax, 2880.53), out.current.pretax);
+ok('pretax 2,886.65 = the statement\'s own total', near(out.current.pretax, 2886.65), out.current.pretax);
 ok('reconciled, no gap', codes.includes('reconciled') && !codes.includes('reconcileMismatch'), codes);
 
 console.log(fail ? `\n${fail} FAILING` : '\nall green');

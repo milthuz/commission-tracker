@@ -25,6 +25,7 @@ const rateTables = require('./rateTables');
 const notes = require('./notes');
 const ratesStore = require('./ratesStore');
 const rateCardExtract = require('./rateCardExtract');
+const rateCardExcel = require('./rateCardExcel');
 const multer = require('multer');
 
 const PERM_USE = 'icplus:use';
@@ -294,6 +295,69 @@ function registerIcplusRoutes(app, deps) {
       res.json(out);
     } catch (e) {
       console.error('[icplus] extraction impossible:', e.message);
+      res.status(500).json({ ok: false, reason: 'error', detail: e.message });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // POST /api/icplus/rates/import-workbook — lire un classeur de correspondance.
+  //
+  // ⚠️ N'ÉCRIT RIEN, exactement comme l'extraction PDF : propositions seulement, revues
+  // à l'écran, enregistrées par le même PUT que la saisie manuelle.
+  //
+  // ⚠️ Et le module ne coche QUE les lignes sur lesquelles les deux acquéreurs du classeur
+  // facturent le même chiffre. Tout le reste — donc l'intégralité des frais de réseau —
+  // arrive décoché, avec les deux chiffres affichés : ce sont des taux FACTURÉS, et ces
+  // tables jugent du PUBLIÉ. Charger l'un pour l'autre est le bug du 2026-09-21.
+  //
+  // Les tables passées au lecteur sont celles de la BASE, pas celles du code : les heurts
+  // doivent se mesurer contre ce qui est réellement en service.
+  // ---------------------------------------------------------------------------
+  const uploadWorkbook = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: rateCardExcel.MAX_XLSX_BYTES },
+  });
+
+  app.post('/api/icplus/rates/import-workbook', authenticateToken, uploadWorkbook.single('file'), async (req, res) => {
+    if (!(await requirePerm(req, res, PERM_RATES))) return;
+    if (!req.file || !req.file.buffer) return res.status(400).json({ ok: false, reason: 'no_file' });
+    if (!/\.xlsx?$/i.test(req.file.originalname || '')) {
+      return res.status(400).json({ ok: false, reason: 'not_a_workbook', filename: req.file.originalname });
+    }
+
+    try {
+      // ⚠️ `load()` rend un COMPTE, pas les tables : il remplit RATE_TABLES SUR PLACE, à
+      // dessein, parce que le classificateur en garde les références. L'affecter à une
+      // variable donnait un nombre, donc zéro heurt détecté — et l'écran annonçait
+      // « aucun conflit » sur un classeur qui en contenait.
+      if (pool) {
+        try { await ratesStore.load(pool); } catch (e) {
+          // Une base indisponible ne doit pas empêcher la LECTURE du classeur : on le dit
+          // et on compare contre le code, plutôt que de refuser le dépôt.
+          console.warn('[icplus] heurts mesurés contre le code, base injoignable:', e.message);
+        }
+      }
+      const tables = rateTables.RATE_TABLES;
+
+      const out = rateCardExcel.readWorkbook({
+        buffer: req.file.buffer,
+        tables,
+        labels: {
+          a: String((req.body && req.body.labelA) || 'Relevé').slice(0, 40),
+          b: String((req.body && req.body.labelB) || 'Référence').slice(0, 40),
+        },
+      });
+      if (!out.ok) return res.status(400).json(out);
+
+      if (typeof logActivity === 'function') {
+        await logActivity('icplus_rates', 'import_workbook', 'workbook_read',
+          `Classeur de correspondance lu : ${req.file.originalname || 'sans nom'} — ${out.summary.proposed} proposition(s), `
+          + `${out.summary.accepted} concordante(s), ${out.summary.disagree} en désaccord, ${out.summary.unmapped} non appariée(s).`,
+          req.user && req.user.email, { metadata: { filename: req.file.originalname, ...out.summary } });
+      }
+      res.json(out);
+    } catch (e) {
+      console.error('[icplus] lecture du classeur impossible:', e.message);
       res.status(500).json({ ok: false, reason: 'error', detail: e.message });
     }
   });
