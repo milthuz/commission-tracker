@@ -20,6 +20,7 @@ const {
   RATE_TABLES, SUSPECT_LABELS,
   GLOBAL_INTERCHANGE_ALIASES, GLOBAL_BRAND_ALIASES,
 } = require('./rateTables');
+const { PROCESSOR_ALIASES } = require('./aliases');
 
 // The six statuses a classified line can carry. Nothing outside this object may invent
 // a seventh — the UI badge styling and the calc engine both switch on these exact values.
@@ -352,9 +353,60 @@ function decide(item, match, opts = {}) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Alias : le nom que CE processeur imprime sur son relevé, pour un frais que nos tables
+// connaissent sous un autre libellé. Voir aliases.js pour la provenance.
+//
+// ⚠️ L'appariement par nom entre processeurs échoue presque toujours sans ça :
+// « MC - EVALUATION » (Moneris) contre « Mastercard — Frais d'évaluation (assessment,
+// domestique) » ne fait que 0,70 de ressemblance, sous le seuil de 0,75. Restait le taux
+// seul, qui ne distingue pas deux frais tarifés pareil.
+//
+// ⚠️ Les clés sont essayées de la PLUS LONGUE à la plus courte. Un relevé colle souvent
+// volume et taux derrière le libellé, d'où le préfixe ; mais sans cet ordre, un alias
+// court préfixerait une ligne plus longue qui désigne autre chose.
+// Longueur minimale pour qu'une clé puisse s'apparier PAR PRÉFIXE. En dessous, seule
+// l'égalité exacte compte.
+const MIN_PREFIX_ALIAS = 8;
+
+const ALIAS_KEYS = {};
+function aliasFor(desc, processor) {
+  const table = PROCESSOR_ALIASES[processor];
+  if (!table || !desc) return null;
+  const key = norm(desc);
+  if (table[key]) return table[key];
+  if (!ALIAS_KEYS[processor]) {
+    ALIAS_KEYS[processor] = Object.keys(table)
+      // ⚠️ Un code court ne peut PAS s'apparier par préfixe. « VINF » préfixe quatre
+      // lignes distinctes d'un relevé Global — VINF CDN ELC SME, VINF CDN HI-NET ELC SME,
+      // VINF CDN EDS ELC, VINF CDN HI-NET OTHR — qui sont quatre produits à quatre taux.
+      // Les ramener tous au même par préfixe déclare conforme un Infinite Privilege à
+      // 2,08 % contre l'Infinite de base à 1,57 %. Sous ce seuil, l'égalité exacte seule.
+      .filter((k) => k.length >= MIN_PREFIX_ALIAS)
+      .sort((a, b) => b.length - a.length);
+  }
+  for (const k of ALIAS_KEYS[processor]) if (key.startsWith(`${k} `)) return table[k];
+  return null;
+}
+
+// Rejoue la classification sous le libellé de l'alias. `desc` garde la formulation du
+// relevé — c'est elle que le rep retrouve sur le papier ; un libellé silencieusement
+// réécrit rend la ligne introuvable. `aliasOf` dit sous quel nom elle a été reconnue.
+function viaAliasWith(fn, item, alias, opts) {
+  const out = fn({ ...item, desc: alias }, { ...opts, _aliasDone: true });
+  return { ...out, desc: item.desc, aliasOf: alias };
+}
+
 function classifyInterchangeLine(item, opts = {}) {
   const sus = suspectLabel(item.desc, opts.processor);
   if (sus) return { ...item, cat: null, publishedRate: null, theoretical: null, delta: null, status: STATUS.SUSPECT, why: `Nom sans contrepartie réseau : ${sus}` };
+
+  // ⚠️ APRÈS le contrôle SUSPECT, jamais avant : un nom de frais bidon connu doit rester
+  // SUSPECT même s'il ressemble par ailleurs à un vrai frais réseau.
+  if (!opts._aliasDone) {
+    const alias = aliasFor(item.desc, opts.processor);
+    if (alias) return viaAliasWith(classifyInterchangeLine, item, alias, opts);
+  }
 
   const tables = opts.tables || [
     RATE_TABLES.visaDomestic, RATE_TABLES.mcDomestic,
@@ -371,6 +423,11 @@ function classifyInterchangeLine(item, opts = {}) {
 function classifyBrandLine(item, opts = {}) {
   const sus = suspectLabel(item.desc, opts.processor);
   if (sus) return { ...item, cat: null, publishedRate: null, theoretical: null, delta: null, status: STATUS.SUSPECT, why: `Nom sans contrepartie réseau : ${sus}` };
+
+  if (!opts._aliasDone) {
+    const alias = aliasFor(item.desc, opts.processor);
+    if (alias) return viaAliasWith(classifyBrandLine, item, alias, opts);
+  }
 
   const tables = opts.tables || [RATE_TABLES.networkFees, RATE_TABLES.schemeFeesCA];
   const byName = matchByName(item.desc, tables, opts.minRatio, item.rate, opts.minWords);
