@@ -206,6 +206,10 @@ const TEMPLATES = {
   },
 
   // ---- review help (surfaced next to the audit, keyed by processor in rateTables.HELP)
+  helpCrossBorderUplift: {
+    fr: "Les frais transfrontaliers publiés sont 0,60 % (CAD / multidevise) et 1,00 % (devise étrangère / DCC). Un relevé Moneris de mai 2026 les facturait à 0,678 % et 1,13 % — soit exactement le taux publié multiplié par 1,13, sur les deux. Ce facteur est trop régulier pour être une erreur de saisie.",
+    en: 'The published cross-border fees are 0.60% (CAD / multicurrency) and 1.00% (foreign currency / DCC). A May 2026 Moneris statement billed them at 0.678% and 1.13% — exactly the published rate times 1.13, on both. That factor is too consistent to be a typing error.',
+  },
   helpAssessmentInflation: {
     fr: "Les frais d'évaluation Visa/MC (ASMTS) devraient être exactement 0,0900 %. Des taux de 0,1017 %, 0,1250 % et jusqu'à 0,1500 % ont déjà été observés facturés sous ce même nom.",
     en: 'Visa/MC assessment fees (ASMTS) should be exactly 0.0900%. Rates of 0.1017%, 0.1250% and up to 0.1500% have been observed billed under that same name.',

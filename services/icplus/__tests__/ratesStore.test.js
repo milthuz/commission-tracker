@@ -37,8 +37,8 @@ function adapt(db) {
   // ---------------------------------------------------------------------------
   await store.ensureSchema(pool);
   const seeded = await store.listAll(pool);
-  ok('la table est amorcée depuis le code', seeded.length === 6, seeded.length);
-  ok('les 6 entrées amorcées sont des frais réseau',
+  ok('la table est amorcée depuis le code', seeded.length === 8, seeded.length);
+  ok('les entrées amorcées sont toutes des frais réseau',
     seeded.every((r) => r.table_name === 'networkFees'), [...new Set(seeded.map((r) => r.table_name))]);
   ok('chaque entrée amorcée porte une source', seeded.every((r) => !!r.src), seeded.filter((r) => !r.src));
 

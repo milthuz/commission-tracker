@@ -185,7 +185,7 @@ const lines = fs.readFileSync(path.join(__dirname, 'fixtures', 'global-fr.lines.
     ok('lecture autorisée avec icplus:rates', got.status === 200 && got.body.ok, got.status);
     ok('les huit tables sont renvoyées', got.body.tableNames.length === 8, got.body.tableNames);
     ok('la liste des sources est fournie', Object.keys(got.body.sources).length > 0, Object.keys(got.body.sources).length);
-    ok('networkFees est amorcée', (got.body.tables.networkFees || []).length === 6, (got.body.tables.networkFees || []).length);
+    ok('networkFees est amorcée', (got.body.tables.networkFees || []).length === 8, (got.body.tables.networkFees || []).length);
 
     // ⚠️ Le piège de cet écran : un pourcentage non converti. Refusé, jamais divisé en douce.
     const bad = await call('PUT', '/api/icplus/rates/visaDomestic', {

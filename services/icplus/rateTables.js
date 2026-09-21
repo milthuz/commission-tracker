@@ -13,14 +13,15 @@
 // a plausible-looking round number. A table with nothing sourced yet stays EMPTY —
 // see the "empty tables" note below for why that is the safe failure direction.
 //
-// MAINTENANCE. These tables go stale: the July 2026 Mastercard/Visa cross-border
-// change below is already the second revision this data has seen. This file needs an
+// MAINTENANCE. These tables go stale, AND they can be wrong on arrival: the cross-border
+// entries below shipped carrying what Moneris BILLS rather than what the networks PUBLISH,
+// and blessed a 13 % overcharge until the published pages were checked (2026-09-21). This file needs an
 // owner and a review whenever a network publishes a new schedule — it is not a
 // one-time port. Bump DATA_VERSION on every change, so a saved analysis can say which
 // rate vintage it was judged against.
 // ============================================================================
 
-const DATA_VERSION = '2026-09-17';
+const DATA_VERSION = '2026-09-21';
 
 // Where each rate came from. Carried into the audit UI so a disputed line can be traced
 // back to a document rather than to "the app says so".
@@ -87,12 +88,22 @@ const networkFees = [
   { cat: 'Visa — Frais d\'évaluation (assessment, domestique)',       rate: 0.0009,  src: 'visa_published' },
   { cat: 'Mastercard — Frais d\'évaluation (assessment, domestique)', rate: 0.0009,  src: 'mc_published'   },
 
-  // Cross-border assessment. Raised from 0.678 % to 1.13 % effective 2026-07-20. The old
-  // value is kept, flagged `weak`, so a statement covering a period BEFORE the change
-  // still reconciles instead of reading as an overcharge — but it only matches when the
-  // description corroborates it, never on the number alone.
-  { cat: 'Visa/Mastercard — Frais d\'évaluation transfrontalier (cross-border)',                    rate: 0.0113,  src: 'moneris_notice' },
-  { cat: 'Visa/Mastercard — Frais d\'évaluation transfrontalier (cross-border, avant 2026-07-20)',  rate: 0.00678, weak: true, src: 'moneris_notice' },
+  // ⚠️ CORRIGÉ le 2026-09-21 à partir des pages publiées de Visa et de Mastercard, fournies
+  // par Christine. Ces entrées portaient 0,678 % et 1,13 %, valeurs tirées d'un avis de
+  // changement de tarif imprimé sur un relevé MONERIS — donc ce que Moneris FACTURE, jamais
+  // ce que les réseaux PUBLIENT.
+  //
+  // Le rapport le dit sans ambiguïté : 0,678 / 0,60 = 1,1300 et 1,13 / 1,00 = 1,1300. Les
+  // deux sont le taux publié multiplié par exactement 1,13. Tant que les mauvaises valeurs
+  // étaient ici, un relevé facturant 0,678 % ressortait « Conforme » et l'outil bénissait
+  // une surfacturation de 13 % au lieu de la dénoncer — l'inverse exact de son travail.
+  //
+  // Visa nomme ça l'IASF, Mastercard l'Acquirer Cross-Border Assessment; les libellés
+  // diffèrent, les chiffres non. Ils sont donc portés par réseau, avec le libellé de chacun.
+  { cat: 'Visa — IASF, achat multidevise (international)',                       rate: 0.0060, src: 'visa_published' },
+  { cat: 'Visa — IASF, achat en devise unique (international)',                  rate: 0.0100, src: 'visa_published' },
+  { cat: 'Mastercard — Évaluation transfrontalière, transaction en CAD',         rate: 0.0060, src: 'mc_published' },
+  { cat: 'Mastercard — Évaluation transfrontalière, devise autre que CAD (DCC)', rate: 0.0100, src: 'mc_published' },
 
   // Visa's authorization-estimate fee. The scope document notes this one "seems to hide"
   // inside Global's TAX REIMBURSEMENT CH row without being isolated separately — so a
@@ -230,6 +241,7 @@ const SUSPECT_LABELS = {
 // piece of rep-facing text in this feature renders through one bilingual catalogue.
 // ---------------------------------------------------------------------------
 const HELP = [
+  { code: 'helpCrossBorderUplift',      processors: ['moneris', 'global', 'clover', 'nuvei', 'payfacto', 'chase'] },
   { code: 'helpAssessmentInflation',    processors: ['global', 'moneris', 'clover', 'nuvei', 'payfacto', 'chase'] },
   { code: 'helpDuplicateSecurityFee',   processors: ['global'] },
   { code: 'helpZeroBasisFee',           processors: ['global'] },

@@ -28,9 +28,9 @@ const m1017 = C.matchByRate(0.001017, nf, undefined, 'VISA ASSESSMENT');
 ok('0.1017% does NOT match (inflated)', m1017 === null, m1017);
 
 // --- weak entries need keyword corroboration
-const weakNoDesc = C.matchByRate(0.00678, nf, undefined, 'RANDOM FEE');
+const weakNoDesc = C.matchByRate(0.0012, nf, undefined, 'RANDOM FEE');
 ok('weak entry rejected without keyword overlap', weakNoDesc === null, weakNoDesc);
-const weakWithDesc = C.matchByRate(0.00678, nf, undefined, 'FRAIS EVALUATION TRANSFRONTALIER CROSS-BORDER');
+const weakWithDesc = C.matchByRate(0.0012, nf, undefined, 'AMEX ASSESSMENT');
 ok('weak entry accepted with keyword overlap', !!weakWithDesc, weakWithDesc);
 
 // --- empty tables fail toward "A verifier", never Conforme/SUSPECT
