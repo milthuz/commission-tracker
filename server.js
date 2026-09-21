@@ -19303,6 +19303,26 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
           continue;
         }
       }
+      // MEME refus que le passage automatique : un abonnement sorti de la liste eligible
+      // (resilie, en pause) ou dont le prix de base n'a pas ete verifie ne recoit pas d'avis.
+      // Sans ce garde-fou, l'avis part quand meme — avec le texte redige plus tot, donc une date
+      // que rien n'enregistre — et le marchand lit une hausse qui ne le concerne plus.
+      if (dbRow) {
+        const cleVive = `${dbRow.org_id}||${dbRow.subscription_number}`;
+        const encoreLa = liveSubs.some(x => x.orgId === dbRow.org_id
+          && x.subscriptionNumber === dbRow.subscription_number);
+        const prixConnu = periodByKey.get(cleVive) ?? null;
+        if (!encoreLa || prixConnu == null) {
+          const raison = !encoreLa
+            ? 'Abonnement absent de la liste eligible chez Zoho (resilie ou en pause) au moment de l envoi'
+            : 'Prix de base pas encore verifie par l analyse au moment de l envoi';
+          await pool.query(
+            `UPDATE saas_increase_items SET notify_status = 'not_sent', notify_error = $1
+              WHERE id = $2 AND scenario_id = $3`, [raison, itemId, req.params.id]);
+          results.push({ itemId, sent: false, notEligible: true, reason: raison });
+          continue;
+        }
+      }
       const lang = (dbRow && dbRow.notify_lang) || langDefaut;
       let change = null;
       if (dbRow) {
@@ -19752,11 +19772,16 @@ async function runSaasScheduledNotices() {
 // ── 2. Les poussees Zoho devenues possibles ──────────────────────────────────────────────────
 async function runSaasScheduledPushes() {
   if (!(await saasAutoEnabled())) return { skipped: 'disabled' };
+  // ⚠️ `effective_date IS NOT NULL` figurait ici : une ligne avisee dont la date d'effet n'avait
+  // pas ete enregistree devenait INVISIBLE au pilote — jamais poussee, jamais fermee, jamais
+  // signalee. Trois lignes dormaient ainsi depuis le 16 septembre (vecu le 2026-09-21). Elles
+  // passent maintenant en tete (NULLS FIRST) : elles sont peu nombreuses, et ce sont justement
+  // celles dont personne ne s'occupait. La poussee, elle, reste refusee plus bas faute de
+  // promesse a respecter.
   const attente = (await pool.query(
     `SELECT * FROM saas_increase_items
-      WHERE skipped = FALSE AND notify_status = 'sent'
-        AND effective_date IS NOT NULL AND status IN ('pending', 'deferred')
-      ORDER BY effective_date, id LIMIT $1`, [SAAS_AUTO_MAX_PER_RUN])).rows;
+      WHERE skipped = FALSE AND notify_status = 'sent' AND status IN ('pending', 'deferred')
+      ORDER BY effective_date NULLS FIRST, id LIMIT $1`, [SAAS_AUTO_MAX_PER_RUN])).rows;
   if (!attente.length) return { pushed: 0, failed: 0, waiting: 0 };
 
   const liveSubs = await getSaasIncreaseSubscriptions();
@@ -19790,7 +19815,14 @@ async function runSaasScheduledPushes() {
       });
       continue;
     }
+    // La lettre, elle, portait bien une date — elle est dans `notify_body`. C'est son
+    // ENREGISTREMENT qui a manque. Sans promesse en base, la barriere des 30 jours n'a rien a
+    // comparer : on ne pousse pas a l'aveugle, on le dit, et on repasse demain.
     const promise = ymd(item.effective_date);
+    if (!promise) {
+      manquants.push({ item, raison: 'Date d effet jamais enregistree au moment de l avis' });
+      continue;
+    }
     const nextTerm = live.nextBillingAt ? ymd(live.nextBillingAt) : null;
     // MEME barriere que la poussee manuelle : tant que le prochain terme precede la date
     // promise, `end_of_term` l'appliquerait un cycle trop tot. On repasse demain.
