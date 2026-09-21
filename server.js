@@ -2882,6 +2882,10 @@ async function initializeDatabase() {
     // title survives a reload and reaches the send — it was previously recomputed at send time
     // from the hardcoded default, which silently ignored the template's own heading.
     await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notify_heading VARCHAR(300)`);
+    // Quand un marchand resilie APRES avoir recu son avis, sa hausse n'a plus d'objet. La ligne
+    // est fermee (`status = 'closed'`) et cette date dit QUAND — sans elle, le bilan quotidien
+    // reannoncerait la meme resiliation tous les matins jusqu'a la fin de la campagne.
+    await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS closed_at TIMESTAMP`);
     // La langue de l'avis, decidee par marchand a la redaction. Elle est FIGEE la, avec le sujet
     // et le corps : le cadre du courriel doit parler la meme langue que le texte qu'on a relu.
     await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notify_lang VARCHAR(2)`);
@@ -17356,6 +17360,71 @@ async function computeSaasIncreaseSubscriptions() {
 const saasIncreaseSubsCache = makeDurableCache('saas_increase_subs_durable_cache');
 const getSaasIncreaseSubscriptions = (opts) => saasIncreaseSubsCache.get(computeSaasIncreaseSubscriptions, opts);
 
+// La liste ci-dessus ne garde que les abonnements ELIGIBLES (MRR_STATUSES). Un abonnement qui
+// disparait de cette liste peut donc etre deux choses tres differentes :
+//   - un creux de lecture : Zoho a repondu partiellement, il reviendra demain ;
+//   - une SORTIE : le marchand a resilie, ou son abonnement est en pause.
+// Sans distinguer les deux, le pilote reessaie eternellement une hausse devenue sans objet et le
+// bilan quotidien la signale chaque matin. D'ou cette lecture-ci, volontairement non mise en
+// cache et appelee SEULEMENT quand une ligne manque a l'appel : quelques appels par jour, pas un
+// par passage. Vecu le 2026-09-21 (4 resiliations et 2 pauses lues comme « donnee incomplete »).
+const SAAS_STATUTS_SORTIS = new Set(['cancelled', 'expired', 'cancelled_from_dunning']);
+
+async function saasZohoSubStatuses() {
+  const { accessToken, apiDomain } = await getAdminBooksAuth();
+  const m = new Map();
+  for (const orgId of ZOHO_BILLING_ORG_IDS) {
+    const subs = await fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.All');
+    for (const x of subs) {
+      const num = String(x.subscription_number || '').trim();
+      if (num) m.set(`${orgId}||${num}`, {
+        status: String(x.status || '').toLowerCase(),
+        cancelledAt: x.cancelled_at ? String(x.cancelled_at).slice(0, 10) : null,
+      });
+    }
+  }
+  return m;
+}
+
+// Les lignes que le passage n'a pas pu traiter, expliquees en UN seul appel a Zoho.
+// Une resiliation ferme la ligne ; une pause et un creux de lecture la laissent repartir demain.
+const SAAS_MSG_PAUSE = 'Abonnement en pause chez Zoho';
+async function saasExpliquerManquants(liste) {
+  if (!liste.length) return { incomplets: 0, fermes: 0, enPause: 0 };
+  const jour = new Date().toISOString().slice(0, 10);
+  let statuts = null;
+  try {
+    statuts = await saasZohoSubStatuses();
+  } catch (e) {
+    // Zoho muet : on ne ferme RIEN sur une lecture ratee — tout repart demain.
+    console.warn('[saas-auto] statuts Zoho illisibles, aucune ligne fermee :', e.message);
+  }
+  let incomplets = 0, fermes = 0, enPause = 0;
+  for (const { item, raison } of liste) {
+    const z = statuts ? statuts.get(`${item.org_id}||${item.subscription_number}`) : null;
+    if (z && SAAS_STATUTS_SORTIS.has(z.status)) {
+      await pool.query(
+        `UPDATE saas_increase_items SET status = 'closed', closed_at = NOW(), push_error = $1
+          WHERE id = $2 AND status = 'pending'`,
+        [`Abonnement resilie chez Zoho${z.cancelledAt ? ' le ' + z.cancelledAt : ''}`
+         + ` — hausse sans objet, ligne fermee le ${jour}`, item.id]).catch(() => {});
+      fermes++;
+    } else if (z && z.status === 'paused') {
+      await pool.query(
+        `UPDATE saas_increase_items SET push_error = $1 WHERE id = $2 AND status = 'pending'`,
+        [`${SAAS_MSG_PAUSE} (${jour}) — la hausse s'appliquera d'elle-meme s'il redevient actif`,
+         item.id]).catch(() => {});
+      enPause++;
+    } else {
+      await pool.query(
+        `UPDATE saas_increase_items SET push_error = $1 WHERE id = $2 AND status = 'pending'`,
+        [`${raison} (${jour}) — reessai automatique demain`, item.id]).catch(() => {});
+      incomplets++;
+    }
+  }
+  return { incomplets, fermes, enPause };
+}
+
 // GET /api/admin/saas-increase/subscriptions?q=&org=&plan= — every live/active subscription
 // eligible for a SaaS price increase, with merchant identity attached via merchant_saas_links.
 // Cached the same way as the other Billing reads (see makeDurableCache).
@@ -19698,7 +19767,8 @@ async function runSaasScheduledPushes() {
     .map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
   const { accessToken, apiDomain } = await getAdminBooksAuth();
 
-  let pushed = 0, failed = 0, waiting = 0, incomplets = 0;
+  let pushed = 0, failed = 0, waiting = 0;
+  const manquants = [];
   for (const item of attente) {
     const key = `${item.org_id}||${item.subscription_number}`;
     const live = liveByKey.get(key);
@@ -19712,14 +19782,12 @@ async function runSaasScheduledPushes() {
     // fausses suppressions de la synchro). On garde donc `pending` pour que la ligne reparte
     // d'elle-meme demain, et on ecrit la raison pour qu'un manque QUI DURE se voie.
     if (!live || !live.subscriptionId || currentPeriod == null) {
-      const raison = !live ? 'Abonnement absent du cache Zoho au moment du passage'
-                   : !live.subscriptionId ? 'Abonnement sans identifiant chez Zoho'
-                   : 'Prix de base pas encore verifie par l analyse';
-      await pool.query(
-        `UPDATE saas_increase_items SET push_error = $1 WHERE id = $2 AND status = 'pending'`,
-        [`${raison} (${new Date().toISOString().slice(0, 10)}) — reessai automatique demain`, item.id]
-      ).catch(() => {});
-      incomplets++;
+      manquants.push({
+        item,
+        raison: !live ? 'Abonnement absent du cache Zoho au moment du passage'
+              : !live.subscriptionId ? 'Abonnement sans identifiant chez Zoho'
+              : 'Prix de base pas encore verifie par l analyse',
+      });
       continue;
     }
     const promise = ymd(item.effective_date);
@@ -19748,7 +19816,9 @@ async function runSaasScheduledPushes() {
     }
     await new Promise(r2 => setTimeout(r2, 250));
   }
-  return { pushed, failed, waiting, incomplets };
+  // Une seule lecture de Zoho pour tout le lot, et seulement s'il y a quelque chose a expliquer.
+  const { incomplets, fermes, enPause } = await saasExpliquerManquants(manquants);
+  return { pushed, failed, waiting, incomplets, fermes, enPause };
 }
 
 // ── LE BILAN QUOTIDIEN DE LA CAMPAGNE ────────────────────────────────────────────────────────
@@ -19783,6 +19853,8 @@ async function runSaasCampaignDigest() {
       COUNT(*) FILTER (WHERE status = 'pushed')::int AS poussees,
       COUNT(*) FILTER (WHERE status = 'pending')::int AS attente,
       COUNT(*) FILTER (WHERE status = 'push_failed')::int AS echecs,
+      COUNT(*) FILTER (WHERE status = 'closed')::int AS fermees,
+      ROUND(SUM(new_monthly - current_monthly) FILTER (WHERE status = 'closed')::numeric, 2) AS mrr_ferme,
       ROUND(SUM(new_monthly - current_monthly) FILTER (WHERE status = 'pushed')::numeric, 2) AS mrr_applique,
       ROUND(SUM(new_monthly - current_monthly)::numeric, 2) AS mrr_total,
       MAX(pushed_at) AS derniere_poussee ${OU}`)).rows[0];
@@ -19802,10 +19874,23 @@ async function runSaasCampaignDigest() {
   const echecs = (await pool.query(
     `SELECT customer_name, subscription_number, push_error ${OU} AND status = 'push_failed'
       ORDER BY customer_name LIMIT 15`)).rows;
-  // Une donnee manquante qui DURE est un vrai signal ; une seule journee, c'est le cache.
+  // Trois choses tres differentes se cachaient sous « donnee incomplete ». Elles sont
+  // separees ici parce qu'elles n'appellent pas la meme reaction :
+  //   - une RESILIATION est une nouvelle (le marchand est parti), annoncee UNE fois ;
+  //   - une PAUSE est un etat, rappele sans alarme tant qu'il dure ;
+  //   - un creux de lecture est le seul cas a surveiller s'il se repete.
+  const fermeesRecentes = (await pool.query(
+    `SELECT customer_name, subscription_number, push_error ${OU}
+        AND status = 'closed' AND closed_at >= NOW() - INTERVAL '36 hours'
+      ORDER BY customer_name LIMIT 15`)).rows;
+  const enPause = (await pool.query(
+    `SELECT customer_name, subscription_number, push_error ${OU}
+        AND status = 'pending' AND push_error LIKE $1 ORDER BY customer_name LIMIT 15`,
+    [`${SAAS_MSG_PAUSE}%`])).rows;
   const incomplets = (await pool.query(
     `SELECT customer_name, subscription_number, push_error ${OU}
-        AND status = 'pending' AND push_error IS NOT NULL ORDER BY customer_name LIMIT 15`)).rows;
+        AND status = 'pending' AND push_error IS NOT NULL AND push_error NOT LIKE $1
+      ORDER BY customer_name LIMIT 15`, [`${SAAS_MSG_PAUSE}%`])).rows;
   const parMois = (await pool.query(
     `SELECT to_char(effective_date, 'YYYY-MM') AS mois, COUNT(*)::int AS n ${OU}
         AND status = 'pending' AND effective_date IS NOT NULL GROUP BY 1 ORDER BY 1 LIMIT 8`)).rows;
@@ -19852,6 +19937,8 @@ async function runSaasCampaignDigest() {
           ${l('Avis envoy&eacute;s', chiffres.avises)}
           ${l('Avis annuels &agrave; venir', chiffres.programmes)}
           ${l('&Eacute;checs de pouss&eacute;e', chiffres.echecs, true)}
+          ${Number(chiffres.fermees) ? l('R&eacute;sili&eacute;s depuis leur avis (hausse sans objet)',
+            `${chiffres.fermees} &mdash; ${argent(chiffres.mrr_ferme)}`) : ''}
         </table>
       </td></tr>
 
@@ -19861,6 +19948,8 @@ async function runSaasCampaignDigest() {
       </td></tr>` : ''}
 
       ${liste('&Eacute;checs — Zoho a refus&eacute;, une action est requise', echecs, '#dc2626')}
+      ${liste('R&eacute;sili&eacute;s depuis hier — leur hausse est sans objet, la ligne est ferm&eacute;e', fermeesRecentes, '#1c2434')}
+      ${liste('En pause chez Zoho — la hausse reprendra d\'elle-m&ecirc;me s\'ils redeviennent actifs', enPause, '#64748b')}
       ${liste('Donn&eacute;e incompl&egrave;te — repris automatiquement, &agrave; surveiller si la m&ecirc;me ligne revient', incomplets, '#b45309')}
 
       <tr><td style="padding:22px 32px 28px">
@@ -19890,9 +19979,11 @@ async function runSaasIncreaseAutopilot() {
   const avis = await runSaasScheduledNotices();
   const push = await runSaasScheduledPushes();
   if (avis.skipped || push.skipped) { console.log('[saas-auto] interrupteur ferme, rien fait'); return; }
-  const rien = !avis.sent && !avis.failed && !push.pushed && !push.failed && !push.incomplets;
+  const rien = !avis.sent && !avis.failed && !push.pushed && !push.failed
+    && !push.incomplets && !push.fermes;
   console.log(`[saas-auto] avis ${avis.sent}/${avis.failed} echecs · poussees ${push.pushed}/${push.failed} echecs`
-    + ` · ${push.incomplets || 0} incomplets · ${push.waiting} en attente`);
+    + ` · ${push.fermes || 0} resilies · ${push.enPause || 0} en pause · ${push.incomplets || 0} incomplets`
+    + ` · ${push.waiting} en attente`);
   if (rien) return;
 
   const to = await getSaasIncreaseInternalRecipients();
@@ -19914,6 +20005,8 @@ async function runSaasIncreaseAutopilot() {
             ${l('&Eacute;checs d\'envoi / Send failures', avis.failed, true)}
             ${l('Hausses appliqu&eacute;es chez Zoho / Pushed to Zoho', push.pushed)}
             ${l('&Eacute;checs de pouss&eacute;e / Push failures', push.failed, true)}
+            ${push.fermes ? l('R&eacute;sili&eacute;s depuis leur avis, lignes ferm&eacute;es / Cancelled since notice, lines closed', push.fermes) : ''}
+            ${push.enPause ? l('Abonnements en pause chez Zoho / Paused at Zoho', push.enPause) : ''}
             ${push.incomplets ? l('Donn&eacute;e incompl&egrave;te, r&eacute;essai demain / Incomplete data, retried tomorrow', push.incomplets) : ''}
             ${l('En attente de leur renouvellement / Waiting for renewal', push.waiting)}
           </table>
@@ -20498,6 +20591,9 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
     const poussees = parEtat(enrichies, 'pushStatus', 'pushed');
     const differees = parEtat(enrichies, 'pushStatus', 'deferred');
     const echecsPoussee = parEtat(enrichies, 'pushStatus', 'push_failed');
+    // Fermees = resiliees apres leur avis. Elles ne sont ni appliquees ni en attente : les
+    // laisser dans « a pousser » ferait attendre indefiniment un reste qui ne bougera jamais.
+    const fermees = parEtat(enrichies, 'pushStatus', 'closed');
     const echecsAvis = parEtat(enrichies, 'notifyStatus', 'send_failed');
     const horodatages = (await pool.query(
       `SELECT MAX(notified_at) AS avis, MAX(pushed_at) AS poussee
@@ -20514,9 +20610,13 @@ app.get('/api/admin/saas-increase/scenarios/:id/report', authenticateToken, asyn
         notifyFailed: echecsAvis.length,
         mrrNotified: mrrDe(avises), mrrScheduled: mrrDe(programmes), mrrToNotify: mrrDe(aAviser),
         pushed: poussees.length, deferred: differees.length, pushFailed: echecsPoussee.length,
-        toPush: enrichies.length - poussees.length,
+        closed: fermees.length, mrrClosed: mrrDe(fermees),
+        pushTotal: enrichies.length - fermees.length,
+        toPush: enrichies.length - poussees.length - fermees.length,
         mrrPushed: mrrDe(poussees), mrrToPush: r2Money(
-          enrichies.reduce((a, e) => a + e.mrrAdd, 0) - poussees.reduce((a, e) => a + e.mrrAdd, 0)),
+          enrichies.reduce((a, e) => a + e.mrrAdd, 0)
+          - poussees.reduce((a, e) => a + e.mrrAdd, 0)
+          - fermees.reduce((a, e) => a + e.mrrAdd, 0)),
         lastNotifiedAt: horodatages.avis || null,
         lastPushedAt: horodatages.poussee || null,
       },
