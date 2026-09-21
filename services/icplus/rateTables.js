@@ -180,19 +180,43 @@ const GLOBAL_BRAND_ALIASES = {
 // section 3 exactly and therefore leaves zero room for a section-4 network row: anything
 // here that IS a network fee has to move out of the markup total and into interchange,
 // or the two sides stop adding up.
+// ⚠️ DOCUMENTATION, pas une liste active. Le partage de la section 4 se fait sur la présence
+// du mot « TRANSACTION » (voir isSection4Markup dans parsers/moneris.js) ; ceci recense les
+// lignes de transfert réseau réellement observées, pour qu'on sache ce que la section
+// contient. Trois lignes en ont été RETIRÉES le 2026-09-21 — voir juste en dessous.
 const MONERIS_SECTION4_NETWORK_ROWS = [
-  'VISA - FRAIS D\'ACCÈS AU SYSTÈME',
-  'VISA - SYSTEM ACCESS FEE',
   'MC - FRAIS COMPENSATION',
   'MC - CLEARING FEE - SMALL TICKET',
   'MC - CLEARING FEE - LARGE TICKET',
+  'FRAIS DE CONNEXION AU RÉSEAU',
+  'NETWORK CONNECTIVITY FEE',
+  'VISA/MC - CARD BRAND MAINTENANCE',
+];
+
+// ⚠️ MAJORATION DE L'ACQUÉREUR DÉGUISÉE EN FRAIS RÉSEAU (Moneris).
+//
+// Le devis §4 listait ces trois lignes comme du transfert réseau authentique « déguisé en
+// majoration ». C'est l'inverse : elles sont facturées par l'acquéreur, pas par le réseau.
+//
+// Le test qui tranche, et il est décisif : **Adyen ne les facture pas.** Un vrai frais de
+// réseau, tout acquéreur le paie et le refacture — un concurrent qui traite les mêmes
+// réseaux canadiens ne peut pas y échapper. Qu'un autre acquéreur ne le charge pas prouve
+// que ce n'est pas le réseau qui le réclame. (Confirmé par Christine, 2026-09-21, sur la
+// base du classeur « Adyen vs Moneris ».)
+//
+// Le libellé français le disait déjà : « (ACQUÉREUR) ». Un frais nommé d'après l'acquéreur
+// est par définition le sien, pas celui du réseau.
+//
+// Effet : la ligne reste comptée dans le total du processeur actuel — le marchand l'a bel
+// et bien payée — mais elle est marquée SUSPECT, dupliquée dans les frais cachés, et
+// SOUSTRAITE de l'interchange Cluster. Cluster ne reprend pas la majoration d'un autre.
+const MONERIS_ACQUIRER_MARKUP_ROWS = [
+  'VISA - FRAIS D\'ACCÈS AU SYSTÈME',
+  'VISA - SYSTEM ACCESS FEE',
   'MC - FRAIS D\'ÉVALUATION (ACQUÉREUR)',
   'MC - ACQUIRER LICENSE FEE',
   'MC - FRAIS DE SAFETY NET (ACQUÉREUR)',
   'MC - SAFETY NET ACQUIRER FEE',
-  'FRAIS DE CONNEXION AU RÉSEAU',
-  'NETWORK CONNECTIVITY FEE',
-  'VISA/MC - CARD BRAND MAINTENANCE',
 ];
 
 // ---------------------------------------------------------------------------
@@ -231,9 +255,10 @@ const PUSH_PAYMENT_SUSPECT_LABELS = [
 ];
 
 const SUSPECT_LABELS = {
-  global: GLOBAL_SUSPECT_LABELS,
-  nuvei:  [...NUVEI_SUSPECT_LABELS, ...PUSH_PAYMENT_SUSPECT_LABELS],
-  shared: ['PCI NONCOM', 'PNCOMPFEE'],
+  global:  GLOBAL_SUSPECT_LABELS,
+  nuvei:   [...NUVEI_SUSPECT_LABELS, ...PUSH_PAYMENT_SUSPECT_LABELS],
+  moneris: MONERIS_ACQUIRER_MARKUP_ROWS,
+  shared:  ['PCI NONCOM', 'PNCOMPFEE'],
 };
 
 // ---------------------------------------------------------------------------
@@ -266,7 +291,7 @@ module.exports = {
   networkFees, schemeFeesCA, interacNetwork, interacFlash,
   tableStatus, tablesIncomplete, unsourcedTables,
   GLOBAL_INTERCHANGE_ALIASES, GLOBAL_BRAND_ALIASES,
-  MONERIS_SECTION4_NETWORK_ROWS,
+  MONERIS_SECTION4_NETWORK_ROWS, MONERIS_ACQUIRER_MARKUP_ROWS,
   SUSPECT_LABELS, GLOBAL_SUSPECT_LABELS, NUVEI_SUSPECT_LABELS, PUSH_PAYMENT_SUSPECT_LABELS,
   HELP, helpFor,
 };

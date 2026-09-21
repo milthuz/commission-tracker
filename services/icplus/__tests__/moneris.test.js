@@ -91,6 +91,24 @@ for (const lang of ['fr', 'en']) {
   // section 3) leaves no room for them anywhere else.
   ok(`${tag} network rows rescued from section 4`, near(cp.interchange, 4582.63), cp.interchange);
   ok(`${tag} = s2 + s3 + the 54.00 of rescued rows`, near(cp.interchange - 4528.63, 54.00), cp.interchange - 4528.63);
+  // ---- majoration de l'acquéreur déguisée en frais réseau.
+  //
+  // ⚠️ Le devis §4 listait ces trois lignes comme du transfert réseau authentique. C'est
+  // l'inverse, et le test qui tranche est qu'Adyen ne les facture pas : un vrai frais de
+  // réseau, tout acquéreur le paie et le refacture. (Christine, 2026-09-21.)
+  const suspects = [...r.line_audit.interchange, ...r.line_audit.brand, ...r.line_audit.interac]
+    .filter((x) => x.status === STATUS.SUSPECT);
+  ok(`${tag} les 3 lignes d'acquéreur sont SUSPECT`, suspects.length === 3, suspects.map((x) => x.desc));
+  ok(`${tag} total suspect 20,60 $`, near(suspects.reduce((s, x) => s + x.total, 0), 20.60),
+    suspects.reduce((s, x) => s + x.total, 0));
+
+  // ⚠️ Et les VRAIS frais réseau de la même section restent intacts : la reclassification
+  // doit atteindre trois lignes, pas la section entière.
+  for (const keep of ['COMPENSATION', 'CLEARING', 'CONNEXION', 'CONNECTIVITY', 'CARD BRAND']) {
+    const row = [...r.line_audit.brand].find((x) => x.desc.toUpperCase().includes(keep));
+    if (row) ok(`${tag} « ${keep} » reste un vrai frais réseau`, row.status !== STATUS.SUSPECT, [row.desc, row.status]);
+  }
+
   ok(`${tag} reconciles against the section-6 rollup`, r.notes.some((n) => n.code === 'reconciled'), r.notes.map((n) => n.code));
   ok(`${tag} no reconciliation gap`, !r.notes.some((n) => n.code === 'reconcileMismatch'), r.notes.map((n) => n.code));
 
@@ -115,6 +133,17 @@ for (const lang of ['fr', 'en']) {
   ok(`${tag} raises the service-section warning`, r.notes.some((n) => n.code === 'monerisServiceSectionWarning'));
 
   ok(`${tag} three fixed-fee rows`, cp.fixed_rows.length === 3, cp.fixed_rows.map((f) => f.label));
+}
+
+// ---- l'asymetrie SUSPECT sur cet argent reclassifie : le marchand l'a paye (donc le total
+// actuel ne bouge pas) mais Cluster ne reprend pas la majoration d'un autre acquereur.
+for (const lang of ['fr', 'en']) {
+  const before = K.recalc(K.populate(R[lang], {}));
+  ok(`${lang.toUpperCase()} le total actuel INCLUT toujours les 20,60 $`, near(before.current.pretax, 5383.43), before.current.pretax);
+  ok(`${lang.toUpperCase()} mais l'interchange Cluster les SOUSTRAIT`,
+    near(before.current.interchange - before.cluster.interchange, 20.60),
+    [before.current.interchange, before.cluster.interchange]);
+  ok(`${lang.toUpperCase()} et ils sont affiches en frais caches`, near(before.current.suspectBumps, 20.60), before.current.suspectBumps);
 }
 
 // ---- the Moneris-scoped VS-ASSESSMENT override reaches the brand audit.
