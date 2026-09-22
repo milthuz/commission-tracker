@@ -47,6 +47,11 @@ const SCHEMA = {
       type: 'string',
       description: "'statement' si c'est bien un relevé de marchand, 'other' sinon (carte de taux, contrat, page sans rapport).",
     },
+    // ⚠️ LE MODÈLE TARIFAIRE CHANGE OÙ VONT LES CHIFFRES — voir la règle 4 de l'invite.
+    pricing_model: {
+      type: 'string',
+      description: "'interchange_plus' si le relevé sépare l'interchange du réseau de la majoration du processeur ; 'bundled' s'il facture un taux unique qui fond les deux (« Discount », « escompte », taux par marque sans ligne d'interchange distincte) ; 'unknown' si indéterminable.",
+    },
     merchant_name: { type: 'string', description: "Le nom du marchand tel qu'imprimé, ou '' si absent." },
     processor_name: { type: 'string', description: "Le processeur qui émet le relevé (Moneris, Global Payments, Clover, Chase, Nuvei, Payfacto…), ou ''." },
     period: { type: 'string', description: "La période couverte, telle qu'imprimée, ou ''." },
@@ -70,7 +75,7 @@ const SCHEMA = {
 
     current_processor: {
       type: 'object',
-      description: "Ce que le processeur facture AU-DESSUS du transfert réseau, par marque.",
+      description: "Ce que le processeur facture, par marque. En tarification INTERCHANGE+, c'est ce qu'il prend AU-DESSUS du transfert réseau. En tarification GROUPÉE, c'est le taux forfaitaire COMPLET (interchange compris) et interchange vaut 0 — voir la règle 4.",
       properties: {
         visa_rate: MONEY("Majoration en FRACTION DÉCIMALE du volume Visa. 0,20 % -> 0.002. 0 si le relevé n'en montre pas."),
         mc_rate: MONEY('Idem pour Mastercard.'),
@@ -104,7 +109,7 @@ const SCHEMA = {
 
     // ⚠️ La pièce qui rend la revue tenable : ce que le relevé affiche LUI-MÊME comme
     // total, pour pouvoir confronter la transcription à un chiffre imprimé.
-    printed_total_fees: MONEY("Le TOTAL DES FRAIS que le relevé affiche lui-même, en dollars. -1 si le relevé n'en imprime aucun."),
+    printed_total_fees: MONEY("Le TOTAL DES FRAIS AVANT TAXES que le marchand paie sur la période, en dollars : ce que le relevé totalise, PLUS l'équipement et les frais de service s'ils sont facturés à part, MOINS les taxes. C'est ce total qui doit correspondre à la somme de ce que tu as transcrit. -1 si rien ne permet de le former."),
 
     readings: {
       type: 'array',
@@ -128,7 +133,7 @@ const SCHEMA = {
       items: { type: 'string' },
     },
   },
-  required: ['document_kind', 'merchant_name', 'processor_name', 'period',
+  required: ['document_kind', 'pricing_model', 'merchant_name', 'processor_name', 'period',
     'volume', 'current_processor', 'printed_total_fees', 'readings', 'caveats'],
   additionalProperties: false,
 };
@@ -145,15 +150,32 @@ RÈGLES, dans l'ordre d'importance :
 
 3. DISTINGUE UN TAUX D'UN MONTANT PAR TRANSACTION. « 0,20 % » va dans *_rate ; « 0,015 $ par transaction » va dans *_fee. Une même marque peut porter les deux, et les confondre calcule la majoration sur le mauvais volume.
 
-4. NE METS DANS current_processor QUE LA MAJORATION DU PROCESSEUR, pas l'interchange du réseau. Si le relevé ne sépare pas les deux, laisse les taux à 0 et dis-le dans caveats — c'est exactement le cas que l'outil sait signaler.
+4. DEUX MODÈLES TARIFAIRES, DEUX TRAITEMENTS. Dis lequel dans pricing_model.
 
-5. Discover n'a pas de champ à lui : replie-le sur Amex, comme le font les relevés eux-mêmes.
+   a) INTERCHANGE+ : le relevé sépare l'interchange du réseau de la majoration du
+      processeur. Mets dans current_processor la SEULE majoration, et le total de
+      l'interchange refacturé dans interchange.
 
-6. RECOPIE printed_total_fees TEL QUE LE RELEVÉ L'AFFICHE. C'est ce qui permet de vérifier ta transcription contre le papier. S'il n'imprime aucun total de frais, mets -1 — ne le calcule pas toi-même.
+   b) GROUPÉ (« bundled », « Discount », « escompte ») : un taux unique par marque qui fond
+      l'interchange et la marge, sans ligne d'interchange distincte. Alors mets ce taux
+      COMPLET dans les *_rate / *_fee de current_processor, et interchange à 0.
 
-7. Pour chaque montant que tu renseignes, ajoute une entrée dans readings avec le texte EXACT lu sur la page et ta confiance. Une lecture d'image se trompe ; c'est ce qui permet à un humain de vérifier sans rouvrir le PDF.
+      La raison : du point de vue du marchand, un forfait n'a rien de séparable. Tout ce
+      qu'il paie est ce que le processeur lui facture. Laisser les taux à 0 « par prudence »
+      fait disparaître la quasi-totalité de son coût — un relevé à 1 850 $ de frais
+      ressortait à 215 $, ce qui est bien pire qu'imprécis.
 
-8. Si ce document n'est pas un relevé de marchand, dis-le dans document_kind et renvoie des volumes à zéro plutôt que d'extraire n'importe quoi.
+5. NE TRANSCRIS JAMAIS LES TAXES (TPS, TVQ, GST, HST, QST). Le calculateur applique son
+   propre multiplicateur de taxe : les reprendre ici les compterait DEUX FOIS. Elles ne vont
+   ni dans fixed_rows, ni dans printed_total_fees.
+
+6. Discover n'a pas de champ à lui : replie-le sur Amex, comme le font les relevés eux-mêmes.
+
+7. RECOPIE printed_total_fees TEL QUE LE RELEVÉ L'AFFICHE. C'est ce qui permet de vérifier ta transcription contre le papier. S'il n'imprime aucun total de frais, mets -1 — ne le calcule pas toi-même.
+
+8. Pour chaque montant que tu renseignes, ajoute une entrée dans readings avec le texte EXACT lu sur la page et ta confiance. Une lecture d'image se trompe ; c'est ce qui permet à un humain de vérifier sans rouvrir le PDF.
+
+9. Si ce document n'est pas un relevé de marchand, dis-le dans document_kind et renvoie des volumes à zéro plutôt que d'extraire n'importe quoi.
 
 Mets dans caveats tout ce qu'un humain doit revoir : zones illisibles, colonnes dont l'en-tête est ambigu, pages que tu n'as pas pu traiter, sections manifestement coupées au scan.`;
 
@@ -188,6 +210,20 @@ function review(parsed) {
   }
   for (const f of ['visa_fee', 'mc_fee', 'debit_fee', 'amex_fee']) {
     if (num(cp[f]) > IMPLAUSIBLE_FEE) flags.push({ code: 'feeLooksWrong', field: f, value: num(cp[f]) });
+  }
+
+  // ⚠️ TARIFICATION GROUPÉE : décision de David du 2026-09-22. Tout le taux forfaitaire va
+  // dans la MAJORATION et l'interchange reste à 0, parce qu'un forfait n'a rien de
+  // séparable du point de vue du marchand. L'écran doit le DIRE : la comparaison qui suit
+  // oppose un forfait à une tarification interchange+, ce qui n'est pas anodin.
+  if (parsed.pricing_model === 'bundled') {
+    flags.push({ code: 'bundledPricing' });
+    // Un forfait annoncé mais sans aucun taux porté veut dire que la lecture a échoué là
+    // où elle comptait le plus : c'est le relevé entier qui disparaît.
+    const totalTaux = ['visa_rate', 'mc_rate', 'debit_rate', 'amex_rate', 'visa_fee', 'mc_fee', 'debit_fee', 'amex_fee']
+      .reduce((s2, f) => s2 + num(cp[f]), 0);
+    if (totalTaux === 0) flags.push({ code: 'bundledButNoRate' });
+    if (num(cp.interchange) > 0) flags.push({ code: 'bundledButInterchange', value: num(cp.interchange) });
   }
 
   const lowConfidence = (parsed.readings || []).filter((r) => r && r.confidence === 'low');
@@ -287,6 +323,7 @@ async function readScannedStatement({ anthropic, pdfBase64, filename }) {
     ok: true,
     payload,
     documentKind: parsed.document_kind || 'other',
+    pricingModel: parsed.pricing_model || 'unknown',
     processorName: parsed.processor_name || '',
     period: parsed.period || '',
     readings: Array.isArray(parsed.readings) ? parsed.readings.slice(0, 60) : [],

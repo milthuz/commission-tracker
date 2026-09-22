@@ -131,6 +131,54 @@ const codes = (p) => S.review(p).map((f) => f.code);
 }
 
 // ---------------------------------------------------------------------------
+// 3bis. TARIFICATION GROUPÉE — décision de David, 2026-09-22.
+//
+// ⚠️ Tous les relevés d'un même processeur n'ont pas le même modèle tarifaire. Quand le
+// relevé facture un taux UNIQUE par marque qui fond l'interchange et la marge, ce taux
+// COMPLET va dans la majoration et l'interchange reste à 0 — parce que du point de vue du
+// marchand, un forfait n'a rien de séparable : tout ce qu'il paie est ce que le processeur
+// lui facture.
+//
+// Ce que la consigne précédente coûtait, mesuré sur un vrai relevé Global numérisé :
+// laisser les taux à 0 « par prudence » faisait ressortir 215 $ de frais là où le marchand
+// en payait 1 850. Une comparaison bâtie là-dessus est fausse dans le sens le plus coûteux
+// — elle sous-estime ce que le marchand paie aujourd'hui, donc l'économie annoncée.
+// ---------------------------------------------------------------------------
+{
+  const groupe = base();
+  groupe.pricing_model = 'bundled';
+  groupe.current_processor.visa_rate = 0.0139;
+  groupe.current_processor.mc_rate = 0.0143;
+  groupe.current_processor.interchange = 0;
+  ok('un relevé groupé est signalé comme tel', codes(groupe).includes('bundledPricing'), codes(groupe));
+
+  // ⚠️ Le contrôle qui rattraperait l'ancienne consigne si elle revenait : un forfait
+  // annoncé dont AUCUN taux n'est porté, c'est le relevé entier qui disparaît.
+  const vide = base();
+  vide.pricing_model = 'bundled';
+  for (const f of ['visa_rate', 'mc_rate', 'debit_rate', 'amex_rate',
+    'visa_fee', 'mc_fee', 'debit_fee', 'amex_fee']) {
+    vide.current_processor[f] = 0;
+  }
+  ok('un forfait sans aucun taux est signalé', codes(vide).includes('bundledButNoRate'), codes(vide));
+
+  // ⚠️ Et l'incohérence inverse : un forfait ne peut pas porter d'interchange séparé, par
+  // définition. S'il y en a un, une des deux lectures est fausse.
+  const incoherent = base();
+  incoherent.pricing_model = 'bundled';
+  incoherent.current_processor.visa_rate = 0.0139;
+  incoherent.current_processor.interchange = 2500;
+  ok('un forfait AVEC interchange séparé est signalé comme incohérent',
+    codes(incoherent).includes('bundledButInterchange'), codes(incoherent));
+
+  // Un relevé interchange+ normal ne déclenche évidemment rien de tout cela.
+  const ic = base();
+  ic.pricing_model = 'interchange_plus';
+  ok('un relevé interchange+ ne déclenche aucun de ces signalements',
+    !codes(ic).some((c) => c.indexOf('bundled') === 0), codes(ic));
+}
+
+// ---------------------------------------------------------------------------
 // 4. Les refus francs, sans appeler le modèle.
 // ---------------------------------------------------------------------------
 (async () => {
