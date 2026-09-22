@@ -389,6 +389,46 @@ const GLOBAL_SUSPECT_LABELS = [
   // anywhere on the statement. Without this entry the row matches ARQ cleanly and reports
   // "Conforme", which is the opposite of the warning it deserves. See HELP.hiddenArq.
   'TAX REIMBURSEMENT CH',
+  // La section « Interchange Downgrade Fees » de Global : des surcharges empilées sur le
+  // forfait quand une carte primée ou commerciale se présente. Elles n'existent pas en
+  // tarification interchange+, donc aucun réseau n'est derrière. « DÉCLASSEMENT » ci-dessus
+  // est le même nom en français ; la version anglaise manquait.
+  // (Dictionnaire de terminologie, feuille « Look-alike Fees », 114,62 $ sur le relevé HFH.)
+  'INTERCHANGE DOWNGRADE',
+];
+
+// ---------------------------------------------------------------------------
+// Chase Paymentech.
+//
+// « TRANSACTION FEES » est imprimé DANS la section « Fees and Assessments », donc au
+// milieu des frais de réseau — et la note de bas de page du relevé admet elle-même que
+// les frais de marque « are inclusive of Paymentech markup ». C'est la marge de Chase
+// habillée en frais de réseau, le même motif que les trois lignes d'acquéreur Moneris
+// tranchées le 2026-09-21.
+//
+// ⚠️ Volontairement limité à Chase. Le mot « TRANSACTION » désigne chez Moneris sa propre
+// majoration, traitée dans son analyseur, et ailleurs il peut nommer un vrai frais.
+// (Dictionnaire, feuille « Look-alike Fees » : 69,89 $ en pourcentage + 9,28 $ sur le débit.)
+const CHASE_SUSPECT_LABELS = [
+  'TRANSACTION FEES',
+];
+
+// ---------------------------------------------------------------------------
+// Payfacto.
+//
+// Aucun réseau ne facture de « processor network fee » — le nom se contredit lui-même :
+// un frais de réseau n'appartient pas au processeur. Rangé chez Payfacto dans « Frais de
+// marques », c'est-à-dire là où le marchand s'attend à du transfert réseau.
+// (Dictionnaire, feuille « Look-alike Fees » : 68,25 $.)
+//
+// ⚠️ CE QUI N'EST PAS ICI, et pourquoi. « VI/MC Card Brand Network Access Fee » figure sur
+// la même feuille, mais le dictionnaire précise que le vrai frais Mastercard existe bien
+// (~0,0098 $) : Payfacto le facture à 0,0133 $ ET sur les deux marques au lieu de MC
+// seule. Le NOM est donc légitime ; c'est le taux et l'assiette qui sont faux. Le marquer
+// SUSPECT accuserait le libellé au lieu du montant, et masquerait la vraie surfacturation
+// que la comparaison de taux, elle, sait montrer.
+const PAYFACTO_SUSPECT_LABELS = [
+  'PROCESSOR NETWORK FEE',
 ];
 
 // No card network publishes a "PCI non-compliance" fee — it is a processor penalty
@@ -396,6 +436,24 @@ const GLOBAL_SUSPECT_LABELS = [
 const NUVEI_SUSPECT_LABELS = [
   'PCI',
   'PCI NON-COMPLIANCE ASSESSMENT FEE',
+  // Des forfaits à montant fixe portant des noms de marque, sans contrepartie chez un
+  // acquéreur qui facture en transfert réel — alors que les évaluations en pourcentage
+  // sont déjà facturées séparément sur le même relevé. C'est le test réutilisable établi
+  // le 2026-09-21 : un vrai frais de réseau, tout acquéreur le paie et le refacture.
+  // (Dictionnaire, feuille « Look-alike Fees » : 13,50 $ pour l'ensemble.)
+  'MC CYBER SECURE',
+  'MC DIRECT ASSESSMENT',
+  'MC DIRECT LICENSE',
+  // « VISA DIRECT ACQ ASSESSMENT » est déjà couvert par PUSH_PAYMENT_SUSPECT_LABELS.
+  //
+  // ⚠️ « MC SERVICE » et « MC TRANSMISSION » sont DÉLIBÉRÉMENT ABSENTS : le dictionnaire
+  // se contredit à leur sujet. Sa feuille « Card Brand Fees » les donne comme la façon
+  // dont Nuvei nomme le vrai frais de connectivité Mastercard — avec la réserve
+  // « (closest match) » — tandis que sa feuille « Look-alike Fees » les range parmi six
+  // forfaits sans contrepartie. Les deux lectures ne peuvent pas être vraies. Tant que la
+  // source se contredit, un alias vers le frais réel vaut mieux qu'une accusation : une
+  // surfacturation ratée coûte moins cher qu'un « SUSPECT » infondé sur un document remis
+  // à un client.
 ];
 
 // Real-time push-payment product names. These ARE real fees — for a product a normal
@@ -407,11 +465,35 @@ const PUSH_PAYMENT_SUSPECT_LABELS = [
   'VISA DIRECT',
 ];
 
+// ⚠️ CE QUI N'ENTRE PAS DANS CE CATALOGUE, et la règle qui le décide.
+//
+// SUSPECT ne veut pas dire « frais abusif ». Il veut dire : FACTURÉ SOUS UN NOM QUI
+// N'A AUCUNE CONTREPARTIE RÉSEAU. C'est une accusation portée sur un document remis à un
+// client, et elle vise le LIBELLÉ. Trois familles de la feuille « Look-alike Fees » du
+// dictionnaire en sont donc écartées, chacune pour une raison différente :
+//
+//   • Un VRAI frais, gonflé. « VI/MC Card Brand Network Access Fee » chez Payfacto :
+//     le frais Mastercard existe (~0,0098 $), Payfacto le facture 0,0133 $. Le nom est
+//     honnête, c'est le montant qui ne l'est pas — et la comparaison de taux le montre
+//     déjà. L'accuser par le nom masquerait la vraie surfacturation.
+//
+//   • Un VRAI frais, mauvaise assiette. « VS CA IASF MULTICURRENCY » chez Nuvei appliqué
+//     à du débit Visa entièrement domestique. Le nom est bon, le taux est bon ; c'est le
+//     VOLUME qui ne devrait pas y passer. Aucun libellé ne peut attraper ça — il faudrait
+//     comparer l'assiette, ce que l'outil ne sait pas faire aujourd'hui.
+//
+//   • Des frais de service honnêtement nommés. « QUARTERLY DATA SECURITY », « WEB
+//     REPORTS », « MONTHLY ADMIN », « STATEMENT FEE » chez quatre processeurs. Le
+//     dictionnaire les qualifie de négociables, et il a raison — mais ils ne se font pas
+//     passer pour du réseau. Ils appartiennent à la section des frais fixes, où ils sont
+//     déjà comptés dans le coût actuel du marchand.
 const SUSPECT_LABELS = {
-  global:  GLOBAL_SUSPECT_LABELS,
-  nuvei:   [...NUVEI_SUSPECT_LABELS, ...PUSH_PAYMENT_SUSPECT_LABELS],
-  moneris: MONERIS_ACQUIRER_MARKUP_ROWS,
-  shared:  ['PCI NONCOM', 'PNCOMPFEE'],
+  global:   GLOBAL_SUSPECT_LABELS,
+  nuvei:    [...NUVEI_SUSPECT_LABELS, ...PUSH_PAYMENT_SUSPECT_LABELS],
+  moneris:  MONERIS_ACQUIRER_MARKUP_ROWS,
+  chase:    CHASE_SUSPECT_LABELS,
+  payfacto: PAYFACTO_SUSPECT_LABELS,
+  shared:   ['PCI NONCOM', 'PNCOMPFEE'],
 };
 
 // ---------------------------------------------------------------------------
@@ -446,5 +528,6 @@ module.exports = {
   GLOBAL_INTERCHANGE_ALIASES, GLOBAL_BRAND_ALIASES,
   MONERIS_SECTION4_NETWORK_ROWS, MONERIS_ACQUIRER_MARKUP_ROWS,
   SUSPECT_LABELS, GLOBAL_SUSPECT_LABELS, NUVEI_SUSPECT_LABELS, PUSH_PAYMENT_SUSPECT_LABELS,
+  CHASE_SUSPECT_LABELS, PAYFACTO_SUSPECT_LABELS,
   HELP, helpFor,
 };
