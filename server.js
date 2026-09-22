@@ -222,6 +222,10 @@ const PERMISSION_CATALOG = [
   // l'usage courant pour que le cout reste un choix, et parce que le document part chez un
   // tiers le temps de la lecture.
   { key: 'icplus:read_scan',           label: 'Read a SCANNED statement (no text layer) by having the AI transcribe it — costs an API call', category: 'IC+ Calculator' },
+
+  // Modélisateur de revenus : P&L 3 ans d'un marchand. La page affiche les COÛTS de Cluster
+  // (réseau, achat de terminaux, marge matériel) — ne pas l'accorder à un rôle externe.
+  { key: 'revmodel:use',               label: 'Use the Revenue Modeler (3-year merchant P&L — shows Cluster network, terminal and hardware costs)', category: 'Revenue Modeler' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -3800,6 +3804,11 @@ function applyDemoGuards(req, res) {
 // calc engine, both PDF exporters — lives under services/icplus/.
 require('./services/icplus/routes').registerIcplusRoutes(app, {
   authenticateToken, requirePerm, hasPerm, pool, logActivity, getAnthropic,
+});
+
+// Modélisateur de revenus (P&L 3 ans d'un marchand) — tout vit sous services/revenueModel/.
+require('./services/revenueModel/routes').registerRevenueModelRoutes(app, {
+  authenticateToken, requirePerm, pool, logActivity,
 });
 
 // ============================================================================
@@ -10589,6 +10598,7 @@ THE APP'S SECTIONS (left sidebar):
 - Hardware Overview: the full Cluster hardware catalog (POS terminals, printers, payment devices, displays, networking, peripherals) — searchable, filterable by Kaizen(V2)/V1 compatibility and lifecycle status, with a compare tool (up to 4 side by side) and one-click SKU copy.
 - Services & Pricing Guide: Cluster's pricing reference (SaaS, Integrations & Add-ons, Rental, Menu Build, Installation, Support, Online Ordering, Shipping, On-Site/XPERIO) with a monthly/yearly toggle and a built-in quote builder that totals recurring vs one-time costs. "Integrations & Add-ons" holds the recurring monthly add-ons: the non-Cluster payment-processing integration ($45/mo, +$15 per extra terminal), Cluster KDS ($39/mo), the Aligner kitchen-display integrations ($69 suite / $39 extra screen / $169 unlimited 3+ units) and the third-party integrations (7Shifts, Androbar, Datacandy, Deliverect, Freebees, GGGolf, LIBRO, Mews, Octogone, Piecemeal, PIVOT, Planifico, PUSH, QuickBooks, RapidStock (formerly Rapid Bar), RESTOCK, Sage, UEAT, Wisk) — $19/month each except Freebees, PIVOT and RESTOCK (free) and GGGolf ($59).
 - Proposals: build and send a branded sales proposal (cover + company deck + optional Zoho Books estimate) to a client, with open/click tracking.
+- Revenue Modeler (Modélisateur de revenus): an INTERNAL what-if tool that models Cluster's 3-year P&L for onboarding a merchant chain. The rep enters locations, terminals per location, annual credit and Interac volume, SaaS price, payment pricing, network costs, terminal economics, hardware/installation prices and commission rates; the P&L table updates live. Year 1 carries the one-time items (terminal purchase, hardware, installation, all commissions); years 2 and 3 are recurring only. It warns when installation loses money (a commission on a pass-through item) and when the Interac margin is under $10k/year, compares the three SaaS tiers side by side, exports CSV, prints, and saves named scenarios that can be shared by link. It shows Cluster's own costs, so it is internal only — never present its figures to a merchant as a quote. It is a model: nothing in it is billed or paid, and its commission lines are the model's assumptions, not the rep's actual commission.
 - Partners: the referral-partner program (Moneris and others). Partner staff submit merchant leads through their own portal; a Cluster partner manager reviews each one in the Opportunity Queue, and approving it creates a real Lead in Zoho CRM assigned to a chosen Cluster rep. Sub-tabs: Opportunity Queue (review/approve/reject), Manage Partners, Users, Payouts, Data import, and Statistics. Statistics has two halves — the deal PIPELINE (volume submitted, what is still open, won vs lost, win rate over decided records, and per-partner conversion) and portal USAGE (invitations, activations, logins, dormant accounts). A partner payout is triggered by the deposit date on the Zoho deal, not by a paid invoice.
 - Support (Soutien technique): high-level reports on Zoho Desk tickets — a local copy of ~126k tickets since 2022, refreshed hourly. Sub-tabs: Overview (monthly volume, resolution-time distribution, channels), Issues (Ticket Type, sub-categories, recurring words in subjects), Team (departments and agents), Merchants (who opens the most tickets), and Revenue & churn (tickets crossed with invoiced revenue, plus a churned-vs-active comparison). Two things to know when answering: the measured delay is creation-to-closure, because Zoho only exposes FIRST-RESPONSE time one ticket at a time; and the "Integration Emails" department is absent, because Zoho refuses to serve it to the reader account — it is automated lead email, not support.
   What the numbers actually say about churn, so you do not overclaim: ticket VOLUME barely separates merchants who left from those who stayed (8.2 vs 6.6 on average over 12 months). What does separate them is tickets that DRAGGED past 72 hours — 1.86 per merchant who left for a competitor and 2.17 for those who stopped using the system, against 0.84 for active merchants. And 61% of cancellations are a business closure or a change of owner, which support cannot influence at all. Point people at slow tickets, not at ticket counts.
@@ -22025,25 +22035,33 @@ async function checkCrmDuplicate({ businessName, contactEmail, contactPhone }) {
 // On ne TOUCHE PAS a un numero deja propre : 629 numeros existants marchent tels quels, les
 // reformater tous pour un cas serait un risque pour zero gain. On ne reecrit que ce qui sort du
 // format sur.
+// Zoho recoit le numero EN CHIFFRES NUS, toujours.
+//
+// 🐛 2026-09-22, signale par Gabriella via David : le telephone etait bien dans la fiche Zoho
+// mais n'apparaissait PAS dans la section « Contact Information ». Comparaison de deux fiches
+// de la MEME mise en page : celle qui s'affiche porte « 4384530848 », celle qui ne s'affiche
+// pas porte « (778) 585-9907 ». Zoho stocke exactement ce qu'on envoie et ne remet pas en forme
+// une valeur qui contient des parentheses — elle reste alors invisible dans le corps de la fiche.
+// Audit sur 14 pistes : 10 en chiffres (toutes lisibles), 4 avec parentheses. La seule en
+// parentheses devenue lisible l'avait ete parce qu'une representante l'avait RETAPEE a la main.
+//
+// La ligne fautive etait un court-circuit « deja acceptable » qui renvoyait la saisie du
+// partenaire telle quelle. On normalise desormais TOUJOURS.
 function telephonePourZoho(v) {
   const brut = String(v == null ? '' : v).trim();
   if (!brut) return null;
-  const equilibre = (brut.match(/\(/g) || []).length === (brut.match(/\)/g) || []).length;
-  if (/^[+]?[0-9 ()\-.]{7,25}$/.test(brut) && equilibre) return brut;   // deja acceptable
-  const plus = brut.trim().startsWith('+');
+  const plus = brut.startsWith('+');
   // On travaille par GROUPES de chiffres, pas sur leur concatenation. « tel: 5145859966 poste 4 »
   // recolle en « 51458599664 » : un numero FAUX qui a l'air valide, donc pire qu'un champ vide —
   // quelqu'un le composerait. Un groupe qui ressemble deja a un numero l'emporte.
   const groupes = brut.match(/\d+/g) || [];
   const vraisemblable = groupes.find((g) => g.length === 10 || (g.length === 11 && g[0] === '1'));
   const d = vraisemblable || groupes.join('');
-  if (plus && d.length >= 8 && d.length <= 15) return '+' + d;
-  if (d.length === 10) return `${d.slice(0,3)}-${d.slice(3,6)}-${d.slice(6)}`;
-  if (d.length === 11 && d[0] === '1') return `1-${d.slice(1,4)}-${d.slice(4,7)}-${d.slice(7)}`;
-  if (d.length >= 7 && d.length <= 15) return d;
-  // Rien d'exploitable : on RETIRE le champ. Un lead sans telephone se corrige, un lead qui
-  // n'existe pas se perd.
-  return null;
+  // Aucun groupe vraisemblable ET un recollage trop long : on ne DEVINE pas ou couper. Un lead
+  // sans telephone se corrige, un faux numero se compose.
+  if (!vraisemblable && !plus && d.length > 11) return null;
+  if (d.length < 7 || d.length > 15) return null;
+  return (plus ? '+' : '') + d;
 }
 
 async function createCrmLead(o) {
@@ -35125,6 +35143,7 @@ app.get('/api/releases/generate-notes', authenticateToken, async (req, res) => {
       report:               { path: '/commission-report',   title: 'Commission Report' },
       salespeople:          { path: '/admin/salespeople',   title: 'Salespeople' },
       roles:                { path: '/admin/roles',         title: 'Roles & Permissions' },
+      'revenue-modeler':    { path: '/revenue-modeler',     title: 'Revenue Modeler' },
     };
     const suggestedMap = new Map();
     for (const c of filtered) {
