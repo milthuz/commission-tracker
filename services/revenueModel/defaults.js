@@ -27,7 +27,7 @@ const DEFAULTS = Object.freeze({
   txnFeeCredit: 0.04,
   txnFeeInterac: 0.04,
 
-  creditCostPct: 0.06,
+  creditCostPct: 0.04, // 0,04 % du volume (David, 2026-09-22 ; était 0,06 % dans le brief)
   creditCostPerTxn: 0,
   interacCostPerTxn: 0.035,
 
