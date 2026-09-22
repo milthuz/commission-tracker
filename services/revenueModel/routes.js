@@ -19,7 +19,7 @@
 // ============================================================================
 
 const crypto = require('crypto');
-const { DEFAULTS, SAAS_TIERS, MAX_NAME, validateInputs, validateTiers } = require('./defaults');
+const { DEFAULTS, SAAS_TIERS, MAX_NAME, validateInputs, validateTiers, upgradeInputs } = require('./defaults');
 
 const PERM_USE = 'revmodel:use';
 // Changer les paliers les change pour TOUS les usagers du modélisateur : permission distincte.
@@ -47,7 +47,7 @@ async function ensureSchema(pool) {
 const shape = (r, email) => ({
   id: r.id,
   name: r.name,
-  inputs: r.inputs,
+  inputs: upgradeInputs(r.inputs),
   owner: r.owner_email,
   mine: !!email && r.owner_email.toLowerCase() === email.toLowerCase(),
   updatedAt: r.updated_at,

@@ -35,8 +35,10 @@ const DEFAULTS = Object.freeze({
   termWarrantyCost: 3.5,
   termUnitCost: 663,
 
+  // Matériel : prix d'ACHAT et prix de VENTE par emplacement ; la marge en découle.
+  // (Avant le 2026-09-22 on saisissait une marge en % : 4 679 $ à 40 % = 2 807,40 $ d'achat.)
+  hwCost: 2807.4,
   hwPrice: 4679,
-  hwMarginPct: 40,
   instPrice: 1650,
 
   commSaasMonths: 1,
@@ -82,8 +84,8 @@ const BOUNDS = Object.freeze({
   termRentalRev: [0, 100000],
   termWarrantyCost: [0, 100000],
   termUnitCost: [0, 1e6],
+  hwCost: [0, 1e7],
   hwPrice: [0, 1e7],
-  hwMarginPct: [0, 100],
   instPrice: [0, 1e7],
   commSaasMonths: [0, 120],
   commPayPerLoc: [0, 1e6],
@@ -94,10 +96,20 @@ const BOUNDS = Object.freeze({
 const MAX_NAME = 120;
 const BOUNDS_SAAS = BOUNDS.saasPerLoc;
 
+// Scénario d'avant le 2026-09-22 : une marge en % au lieu d'un prix d'achat. On en déduit le
+// prix d'achat qui donne EXACTEMENT la même marge, pour que le scénario se relise à l'identique.
+function upgradeInputs(raw) {
+  if (!raw || raw.hwCost != null || raw.hwMarginPct == null) return raw;
+  const price = raw.hwPrice == null ? DEFAULTS.hwPrice : Number(raw.hwPrice);
+  const { hwMarginPct, ...rest } = raw;
+  return { ...rest, hwCost: Math.round(price * (1 - Number(hwMarginPct) / 100) * 100) / 100 };
+}
+
 // Rend { ok, inputs } ou { ok:false, field }. Seules les clefs connues passent : un champ
 // inconnu envoyé par le navigateur est ignoré, un champ manquant prend sa valeur par défaut.
 function validateInputs(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, field: 'inputs' };
+  raw = upgradeInputs(raw);
   const out = {};
   const name = raw.merchantName == null ? DEFAULTS.merchantName : String(raw.merchantName).trim();
   if (name.length > MAX_NAME) return { ok: false, field: 'merchantName' };
@@ -110,4 +122,4 @@ function validateInputs(raw) {
   return { ok: true, inputs: out };
 }
 
-module.exports = { DEFAULTS, SAAS_TIERS, BOUNDS, MAX_NAME, validateInputs, validateTiers };
+module.exports = { DEFAULTS, SAAS_TIERS, BOUNDS, MAX_NAME, validateInputs, validateTiers, upgradeInputs };
