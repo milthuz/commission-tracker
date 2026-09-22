@@ -226,6 +226,8 @@ const PERMISSION_CATALOG = [
   // Modélisateur de revenus : P&L 3 ans d'un marchand. La page affiche les COÛTS de Cluster
   // (réseau, achat de terminaux, marge matériel) — ne pas l'accorder à un rôle externe.
   { key: 'revmodel:use',               label: 'Use the Revenue Modeler (3-year merchant P&L — shows Cluster network, terminal and hardware costs)', category: 'Revenue Modeler' },
+  // Changer les paliers SaaS les change pour tous les usagers du modélisateur.
+  { key: 'revmodel:settings',          label: 'Edit the Revenue Modeler SaaS tiers (the three default prices, applied to everyone)', category: 'Revenue Modeler' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -3808,7 +3810,7 @@ require('./services/icplus/routes').registerIcplusRoutes(app, {
 
 // Modélisateur de revenus (P&L 3 ans d'un marchand) — tout vit sous services/revenueModel/.
 require('./services/revenueModel/routes').registerRevenueModelRoutes(app, {
-  authenticateToken, requirePerm, pool, logActivity,
+  authenticateToken, requirePerm, hasPerm, pool, logActivity,
 });
 
 // ============================================================================

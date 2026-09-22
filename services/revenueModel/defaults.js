@@ -45,8 +45,21 @@ const DEFAULTS = Object.freeze({
   commInstPct: 10,
 });
 
-// Les trois paliers SaaS (pastilles + tableau de comparaison Bas / Base / Haut).
+// Les trois paliers SaaS (pastilles + tableau de comparaison Bas / Base / Haut). Valeurs de
+// départ seulement : les paliers en vigueur vivent dans app_settings ('revenue_model_saas_tiers'),
+// modifiables depuis la page par qui détient `revmodel:settings`.
 const SAAS_TIERS = Object.freeze([89, 119, 149]);
+
+// Trois paliers exactement (la page les nomme Bas / Base / Haut), strictement croissants,
+// chacun entre 0 et le plafond de saasPerLoc. Refusés sinon, jamais triés ni corrigés.
+function validateTiers(raw) {
+  if (!Array.isArray(raw) || raw.length !== 3) return null;
+  const t = raw.map(Number);
+  const [min, max] = BOUNDS_SAAS;
+  if (t.some((v) => !Number.isFinite(v) || v <= min || v > max)) return null;
+  if (!(t[0] < t[1] && t[1] < t[2])) return null;
+  return t.map((v) => Math.round(v * 100) / 100);
+}
 
 // Bornes de chaque champ numérique. Une valeur hors bornes est REFUSÉE à l'enregistrement,
 // jamais corrigée : un scénario sauvegardé doit se relire exactement comme il a été saisi.
@@ -79,6 +92,7 @@ const BOUNDS = Object.freeze({
 });
 
 const MAX_NAME = 120;
+const BOUNDS_SAAS = BOUNDS.saasPerLoc;
 
 // Rend { ok, inputs } ou { ok:false, field }. Seules les clefs connues passent : un champ
 // inconnu envoyé par le navigateur est ignoré, un champ manquant prend sa valeur par défaut.
@@ -96,4 +110,4 @@ function validateInputs(raw) {
   return { ok: true, inputs: out };
 }
 
-module.exports = { DEFAULTS, SAAS_TIERS, BOUNDS, MAX_NAME, validateInputs };
+module.exports = { DEFAULTS, SAAS_TIERS, BOUNDS, MAX_NAME, validateInputs, validateTiers };

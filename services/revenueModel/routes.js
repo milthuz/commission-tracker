@@ -19,9 +19,12 @@
 // ============================================================================
 
 const crypto = require('crypto');
-const { DEFAULTS, SAAS_TIERS, MAX_NAME, validateInputs } = require('./defaults');
+const { DEFAULTS, SAAS_TIERS, MAX_NAME, validateInputs, validateTiers } = require('./defaults');
 
 const PERM_USE = 'revmodel:use';
+// Changer les paliers les change pour TOUS les usagers du modélisateur : permission distincte.
+const PERM_SETTINGS = 'revmodel:settings';
+const TIERS_KEY = 'revenue_model_saas_tiers';
 const MAX_SCENARIOS_PER_USER = 200;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -50,8 +53,26 @@ const shape = (r, email) => ({
   updatedAt: r.updated_at,
 });
 
+// Paliers en vigueur : app_settings s'il y a une valeur valide, sinon ceux du code. Une valeur
+// stockée invalide (édition manuelle en base) retombe sur le code plutôt que de casser la page.
+async function readTiers(pool) {
+  try {
+    const r = await pool.query('SELECT value FROM app_settings WHERE key = $1', [TIERS_KEY]);
+    if (!r.rows[0]) return [...SAAS_TIERS];
+    let v = r.rows[0].value;
+    if (typeof v === 'string') v = JSON.parse(v);
+    return validateTiers(v) || [...SAAS_TIERS];
+  } catch { return [...SAAS_TIERS]; }
+}
+
 function registerRevenueModelRoutes(app, deps) {
-  const { authenticateToken, requirePerm, pool, logActivity } = deps;
+  const { authenticateToken, requirePerm, hasPerm, pool, logActivity } = deps;
+
+  // Décidé par le serveur, jamais lu du jeton côté navigateur (voir impersonation-security).
+  async function canEditSettings(req) {
+    if (req.user && req.user.isAdmin === true) return true;
+    try { return await hasPerm(req, PERM_SETTINGS); } catch { return false; }
+  }
 
   let ready = null;
   const schema = () => (ready = ready || ensureSchema(pool).catch((e) => { ready = null; throw e; }));
@@ -59,7 +80,34 @@ function registerRevenueModelRoutes(app, deps) {
 
   app.get('/api/revenue-model/defaults', authenticateToken, async (req, res) => {
     if (!(await requirePerm(req, res, PERM_USE))) return;
-    res.json({ defaults: DEFAULTS, saasTiers: SAAS_TIERS });
+    const saasTiers = await readTiers(pool);
+    // Un nouveau modèle démarre au palier du MILIEU : si les paliers changent, le prix par défaut
+    // suit, sinon il ne correspondrait plus à aucune pastille. Les scénarios gardent le leur.
+    res.json({
+      defaults: { ...DEFAULTS, saasPerLoc: saasTiers[1] },
+      saasTiers,
+      canEditSettings: await canEditSettings(req),
+    });
+  });
+
+  app.put('/api/revenue-model/saas-tiers', authenticateToken, async (req, res) => {
+    if (!(await requirePerm(req, res, PERM_SETTINGS))) return;
+    const tiers = validateTiers(req.body && req.body.tiers);
+    if (!tiers) return res.status(400).json({ error: 'bad_tiers' });
+    try {
+      const before = await readTiers(pool);
+      await pool.query(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES ($1, $2::jsonb, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+        [TIERS_KEY, JSON.stringify(tiers)]);
+      await logActivity('revenue_model', 'saas_tiers', 'saas_tiers_updated',
+        `Paliers SaaS : ${before.join(' / ')} → ${tiers.join(' / ')} $`, req.user.email,
+        { metadata: { before, after: tiers } });
+      res.json({ saasTiers: tiers });
+    } catch (e) {
+      console.error('revenue-model tiers:', e.message);
+      res.status(500).json({ error: 'save_failed' });
+    }
   });
 
   app.get('/api/revenue-model/scenarios', authenticateToken, async (req, res) => {
@@ -147,4 +195,4 @@ function registerRevenueModelRoutes(app, deps) {
   });
 }
 
-module.exports = { registerRevenueModelRoutes, PERM_USE };
+module.exports = { registerRevenueModelRoutes, PERM_USE, PERM_SETTINGS };
