@@ -19093,10 +19093,46 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
   const limite = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
   const decalage = Math.max(0, parseInt(req.query.offset) || 0);
   try {
-    const filtre = recherche
-      ? `AND (i.customer_name ILIKE $1 OR i.subscription_number ILIKE $1 OR i.merchant_account_id ILIKE $1)`
-      : '';
-    const params = recherche ? [`%${q}%`] : [];
+    // Les filtres portent sur TOUTE la campagne, pas sur les cinquante lignes deja affichees :
+    // filtrer apres la pagination afficherait « 3 resultats » sur une page qui en contient 50,
+    // et l'agent en conclurait qu'il n'existe que trois marchands dans ce cas.
+    const conds = [];
+    const params = [];
+    const $ = () => `$${params.length}`;   // le numero du parametre qu'on vient d'empiler
+
+    if (recherche) {
+      params.push(`%${q}%`);
+      conds.push(`AND (i.customer_name ILIKE ${$()} OR i.subscription_number ILIKE ${$()}`
+        + ` OR i.merchant_account_id ILIKE ${$()})`);
+    }
+
+    const org = String(req.query.org || '').trim();
+    if (ZOHO_BILLING_ORG_IDS.includes(org)) {
+      params.push(org);
+      conds.push(`AND i.org_id = ${$()}`);
+    }
+
+    const avis = String(req.query.notify || '').trim();
+    if (['sent', 'not_sent', 'send_failed', 'scheduled'].includes(avis)) {
+      params.push(avis);
+      conds.push(`AND i.notify_status = ${$()}`);
+    }
+
+    // « Aucune hausse » = ligne retiree de la campagne OU abonnement portant la case « Prix
+    // gele » chez Zoho. Le gel ne vit pas en base : il est lu sur la liste d'abonnements, deja
+    // en cache, donc ce filtre ne coute aucun appel. Le faire en JS apres la requete casserait
+    // la pagination et le total.
+    if (String(req.query.state || '').trim() === 'nohike') {
+      let gelees = [];
+      try {
+        gelees = (await getSaasIncreaseSubscriptions())
+          .filter(x => x.priceFrozen).map(x => `${x.orgId}||${x.subscriptionNumber}`);
+      } catch (e) { console.warn('[saas-lookup] gels illisibles :', e.message); }
+      params.push(gelees);
+      conds.push(`AND (i.skipped = TRUE OR (i.org_id || '||' || i.subscription_number) = ANY(${$()}::text[]))`);
+    }
+
+    const filtre = conds.join(' ');
     const total = parseInt((await pool.query(`
       SELECT COUNT(*)::int AS n FROM saas_increase_items i
        WHERE TRUE ${filtre}`, params)).rows[0].n) || 0;
