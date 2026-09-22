@@ -17315,6 +17315,38 @@ const getBillingCustomers = (opts) => billingCustomersCache.get(computeBillingCu
 // as editable-but-not-counted rows (which would mean typing an increase on one silently didn't
 // move the MRR stats/progress bar). This also keeps "Current MRR" comparable to the board
 // dashboard's official MRR tile, which uses the same MRR_STATUSES definition.
+// ── LA CASE « PRIX GELE » ────────────────────────────────────────────────────────────────────
+//
+// Le service client s'engage parfois par ecrit a maintenir le prix d'un marchand. Cet engagement
+// ne vivait que dans un fil de courriels : Mo'Cafe, puis Delices Lactes le 2026-09-22, rattrape
+// seulement parce qu'un collegue a pense a transferer le fil. La case coche dans Zoho Billing
+// rend l'engagement visible de l'outil, donc opposable a la campagne.
+//
+// ⚠️ Les trois organisations ont chacune leurs propres champs personnalises, avec leur propre
+// `api_name` (on a deja `cf_type` ici et `cf_order_type` la). On ne se fie donc PAS a un nom
+// exact : on reconnait le champ a son api_name COMME a son libelle, accents et casse ignores.
+// Un nom code en dur casserait dans l'organisation ou l'admin a tape le libelle autrement.
+const SAAS_GEL_NOMS = new Set([
+  'prix gele', 'prix gele client', 'gel de prix', 'prix fige',
+  'frozen price', 'price frozen', 'price freeze', 'locked price',
+]);
+const saasNormChamp = (v) => String(v == null ? '' : v)
+  .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+  .toLowerCase().replace(/^cf[_ ]+/, '').replace(/[_\-]+/g, ' ').replace(/\s+/g, ' ').trim();
+// Une case cochee revient selon les cas en booleen, en chaine, ou en libelle traduit.
+const saasCaseCochee = (v) => v === true || v === 1
+  || ['true', 'yes', 'oui', '1'].includes(String(v == null ? '' : v).trim().toLowerCase());
+
+function saasPrixGele(sub) {
+  const champs = Array.isArray(sub?.custom_fields) ? sub.custom_fields : [];
+  for (const c of champs) {
+    if (!SAAS_GEL_NOMS.has(saasNormChamp(c?.api_name)) && !SAAS_GEL_NOMS.has(saasNormChamp(c?.label))) continue;
+    // `value` d'abord : `value_formatted` peut etre traduit (« Oui », « Yes ») ou vide.
+    if (saasCaseCochee(c?.value) || saasCaseCochee(c?.value_formatted)) return true;
+  }
+  return false;
+}
+
 async function computeSaasIncreaseSubscriptions() {
   const { accessToken, apiDomain } = await getAdminBooksAuth();
   const perOrgAll = await Promise.all(
@@ -17357,6 +17389,8 @@ async function computeSaasIncreaseSubscriptions() {
         // When this subscription's next term/price change actually takes effect — used for the
         // merchant notification's {{effectiveDate}} placeholder, not just the price itself.
         nextBillingAt: toDate(s.next_billing_at || s.current_term_ends_at),
+        // La liste porte deja `custom_fields` : lire le gel ne coute AUCUN appel de plus.
+        priceFrozen: saasPrixGele(s),
       });
     }
   }
@@ -17394,6 +17428,9 @@ async function saasZohoSubStatuses() {
 // Les lignes que le passage n'a pas pu traiter, expliquees en UN seul appel a Zoho.
 // Une resiliation ferme la ligne ; une pause et un creux de lecture la laissent repartir demain.
 const SAAS_MSG_PAUSE = 'Abonnement en pause chez Zoho';
+// Le libelle exact sert aussi de filtre au bilan quotidien : le changer change les deux.
+const SAAS_MSG_GEL = 'Prix gele par le service client (case cochee dans Zoho Billing)';
+const SAAS_MSG_GEL_AVIS = 'Prix gele par le service client : avis non envoye, ligne retiree de la campagne';
 async function saasExpliquerManquants(liste) {
   if (!liste.length) return { incomplets: 0, fermes: 0, enPause: 0 };
   const jour = new Date().toISOString().slice(0, 10);
@@ -17890,6 +17927,15 @@ app.post('/api/admin/saas-increase/scenarios/:id/items', authenticateToken, asyn
       `SELECT org_id, subscription_number, plan_price_period FROM saas_subscription_insights
         WHERE plan_price_period IS NOT NULL`
     )).rows.map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
+    // Le gel est verifie ICI, cote serveur, et pas seulement a l'ecran : le navigateur envoie ce
+    // qu'il veut, et une hausse planifiee sur un prix gele serait une promesse rompue.
+    const gelesParCle = new Set();
+    try {
+      for (const x of await getSaasIncreaseSubscriptions()) {
+        if (x.priceFrozen) gelesParCle.add(`${x.orgId}||${x.subscriptionNumber}`);
+      }
+    } catch (e) { console.warn('[saas-increase] gels illisibles au moment de l enregistrement :', e.message); }
+
     const byNumber = new Map();
     for (const it of items) {
       const subscriptionNumber = String(it.subscriptionNumber || '').trim();
@@ -17897,7 +17943,8 @@ app.post('/api/admin/saas-increase/scenarios/:id/items', authenticateToken, asyn
       const increaseType = (it.increaseType === 'flat' || it.increaseType === 'target') ? it.increaseType : 'percent';
       const currentMonthly = r2Money(it.currentMonthly);
       const increaseValue = Number(it.increaseValue) || 0;
-      const skipped = it.skipped === true;
+      const skipped = it.skipped === true
+        || gelesParCle.has(`${String(it.orgId || '')}||${subscriptionNumber}`);
       byNumber.set(`${String(it.orgId || '')}||${subscriptionNumber}`, [
         req.params.id, String(it.orgId || ''), subscriptionNumber, it.customerId || null, it.customerName || null,
         it.merchantAccountId || null, it.planCode || null, it.planName || null, currentMonthly, increaseType,
@@ -19045,13 +19092,13 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
     const params = recherche ? [`%${q}%`] : [];
     const total = parseInt((await pool.query(`
       SELECT COUNT(*)::int AS n FROM saas_increase_items i
-       WHERE i.skipped = FALSE ${filtre}`, params)).rows[0].n) || 0;
+       WHERE TRUE ${filtre}`, params)).rows[0].n) || 0;
 
     const rows = (await pool.query(`
       SELECT i.*, s.name AS scenario_name, s.status AS scenario_status
         FROM saas_increase_items i
         JOIN saas_increase_scenarios s ON s.id = i.scenario_id
-       WHERE i.skipped = FALSE ${filtre}
+       WHERE TRUE ${filtre}
        ORDER BY ${recherche ? 'i.notified_at DESC NULLS LAST, ' : ''}i.customer_name, i.subscription_number
        LIMIT ${limite} OFFSET ${decalage}`, params)).rows;
 
@@ -19137,6 +19184,11 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
               liveByKey.get(`${r.org_id}||${r.subscription_number}`)?.intervalUnit, null),
         pushStatus: r.status,
         pushedAt: r.pushed_at,
+        // Un agent au telephone doit le voir AVANT de parler du nouveau prix : c'est tout
+        // l'interet de la case. `skipped` dit que la ligne est hors campagne, `priceFrozen` dit
+        // que Zoho porte l'engagement — les deux peuvent differer le temps d'un passage.
+        priceFrozen: liveByKey.get(`${r.org_id}||${r.subscription_number}`)?.priceFrozen || false,
+        excluded: r.skipped === true,
         notifyStatus: r.notify_status,
         notifyTo: r.notify_to,
         notifiedAt: r.notified_at,
@@ -19314,11 +19366,13 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/send', authentica
       // que rien n'enregistre — et le marchand lit une hausse qui ne le concerne plus.
       if (dbRow) {
         const cleVive = `${dbRow.org_id}||${dbRow.subscription_number}`;
-        const encoreLa = liveSubs.some(x => x.orgId === dbRow.org_id
+        const vivant = liveSubs.find(x => x.orgId === dbRow.org_id
           && x.subscriptionNumber === dbRow.subscription_number);
+        const encoreLa = !!vivant;
         const prixConnu = periodByKey.get(cleVive) ?? null;
-        if (!encoreLa || prixConnu == null) {
-          const raison = !encoreLa
+        if (!encoreLa || prixConnu == null || vivant.priceFrozen) {
+          const raison = vivant && vivant.priceFrozen ? SAAS_MSG_GEL_AVIS
+            : !encoreLa
             ? 'Abonnement absent de la liste eligible chez Zoho (resilie ou en pause) au moment de l envoi'
             : 'Prix de base pas encore verifie par l analyse au moment de l envoi';
           await pool.query(
@@ -19711,6 +19765,13 @@ async function runSaasScheduledNotices() {
                  : 'Base plan price not verified at scheduled notice time', it.id]);
         failed++; continue;
       }
+      // Le service client a pu geler ce prix APRES la planification de l'avis. On ne l'envoie pas.
+      if (live.priceFrozen) {
+        await pool.query(
+          `UPDATE saas_increase_items SET notify_status = 'not_sent', notify_error = $1, skipped = TRUE
+            WHERE id = $2`, [SAAS_MSG_GEL_AVIS, it.id]);
+        failed++; continue;
+      }
       const contact = await resolveMerchantContact(it.customer_id, it.customer_name, it.org_id);
       const to = contact.email;
       if (!to) {
@@ -19797,7 +19858,7 @@ async function runSaasScheduledPushes() {
     .map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
   const { accessToken, apiDomain } = await getAdminBooksAuth();
 
-  let pushed = 0, failed = 0, waiting = 0;
+  let pushed = 0, failed = 0, waiting = 0, geles = 0;
   const manquants = [];
   for (const item of attente) {
     const key = `${item.org_id}||${item.subscription_number}`;
@@ -19818,6 +19879,17 @@ async function runSaasScheduledPushes() {
               : !live.subscriptionId ? 'Abonnement sans identifiant chez Zoho'
               : 'Prix de base pas encore verifie par l analyse',
       });
+      continue;
+    }
+    // Le gel l'emporte sur tout le reste, y compris sur un avis deja parti : un engagement
+    // ecrit du service client ne se laisse pas contredire par un passage automatique. La ligne
+    // reste `pending` et non fermee — decocher la case dans Zoho la remet en route d'elle-meme.
+    if (live.priceFrozen) {
+      await pool.query(
+        `UPDATE saas_increase_items SET push_error = $1 WHERE id = $2 AND status = 'pending'`,
+        [`${SAAS_MSG_GEL} (${new Date().toISOString().slice(0, 10)})`
+         + ` — decochez la case dans Zoho Billing pour la remettre en route`, item.id]).catch(() => {});
+      geles++;
       continue;
     }
     // La lettre, elle, portait bien une date — elle est dans `notify_body`. C'est son
@@ -19855,7 +19927,7 @@ async function runSaasScheduledPushes() {
   }
   // Une seule lecture de Zoho pour tout le lot, et seulement s'il y a quelque chose a expliquer.
   const { incomplets, fermes, enPause } = await saasExpliquerManquants(manquants);
-  return { pushed, failed, waiting, incomplets, fermes, enPause };
+  return { pushed, failed, waiting, incomplets, fermes, enPause, geles };
 }
 
 // ── LE BILAN QUOTIDIEN DE LA CAMPAGNE ────────────────────────────────────────────────────────
@@ -19924,10 +19996,17 @@ async function runSaasCampaignDigest() {
     `SELECT customer_name, subscription_number, push_error ${OU}
         AND status = 'pending' AND push_error LIKE $1 ORDER BY customer_name LIMIT 15`,
     [`${SAAS_MSG_PAUSE}%`])).rows;
+  // Un prix gele n'est ni une panne ni une attente : c'est une decision prise par le service
+  // client. On la montre pour qu'elle soit relue, jamais en rouge.
+  const geles = (await pool.query(
+    `SELECT customer_name, subscription_number, push_error ${OU}
+        AND status = 'pending' AND push_error LIKE $1 ORDER BY customer_name LIMIT 15`,
+    [`${SAAS_MSG_GEL}%`])).rows;
   const incomplets = (await pool.query(
     `SELECT customer_name, subscription_number, push_error ${OU}
-        AND status = 'pending' AND push_error IS NOT NULL AND push_error NOT LIKE $1
-      ORDER BY customer_name LIMIT 15`, [`${SAAS_MSG_PAUSE}%`])).rows;
+        AND status = 'pending' AND push_error IS NOT NULL
+        AND push_error NOT LIKE $1 AND push_error NOT LIKE $2
+      ORDER BY customer_name LIMIT 15`, [`${SAAS_MSG_PAUSE}%`, `${SAAS_MSG_GEL}%`])).rows;
   const parMois = (await pool.query(
     `SELECT to_char(effective_date, 'YYYY-MM') AS mois, COUNT(*)::int AS n ${OU}
         AND status = 'pending' AND effective_date IS NOT NULL GROUP BY 1 ORDER BY 1 LIMIT 8`)).rows;
@@ -19987,6 +20066,7 @@ async function runSaasCampaignDigest() {
       ${liste('&Eacute;checs — Zoho a refus&eacute;, une action est requise', echecs, '#dc2626')}
       ${liste('R&eacute;sili&eacute;s depuis hier — leur hausse est sans objet, la ligne est ferm&eacute;e', fermeesRecentes, '#1c2434')}
       ${liste('En pause chez Zoho — la hausse reprendra d\'elle-m&ecirc;me s\'ils redeviennent actifs', enPause, '#64748b')}
+      ${liste('Prix gel&eacute;s par le service client — la hausse ne sera pas appliqu&eacute;e', geles, '#0f766e')}
       ${liste('Donn&eacute;e incompl&egrave;te — repris automatiquement, &agrave; surveiller si la m&ecirc;me ligne revient', incomplets, '#b45309')}
 
       <tr><td style="padding:22px 32px 28px">
@@ -20019,8 +20099,8 @@ async function runSaasIncreaseAutopilot() {
   const rien = !avis.sent && !avis.failed && !push.pushed && !push.failed
     && !push.incomplets && !push.fermes;
   console.log(`[saas-auto] avis ${avis.sent}/${avis.failed} echecs · poussees ${push.pushed}/${push.failed} echecs`
-    + ` · ${push.fermes || 0} resilies · ${push.enPause || 0} en pause · ${push.incomplets || 0} incomplets`
-    + ` · ${push.waiting} en attente`);
+    + ` · ${push.fermes || 0} resilies · ${push.enPause || 0} en pause · ${push.geles || 0} geles`
+    + ` · ${push.incomplets || 0} incomplets · ${push.waiting} en attente`);
   if (rien) return;
 
   const to = await getSaasIncreaseInternalRecipients();
@@ -20044,6 +20124,7 @@ async function runSaasIncreaseAutopilot() {
             ${l('&Eacute;checs de pouss&eacute;e / Push failures', push.failed, true)}
             ${push.fermes ? l('R&eacute;sili&eacute;s depuis leur avis, lignes ferm&eacute;es / Cancelled since notice, lines closed', push.fermes) : ''}
             ${push.enPause ? l('Abonnements en pause chez Zoho / Paused at Zoho', push.enPause) : ''}
+            ${push.geles ? l('Prix gel&eacute;s par le service client / Price frozen by CS', push.geles) : ''}
             ${push.incomplets ? l('Donn&eacute;e incompl&egrave;te, r&eacute;essai demain / Incomplete data, retried tomorrow', push.incomplets) : ''}
             ${l('En attente de leur renouvellement / Waiting for renewal', push.waiting)}
           </table>
