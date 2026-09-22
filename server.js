@@ -17431,6 +17431,13 @@ const SAAS_MSG_PAUSE = 'Abonnement en pause chez Zoho';
 // Le libelle exact sert aussi de filtre au bilan quotidien : le changer change les deux.
 const SAAS_MSG_GEL = 'Prix gele par le service client (case cochee dans Zoho Billing)';
 const SAAS_MSG_GEL_AVIS = 'Prix gele par le service client : avis non envoye, ligne retiree de la campagne';
+// Un REPORT n'est ni un gel ni une panne : la hausse aura bien lieu, plus tard. Le service client
+// accorde parfois un delai date (« le meme prix jusqu'en janvier ») — la case « Prix gele » ne
+// sait pas exprimer une date, et cocher une case que personne ne pensera a decocher ferait
+// disparaitre la hausse pour toujours. On deplace donc `effective_date` : la barriere de poussee
+// compare le prochain renouvellement a la date promise, donc le pilote attend puis applique de
+// lui-meme. Vecu le 2026-09-22 (Bar de Callieres et les deux Mexigo Express).
+const SAAS_MSG_REPORT = 'Hausse reportee a la demande du service client';
 async function saasExpliquerManquants(liste) {
   if (!liste.length) return { incomplets: 0, fermes: 0, enPause: 0 };
   const jour = new Date().toISOString().slice(0, 10);
@@ -20002,11 +20009,16 @@ async function runSaasCampaignDigest() {
     `SELECT customer_name, subscription_number, push_error ${OU}
         AND status = 'pending' AND push_error LIKE $1 ORDER BY customer_name LIMIT 15`,
     [`${SAAS_MSG_GEL}%`])).rows;
+  const reportes = (await pool.query(
+    `SELECT customer_name, subscription_number, push_error ${OU}
+        AND status = 'pending' AND push_error LIKE $1 ORDER BY effective_date, customer_name LIMIT 15`,
+    [`${SAAS_MSG_REPORT}%`])).rows;
   const incomplets = (await pool.query(
     `SELECT customer_name, subscription_number, push_error ${OU}
         AND status = 'pending' AND push_error IS NOT NULL
-        AND push_error NOT LIKE $1 AND push_error NOT LIKE $2
-      ORDER BY customer_name LIMIT 15`, [`${SAAS_MSG_PAUSE}%`, `${SAAS_MSG_GEL}%`])).rows;
+        AND push_error NOT LIKE $1 AND push_error NOT LIKE $2 AND push_error NOT LIKE $3
+      ORDER BY customer_name LIMIT 15`,
+    [`${SAAS_MSG_PAUSE}%`, `${SAAS_MSG_GEL}%`, `${SAAS_MSG_REPORT}%`])).rows;
   const parMois = (await pool.query(
     `SELECT to_char(effective_date, 'YYYY-MM') AS mois, COUNT(*)::int AS n ${OU}
         AND status = 'pending' AND effective_date IS NOT NULL GROUP BY 1 ORDER BY 1 LIMIT 8`)).rows;
@@ -20067,6 +20079,7 @@ async function runSaasCampaignDigest() {
       ${liste('R&eacute;sili&eacute;s depuis hier — leur hausse est sans objet, la ligne est ferm&eacute;e', fermeesRecentes, '#1c2434')}
       ${liste('En pause chez Zoho — la hausse reprendra d\'elle-m&ecirc;me s\'ils redeviennent actifs', enPause, '#64748b')}
       ${liste('Prix gel&eacute;s par le service client — la hausse ne sera pas appliqu&eacute;e', geles, '#0f766e')}
+      ${liste('Hausses report&eacute;es — elles s\'appliqueront d\'elles-m&ecirc;mes &agrave; leur nouvelle date', reportes, '#0f766e')}
       ${liste('Donn&eacute;e incompl&egrave;te — repris automatiquement, &agrave; surveiller si la m&ecirc;me ligne revient', incomplets, '#b45309')}
 
       <tr><td style="padding:22px 32px 28px">
