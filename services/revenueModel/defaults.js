@@ -27,9 +27,9 @@ const DEFAULTS = Object.freeze({
   txnFeeCredit: 0.04,
   txnFeeInterac: 0.04,
 
-  creditCostPct: 0.04, // 0,04 % du volume (David, 2026-09-22 ; était 0,06 % dans le brief)
-  creditCostPerTxn: 0,
-  interacCostPerTxn: 0.03, // 0,03 $ par transaction (David, 2026-09-22 ; était 0,035 $ dans le brief)
+  creditCostPct: 0.05, // 0,05 % du volume (David, 2026-09-22)
+  creditCostPerTxn: 0.035, // 0,035 $ par transaction crédit (David, 2026-09-22)
+  interacCostPerTxn: 0.035, // 0,035 $ par transaction Interac (David, 2026-09-22)
 
   termRentalRev: 30,
   termWarrantyCost: 3.5,
