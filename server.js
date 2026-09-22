@@ -22071,6 +22071,13 @@ async function createCrmLead(o) {
     Company: o.business_name,
     Last_Name: o.contact_last_name || o.business_name,
     Country: 'Canada',
+    // 🐛 2026-09-22 : le CRM porte une regle d'affichage ACTIVE nommee « Hide All Fields before
+    // the Country - POS », pilotee par Country_New — une LISTE DE CHOIX distincte du champ texte
+    // Country qu'on remplissait. Country_New restant vide sur toutes nos fiches, la regle masquait
+    // les champs situes avant le pays : telephone, courriel et mobile etaient bien enregistres
+    // mais INVISIBLES a l'ecran. Verifie en le posant sur une fiche : les champs sont revenus.
+    // Les deux sont remplis — `Country` reste lu ailleurs, `Country_New` commande l'affichage.
+    Country_New: 'Canada',
     // « New », la forme exacte que Zoho stocke et que les vues de l'equipe filtrent.
     Lead_Status: 'New',
     Lead_Contact_Method: 'Partner Portal',
@@ -22145,7 +22152,9 @@ async function createCrmLead(o) {
     // Ne s'applique qu'aux champs SACRIFIABLES : retirer Company ou Last_Name donnerait un lead
     // anonyme, ce qui est pire qu'un echec visible. Et une seule tentative — boucler jusqu'a ce
     // que Zoho accepte pourrait vider la fiche champ par champ sans que personne le voie.
-    const SACRIFIABLES = new Set(['Phone', 'Email', 'Lead_Source', 'Lead_Contact_Method',
+    // Country_New est une liste de choix : si Zoho en refuse la valeur un jour, mieux vaut une
+    // fiche sans pays qu'aucune fiche.
+    const SACRIFIABLES = new Set(['Phone', 'Email', 'Lead_Source', 'Lead_Contact_Method', 'Country_New',
                                   'Lead_Status', 'Country', 'City', 'State', 'Zip_Code',
                                   'Website', 'First_Name', 'Description']);
     const envoyer = () => axios.post(
