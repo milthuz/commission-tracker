@@ -441,7 +441,12 @@ const NUVEI_SUSPECT_LABELS = [
   // sont déjà facturées séparément sur le même relevé. C'est le test réutilisable établi
   // le 2026-09-21 : un vrai frais de réseau, tout acquéreur le paie et le refacture.
   // (Dictionnaire, feuille « Look-alike Fees » : 13,50 $ pour l'ensemble.)
+  // ⚠️ LES DEUX ÉCRITURES DE LA MARQUE. Le dictionnaire abrège « MC » ; le vrai relevé
+  // Nuvei imprime « MASTERCARD CYBER SECURE FEE » en toutes lettres (2026-09-22).
+  // L'appariement est à frontière de mot, donc « MC CYBER SECURE » ne l'attrape pas — le
+  // seul des quatre libellés qui ne s'est pas déclenché sur le papier.
   'MC CYBER SECURE',
+  'MASTERCARD CYBER SECURE',
   'MC DIRECT ASSESSMENT',
   'MC DIRECT LICENSE',
   // « VISA DIRECT ACQ ASSESSMENT » est déjà couvert par PUSH_PAYMENT_SUSPECT_LABELS.

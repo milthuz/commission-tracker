@@ -72,6 +72,9 @@ function detect(lines) {
 
 function parse(lines) {
   const L = lines.map(foldPunct);
+  // Les cellules du document voyagent avec les lignes normalisées : sans elles,
+  // splitSections ne peut pas les transmettre au sommaire par type de carte.
+  if (Array.isArray(lines && lines.cells)) L.cells = lines.cells;
   const notes = [];
   const sections = splitSections(L);
 
@@ -210,17 +213,29 @@ function parseDepositSummary(lines) {
 }
 
 // ---------------------------------------------------------------------------
+// Les CELLULES suivent la section : le sommaire par type de carte ne se lit pas autrement
+// (voir parseCardTypeSummary).
 function splitSections(lines) {
   const out = {};
-  for (const n of Object.keys(SECTIONS)) out[n] = [];
+  const cells = {};
+  for (const n of Object.keys(SECTIONS)) { out[n] = []; cells[n] = []; }
+  const srcCells = Array.isArray(lines && lines.cells) ? lines.cells : null;
   let current = null;
-  for (const raw of lines) {
+  lines.forEach((raw, i) => {
     const hit = SECTION_KEYS.find((s) => s.keys.includes(squash(raw)));
-    if (hit) { current = hit.name; continue; }
-    if (!current) continue;
-    if (NOISE.some((re) => re.test(raw))) continue;
+    if (hit) { current = hit.name; return; }
+    if (!current) return;
+    if (NOISE.some((re) => re.test(raw))) return;
     out[current].push(raw);
-  }
+    if (srcCells && srcCells[i]) cells[current].push(srcCells[i]);
+    // ⚠️ UNE SECTION SE FERME SUR SON PROPRE TOTAL. Sans ça « OTHER CHARGES » restait
+    // ouverte après « Total Other Charges » et avalait le « FEE SUMMARY » qui suit —
+    // un récapitulatif des mêmes montants, d'où des frais fixes à 1 290,36 $ au lieu des
+    // 263,69 $ imprimés. La ligne de total est conservée (la réconciliation en a besoin),
+    // c'est ce qui vient APRÈS qui ne fait plus partie de la section.
+    if (/^Total\s+(Rates|Other|Amount|Fees)/i.test(raw)) current = null;
+  });
+  if (srcCells) for (const n of Object.keys(SECTIONS)) out[n].cells = cells[n];
   return out;
 }
 
@@ -242,7 +257,85 @@ function splitSections(lines) {
 const NUMS_ONLY = /^(\d[\d,]*)\s+([\d,]+\.\d{2})\s+([\d.]+)\s*%?\s+(-?[\d,]+\.\d{2})$/;
 const FULL_ROW  = /^(.+?)\s+(\d[\d,]*)\s+([\d,]+\.\d{2})\s+([\d.]+)\s*%?\s+(-?[\d,]+\.\d{2})$/;
 
+// Lecture par CELLULES de la section RATES & FEES.
+//
+// ⚠️ LA DESCRIPTION EST COUPÉE AUTOUR DES NOMBRES, comme dans le sommaire par type de
+// carte. Sur un vrai relevé Nuvei (2026-09-22) :
+//
+//     VS CA SMALL MERCHANT ELECTRONIC          <- début du libellé
+//     0.77 % | $.00 | 284 | $5,564.23 | $43.03 <- les nombres
+//     CGP NNSS                                 <- suite du libellé
+//
+// ⚠️ ET DEUX LARGEURS DE RANGÉE. Les lignes d'interchange portent une colonne « articles »,
+// les évaluations n'en ont pas :
+//
+//     0.77 % | $.00 | 284 | $5,564.23 | $43.03   taux, par-article, articles, montant, total
+//     0.09 % | $.00 | $7,781.50 | $7.00          taux, par-article, montant, total
+//
+// Compter les colonnes depuis la fin marcherait, mais on préfère VÉRIFIER : le total doit
+// retomber sur montant × taux. C'est ce qui a validé chaque ligne ailleurs dans ce module,
+// et ici ça confirme jusqu'aux évaluations — 7 781,50 × 0,09 % = 7,00, le total imprimé.
+function parseRatesAndFeesCells(cellRows) {
+  const out = [];
+  let enAttente = null;
+  const estMotSeul = (c) => c.length === 1 && /[A-Za-z]/.test(c[0]) && !/\d/.test(c[0]);
+
+  for (const cells of cellRows || []) {
+    const c = (cells || []).map(foldPunct).filter(Boolean);
+    if (!c.length) continue;
+    if (/^Total/i.test(c[0])) { enAttente = null; continue; }
+
+    if (estMotSeul(c)) {
+      const derniere = out[out.length - 1];
+      if (!enAttente && derniere && derniere.attendSuite) {
+        derniere.desc = (derniere.desc + ' ' + c[0]).trim();
+        derniere.label = derniere.desc;
+        derniere.attendSuite = false;
+      } else {
+        enAttente = c[0];
+      }
+      continue;
+    }
+
+    // La rangée numérique commence par le taux, qui porte le signe %.
+    const iTaux = c.findIndex((x) => /%/.test(x));
+    if (iTaux < 0) { continue; }
+
+    // Le libellé est ce qui précède le taux sur la même rangée, sinon celui mis de côté.
+    const enTete = c.slice(0, iTaux).join(' ').trim();
+    const desc = enTete || enAttente;
+    if (!desc) { enAttente = null; continue; }
+    const venaitDAttente = !enTete;
+    enAttente = null;
+
+    const rate = parseNum(String(c[iTaux]).replace(/[%\s]/g, '')) / 100;
+    const reste = c.slice(iTaux + 1)
+      .filter((x) => NUM_CELL.test(x))
+      .map((x) => parseNum(String(x).replace(/[$%]/g, '')));
+    if (reste.length < 2) continue;
+
+    // reste = [par-article, articles?, montant, total]
+    const perItem = reste[0];
+    const total = Math.abs(reste[reste.length - 1]);
+    const volume = reste[reste.length - 2];
+    const count = reste.length >= 4 ? reste[reste.length - 3] : 0;
+
+    out.push({
+      desc, label: desc, count, volume, rate, perItem, total,
+      attendSuite: venaitDAttente,
+      section: 'RATES & FEES',
+    });
+  }
+  return out;
+}
+
 function parseRatesAndFees(lines) {
+  // Les cellules d'abord : elles seules situent une description coupée autour des nombres.
+  const cellRows = Array.isArray(lines && lines.cells) ? lines.cells : null;
+  if (cellRows) {
+    const viaCells = parseRatesAndFeesCells(cellRows);
+    if (viaCells.length) return viaCells;
+  }
   const rows = [];
   const L = lines || [];
   const used = new Set();
@@ -328,7 +421,81 @@ const SUB_WORD = '(?:\\s+(?:Business|Debit|Prepaid|Corporate|Commercial|Infinite
 const CARD_ROW = new RegExp(
   `(${BRAND_WORD}${SUB_WORD})\\s+(\\d[\\d,]*)\\s+([\\d,]+\\.\\d{2})\\s+([\\d.]+)\\s*%?\\s+([\\d.]+)`, 'g');
 
+// ⚠️ NUVEI IMPRIME « $.08 », PAS « $0.08 ». Un motif qui exige un chiffre juste après le
+// signe de dollar écarte cette cellule — et c'est exactement celle de la majoration par
+// article. Le reste de la rangée passait, la vérification arithmétique échouait faute de
+// cette colonne, et la majoration ressortait NULLE : un relevé où le processeur ne gagne
+// rien, ce qui n'arrive jamais.
+const NUM_CELL = /^\$?-?(\d[\d,. ]*|\.\d+)%?$/;
+const estMot = (x) => /[A-Za-z]/.test(x) && !/\d/.test(x);
+
+function parseCardTypeSummaryCells(cellRows) {
+  const out = [];
+  // ⚠️ LE LIBELLÉ D'UNE MARQUE PEUT ÊTRE COUPÉ SUR TROIS RANGÉES :
+  //     « Visa »   puis   « 9|$187.55|… »   puis   « Business »
+  // Le PDF place le qualificatif SOUS la marque et les nombres entre les deux. Exiger la
+  // marque dans la première cellule de la rangée numérique perdait Visa Business, Visa
+  // Prepaid, MasterCard Debit, MasterCard Business et MasterCard Prepaid — cinq lignes de
+  // volume absentes du total.
+  let enAttente = null;
+  for (const cells of cellRows || []) {
+    const c = (cells || []).map(foldPunct).filter(Boolean);
+    if (!c.length) continue;
+    if (/^Total/i.test(c[0])) { enAttente = null; continue; }
+
+    // Une rangée d'un seul mot est soit une marque qui attend ses nombres, soit le
+    // qualificatif de la ligne qu'on vient d'émettre.
+    if (c.length === 1 && estMot(c[0])) {
+      const derniere = out[out.length - 1];
+      if (!enAttente && derniere && derniere.attendQualificatif) {
+        derniere.label = (derniere.label + ' ' + c[0]).trim();
+        derniere.attendQualificatif = false;
+      } else {
+        enAttente = c[0];
+      }
+      continue;
+    }
+
+    const marqueEnTete = brandOf(c[0]);
+    const label = marqueEnTete ? c[0] : enAttente;
+    const brand = marqueEnTete || (enAttente ? brandOf(enAttente) : null);
+    if (!brand) { enAttente = null; continue; }
+
+    const corps = marqueEnTete ? c.slice(1) : c;
+    const nums = corps.filter((x) => NUM_CELL.test(x))
+      .map((x) => parseNum(String(x).replace(/[$%]/g, '')));
+    const venaitDAttente = !marqueEnTete;
+    enAttente = null;
+    if (nums.length < 2) continue;
+
+    let pct = 0;
+    let perItem = 0;
+    if (nums.length >= 5) {
+      const parArticle = nums[nums.length - 3];
+      const pourcent = nums[nums.length - 2] / 100;
+      const escompte = nums[nums.length - 1];
+      // L'arithmétique de la ligne valide la lecture : 7 158,50 × 0,15 % + 374 × 0,08 $
+      // = 40,66, soit l'escompte imprimé juste à côté.
+      const calcule = nums[1] * pourcent + nums[0] * parArticle;
+      if (escompte > 0 && Math.abs(calcule - escompte) <= Math.max(0.05, escompte * 0.01)) {
+        perItem = parArticle;
+        pct = pourcent;
+      }
+    }
+    out.push({
+      label, brand, count: nums[0], volume: nums[1], pct, perItem,
+      attendQualificatif: venaitDAttente,
+    });
+  }
+  return out;
+}
+
 function parseCardTypeSummary(lines) {
+  const cellRows = Array.isArray(lines && lines.cells) ? lines.cells : null;
+  if (cellRows) {
+    const viaCells = parseCardTypeSummaryCells(cellRows);
+    if (viaCells.length) return viaCells;
+  }
   const joined = (lines || []).map(foldPunct).join(' ').replace(/\s+/g, ' ');
   const out = [];
   let m;

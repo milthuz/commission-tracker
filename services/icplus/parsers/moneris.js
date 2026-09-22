@@ -212,7 +212,16 @@ function merchantNameEn(records) {
 // Row extraction, shared in SHAPE but fed pre-normalized text by each layout.
 // ===========================================================================
 
-const NOISE_ROW = /^(Description|Total|Sous-total|Subtotal|Page\b|Moneris\b|Relev|Statement|Date\b|No de|Merchant No)/i;
+// ⚠️ L'EN-TÊTE DE PAGE SE RÉPÈTE, ET IL RETOMBE AU MILIEU D'UNE SECTION. Sur un vrai
+// relevé Moneris de trois pages, « Numéro de commerçant: 30111158912 » et « Numéro
+// d'entreprise: … » réapparaissent à chaque page — donc à l'intérieur de la section 2,
+// entre deux vraies lignes de frais. Pris pour des lignes de frais, ils ajoutaient
+// 181 MILLIARDS de dollars à l'interchange.
+//
+// Le jeu d'essai synthétique tenait sur une page et n'avait aucun en-tête répété : c'est
+// typiquement ce que seul du vrai papier révèle. « No de » couvrait déjà l'abréviation,
+// pas la forme longue ni « Numéro d'entreprise ».
+const NOISE_ROW = /^(Description|Total|Sous-total|Subtotal|Page\b|Moneris\b|Relev|Statement|Date\b|No de|Num[ée]ro d|Merchant No|Business No|Corporation Solutions)/i;
 function isNoiseRow(s) { return !s || NOISE_ROW.test(s); }
 
 // A row can disclose a % rate, a $/item rate, or BOTH:
@@ -264,9 +273,29 @@ function extractRow(line, layout) {
 // Cell-based extraction. Each cell is exactly one column as the PDF laid it out, so the
 // label, the count, the volume and the two rate components cannot bleed into each other —
 // which is the entire reason cells exist for this layout.
+// \u26a0\ufe0f MONTANT ET NOMBRE D'ARTICLES NE SONT PAS DANS LE M\u00caME ORDRE SELON LA SECTION.
+//
+// Mesur\u00e9 sur un vrai relev\u00e9 Moneris (2026-09-22), et c'est l'inverse de ce que le jeu
+// d'essai synth\u00e9tique supposait :
+//
+//   section 1, ventes    \u00ab Interac | 661 | 29 751,46 | \u2026 \u00bb      -> ARTICLES puis MONTANT
+//   sections 2 \u00e0 4, frais \u00ab CAN-CE01 \u2026 | 27 381,66 | 522 | \u2026 \u00bb  -> MONTANT puis ARTICLES
+//
+// Les deux rang\u00e9es portent huit cellules, donc leur nombre ne les distingue pas. Ce qui
+// les distingue sans ambigu\u00eft\u00e9, c'est le S\u00c9PARATEUR D\u00c9CIMAL : un montant s'imprime
+// toujours avec ses deux d\u00e9cimales (\u00ab 27 381,66 \u00bb, \u00ab 1 000,00 \u00bb), un compte d'articles
+// jamais. On tranche donc sur le TEXTE BRUT de la cellule, pas sur le nombre une fois
+// converti \u2014 \u00ab 1 000,00 \u00bb converti vaut 1000, un entier, et la distinction serait perdue.
+//
+// Ce que l'inversion co\u00fbtait : le compte d'articles \u00e9tait pris pour le volume, le taux
+// imprim\u00e9 ignor\u00e9, et un taux faux recalcul\u00e9 \u00e0 partir du total. Sur CAN-CE01, 1,25 % devenait
+// 0,6556 %.
+const HAS_DECIMALS = /[.,]\d{2}\s*\)?\$?$/;
+
 function extractRowCells(cells, layout) {
   const labelParts = [];
-  const nums = [];
+  const nums = [];       // valeurs converties, dans l'ordre des colonnes
+  const rawNums = [];    // leur texte d'origine, pour trancher montant / compte
   let pct = null;
   let perItem = null;
 
@@ -278,19 +307,41 @@ function extractRowCells(cells, layout) {
       perItem = parseNum(c.replace(/\$?\s*\/\s*\w+.*$/i, ''));
       continue;
     }
-    if (/\d/.test(c) && /^[-(]?[\d][\d\s.,\u00a0]*\)?\$?$/.test(c)) { nums.push(parseNum(c)); continue; }
+    if (/\d/.test(c) && /^[-(]?[\d][\d\s.,\u00a0]*\)?\$?$/.test(c)) { nums.push(parseNum(c)); rawNums.push(c); continue; }
     if (!nums.length) labelParts.push(c);
   }
 
   const label = labelParts.join(' ').trim();
   if (!label || !nums.length) return null;
 
+  let count = 0;
+  let volume = 0;
+  if (nums.length >= 2) {
+    const premierEstMontant = HAS_DECIMALS.test(rawNums[0]);
+    const secondEstMontant = HAS_DECIMALS.test(rawNums[1]);
+    if (premierEstMontant && !secondEstMontant) { volume = nums[0]; count = nums[1]; }
+    else { count = nums[0]; volume = nums[1]; }
+  }
+
+  // \u26a0\ufe0f LES COLONNES DE TAUX N'ONT NI \u00ab % \u00bb NI \u00ab /article \u00bb SUR LE VRAI RELEV\u00c9 : elles
+  // s'impriment nues (\u00ab 1.25000 \u00bb, \u00ab 0,035000 \u00bb). Sans \u00e7a le taux imprim\u00e9 \u00e9tait perdu, et
+  // le classificateur en recalculait un depuis le total \u2014 c'est-\u00e0-dire qu'il v\u00e9rifiait le
+  // relev\u00e9 contre lui-m\u00eame au lieu de le v\u00e9rifier contre la carte de taux publi\u00e9e.
+  //
+  // Sur la grille de huit colonnes des sections de frais, le taux suit imm\u00e9diatement le
+  // couple montant/articles, et le montant par article le suit.
+  if (pct === null && perItem === null && nums.length >= 4) {
+    const tauxPct = nums[2];
+    const tauxArticle = nums[3];
+    // Un taux d'interchange s'exprime en pourcentage sur un relev\u00e9 : 1.25 vaut 1,25 %.
+    if (Number.isFinite(tauxPct) && tauxPct > 0 && tauxPct < 100) pct = tauxPct / 100;
+    if (Number.isFinite(tauxArticle) && tauxArticle > 0 && tauxArticle < 10) perItem = tauxArticle;
+  }
+
   const total = nums[nums.length - 1];
   return {
     desc: label, label,
-    count: nums.length >= 2 ? nums[0] : 0,
-    volume: nums.length >= 2 ? nums[1] : 0,
-    pct, perItem,
+    count, volume, pct, perItem,
     total: Number.isFinite(total) ? Math.abs(total) : 0,
     layout,
   };

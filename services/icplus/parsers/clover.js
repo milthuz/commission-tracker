@@ -60,6 +60,16 @@ const NOISE = [
 const FISERV_MARKUP_RE = new RegExp([
   'FRAIS DE TRANSACTION',
   'FRAIS PAR TRAN',                       // INTERAC FRAIS PAR TRAN-FLASH / -CONTACT
+  // ⚠️ L'ESCOMPTE EST LA MARGE, PAS DU TRANSFERT. Constaté sur un vrai relevé Clover
+  // (2026-09-22) : la section des frais de service distingue trois lignes Interac par
+  // produit, et elles n'ont pas la même nature —
+  //     INTERAC FRAIS D'INTERCH-FLASH   -7,23   l'interchange du réseau
+  //     INTERAC FRAIS DE COMM-FLASH     -3,20   la commutation, réseau aussi
+  //     INTERAC FRAIS D'ESCOMPTE-FLASH -20,54   l'escompte = la marge de Fiserv
+  // Sans cette entrée, l'escompte était compté comme transfert Interac ET refacturé une
+  // seconde fois par le taux du tableau des types de carte.
+  'FRAIS D.?ESCOMPTE',
+  'DISCOUNT FEE',
   'FRAIS (MAST|VISA|VDBT) DE TRANSACTION',
   'FRAIS-(DEBIT|FLASH|VDBT) TRANSACTION',
   'TRANSACTION FEE',
