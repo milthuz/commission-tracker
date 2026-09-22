@@ -26,11 +26,15 @@ const notes = require('./notes');
 const ratesStore = require('./ratesStore');
 const rateCardExtract = require('./rateCardExtract');
 const rateCardExcel = require('./rateCardExcel');
+const scanRead = require('./scanRead');
 const multer = require('multer');
 
 const PERM_USE = 'icplus:use';
 const PERM_MARGIN = 'icplus:margin';
 const PERM_RATES = 'icplus:rates';
+// La lecture d'un relevé NUMÉRISÉ coûte un appel payant et transcrit un document client :
+// permission distincte de l'usage courant du calculateur.
+const PERM_SCAN = 'icplus:read_scan';
 
 // Cap the posted payload: a statement is a few hundred lines, and anything far past that is
 // either a mistake or an attempt to make the server chew on nothing useful.
@@ -105,6 +109,13 @@ function registerIcplusRoutes(app, deps) {
         brands: calc.BRANDS,
       },
       canSeeMargin: await canSeeMargin(req),
+      // ⚠️ Sert à savoir s'il faut PROPOSER la transcription quand un PDF se révèle
+      // numérisé. Sans ça, l'écran renverrait tout le monde vers la saisie à la main, y
+      // compris ceux qui ont le droit de la faire faire.
+      canReadScan: await (async () => {
+        if (req.user && req.user.isAdmin === true) return true;
+        try { return await hasPerm(req, PERM_SCAN); } catch { return false; }
+      })(),
       statuses: require('./classify').STATUS,
     });
   });
@@ -363,6 +374,57 @@ function registerIcplusRoutes(app, deps) {
   });
 
   // ---------------------------------------------------------------------------
+  // POST /api/icplus/read-scan — transcrire un relevé NUMÉRISÉ.
+  //
+  // Un PDF scanné n'a pas de couche de texte : le navigateur n'en extrait rien et aucun
+  // analyseur ne peut travailler. Le modèle lit les IMAGES des pages et rend la MÊME
+  // forme que la saisie JSON, si bien que le relevé rejoint ensuite le chemin normal par
+  // /api/icplus/import — même validation, mêmes garde-fous, mêmes notes.
+  //
+  // ⚠️ N'ANALYSE RIEN ET N'ENREGISTRE RIEN : il rend une TRANSCRIPTION à revoir, avec le
+  // texte imprimé en regard de chaque montant et une réconciliation contre le total que
+  // le relevé affiche lui-même. Une lecture d'image se trompe, et le document qui en sort
+  // va devant un marchand.
+  // ---------------------------------------------------------------------------
+  const uploadScan = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: scanRead.MAX_PDF_BYTES },
+  });
+
+  app.post('/api/icplus/read-scan', authenticateToken, uploadScan.single('file'), async (req, res) => {
+    if (!(await requirePerm(req, res, PERM_SCAN))) return;
+
+    const anthropic = typeof getAnthropic === 'function' ? getAnthropic() : null;
+    if (!anthropic) return res.status(503).json({ ok: false, reason: 'ai_not_configured' });
+    if (!req.file || !req.file.buffer) return res.status(400).json({ ok: false, reason: 'no_file' });
+    if (req.file.mimetype && !/pdf/i.test(req.file.mimetype)) {
+      return res.status(400).json({ ok: false, reason: 'not_a_pdf', mimetype: req.file.mimetype });
+    }
+
+    try {
+      const out = await scanRead.readScannedStatement({
+        anthropic,
+        pdfBase64: req.file.buffer.toString('base64'),
+        filename: req.file.originalname,
+      });
+      if (out.ok && typeof logActivity === 'function') {
+        await logActivity('icplus', 'read_scan', 'scanned_statement_read',
+          `Relevé numérisé transcrit : ${req.file.originalname || 'sans nom'}`
+          + ` — ${out.processorName || 'processeur inconnu'}, ${out.flags.length} signalement(s), `
+          + (out.reconcile.available
+            ? (out.reconcile.ok ? 'réconcilié' : `écart de ${out.reconcile.gap} $ avec le total imprimé`)
+            : 'aucun total imprimé pour réconcilier') + '.',
+          req.user && req.user.email,
+          { metadata: { filename: req.file.originalname, flags: out.flags, reconcile: out.reconcile } });
+      }
+      res.json(out);
+    } catch (e) {
+      console.error('[icplus] lecture du relevé numérisé impossible:', e.message);
+      res.status(500).json({ ok: false, reason: 'error', detail: e.message });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
   // POST /api/icplus/pdf — the two exports (§6).
   //
   // ⚠️ The server recomputes from the posted state before rendering, so the document can
@@ -416,4 +478,4 @@ function registerIcplusRoutes(app, deps) {
   });
 }
 
-module.exports = { registerIcplusRoutes, PERM_USE, PERM_MARGIN, PERM_RATES };
+module.exports = { registerIcplusRoutes, PERM_USE, PERM_MARGIN, PERM_RATES, PERM_SCAN };

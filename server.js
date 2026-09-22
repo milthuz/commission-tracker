@@ -217,6 +217,11 @@ const PERMISSION_CATALOG = [
   // Les taux de référence décident si un frais est « Conforme » ou « SUSPECT » sur un document
   // remis a un client : les modifier est un geste de maintenance, pas d'usage courant.
   { key: 'icplus:rates',               label: 'Edit the IC+ reference rate tables (Visa/MC/Interac published rates)', category: 'IC+ Calculator' },
+  // Un releve NUMERISE n'a pas de couche de texte : aucun analyseur ne peut le lire, et la
+  // transcription passe par un appel au modele, facturé a l'appel. Permission distincte de
+  // l'usage courant pour que le cout reste un choix, et parce que le document part chez un
+  // tiers le temps de la lecture.
+  { key: 'icplus:read_scan',           label: 'Read a SCANNED statement (no text layer) by having the AI transcribe it — costs an API call', category: 'IC+ Calculator' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
