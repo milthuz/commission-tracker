@@ -115,7 +115,8 @@ function footer(doc, left, right, header) {
     doc.page.margins.bottom = 0;
     doc.font('Helvetica-Bold').fontSize(8).fillColor(ORANGE).text('c', M, y, { lineBreak: false, continued: true })
       .font('Helvetica').fillColor(MUTED).text(`luster${left}`, { lineBreak: false, width: CW - 160 });
-    if (right) doc.font('Helvetica').fontSize(8).fillColor(MUTED).text(right, W - M - 200, y, { width: 200, align: 'right', lineBreak: false });
+    const r = typeof right === 'function' ? right(i - range.start + 1, range.count) : right;
+    if (r) doc.font('Helvetica').fontSize(8).fillColor(MUTED).text(r, W - M - 220, y, { width: 220, align: 'right', lineBreak: false });
     doc.page.margins.bottom = saved;
   }
 }
@@ -339,13 +340,18 @@ async function renderAgreement(snap, { employeeSig = null, companySig = null, la
   f.st.y = cardY + 168;
   f.para(L.confidential, { size: 7.5, font: 'Helvetica-Oblique', color: MUTED, align: 'center' });
 
-  footer(doc, L.footer(position, p.version), name);
+  footer(doc, L.footer(position, p.version), (i, n) => `${name}   ·   ${i} / ${n}`);
   doc.end();
   return out;
 }
 
 // ---------------------------------------------------------------------------
 // Offre d'emploi — FR ou EN (voir text.js). `lang` force une langue (versions de référence).
+//
+// Mise en page refaite le 2026-09-23 (demande de David : « plus beau ») dans le vocabulaire
+// visuel de l'entente v7.7 : bandeau noir, filet orange, bande d'identification, titres de
+// clause numérotés en orange, page d'acceptation en deux cartes. ⚠️ Le TEXTE juridique ne
+// change pas : seuls sa présentation et l'identification des signataires ont bougé.
 // ---------------------------------------------------------------------------
 async function renderOffer(snap, { employeeSig = null, companySig = null, lang: forced = null } = {}) {
   const h = snap.hire;
@@ -353,13 +359,15 @@ async function renderOffer(snap, { employeeSig = null, companySig = null, lang: 
   const O = T.OFFER[lang];
   const name = `${h.firstName} ${h.lastName}`;
   const m = (v) => money(v, lang);
+  const position = lang === 'fr' ? (h.positionFr || h.position) : h.position;
+  const managerTitle = lang === 'fr' ? (h.reportsToTitleFr || h.reportsToTitle) : h.reportsToTitle;
   const vars = {
     startDate: longDate(h.startDate, lang),
-    reportsToTitle: lang === 'fr' ? (h.reportsToTitleFr || h.reportsToTitle) : h.reportsToTitle,
+    reportsToTitle: managerTitle,
     reportsToName: h.reportsToName,
     annualSalary: m(h.annualSalary),
     vacationWeeks: String(snap.terms.vacationWeeks),
-    position: lang === 'fr' ? (h.positionFr || h.position) : h.position,
+    position,
     salaryExtra: O.salaryExtra(snap.terms, m),
   };
   const fill = (s) => s.replace(/\{(\w+)\}/g, (_, k) => (vars[k] != null ? vars[k] : ''));
@@ -367,78 +375,141 @@ async function renderOffer(snap, { employeeSig = null, companySig = null, lang: 
   const doc = newDoc(`${O.title} — ${name}`);
   const out = collect(doc);
   const f = flow(doc);
-  const SIZE = 10;
+  const SIZE = 9.8;
+  const GAP = 7;
 
-  f.st.y = 84;
+  // --- Bandeau (même construction que l'entente) ---
+  const bandH = 64;
+  doc.rect(M, M, CW, bandH).fill(INK);
+  doc.rect(M + CW * 0.34, M, CW * 0.66, bandH).fill('#262626');
+  wordmark(doc, M + 16, M + 12, 26, '#ffffff');
+  doc.font('Helvetica').fontSize(7.5).fillColor('#a3a3a3').text('clustersystems.com', M + 16, M + 44, { lineBreak: false });
+  doc.font('Helvetica-Bold').fontSize(13).fillColor('#ffffff').text(O.title, M, M + 11, { width: CW - 16, align: 'right' });
+  doc.font('Helvetica-Bold').fontSize(13).fillColor(ORANGE).text(position, M, M + 28, { width: CW - 16, align: 'right' });
+  doc.font('Helvetica').fontSize(8).fillColor('#e5e5e5').text(O.confidential, M, M + 46, { width: CW - 16, align: 'right' });
+  f.st.y = M + bandH + 12;
+  doc.rect(M - 2, f.st.y, CW + 38, 1.6).fill(ORANGE);
+  f.st.y += 14;
 
+  // --- Bande d'identification ---
+  const fields = [
+    [O.fields[0], name],
+    [O.fields[1], position],
+    [O.fields[2], longDate(h.startDate, lang)],
+    [O.fields[3], h.reportsToName + (managerTitle ? `, ${managerTitle}` : '')],
+  ];
+  const colW = CW / 4;
+  doc.rect(M, f.st.y, CW, 50).fill('#f4f4f4');
+  fields.forEach(([label, value], i) => {
+    const x = M + i * colW + 8;
+    doc.font('Helvetica-Bold').fontSize(6.5).fillColor(ORANGE).text(label, x, f.st.y + 7, { width: colW - 16, lineBreak: false });
+    doc.font('Helvetica').fontSize(8.5).fillColor(TEXT).text(value || '', x, f.st.y + 18, { width: colW - 16, height: 22, ellipsis: true, lineGap: 0 });
+    doc.save().moveTo(x, f.st.y + 42).lineTo(x + colW - 16, f.st.y + 42).lineWidth(0.6).strokeColor('#bdbdbd').stroke().restore();
+  });
+  f.st.y += 66;
+
+  // --- En-tête de lettre : date à droite, destinataire à gauche ---
+  const top = f.st.y;
+  doc.font('Helvetica').fontSize(SIZE).fillColor(MUTED).text(longDate(h.offerDate, lang), M, top, { width: CW, align: 'right' });
   const addrCity = [h.city, [h.province, h.postalCode].filter(Boolean).join(' ')].filter(Boolean).join(', ');
-  for (const line of [longDate(h.offerDate, lang), name, h.addressLine1, addrCity, h.country].filter(Boolean)) {
-    f.para(line, { size: SIZE, font: 'Helvetica-Bold', gap: 1 });
+  let ay = top;
+  for (const [i, line] of [name, h.addressLine1, addrCity, h.country].filter(Boolean).entries()) {
+    doc.font(i === 0 ? 'Helvetica-Bold' : 'Helvetica').fontSize(SIZE).fillColor(TEXT).text(line, M, ay, { width: CW * 0.6 });
+    ay += 13;
   }
-  f.st.y += 12;
-  f.para(O.subject, { size: SIZE, font: 'Helvetica-Bold', gap: 12 });
-  f.para(O.dear(h.firstName), { size: SIZE, gap: 10 });
-  for (const p of O.intro) f.para(fill(p), { size: SIZE, gap: 10 });
+  f.st.y = ay + 12;
+  f.para(O.subject, { size: SIZE + 0.5, font: 'Helvetica-Bold', gap: 12 });
+  f.para(O.dear(h.firstName), { size: SIZE, gap: GAP + 2 });
+  for (const p of O.intro) f.para(fill(p), { size: SIZE, gap: GAP + 2 });
+  f.st.y += 6;
 
+  // --- Clauses : numéro orange + titre, filet léger, texte dessous ---
   for (const [title, body, kind] of O.clauses) {
     const text = fill(body);
     if (!text.trim()) continue;
     if (kind === 'item') {
       doc.font('Helvetica').fontSize(SIZE);
-      const hh = doc.heightOfString(text, { width: CW - 56, lineGap: 1.5 });
+      const hh = doc.heightOfString(text, { width: CW - 44, lineGap: 1.5 });
       f.ensure(hh);
-      doc.fillColor(TEXT).text(title, M + 24, f.st.y, { lineBreak: false });
-      doc.text(text, M + 56, f.st.y, { width: CW - 56, lineGap: 1.5 });
-      f.st.y += hh + 8;
+      doc.font('Helvetica-Bold').fillColor(ORANGE).text(title, M + 16, f.st.y, { lineBreak: false });
+      doc.font('Helvetica').fillColor(TEXT).text(text, M + 44, f.st.y, { width: CW - 44, lineGap: 1.5 });
+      f.st.y += hh + GAP;
       continue;
     }
-    if (kind === 'sub') { f.para(text, { size: SIZE, font: 'Helvetica-Oblique', gap: 4 }); continue; }
-    if (!title) { f.para(text, { size: SIZE, gap: 10 }); continue; }
-    // Titre de clause gras souligné, suivi du texte sur la même ligne — comme dans le Word.
+    if (kind === 'sub') {
+      f.st.y += 2;
+      f.para(text, { size: SIZE, font: 'Helvetica-Bold', color: INK, gap: 3 });
+      continue;
+    }
+    if (!title) { f.para(text, { size: SIZE, gap: GAP + 1 }); continue; }
+    const mm = /^(\d+)\.\s*(.*?)\.?$/.exec(title);
+    const num = mm ? mm[1] : '';
+    const label = mm ? mm[2] : title;
+    // Le titre ne reste jamais seul en bas de page : il part avec les premières lignes du texte.
     doc.font('Helvetica').fontSize(SIZE);
-    const hh = doc.heightOfString(`${title} ${text}`, { width: CW, lineGap: 1.5 });
-    f.ensure(Math.min(hh, 60));
-    doc.font('Helvetica-Bold').fillColor(TEXT).text(title, M, f.st.y, { width: CW, lineGap: 1.5, continued: true, underline: true })
-      .font('Helvetica').text(` ${text}`, { underline: false });
-    f.st.y = doc.y + 10;
+    f.ensure(22 + Math.min(doc.heightOfString(text, { width: CW, lineGap: 1.5 }), 40));
+    f.st.y += 6;
+    doc.font('Helvetica-Bold').fontSize(10.5).fillColor(ORANGE).text(num, M, f.st.y, { width: 22, lineBreak: false });
+    doc.fillColor(INK).text(label, M + 22, f.st.y, { width: CW - 22 });
+    f.st.y += 15;
+    doc.rect(M, f.st.y, CW, 0.6).fill('#ececec');
+    f.st.y += 6;
+    f.para(text, { size: SIZE, gap: GAP + 1 });
   }
-  for (const p of O.closing) f.para(p, { size: SIZE, gap: 10 });
-  f.st.y += 10;
-  f.para(O.blank, { size: 9, font: 'Helvetica-Oblique', color: MUTED, align: 'center' });
 
-  // Page de signature
+  // --- Formule de politesse, signée par le gestionnaire ---
+  // Formule + signature d'un seul bloc : la signature ne doit jamais partir seule en page suivante.
+  f.st.y += 4;
+  doc.font('Helvetica').fontSize(SIZE);
+  f.ensure(O.closing.reduce((a, p) => a + doc.heightOfString(p, { width: CW, lineGap: 1.5 }) + GAP + 2, 0) + 70);
+  for (const p of O.closing) f.para(p, { size: SIZE, gap: GAP + 2 });
+  f.para(h.reportsToName, { size: SIZE, font: 'Helvetica-Bold', gap: 1 });
+  if (managerTitle) f.para(managerTitle, { size: SIZE, color: MUTED, gap: 1 });
+  f.para('Cluster Systems', { size: SIZE, color: MUTED, gap: 12 });
+  f.para(O.blank, { size: 8.5, font: 'Helvetica-Oblique', color: MUTED, align: 'center' });
+
+  // --- Page d'acceptation ---
   doc.addPage();
-  let y = 110;
-  doc.font('Helvetica-Bold').fontSize(SIZE).fillColor(TEXT).text('CLUSTER SYSTEMS.', M, y);
-  y += 24;
-  doc.font('Helvetica').text(O.by, M, y);
-  y += 16;
-  const line = (x, yy, w) => doc.save().moveTo(x, yy).lineTo(x + w, yy).lineWidth(0.7).strokeColor('#555555').stroke().restore();
-  const sigRow = (sig, ts, leftLabel, printed) => {
-    const img = sigBuffer(sig);
-    if (img) { try { doc.image(img, M + 4, y, { fit: [200, 42] }); } catch { /* ignoré */ } }
-    if (ts) doc.font('Helvetica').fontSize(SIZE).fillColor(TEXT).text(longDate(isoDay(ts), lang), M + 300, y + 28);
-    y += 46;
-    line(M, y, 210);
-    line(M + 300, y, 180);
-    y += 5;
-    doc.font('Helvetica').fontSize(SIZE).fillColor(TEXT).text(leftLabel, M, y);
-    doc.text(O.date, M + 300, y);
-    if (printed) doc.font('Helvetica').fontSize(8.5).fillColor(MUTED).text(printed, M, y + 13);
-    y += 34;
-  };
-  sigRow(companySig, companySig && companySig.at, O.manager, companySig ? companySig.name : '');
-  f.st.y = y + 6;
-  f.para(O.ack, { size: SIZE, gap: 16 });
-  y = f.st.y;
-  sigRow(employeeSig, employeeSig && employeeSig.at, O.name, employeeSig ? employeeSig.name : name);
+  doc.rect(M, M, CW, 46).fill(INK);
+  doc.font('Helvetica-Bold').fontSize(14).fillColor('#ffffff').text(O.ackTitle, M, M + 10, { width: CW, align: 'center' });
+  doc.font('Helvetica').fontSize(8.5).fillColor('#fdba8c').text(O.ackSub, M, M + 29, { width: CW, align: 'center' });
+  f.st.y = M + 58;
+  doc.rect(M - 2, f.st.y, CW + 38, 1.6).fill(ORANGE);
+  f.st.y += 20;
+  f.para(O.ack, { size: SIZE, gap: 18 });
 
-  footer(doc, O.footer, name, () => {
-    const saved = doc.page.margins.top;
-    doc.page.margins.top = 0;
-    wordmark(doc, M, 22, 22, '#9ca3af');
-    doc.page.margins.top = saved;
-  });
+  // Le signataire pour Cluster : la personne qui a contresigné, sinon le gestionnaire du poste
+  // (nom imprimé dès l'envoi — demande de David, 2026-09-23). Son titre n'est repris que si
+  // c'est bien le gestionnaire du poste : on ne prête pas un titre à quelqu'un d'autre.
+  const companyName = companySig ? companySig.name : h.reportsToName;
+  const companyTitle = companyName === h.reportsToName ? managerTitle : '';
+  const cardW = (CW - 18) / 2;
+  const cardY = f.st.y;
+  const card = (x, role, fullName, subtitle, sig, ts) => {
+    const hC = 170;
+    doc.save().rect(x, cardY, cardW, hC).lineWidth(0.6).strokeColor('#e0e0e0').stroke().restore();
+    doc.rect(x, cardY, 1.8, hC).fill(ORANGE);
+    const ix = x + 12;
+    const iw = cardW - 24;
+    doc.font('Helvetica-Bold').fontSize(7).fillColor(ORANGE).text(role, ix, cardY + 12);
+    doc.font('Helvetica-Bold').fontSize(8.5).fillColor('#444444').text(O.fullName, ix, cardY + 30);
+    doc.font('Helvetica').fontSize(9).fillColor(TEXT).text(fullName || '', ix, cardY + 41, { width: iw });
+    if (subtitle) doc.font('Helvetica').fontSize(8).fillColor(MUTED).text(subtitle, ix, cardY + 53, { width: iw, lineBreak: false, ellipsis: true });
+    doc.save().moveTo(ix, cardY + 66).lineTo(ix + iw, cardY + 66).lineWidth(0.6).strokeColor('#bdbdbd').stroke().restore();
+    doc.font('Helvetica-Bold').fontSize(8.5).fillColor('#444444').text(O.signature, ix, cardY + 76);
+    const img = sigBuffer(sig);
+    if (img) { try { doc.image(img, ix + 58, cardY + 70, { fit: [iw - 62, 40] }); } catch { /* image illisible : case laissée vide */ } }
+    doc.save().moveTo(ix, cardY + 114).lineTo(ix + iw, cardY + 114).lineWidth(0.6).strokeColor('#bdbdbd').stroke().restore();
+    doc.font('Helvetica-Bold').fontSize(8.5).fillColor('#444444').text(O.date, ix, cardY + 124);
+    if (ts) doc.font('Helvetica').fontSize(9).fillColor(TEXT).text(longDate(isoDay(ts), lang), ix + 40, cardY + 124);
+    doc.save().moveTo(ix, cardY + 152).lineTo(ix + iw, cardY + 152).lineWidth(0.6).strokeColor('#bdbdbd').stroke().restore();
+  };
+  card(M, `CLUSTER SYSTEMS — ${O.manager.toUpperCase()}`, companyName, companyTitle, companySig, companySig && companySig.at);
+  card(M + cardW + 18, O.employee, employeeSig ? employeeSig.name : name, position, employeeSig, employeeSig && employeeSig.at);
+  f.st.y = cardY + 190;
+  f.para(O.confidentialNote, { size: 7.5, font: 'Helvetica-Oblique', color: MUTED, align: 'center' });
+
+  footer(doc, O.footer, (i, n) => `${name}   ·   ${O.page(i, n)}`);
   doc.end();
   return out;
 }

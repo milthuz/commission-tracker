@@ -355,12 +355,20 @@ const OFFER = {
     title: 'Offer of Employment', subject: 'Subject: Welcome to Cluster', dear: (n) => `Dear ${n},`,
     blank: '[Remainder of this page intentionally left blank. The next page is the signature page]',
     by: 'By:', manager: 'Manager', name: 'Name', date: 'Date', footer: '  |  Offer of Employment  |  Confidential',
+    confidential: 'Confidential', fields: ['CANDIDATE', 'POSITION', 'START DATE', 'REPORTS TO'],
+    ackTitle: 'Acceptance of the Offer', ackSub: 'Please read carefully before signing',
+    fullName: 'Full Name:', signature: 'Signature:', employee: 'EMPLOYEE', page: (i, n) => `Page ${i} of ${n}`,
+    confidentialNote: 'This document is confidential and intended solely for the named parties.',
   },
   fr: {
     intro: OFFER_INTRO_FR, clauses: OFFER_CLAUSES_FR, closing: OFFER_CLOSING_FR, ack: OFFER_ACK_FR, salaryExtra: offerSalaryExtraFr,
     title: 'Offre d’emploi', subject: 'Objet : Bienvenue chez Cluster', dear: (n) => `Bonjour ${n},`,
     blank: '[Le reste de cette page est laissé en blanc intentionnellement. La page suivante est la page de signature]',
     by: 'Par :', manager: 'Gestionnaire', name: 'Nom', date: 'Date', footer: '  |  Offre d’emploi  |  Confidentiel',
+    confidential: 'Confidentiel', fields: ['CANDIDAT(E)', 'POSTE', 'ENTRÉE EN FONCTION', 'RELÈVE DE'],
+    ackTitle: 'Acceptation de l’offre', ackSub: 'Veuillez lire attentivement avant de signer',
+    fullName: 'Nom complet :', signature: 'Signature :', employee: 'EMPLOYÉ(E)', page: (i, n) => `Page ${i} de ${n}`,
+    confidentialNote: 'Ce document est confidentiel et destiné uniquement aux parties nommées.',
   },
 };
 
