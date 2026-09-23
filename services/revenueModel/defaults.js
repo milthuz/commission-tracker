@@ -34,6 +34,15 @@ const DEFAULTS = Object.freeze({
   // que le vrai taux n'est pas saisi : un taux inventé fausserait le profit.
   interacCostPct: 0,
 
+  // Frais de traitement PAR EMPLACEMENT PAR MOIS, revenu ET coût (David, 2026-09-23). 0 tant que
+  // les vrais montants ne sont pas saisis.
+  aofRev: 0,   // Account on file
+  aofCost: 0,
+  pciRev: 0,   // PCI Fee
+  pciCost: 0,
+  bankRev: 0,  // Bank transfer
+  bankCost: 0,
+
   termRentalRev: 30,
   termWarrantyCost: 3.6, // 3,60 $ par terminal par mois (David, 2026-09-23 ; était 3,50 $)
   termUnitCost: 663,
@@ -43,6 +52,9 @@ const DEFAULTS = Object.freeze({
   hwCost: 2807.4,
   hwPrice: 4679,
   instPrice: 1650,
+  // Coût de l'installation par emplacement (David, 2026-09-23). Jusque-là l'installation était
+  // supposée refacturée au coût : on démarre donc au prix, pour ne rien changer d'emblée.
+  instCost: 1650,
 
   commSaasMonths: 1,
   commPayPerLoc: 100,
@@ -85,12 +97,16 @@ const BOUNDS = Object.freeze({
   creditCostPerTxn: [0, 100],
   interacCostPerTxn: [0, 100],
   interacCostPct: [0, 100],
+  aofRev: [0, 1e6], aofCost: [0, 1e6],
+  pciRev: [0, 1e6], pciCost: [0, 1e6],
+  bankRev: [0, 1e6], bankCost: [0, 1e6],
   termRentalRev: [0, 100000],
   termWarrantyCost: [0, 100000],
   termUnitCost: [0, 1e6],
   hwCost: [0, 1e7],
   hwPrice: [0, 1e7],
   instPrice: [0, 1e7],
+  instCost: [0, 1e7],
   commSaasMonths: [0, 120],
   commPayPerLoc: [0, 1e6],
   commHwPct: [0, 100],
@@ -100,13 +116,28 @@ const BOUNDS = Object.freeze({
 const MAX_NAME = 120;
 const BOUNDS_SAAS = BOUNDS.saasPerLoc;
 
-// Scénario d'avant le 2026-09-22 : une marge en % au lieu d'un prix d'achat. On en déduit le
-// prix d'achat qui donne EXACTEMENT la même marge, pour que le scénario se relise à l'identique.
+// Champs ajoutés le 2026-09-23 : un scénario plus ancien ne les a pas, et doit se relire EXACTEMENT
+// comme il a été enregistré — donc 0, et non la valeur par défaut du moment.
+const FEE_KEYS = ['aofRev', 'aofCost', 'pciRev', 'pciCost', 'bankRev', 'bankCost'];
+
+// Remet un scénario ancien au format courant, sans changer un seul de ses chiffres.
+// ⚠️ Même logique que upgradeInputs() de frontend/src/pages/RevenueModeler/model.ts : garder
+// les deux identiques.
 function upgradeInputs(raw) {
-  if (!raw || raw.hwCost != null || raw.hwMarginPct == null) return raw;
-  const price = raw.hwPrice == null ? DEFAULTS.hwPrice : Number(raw.hwPrice);
-  const { hwMarginPct, ...rest } = raw;
-  return { ...rest, hwCost: Math.round(price * (1 - Number(hwMarginPct) / 100) * 100) / 100 };
+  if (!raw || typeof raw !== 'object') return raw;
+  const out = { ...raw };
+  // Avant le 2026-09-22 : marge matériel en % au lieu d'un prix d'achat → le prix d'achat qui
+  // donne exactement la même marge.
+  if (out.hwCost == null && out.hwMarginPct != null) {
+    const price = out.hwPrice == null ? DEFAULTS.hwPrice : Number(out.hwPrice);
+    out.hwCost = Math.round(price * (1 - Number(out.hwMarginPct) / 100) * 100) / 100;
+  }
+  delete out.hwMarginPct;
+  // Avant le 2026-09-23 : installation refacturée au coût, donc coût = prix.
+  if (out.instCost == null && out.instPrice != null) out.instCost = Number(out.instPrice);
+  // Avant le 2026-09-23 : aucun frais de traitement par emplacement.
+  if (Object.keys(raw).length) for (const k of FEE_KEYS) if (out[k] == null) out[k] = 0;
+  return out;
 }
 
 // Rend { ok, inputs } ou { ok:false, field }. Seules les clefs connues passent : un champ
