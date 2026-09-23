@@ -35,7 +35,7 @@ const DEFAULTS = Object.freeze({
   interacCostPct: 0,
 
   termRentalRev: 30,
-  termWarrantyCost: 3.5,
+  termWarrantyCost: 3.6, // 3,60 $ par terminal par mois (David, 2026-09-23 ; était 3,50 $)
   termUnitCost: 663,
 
   // Matériel : prix d'ACHAT et prix de VENTE par emplacement ; la marge en découle.
