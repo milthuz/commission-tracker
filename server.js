@@ -29668,11 +29668,17 @@ function classifyLineType(name, sku, planCodes, planNames) {
   const n = normalizePlanName(name);
   // Non-commissionable: residuals, referral payouts, fees, and shipping earn nothing
   // (shipping excluded per user decision 2026-06-11 — old reports never paid on it).
-  if (/\b(residual|referral|fee|frais|shipping|livraison|freight)/.test(n)) return 'noncommission';
+  if (/\b(residual|referral|shipping|livraison|freight)/.test(n)) return 'noncommission';
+  // Un « fee » MENSUEL est un abonnement, pas un frais ponctuel : « Payment Processing
+  // Integration Fee - Monthly » est le même produit à 45 $/mois que « ... Custom - Monthly »,
+  // qui paie (décision de David, 2026-09-23). Les frais ponctuels (setup, pause, application,
+  // one time, frais de service) restent exclus.
+  if (/\b(fee|frais)/.test(n)) return /\b(monthly|mensuel)/.test(n) ? 'saas' : 'noncommission';
   // SaaS: matches a Zoho plan, OR a recurring software product/add-on by keyword.
   if (sku && planCodes.has(String(sku).toLowerCase().trim())) return 'saas';
   if (n && planNames.has(n)) return 'saas';
-  if (/integration|online ordering|qr table|delivery|bundle|cluster os|add-?on|saas/.test(n)) return 'saas';
+  // « api key » : « API Key Access (monthly) », 19 $/mois, tombait en matériel à 10 % (2026-09-23).
+  if (/integration|online ordering|qr table|delivery|bundle|cluster os|add-?on|saas|api key/.test(n)) return 'saas';
   // Everything else (POS, printers, terminals, installation/labor/shipping services) → hardware.
   return 'hardware';
 }
@@ -34517,6 +34523,7 @@ async function runRecalcV2(source = 'manual') {
       const dataFloor = (await pool.query(`SELECT MIN(date) AS d FROM invoices WHERE organization_id = $1`, [process.env.ZOHO_ORG_ID])).rows[0]?.d;
       const dataFloorTs = dataFloor ? new Date(dataFloor).getTime() : 0;
 
+      const ANNUAL_SAME_SALE_SLACK_MS = 45 * 24 * 3600 * 1000;
       const annualByInvoice = new Map(); // invoice id → { total, firstTotal }
       {
         const annualRows = (await pool.query(
@@ -34560,7 +34567,14 @@ async function runRecalcV2(source = 'manual') {
               // missed (it genuinely had a prior SaaS sale, correctly $0), and long-standing
               // customers (Gattusso, Bistro Arôme, Ches's) are no longer mistaken for new ones
               // just because our own synced invoice history doesn't reach back far enough.
-              hadPriorSaas = trueFirst < annualDate;
+              // La 1re facture Zoho d'un NOUVEAU client est presque toujours celle de
+              // l'installation, émise quelques jours avant l'abonnement : sans marge, aucun
+              // nouveau client annuel ne touchait plus le 10 % (Poke Monster Lasalle / St Joseph,
+              // 17 factures depuis mai). Une vente ≤ 45 jours avant l'annuel = la même vente
+              // initiale — même marge que l'activation mensuelle (INITIAL_GROUP_SLACK_MS). Un
+              // vieux client a sa 1re facture des mois ou des années avant : toujours 0 %
+              // (décision de David, 2026-09-23).
+              hadPriorSaas = trueFirst < annualDate - ANNUAL_SAME_SALE_SLACK_MS;
               preExistingSub = false;
             } else {
               // Fallback while backfillCustomerFirstSale works through the customer base — same
