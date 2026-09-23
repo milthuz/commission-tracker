@@ -227,6 +227,12 @@ const PERMISSION_CATALOG = [
   // (réseau, achat de terminaux, marge matériel) — ne pas l'accorder à un rôle externe.
   { key: 'revmodel:use',               label: 'Use the Revenue Modeler (3-year merchant P&L — shows Cluster network, terminal and hardware costs)', category: 'Revenue Modeler' },
   // Changer les paliers SaaS les change pour tous les usagers du modélisateur.
+  // RH : embauche d'un représentant (offre d'emploi + entente de rémunération + signature).
+  // Données sensibles (salaire, adresse) : la simple consultation a sa propre clé.
+  { key: 'hr:view',                    label: 'HR — view hiring files, offers and signed contracts (salary, personal info)', category: 'HR' },
+  { key: 'hr:manage',                  label: 'HR — create hiring files, generate contracts and send them for signature', category: 'HR' },
+  // Signer AU NOM de Cluster engage l'entreprise : clé distincte de la préparation du dossier.
+  { key: 'hr:countersign',             label: 'HR — countersign contracts on behalf of Cluster', category: 'HR' },
   { key: 'revmodel:settings',          label: 'Edit the Revenue Modeler SaaS tiers (the three default prices, applied to everyone)', category: 'Revenue Modeler' },
 ];
 
@@ -3818,6 +3824,14 @@ require('./services/icplus/routes').registerIcplusRoutes(app, {
   authenticateToken, requirePerm, hasPerm, pool, logActivity, getAnthropic,
 });
 
+// RH — embauche : offre d'emploi, entente de rémunération, signature électronique. Tout vit
+// sous services/hr/. Le plan par défaut de l'entente est lu dans le MOTEUR de commissions.
+require('./services/hr/routes').registerHrRoutes(app, {
+  authenticateToken, requirePerm, hasPerm, pool, logActivity,
+  sendMail: (...a) => sendMail(...a), mailShell: (...a) => mailShell(...a), rateLimited: (...a) => rateLimited(...a),
+  engine: () => ({ monthlyQuota: MONTHLY_QUOTA, monthlyTiers: MONTHLY_BONUS_TIERS, annualTiers: ANNUAL_BONUS_TIERS }),
+});
+
 // Modélisateur de revenus (P&L 3 ans d'un marchand) — tout vit sous services/revenueModel/.
 require('./services/revenueModel/routes').registerRevenueModelRoutes(app, {
   authenticateToken, requirePerm, hasPerm, pool, logActivity,
@@ -4544,7 +4558,7 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // sampleEmail(), dans TEMPLATE_TYPES de EmailPreview.tsx, et dans les libellés i18n.
 // Les quatre `pass_*` sont les courriels du programme La Passe ; ils sont les seuls de la
 // liste à partir d'une adresse et d'une enveloppe qui ne sont pas celles de Sales Hub.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder', 'lead_review', 'lead_assigned', 'lead_welcome', 'partner_lead_assigned'];
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder', 'lead_review', 'lead_assigned', 'lead_welcome', 'partner_lead_assigned', 'hr_sign_request', 'hr_countersign', 'hr_completed', 'hr_declined'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -4552,6 +4566,17 @@ function sampleEmail(type, lang) {
   // Les courriels de La Passe passent par leur VRAI constructeur, avec un membre fictif :
   // un aperçu qui recopierait le gabarit à côté finirait par montrer autre chose que ce
   // qui part réellement, ce qui est exactement le contraire du but d'un outil d'aperçu.
+  // RH : les vrais constructeurs de services/hr/emails.js, avec un candidat fictif.
+  if (type.startsWith('hr_')) {
+    const HRE = require('./services/hr/emails');
+    const fr = isFrLocale(lang);
+    const link = `${base}/hr`;
+    if (type === 'hr_sign_request') return HRE.signRequestEmail(mailShell, { firstName: 'Julie', position: fr ? 'Représentant(e) des ventes' : 'Sales Representative', link: `${base}/sign?token=exemple`, expiresDays: 14, lang: fr ? 'fr' : 'en' });
+    if (type === 'hr_countersign') return HRE.countersignEmail(mailShell, { name: 'Julie Tremblay', position: 'Sales Representative', link });
+    if (type === 'hr_declined') return HRE.declinedEmail(mailShell, { name: 'Julie Tremblay', reason: fr ? 'J’ai accepté une autre offre.' : 'I accepted another offer.', link });
+    return HRE.completedEmployeeEmail(mailShell, { firstName: 'Julie', lang: fr ? 'fr' : 'en', startDate: fr ? '5 octobre 2026' : 'October 5, 2026' });
+  }
+
   if (type.startsWith('pass_')) {
     const key = type.slice(5);
     const locale = passLocale(lang);
@@ -10617,6 +10642,7 @@ THE APP'S SECTIONS (left sidebar):
 - SaaS price increase — Référence hausse SaaS (/saas-increase/lookup): the support desk's reference when a merchant calls about their bill going up. An agent searches one account by name, subscription number or merchant account id and reads back the old price, the new price, the effective date, and the exact notice that merchant received.
   ⚠️ RULE THAT OVERRIDES EVERYTHING ELSE ABOUT PRICES. Cluster is raising SaaS prices on existing subscriptions. Each increase takes effect at THAT subscription's own next renewal, never on a single shared date. When anyone asks what a specific merchant pays now or will pay, you MUST call the saas_price_lookup tool and report only what it returns. You must NEVER answer from the Services & Pricing Guide: that guide is a CATALOGUE of list prices, and a merchant's bill is not the catalogue. Quoting it to someone on the phone with a customer would commit Cluster to a price nobody agreed to. If the tool finds nothing, or you do not have access to it, say plainly that you cannot see that merchant's change and that the agent should check Référence hausse SaaS or escalate — never estimate, never interpolate, never reason from the plan name.
 - The Pass (La Passe): the merchant referral program. A merchant refers another merchant; the credit is floored when the referral is submitted, capped at the tier when the new merchant goes live, then the final amount is confirmed by hand (its own permission) before accounting is notified.
+- Hiring (Embauches / HR, /hr): HR prepares a new sales rep's hiring file (candidate, position, start date, salary, allowances, and the commission plan, pre-filled from the plan the commission engine actually pays). Sales Hub generates two documents from it: Cluster's offer of employment (English legal template) and the v7.7 Compensation Agreement (English or French), plus optional PDF attachments. "Send for signature" emails the candidate a personal 14-day link where they read and sign on screen; then someone with the countersign permission signs for Cluster, and the fully signed package (with a signature certificate) is emailed to both sides. A sent file is locked — to change it, cancel and duplicate. Once signed, HR can create the rep in Sales Hub (hire date → 90-day ramp, base salary, login email). Salary data is sensitive: only the HR permissions (hr:view / hr:manage / hr:countersign, bundled in the "RH" role) show this section.
 - What each user sees depends on their permissions — some sections may not be visible to everyone.
 
 THE COMMISSION MODEL:
