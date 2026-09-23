@@ -28,6 +28,7 @@
 const crypto = require('crypto');
 const multer = require('multer');
 const P = require('./plan');
+const EMP = require('./employers');
 const R = require('./pdf');
 const E = require('./emails');
 
@@ -53,7 +54,9 @@ const docLang = (hire) => (hire.agreementLang === 'fr' ? 'fr' : 'en');
 function docKeys(hire) {
   const withAgreement = hire.includeAgreement !== false;
   const keys = ['offer', ...(withAgreement ? ['agreement'] : [])];
-  if (docLang(hire) === 'en') keys.push('offer-fr', ...(withAgreement ? ['agreement-fr'] : []));
+  // Versions françaises de référence : dossier en anglais ET case « remettre aussi le français »
+  // cochée (par défaut).
+  if (docLang(hire) === 'en' && hire.includeFrReference !== false) keys.push('offer-fr', ...(withAgreement ? ['agreement-fr'] : []));
   return keys;
 }
 function renderDoc(key, snap, sigs = {}) {
@@ -258,7 +261,11 @@ function registerHrRoutes(app, deps) {
     };
   }
 
-  const snapOf = (row) => row.snapshot || { hire: row.data, terms: row.terms, plan: row.plan };
+  const snapOf = async (row) => row.snapshot
+    || { hire: row.data, terms: row.terms, plan: row.plan, employer: await EMP.getEmployer(pool, row.data.employer) };
+  // Adresse publique de l'API, pour le logo de l'employeur dans les courriels au candidat.
+  const apiBase = (req) => process.env.PUBLIC_API_URL || `https://${req.get('host')}`;
+  const logoUrl = (req, emp) => (emp && emp.logo ? `${apiBase(req)}/api/public/hr-employer-logo/${emp.key}?v=${sha256(emp.logo).slice(0, 10)}` : null);
 
   // -------------------------------------------------------------------------
   // Méta + liste
@@ -269,6 +276,7 @@ function registerHrRoutes(app, deps) {
       defaults: defaults(),
       terms: P.BASE_TERMS,
       managers: await readManagers(),
+      employers: (await EMP.readEmployers(pool)).map(EMP.publicShape),
       can: { manage: await can(req, PERM_MANAGE), countersign: await can(req, PERM_SIGN) },
     });
   });
@@ -306,7 +314,9 @@ function registerHrRoutes(app, deps) {
       if (!name) continue;
       if (seen.has(name.toLowerCase())) return res.status(400).json({ error: `duplicate: ${name}` });
       seen.add(name.toLowerCase());
-      clean.push({ name, titleEn: String(m?.titleEn || '').trim().slice(0, 120), titleFr: String(m?.titleFr || '').trim().slice(0, 120) });
+      const email = String(m?.email || '').trim().toLowerCase().slice(0, 200);
+      if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: `invalid email: ${name}` });
+      clean.push({ name, titleEn: String(m?.titleEn || '').trim().slice(0, 120), titleFr: String(m?.titleFr || '').trim().slice(0, 120), email });
     }
     try {
       await pool.query(
@@ -494,7 +504,7 @@ function registerHrRoutes(app, deps) {
         const r = await pool.query(`SELECT ${d.col} AS pdf FROM hr_hires WHERE id = $1`, [row.id]);
         if (r.rows[0] && r.rows[0].pdf) return sendPdf(res, r.rows[0].pdf, docFile(doc, row.data, fb));
       }
-      sendPdf(res, await renderDoc(doc, snapOf(row)), docFile(doc, row.data, fb));
+      sendPdf(res, await renderDoc(doc, await snapOf(row)), docFile(doc, row.data, fb));
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
@@ -506,10 +516,11 @@ function registerHrRoutes(app, deps) {
     return { raw, hash: sha256(raw), expires: new Date(Date.now() + TOKEN_DAYS * 86400000) };
   }
 
-  async function mailCandidate(row, snap, rawToken) {
+  async function mailCandidate(req, row, snap, rawToken) {
     const link = `${base()}/sign?token=${encodeURIComponent(rawToken)}`;
+    const emp = snap.employer || EMP.CLUSTER;
     const m = E.signRequestEmail(mailShell, {
-      firstName: snap.hire.firstName, ...positions(snap.hire), link, expiresDays: TOKEN_DAYS,
+      firstName: snap.hire.firstName, ...positions(snap.hire), link, expiresDays: TOKEN_DAYS, employer: emp, logoUrl: logoUrl(req, emp),
     });
     const r = await sendMail(snap.hire.email, m.subject, m.html);
     return { link, mail: r };
@@ -527,6 +538,7 @@ function registerHrRoutes(app, deps) {
         ref: refOf(row.ref_no),
         hire: row.data, terms: row.terms, plan: row.plan,
         attachments: att.map((a) => ({ id: a.id, filename: a.filename, sha256: a.sha256 })),
+        employer: await EMP.getEmployer(pool, row.data.employer),
       };
       // Documents rendus UNE fois et figés. Dossier en anglais → la version française des mêmes
       // documents est aussi rendue et présentée (référence, non signée) : un contrat d'adhésion
@@ -549,7 +561,7 @@ function registerHrRoutes(app, deps) {
           bufs['offer-fr'] || null, bufs['agreement-fr'] || null],
       );
       if (!upd.rows[0]) return res.status(409).json({ error: 'Already sent' });
-      const out = await mailCandidate(row, snap, tok.raw);
+      const out = await mailCandidate(req, row, snap, tok.raw);
       await event(row.id, 'sent', req.user.email, null, { to: row.email, emailed: out.mail.sent, reason: out.mail.reason || null });
       await audit(row.id, 'sent', `Offer sent for signature: ${row.full_name}`, req.user.email);
       // Le lien n'est rendu que si le courriel n'est pas parti : l'employé RH peut alors le
@@ -567,7 +579,7 @@ function registerHrRoutes(app, deps) {
       if (!['sent', 'viewed'].includes(row.status)) return res.status(409).json({ error: 'Nothing to resend' });
       const tok = newToken();
       await pool.query(`UPDATE hr_hires SET token_hash = $2, token_expires_at = $3, updated_at = NOW() WHERE id = $1`, [row.id, tok.hash, tok.expires]);
-      const out = await mailCandidate(row, snapOf(row), tok.raw);
+      const out = await mailCandidate(req, row, await snapOf(row), tok.raw);
       await event(row.id, 'resent', req.user.email, null, { to: row.email, emailed: out.mail.sent });
       res.json({ ...(await shapeDetail(await loadHire(row.id))), emailed: out.mail.sent, link: out.mail.sent ? null : out.link });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -609,7 +621,7 @@ function registerHrRoutes(app, deps) {
     add('agreement', r.doc_hashes.agreementFr, 'FR, reference copy presented / version de référence remise');
     for (const a of att) documents.push({ title: a.filename, sha256: a.sha256 });
     const cert = await R.renderCertificate({
-      ref: refOf(r.ref_no), name: r.full_name, documents,
+      ref: refOf(r.ref_no), name: r.full_name, documents, employer: snap.employer || EMP.CLUSTER,
       sentAt: r.sent_at, viewedAt: r.viewed_at,
       employee: { name: r.full_name, email: r.email, at: r.employee_sig.at, typedName: r.employee_sig.name, ip: r.employee_sig.ip, ua: r.employee_sig.ua },
       company: { name: r.company_sig.name, email: r.company_sig.email, at: r.company_sig.at, ip: r.company_sig.ip },
@@ -641,16 +653,24 @@ function registerHrRoutes(app, deps) {
 
       // Copies signées : au candidat et aux destinataires internes.
       const snap = row.snapshot;
-      const attachment = [{ filename: `Cluster_Signed_${fileBase(row)}.pdf`, content: pdf, contentType: 'application/pdf' }];
+      const emp = snap.employer || EMP.CLUSTER;
+      const attachment = [{ filename: `${emp.shortName.replace(/[^\w-]/g, '')}_Signed_${fileBase(row)}.pdf`, content: pdf, contentType: 'application/pdf' }];
       const dates = { startDateFr: R.longDate(snap.hire.startDate, 'fr'), startDateEn: R.longDate(snap.hire.startDate, 'en') };
-      const me = E.completedEmployeeEmail(mailShell, { firstName: snap.hire.firstName, ...dates });
+      const me = E.completedEmployeeEmail(mailShell, { firstName: snap.hire.firstName, ...dates, employer: emp, logoUrl: logoUrl(req, emp) });
       const toEmp = await sendMail(row.email, me.subject, me.html, { attachments: attachment });
       const mi = E.completedInternalEmail(mailShell, {
         name: row.full_name, ...positions(snap.hire), ...dates, link: `${base()}/hr?id=${row.id}`,
       });
-      const to = await internalTo(row);
+      // Copie du dossier signé : avis RH + gestionnaire du poste (son courriel dans Admin → RH) +
+      // liste « Toujours en copie du dossier signé » (ex. Jen) — demande de Gabriela, 2026-09-23.
+      const cc = new Set(await internalTo(row));
+      const mgr = (await readManagers()).find((m) => m.name === snap.hire.reportsToName);
+      if (mgr && mgr.email) cc.add(mgr.email.toLowerCase());
+      for (const e of await readSignedCc()) cc.add(e.toLowerCase());
+      cc.delete(String(row.email).toLowerCase());
+      const to = [...cc];
       if (to.length) await sendMail(to.join(','), mi.subject, mi.html, { attachments: attachment });
-      await event(row.id, 'copies_sent', 'system', null, { employee: toEmp.sent, internal: to.length });
+      await event(row.id, 'copies_sent', 'system', null, { employee: toEmp.sent, internal: to.length, to });
       res.json({ ...(await shapeDetail(await loadHire(row.id))), emailed: toEmp.sent });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
@@ -719,6 +739,66 @@ function registerHrRoutes(app, deps) {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
+  // -------------------------------------------------------------------------
+  // Employeurs (Admin → RH) — Cluster intégré + employeurs ajoutés (OSP…)
+  // -------------------------------------------------------------------------
+  app.get('/api/hr/employers', authenticateToken, async (req, res) => {
+    if (!(await can(req, PERM_VIEW)) && !(await can(req, PERM_MANAGE))) return res.status(403).json({ error: 'Permission required: hr:view' });
+    res.json({ employers: (await EMP.readEmployers(pool)).map(EMP.publicShape) });
+  });
+  app.put('/api/hr/employers', authenticateToken, async (req, res) => {
+    if (!(await requirePerm(req, res, PERM_MANAGE))) return;
+    const v = EMP.validateCustom(req.body?.employers, await EMP.readCustom(pool));
+    if (!v.ok) return res.status(400).json({ error: v.error });
+    try {
+      await pool.query(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES ($1, $2::jsonb, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+        [EMP.KEY, JSON.stringify(v.list)],
+      );
+      await audit('employers', 'updated', `HR employers updated: ${v.list.map((e) => e.shortName).join(', ') || '(none)'}`, req.user.email);
+      res.json({ employers: (await EMP.readEmployers(pool)).map(EMP.publicShape) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+  // Logo PUBLIC (courriels au candidat, page de signature) : une image de marque n'a rien de secret.
+  app.get('/api/public/hr-employer-logo/:key', async (req, res) => {
+    const emp = await EMP.getEmployer(pool, String(req.params.key || ''));
+    const logo = EMP.logoBuffer(emp);
+    if (!logo || emp.key !== req.params.key) return res.status(404).end();
+    res.setHeader('Content-Type', logo.type);
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.send(logo.buf);
+  });
+
+  // Liste « Toujours en copie du dossier signé » (ex. Jen) — Admin → RH.
+  const SIGNED_CC_KEY = 'hr_signed_cc';
+  async function readSignedCc() {
+    try {
+      const r = await pool.query('SELECT value FROM app_settings WHERE key = $1', [SIGNED_CC_KEY]);
+      let v = r.rows[0] ? r.rows[0].value : [];
+      if (typeof v === 'string') v = JSON.parse(v);
+      return Array.isArray(v) ? v : [];
+    } catch { return []; }
+  }
+  app.get('/api/hr/signed-cc', authenticateToken, async (req, res) => {
+    if (!(await requirePerm(req, res, PERM_MANAGE))) return;
+    res.json({ recipients: await readSignedCc() });
+  });
+  app.put('/api/hr/signed-cc', authenticateToken, async (req, res) => {
+    if (!(await requirePerm(req, res, PERM_MANAGE))) return;
+    const emails = Array.isArray(req.body?.emails) ? req.body.emails.map((e) => String(e).trim().toLowerCase()).filter(Boolean) : null;
+    if (!emails || emails.length > 30) return res.status(400).json({ error: 'emails array required' });
+    if (emails.some((e) => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e))) return res.status(400).json({ error: 'invalid email' });
+    try {
+      await pool.query(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES ($1, $2::jsonb, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+        [SIGNED_CC_KEY, JSON.stringify([...new Set(emails)])],
+      );
+      res.json({ recipients: [...new Set(emails)] });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
   // =========================================================================
   // PUBLIC — page de signature du candidat (/sign?token=…). Aucune session : le jeton EST
   // l'autorisation. Limité en débit par adresse.
@@ -767,6 +847,7 @@ function registerHrRoutes(app, deps) {
         firstName: s.hire.firstName,
         name: row.full_name,
         ...positions(s.hire),
+        employer: EMP.publicShape(s.employer || EMP.CLUSTER),
         startDate: s.hire.startDate,
         lang: s.hire.agreementLang,
         documents: publicDocs(row),
@@ -820,7 +901,7 @@ function registerHrRoutes(app, deps) {
       await audit(row.id, 'employee_signed', `Employee signed: ${row.full_name}`, row.email);
       const to = await internalTo({ created_by: upd.rows[0].created_by });
       if (to.length) {
-        const m = E.countersignEmail(mailShell, { name: row.full_name, ...positions(row.snapshot.hire), link: `${base()}/hr?id=${row.id}` });
+        const m = E.countersignEmail(mailShell, { name: row.full_name, ...positions(row.snapshot.hire), employer: row.snapshot.employer, link: `${base()}/hr?id=${row.id}` });
         await sendMail(to.join(','), m.subject, m.html);
       }
       res.json({ ok: true });

@@ -166,6 +166,11 @@ function normalizeHire(body, defaults) {
     annualSalary: num(b.annualSalary, { min: 0, max: 10000000 }),
     agreementLang: b.agreementLang === 'fr' ? 'fr' : 'en',
     includeAgreement: b.includeAgreement !== false,
+    // Dossier en anglais : remettre AUSSI la version française (Charte, art. 55). Cochée par défaut
+    // (décision de David, 2026-09-23) ; les RH la décochent quand le candidat a choisi l'anglais.
+    includeFrReference: b.includeFrReference !== false,
+    // Employeur du contrat (Cluster, OSP…) — voir employers.js. Vérifié contre la liste à l'envoi.
+    employer: /^[a-z0-9-]{1,40}$/.test(String(b.employer || '')) ? String(b.employer) : 'cluster',
     notes: str(b.notes, 4000),
   };
   if (!hire.firstName) errors.push('firstName');

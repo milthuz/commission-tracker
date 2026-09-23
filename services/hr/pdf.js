@@ -17,6 +17,7 @@
 const PDFDocument = require('pdfkit');
 const { PDFDocument: LibDoc } = require('pdf-lib');
 const T = require('./text');
+const EMP = require('./employers');
 
 const INK = '#1f1f1f';
 const TEXT = '#222222';
@@ -87,10 +88,10 @@ function collect(doc) {
   });
 }
 
-function newDoc(title) {
+function newDoc(title, author = 'Cluster Systems') {
   return new PDFDocument({
     size: 'LETTER', margins: { top: M, bottom: H - BOTTOM, left: M, right: M }, bufferPages: true,
-    info: { Title: title, Author: 'Cluster Systems', Producer: 'Sales Hub' },
+    info: { Title: title, Author: author, Producer: 'Sales Hub' },
   });
 }
 
@@ -101,10 +102,23 @@ function wordmark(doc, x, y, size, rest) {
     .fillColor(rest).text('luster', { lineBreak: false });
 }
 
+function brandMark(doc, emp, x, y, maxW) {
+  if (!emp || emp.key === 'cluster') { wordmark(doc, x, y + 2, 26, '#ffffff'); return; }
+  const logo = EMP.logoBuffer(emp);
+  if (logo) {
+    try {
+      doc.save().roundedRect(x - 6, y - 4, maxW + 12, 36, 4).fill('#ffffff').restore();
+      doc.image(logo.buf, x, y - 1, { fit: [maxW, 30], align: 'left', valign: 'center' });
+      return;
+    } catch { /* logo illisible : on retombe sur le nom */ }
+  }
+  doc.font('Helvetica-Bold').fontSize(20).fillColor('#ffffff').text(emp.shortName, x, y + 4, { width: maxW, lineBreak: false, ellipsis: true });
+}
+
 // En-têtes et pieds dessinés APRÈS coup, page par page (bufferPages). Les dessiner sur
 // l'événement pageAdded dérègle la police et la position d'un paragraphe `continued` coupé
 // par le saut de page — c'est ce qui chevauchait le texte de l'offre.
-function footer(doc, left, right, header) {
+function footer(doc, left, right, header, emp) {
   const range = doc.bufferedPageRange();
   for (let i = range.start; i < range.start + range.count; i++) {
     doc.switchToPage(i);
@@ -113,8 +127,13 @@ function footer(doc, left, right, header) {
     doc.save().moveTo(M, y - 6).lineTo(W - M, y - 6).lineWidth(0.5).strokeColor('#e5e5e5').stroke().restore();
     const saved = doc.page.margins.bottom;
     doc.page.margins.bottom = 0;
-    doc.font('Helvetica-Bold').fontSize(8).fillColor(ORANGE).text('c', M, y, { lineBreak: false, continued: true })
-      .font('Helvetica').fillColor(MUTED).text(`luster${left}`, { lineBreak: false, width: CW - 160 });
+    if (emp && emp.key !== 'cluster') {
+      doc.font('Helvetica-Bold').fontSize(8).fillColor(ORANGE).text(emp.shortName, M, y, { lineBreak: false, continued: true })
+        .font('Helvetica').fillColor(MUTED).text(EMP.applyEmployer(left, emp), { lineBreak: false, width: CW - 160 });
+    } else {
+      doc.font('Helvetica-Bold').fontSize(8).fillColor(ORANGE).text('c', M, y, { lineBreak: false, continued: true })
+        .font('Helvetica').fillColor(MUTED).text(`luster${left}`, { lineBreak: false, width: CW - 160 });
+    }
     const r = typeof right === 'function' ? right(i - range.start + 1, range.count) : right;
     if (r) doc.font('Helvetica').fontSize(8).fillColor(MUTED).text(r, W - M - 220, y, { width: 220, align: 'right', lineBreak: false });
     doc.page.margins.bottom = saved;
@@ -178,11 +197,12 @@ async function renderAgreement(snap, { employeeSig = null, companySig = null, la
   const p = snap.plan;
   const name = `${snap.hire.firstName} ${snap.hire.lastName}`;
   const position = lang === 'fr' ? snap.hire.positionFr : snap.hire.position;
+  const emp = snap.employer || EMP.CLUSTER;
   const m = (n) => money(n, lang);
   const pc = (n) => pct(n, lang);
   const n = (v) => numTxt(v, lang);
 
-  const doc = newDoc(`${L.docType} — ${name}`);
+  const doc = newDoc(`${L.docType} — ${name}`, emp.legalName);
   const out = collect(doc);
   const f = flow(doc);
 
@@ -190,8 +210,8 @@ async function renderAgreement(snap, { employeeSig = null, companySig = null, la
   const bandH = 64;
   doc.rect(M, M, CW, bandH).fill(INK);
   doc.rect(M + CW * 0.34, M, CW * 0.66, bandH).fill('#262626');
-  wordmark(doc, M + 16, M + 12, 26, '#ffffff');
-  doc.font('Helvetica').fontSize(7.5).fillColor('#a3a3a3').text('clustersystems.com', M + 16, M + 44, { lineBreak: false });
+  brandMark(doc, emp, M + 16, M + 10, CW * 0.3);
+  doc.font('Helvetica').fontSize(7.5).fillColor('#a3a3a3').text(emp.website || '', M + 16, M + 48, { lineBreak: false });
   doc.font('Helvetica-Bold').fontSize(13).fillColor('#ffffff').text(position, M, M + 11, { width: CW - 16, align: 'right' });
   doc.font('Helvetica-Bold').fontSize(13).fillColor(ORANGE).text(L.docType, M, M + 28, { width: CW - 16, align: 'right' });
   doc.font('Helvetica').fontSize(8).fillColor('#e5e5e5').text(L.version(p.version), M, M + 46, { width: CW - 16, align: 'right' });
@@ -212,7 +232,7 @@ async function renderAgreement(snap, { employeeSig = null, companySig = null, la
   f.st.y += 66;
 
   f.para(L.agreementLabel, { size: 8.5, font: 'Helvetica-Bold', color: ORANGE, gap: 3 });
-  f.para(L.agreement(name, position), { gap: 3 });
+  f.para(EMP.applyEmployer(L.agreement(name, position), emp), { gap: 3 });
   f.para(L.agreementNote, { font: 'Helvetica-Oblique', color: '#555555', gap: 14 });
 
   let sec = 0;
@@ -340,7 +360,7 @@ async function renderAgreement(snap, { employeeSig = null, companySig = null, la
   f.st.y = cardY + 168;
   f.para(L.confidential, { size: 7.5, font: 'Helvetica-Oblique', color: MUTED, align: 'center' });
 
-  footer(doc, L.footer(position, p.version), (i, n) => `${name}   ·   ${i} / ${n}`);
+  footer(doc, L.footer(position, p.version), (i, n) => `${name}   ·   ${i} / ${n}`, null, emp);
   doc.end();
   return out;
 }
@@ -370,9 +390,11 @@ async function renderOffer(snap, { employeeSig = null, companySig = null, lang: 
     position,
     salaryExtra: O.salaryExtra(snap.terms, m),
   };
-  const fill = (s) => s.replace(/\{(\w+)\}/g, (_, k) => (vars[k] != null ? vars[k] : ''));
+  const emp = snap.employer || EMP.CLUSTER;
+  // Variables d'abord, puis l'employeur (« Cluster » → nom court, « Cluster Systems » → nom légal).
+  const fill = (s) => EMP.applyEmployer(s.replace(/\{(\w+)\}/g, (_, k) => (vars[k] != null ? vars[k] : '')), emp);
 
-  const doc = newDoc(`${O.title} — ${name}`);
+  const doc = newDoc(`${O.title} — ${name}`, emp.legalName);
   const out = collect(doc);
   const f = flow(doc);
   const SIZE = 9.8;
@@ -382,8 +404,8 @@ async function renderOffer(snap, { employeeSig = null, companySig = null, lang: 
   const bandH = 64;
   doc.rect(M, M, CW, bandH).fill(INK);
   doc.rect(M + CW * 0.34, M, CW * 0.66, bandH).fill('#262626');
-  wordmark(doc, M + 16, M + 12, 26, '#ffffff');
-  doc.font('Helvetica').fontSize(7.5).fillColor('#a3a3a3').text('clustersystems.com', M + 16, M + 44, { lineBreak: false });
+  brandMark(doc, emp, M + 16, M + 10, CW * 0.3);
+  doc.font('Helvetica').fontSize(7.5).fillColor('#a3a3a3').text(emp.website || '', M + 16, M + 48, { lineBreak: false });
   doc.font('Helvetica-Bold').fontSize(13).fillColor('#ffffff').text(O.title, M, M + 11, { width: CW - 16, align: 'right' });
   doc.font('Helvetica-Bold').fontSize(13).fillColor(ORANGE).text(position, M, M + 28, { width: CW - 16, align: 'right' });
   doc.font('Helvetica').fontSize(8).fillColor('#e5e5e5').text(O.confidential, M, M + 46, { width: CW - 16, align: 'right' });
@@ -418,7 +440,7 @@ async function renderOffer(snap, { employeeSig = null, companySig = null, lang: 
     ay += 13;
   }
   f.st.y = ay + 12;
-  f.para(O.subject, { size: SIZE + 0.5, font: 'Helvetica-Bold', gap: 12 });
+  f.para(fill(O.subject), { size: SIZE + 0.5, font: 'Helvetica-Bold', gap: 12 });
   f.para(O.dear(h.firstName), { size: SIZE, gap: GAP + 2 });
   for (const p of O.intro) f.para(fill(p), { size: SIZE, gap: GAP + 2 });
   f.st.y += 6;
@@ -467,10 +489,10 @@ async function renderOffer(snap, { employeeSig = null, companySig = null, lang: 
   f.st.y += 4;
   doc.font('Helvetica').fontSize(SIZE);
   f.ensure(O.closing.reduce((a, p) => a + doc.heightOfString(p, { width: CW, lineGap: 1.5 }) + GAP + 2, 0) + 70);
-  for (const p of O.closing) f.para(p, { size: SIZE, gap: GAP + 2 });
+  for (const p of O.closing) f.para(fill(p), { size: SIZE, gap: GAP + 2 });
   f.para(h.reportsToName, { size: SIZE, font: 'Helvetica-Bold', gap: 1 });
   if (managerTitle) f.para(managerTitle, { size: SIZE, color: MUTED, gap: 1 });
-  f.para('Cluster Systems', { size: SIZE, color: MUTED, gap: 12 });
+  f.para(emp.legalName, { size: SIZE, color: MUTED, gap: 12 });
   f.para(O.blank, { size: 8.5, font: 'Helvetica-Oblique', color: MUTED, align: 'center' });
 
   // --- Page d'acceptation ---
@@ -509,12 +531,12 @@ async function renderOffer(snap, { employeeSig = null, companySig = null, lang: 
     if (ts) doc.font('Helvetica').fontSize(9).fillColor(TEXT).text(longDate(isoDay(ts), lang), ix + 40, cardY + 124);
     doc.save().moveTo(ix, cardY + 152).lineTo(ix + iw, cardY + 152).lineWidth(0.6).strokeColor('#bdbdbd').stroke().restore();
   };
-  card(M, `CLUSTER SYSTEMS — ${O.manager.toUpperCase()}`, companyName, companyTitle, companySig, companySig && companySig.at);
+  card(M, `${emp.legalName.toUpperCase()} — ${O.manager.toUpperCase()}`, companyName, companyTitle, companySig, companySig && companySig.at);
   card(M + cardW + 18, O.employee, employeeSig ? employeeSig.name : name, position, employeeSig, employeeSig && employeeSig.at);
   f.st.y = cardY + 190;
   f.para(O.confidentialNote, { size: 7.5, font: 'Helvetica-Oblique', color: MUTED, align: 'center' });
 
-  footer(doc, O.footer, (i, n) => `${name}   ·   ${O.page(i, n)}`);
+  footer(doc, O.footer, (i, n) => `${name}   ·   ${O.page(i, n)}`, null, emp);
   doc.end();
   return out;
 }
@@ -554,14 +576,14 @@ async function renderCertificate(info) {
   kv('IP address / Adresse IP', info.employee.ip);
   kv('Browser / Navigateur', info.employee.ua);
   kv('Consent / Consentement', 'Agreed to sign electronically / A consenti à signer électroniquement');
-  head('Cluster Systems');
+  head(info.employer ? info.employer.legalName : 'Cluster Systems');
   kv('Name / Nom', info.company.name);
   kv('Sales Hub account / Compte', info.company.email);
   kv('Countersigned / Contresigné', stamp(info.company.at, 'en'));
   kv('IP address / Adresse IP', info.company.ip);
   f.st.y += 14;
   f.para('The employee accessed the documents through a single-use link sent to the email address above, reviewed them, consented to sign electronically and applied a handwritten signature. The fingerprints (SHA-256) identify the exact unsigned documents that were presented. / L\'employé(e) a accédé aux documents par un lien à usage unique envoyé à l\'adresse ci-dessus, les a consultés, a consenti à signer électroniquement et y a apposé une signature manuscrite. Les empreintes (SHA-256) identifient les documents exacts présentés avant signature.', { size: 8.5, color: MUTED });
-  footer(doc, '  |  Certificate of Completion', info.name);
+  footer(doc, '  |  Certificate of Completion', info.name, null, info.employer);
   doc.end();
   return out;
 }
