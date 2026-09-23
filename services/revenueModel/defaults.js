@@ -45,6 +45,8 @@ const DEFAULTS = Object.freeze({
   commPayPerLoc: 100,
   commHwPct: 10,
   commInstPct: 10,
+  // Bonus de signature versé au vendeur : montant unique pour le deal, facultatif (0 = aucun).
+  signupBonus: 0,
 });
 
 // Les trois paliers SaaS (pastilles + tableau de comparaison Bas / Base / Haut). Valeurs de
@@ -91,6 +93,7 @@ const BOUNDS = Object.freeze({
   commPayPerLoc: [0, 1e6],
   commHwPct: [0, 100],
   commInstPct: [0, 100],
+  signupBonus: [0, 1e7],
 });
 
 const MAX_NAME = 120;
