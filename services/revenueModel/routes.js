@@ -47,11 +47,21 @@ async function ensureSchema(pool) {
       ON revenue_model_scenarios (LOWER(owner_email), name)`);
 }
 
+// Nom de l'auteur, résolu comme ailleurs dans l'app (« voir en tant que ») : compte Zoho, puis
+// compte externe, puis fiche vendeur. NULLIF : un nom vide ne doit pas masquer le suivant.
+const OWNER_NAME_SQL = `COALESCE(
+  (SELECT NULLIF(TRIM(display_name), '') FROM user_tokens  WHERE LOWER(email) = LOWER(s.owner_email) LIMIT 1),
+  (SELECT NULLIF(TRIM(display_name), '') FROM local_users  WHERE LOWER(email) = LOWER(s.owner_email) LIMIT 1),
+  (SELECT NULLIF(TRIM(name), '')         FROM salespeople  WHERE LOWER(email) = LOWER(s.owner_email) LIMIT 1)
+) AS owner_name`;
+
 const shape = (r, email) => ({
   id: r.id,
   name: r.name,
   inputs: upgradeInputs(r.inputs),
   owner: r.owner_email,
+  // Nom affiché de l'auteur ; le courriel en dernier recours (compte sans nom connu).
+  ownerName: r.owner_name || r.owner_email,
   mine: !!email && r.owner_email.toLowerCase() === email.toLowerCase(),
   updatedAt: r.updated_at,
 });
@@ -160,8 +170,8 @@ function registerRevenueModelRoutes(app, deps) {
       await schema();
       const { rows } = await pool.query(
         // Les siens d'abord, puis ceux de l'équipe ; les plus récents en tête dans chaque groupe.
-        `SELECT * FROM revenue_model_scenarios
-         ORDER BY (LOWER(owner_email) = LOWER($1)) DESC, updated_at DESC`, [req.user.email || '']);
+        `SELECT s.*, ${OWNER_NAME_SQL} FROM revenue_model_scenarios s
+         ORDER BY (LOWER(s.owner_email) = LOWER($1)) DESC, s.updated_at DESC`, [req.user.email || '']);
       res.json({ scenarios: rows.map((r) => shape(r, req.user.email)) });
     } catch (e) {
       console.error('revenue-model list:', e.message);
@@ -175,7 +185,8 @@ function registerRevenueModelRoutes(app, deps) {
     if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'not_found' });
     try {
       await schema();
-      const { rows } = await pool.query('SELECT * FROM revenue_model_scenarios WHERE id = $1', [req.params.id]);
+      const { rows } = await pool.query(
+        `SELECT s.*, ${OWNER_NAME_SQL} FROM revenue_model_scenarios s WHERE s.id = $1`, [req.params.id]);
       if (!rows.length) return res.status(404).json({ error: 'not_found' });
       res.json({ scenario: shape(rows[0], req.user.email) });
     } catch (e) {
