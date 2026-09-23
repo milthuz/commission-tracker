@@ -18242,6 +18242,26 @@ app.post('/api/saas-increase/lookup/deal', authenticateToken, async (req, res) =
         ORDER BY i.id DESC LIMIT 1`, [orgId, number])).rows[0];
     if (!item) return res.status(404).json({ error: 'subscription not found in any scenario' });
 
+    // Une piste par abonnement. La garde vit ICI et pas seulement sur le bouton : deux agents
+    // sur la meme fiche, un rechargement, ou un appel rejoue produiraient sinon deux
+    // opportunites sur le meme compte — ce que la detection de doublon plus bas ne rattrape
+    // que si la premiere est encore ouverte. `force` ne la leve pas : rouvrir sciemment une
+    // piste deja envoyee se fait dans Zoho, ou le vendeur voit ce qui existe deja.
+    const dejaEnvoyee = (await pool.query(
+      `SELECT actor, created_at, metadata FROM activity_log
+        WHERE entity_type = 'saas_increase' AND event_type = 'payment_deal_created'
+          AND entity_id = $1
+        ORDER BY created_at DESC LIMIT 1`, [String(item.id)])).rows[0];
+    if (dejaEnvoyee) {
+      return res.status(409).json({
+        alreadySent: true,
+        at: dejaEnvoyee.created_at,
+        by: dejaEnvoyee.actor || null,
+        dealId: dejaEnvoyee.metadata?.dealId || null,
+        accountName: dejaEnvoyee.metadata?.accountName || null,
+      });
+    }
+
     const scope = await sofiaCrmScope(req);
     const nom = String(item.customer_name || '').trim();
     const crmToken = await ensureValidCrmToken();
@@ -18404,7 +18424,8 @@ app.post('/api/saas-increase/lookup/deal', authenticateToken, async (req, res) =
       [String(item.id),
        `Opportunite de paiement ouverte dans Zoho pour ${compte.Account_Name}`,
        req.user.email || 'unknown',
-       JSON.stringify({ dealId: r.id, accountId: compte.id, subscriptionNumber: number, orgId,
+       JSON.stringify({ dealId: r.id, accountId: compte.id, accountName: compte.Account_Name,
+                        subscriptionNumber: number, orgId,
                         owner: proprio.name, monthlySaving: economie, dropped: r.dropped })]
     ).catch(e2 => console.warn('[saas-deal] journal non ecrit:', e2.message));
 
@@ -19254,6 +19275,34 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
       console.warn('[saas-lookup] statut paiement indisponible:', e.message);
     }
 
+    // ── Une piste deja envoyee ne se renvoie pas ───────────────────────────────────────────
+    // Le bouton ne vivait que dans l'etat de la page : l'agent qui rechargeait, ou un collegue
+    // qui ouvrait la meme fiche, le retrouvait actif et rouvrait une deuxieme opportunite sur
+    // le meme marchand. Le journal d'activite garde deja la trace de ce qui est REELLEMENT
+    // arrive — c'est lui qui fait foi, pas la memoire du navigateur.
+    const pisteParItem = new Map();
+    try {
+      const ids = rows.map(r => String(r.id));
+      const faites = (await pool.query(`
+        SELECT DISTINCT ON (entity_id) entity_id, actor, created_at, metadata
+          FROM activity_log
+         WHERE entity_type = 'saas_increase' AND event_type = 'payment_deal_created'
+           AND entity_id = ANY($1::text[])
+         ORDER BY entity_id, created_at DESC`, [ids])).rows;
+      for (const d of faites) {
+        pisteParItem.set(d.entity_id, {
+          at: d.created_at, by: d.actor || null,
+          dealId: d.metadata?.dealId || null,
+          accountName: d.metadata?.accountName || null,
+        });
+      }
+    } catch (e) {
+      // Journal illisible : on ne PRETEND pas qu'aucune piste n'existe, ce serait rouvrir la
+      // porte au doublon. La page recevra `dealCreated: undefined` et gardera le bouton actif,
+      // mais le serveur refusera le doublon de son cote (voir POST .../lookup/deal).
+      console.warn('[saas-lookup] pistes deja envoyees illisibles:', e.message);
+    }
+
     const results = rows.map(r => {
       const cur = periodByKey.get(`${r.org_id}||${r.subscription_number}`) ?? null;
       const next = cur == null ? null : saasNewPeriodPrice(cur, r.increase_type, r.increase_value);
@@ -19265,6 +19314,8 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
         orgId: r.org_id,
         orgName: ZOHO_BILLING_ORG_NAMES[r.org_id] || r.org_id,
         planName: saasPlanLabel(r.plan_name),
+        // Null quand aucune piste n'est partie pour cet abonnement.
+        dealCreated: pisteParItem.get(String(r.id)) || null,
         currentPrice: cur, newPrice: next,
         // Pour un marchand DEJA avise, la seule bonne reponse est la date que son courriel
         // annonce. La recalculer donnerait une date plus tardive de jour en jour — un agent
