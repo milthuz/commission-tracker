@@ -438,22 +438,27 @@ async function renderOffer(snap, { employeeSig = null, companySig = null, lang: 
     }
     if (kind === 'sub') {
       f.st.y += 2;
-      f.para(text, { size: SIZE, font: 'Helvetica-Bold', color: INK, gap: 3 });
+      f.para(text, { size: SIZE + 0.2, font: 'Helvetica-Bold', color: TEXT, gap: 3 });
       continue;
     }
     if (!title) { f.para(text, { size: SIZE, gap: GAP + 1 }); continue; }
     const mm = /^(\d+)\.\s*(.*?)\.?$/.exec(title);
     const num = mm ? mm[1] : '';
     const label = mm ? mm[2] : title;
-    // Le titre ne reste jamais seul en bas de page : il part avec les premières lignes du texte.
+    // Même style que les sections de l'entente v7.7 (« 1.  Titre », filet orange pleine largeur),
+    // pour que les deux documents se lisent comme un seul dossier. Le titre ne reste jamais seul
+    // en bas de page : il part avec les premières lignes du texte.
     doc.font('Helvetica').fontSize(SIZE);
-    f.ensure(22 + Math.min(doc.heightOfString(text, { width: CW, lineGap: 1.5 }), 40));
-    f.st.y += 6;
-    doc.font('Helvetica-Bold').fontSize(10.5).fillColor(ORANGE).text(num, M, f.st.y, { width: 22, lineBreak: false });
-    doc.fillColor(INK).text(label, M + 22, f.st.y, { width: CW - 22 });
-    f.st.y += 15;
-    doc.rect(M, f.st.y, CW, 0.6).fill('#ececec');
-    f.st.y += 6;
+    // f.para() ne coupe pas un paragraphe : s'il ne tient pas, il part ENTIER à la page suivante.
+    // Le titre doit donc réserver la hauteur du paragraphe complet (sinon « 8. Confidentialité »
+    // restait seul en bas de page), sauf paragraphe plus haut qu'une page.
+    const ph = doc.heightOfString(text, { width: CW, lineGap: 1.5 });
+    f.ensure(36 + (ph < BOTTOM - M - 60 ? ph : 40));
+    f.st.y += 8;
+    doc.font('Helvetica-Bold').fontSize(12).fillColor(INK).text(`${num}.  ${label}`, M, f.st.y, { width: CW });
+    f.st.y += 18;
+    doc.rect(M, f.st.y, CW, 1.2).fill(ORANGE);
+    f.st.y += 9;
     f.para(text, { size: SIZE, gap: GAP + 1 });
   }
 

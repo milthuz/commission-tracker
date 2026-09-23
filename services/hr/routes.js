@@ -76,6 +76,7 @@ const CERT_TITLE = {
 
 const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 const refOf = (n) => `RH-${String(n).padStart(4, '0')}`;
+const DELETABLE = ['draft', 'cancelled', 'declined'];
 
 async function ensureSchema(pool) {
   await pool.query(`
@@ -401,10 +402,14 @@ function registerHrRoutes(app, deps) {
       await schema();
       const row = await loadHire(req.params.id);
       if (!row) return res.status(404).json({ error: 'Not found' });
-      // Un dossier qui a été envoyé est une trace (même annulé) : on ne supprime que les brouillons.
-      if (row.status !== 'draft') return res.status(409).json({ error: 'Only drafts can be deleted' });
+      // Supprimables : brouillon, annulé, refusé (demande de David, 2026-09-23). JAMAIS un dossier
+      // signé — c'est le contrat de travail — ni un dossier en cours de signature : on l'annule
+      // d'abord, pour que le lien du candidat meure avant que la fiche disparaisse.
+      if (!DELETABLE.includes(row.status)) return res.status(409).json({ error: 'not_deletable', message: 'Only draft, cancelled or declined files can be deleted.' });
       await pool.query('DELETE FROM hr_hires WHERE id = $1', [row.id]);
-      await audit(row.id, 'deleted', `Draft hiring file deleted: ${row.full_name}`, req.user.email);
+      // La fiche part avec ses pièces jointes et sa chronologie (ON DELETE CASCADE) : la trace
+      // de la suppression reste dans le journal d'activité général.
+      await audit(row.id, 'deleted', `Hiring file ${refOf(row.ref_no)} deleted (${row.status}): ${row.full_name}`, req.user.email);
       res.json({ ok: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
