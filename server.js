@@ -4571,10 +4571,12 @@ function sampleEmail(type, lang) {
     const HRE = require('./services/hr/emails');
     const fr = isFrLocale(lang);
     const link = `${base}/hr`;
-    if (type === 'hr_sign_request') return HRE.signRequestEmail(mailShell, { firstName: 'Julie', position: fr ? 'Représentant(e) des ventes' : 'Sales Representative', link: `${base}/sign?token=exemple`, expiresDays: 14, lang: fr ? 'fr' : 'en' });
-    if (type === 'hr_countersign') return HRE.countersignEmail(mailShell, { name: 'Julie Tremblay', position: 'Sales Representative', link });
+    // Courriels RH bilingues (français d'abord) : `lang` ne change rien à leur contenu.
+    const pos = { positionFr: 'Représentant(e) des ventes', positionEn: 'Sales Representative' };
+    if (type === 'hr_sign_request') return HRE.signRequestEmail(mailShell, { firstName: 'Julie', ...pos, link: `${base}/sign?token=exemple`, expiresDays: 14 });
+    if (type === 'hr_countersign') return HRE.countersignEmail(mailShell, { name: 'Julie Tremblay', ...pos, link });
     if (type === 'hr_declined') return HRE.declinedEmail(mailShell, { name: 'Julie Tremblay', reason: fr ? 'J’ai accepté une autre offre.' : 'I accepted another offer.', link });
-    return HRE.completedEmployeeEmail(mailShell, { firstName: 'Julie', lang: fr ? 'fr' : 'en', startDate: fr ? '5 octobre 2026' : 'October 5, 2026' });
+    return HRE.completedEmployeeEmail(mailShell, { firstName: 'Julie', startDateFr: '5 octobre 2026', startDateEn: 'October 5, 2026' });
   }
 
   if (type.startsWith('pass_')) {

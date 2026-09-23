@@ -36,15 +36,15 @@ const M = 54;
 const CW = W - 2 * M;
 const BOTTOM = H - 64; // réserve pour le pied de page
 
-const clean = (s) => String(s == null ? '' : s).replace(/[\u202f\u00a0]/g, ' ');
+const clean = (s) => String(s == null ? '' : s).replace(/\u202f/g, '\u00a0');
 
 function money(n, lang) {
   const v = Number(n) || 0;
   const frac = Math.round(v * 100) % 100 !== 0 ? 2 : 0;
-  if (lang === 'fr') return clean(v.toLocaleString('fr-CA', { minimumFractionDigits: frac, maximumFractionDigits: frac })) + ' $';
+  if (lang === 'fr') return clean(v.toLocaleString('fr-CA', { minimumFractionDigits: frac, maximumFractionDigits: frac })) + '\u00a0$';
   return '$' + v.toLocaleString('en-CA', { minimumFractionDigits: frac, maximumFractionDigits: frac });
 }
-const pct = (n, lang) => (lang === 'fr' ? `${clean(Number(n).toLocaleString('fr-CA'))} %` : `${Number(n)}%`);
+const pct = (n, lang) => (lang === 'fr' ? `${clean(Number(n).toLocaleString('fr-CA'))}\u00a0%` : `${Number(n)}%`);
 const numTxt = (n, lang) => clean(Number(n).toLocaleString(lang === 'fr' ? 'fr-CA' : 'en-CA'));
 
 // « September 23, 2026 » / « 23 septembre 2026 », sans passer par un Date en UTC (un
@@ -171,8 +171,8 @@ function table(doc, f, cols, rows, { firstBold = true, align = [] } = {}) {
 // ---------------------------------------------------------------------------
 // Entente de rémunération
 // ---------------------------------------------------------------------------
-async function renderAgreement(snap, { employeeSig = null, companySig = null } = {}) {
-  const lang = snap.hire.agreementLang === 'fr' ? 'fr' : 'en';
+async function renderAgreement(snap, { employeeSig = null, companySig = null, lang: forced = null } = {}) {
+  const lang = (forced || snap.hire.agreementLang) === 'fr' ? 'fr' : 'en';
   const L = T.AGREEMENT[lang];
   const p = snap.plan;
   const name = `${snap.hire.firstName} ${snap.hire.lastName}`;
@@ -345,24 +345,26 @@ async function renderAgreement(snap, { employeeSig = null, companySig = null } =
 }
 
 // ---------------------------------------------------------------------------
-// Offre d'emploi (anglais seulement — voir text.js)
+// Offre d'emploi — FR ou EN (voir text.js). `lang` force une langue (versions de référence).
 // ---------------------------------------------------------------------------
-async function renderOffer(snap, { employeeSig = null, companySig = null } = {}) {
+async function renderOffer(snap, { employeeSig = null, companySig = null, lang: forced = null } = {}) {
   const h = snap.hire;
+  const lang = (forced || h.agreementLang) === 'fr' ? 'fr' : 'en';
+  const O = T.OFFER[lang];
   const name = `${h.firstName} ${h.lastName}`;
-  const m = (v) => money(v, 'en');
+  const m = (v) => money(v, lang);
   const vars = {
-    startDate: longDate(h.startDate, 'en'),
-    reportsToTitle: h.reportsToTitle,
+    startDate: longDate(h.startDate, lang),
+    reportsToTitle: lang === 'fr' ? (h.reportsToTitleFr || h.reportsToTitle) : h.reportsToTitle,
     reportsToName: h.reportsToName,
     annualSalary: m(h.annualSalary),
     vacationWeeks: String(snap.terms.vacationWeeks),
-    position: h.position,
-    salaryExtra: T.offerSalaryExtra(snap.terms, m),
+    position: lang === 'fr' ? (h.positionFr || h.position) : h.position,
+    salaryExtra: O.salaryExtra(snap.terms, m),
   };
   const fill = (s) => s.replace(/\{(\w+)\}/g, (_, k) => (vars[k] != null ? vars[k] : ''));
 
-  const doc = newDoc(`Offer of Employment — ${name}`);
+  const doc = newDoc(`${O.title} — ${name}`);
   const out = collect(doc);
   const f = flow(doc);
   const SIZE = 10;
@@ -370,15 +372,15 @@ async function renderOffer(snap, { employeeSig = null, companySig = null } = {})
   f.st.y = 84;
 
   const addrCity = [h.city, [h.province, h.postalCode].filter(Boolean).join(' ')].filter(Boolean).join(', ');
-  for (const line of [longDate(h.offerDate, 'en'), name, h.addressLine1, addrCity, h.country].filter(Boolean)) {
+  for (const line of [longDate(h.offerDate, lang), name, h.addressLine1, addrCity, h.country].filter(Boolean)) {
     f.para(line, { size: SIZE, font: 'Helvetica-Bold', gap: 1 });
   }
   f.st.y += 12;
-  f.para('Subject: Welcome to Cluster', { size: SIZE, font: 'Helvetica-Bold', gap: 12 });
-  f.para(`Dear ${h.firstName},`, { size: SIZE, gap: 10 });
-  for (const p of T.OFFER_INTRO) f.para(fill(p), { size: SIZE, gap: 10 });
+  f.para(O.subject, { size: SIZE, font: 'Helvetica-Bold', gap: 12 });
+  f.para(O.dear(h.firstName), { size: SIZE, gap: 10 });
+  for (const p of O.intro) f.para(fill(p), { size: SIZE, gap: 10 });
 
-  for (const [title, body, kind] of T.OFFER_CLAUSES) {
+  for (const [title, body, kind] of O.clauses) {
     const text = fill(body);
     if (!text.trim()) continue;
     if (kind === 'item') {
@@ -400,38 +402,38 @@ async function renderOffer(snap, { employeeSig = null, companySig = null } = {})
       .font('Helvetica').text(` ${text}`, { underline: false });
     f.st.y = doc.y + 10;
   }
-  for (const p of T.OFFER_CLOSING) f.para(p, { size: SIZE, gap: 10 });
+  for (const p of O.closing) f.para(p, { size: SIZE, gap: 10 });
   f.st.y += 10;
-  f.para('[Remainder of this page intentionally left blank. The next page is the signature page]', { size: 9, font: 'Helvetica-Oblique', color: MUTED, align: 'center' });
+  f.para(O.blank, { size: 9, font: 'Helvetica-Oblique', color: MUTED, align: 'center' });
 
   // Page de signature
   doc.addPage();
   let y = 110;
   doc.font('Helvetica-Bold').fontSize(SIZE).fillColor(TEXT).text('CLUSTER SYSTEMS.', M, y);
   y += 24;
-  doc.font('Helvetica').text('By:', M, y);
+  doc.font('Helvetica').text(O.by, M, y);
   y += 16;
   const line = (x, yy, w) => doc.save().moveTo(x, yy).lineTo(x + w, yy).lineWidth(0.7).strokeColor('#555555').stroke().restore();
   const sigRow = (sig, ts, leftLabel, printed) => {
     const img = sigBuffer(sig);
     if (img) { try { doc.image(img, M + 4, y, { fit: [200, 42] }); } catch { /* ignoré */ } }
-    if (ts) doc.font('Helvetica').fontSize(SIZE).fillColor(TEXT).text(longDate(isoDay(ts), 'en'), M + 300, y + 28);
+    if (ts) doc.font('Helvetica').fontSize(SIZE).fillColor(TEXT).text(longDate(isoDay(ts), lang), M + 300, y + 28);
     y += 46;
     line(M, y, 210);
     line(M + 300, y, 180);
     y += 5;
     doc.font('Helvetica').fontSize(SIZE).fillColor(TEXT).text(leftLabel, M, y);
-    doc.text('Date', M + 300, y);
+    doc.text(O.date, M + 300, y);
     if (printed) doc.font('Helvetica').fontSize(8.5).fillColor(MUTED).text(printed, M, y + 13);
     y += 34;
   };
-  sigRow(companySig, companySig && companySig.at, 'Manager', companySig ? companySig.name : '');
+  sigRow(companySig, companySig && companySig.at, O.manager, companySig ? companySig.name : '');
   f.st.y = y + 6;
-  f.para(T.OFFER_ACK, { size: SIZE, gap: 16 });
+  f.para(O.ack, { size: SIZE, gap: 16 });
   y = f.st.y;
-  sigRow(employeeSig, employeeSig && employeeSig.at, 'Name', employeeSig ? employeeSig.name : name);
+  sigRow(employeeSig, employeeSig && employeeSig.at, O.name, employeeSig ? employeeSig.name : name);
 
-  footer(doc, '  |  Offer of Employment  |  Confidential', name, () => {
+  footer(doc, O.footer, name, () => {
     const saved = doc.page.margins.top;
     doc.page.margins.top = 0;
     wordmark(doc, M, 22, 22, '#9ca3af');
@@ -456,7 +458,7 @@ async function renderCertificate(info) {
 
   const kv = (k, v) => {
     doc.font('Helvetica').fontSize(9);
-    const hh = Math.max(doc.heightOfString(String(v || '—'), { width: CW - 170 }), 11);
+    const hh = Math.max(doc.heightOfString(String(v || '—'), { width: CW - 170 }), doc.font('Helvetica-Bold').heightOfString(k, { width: 165 }), 11);
     f.ensure(hh + 4);
     doc.font('Helvetica-Bold').fillColor('#444444').text(k, M, f.st.y, { width: 165 });
     doc.font('Helvetica').fillColor(TEXT).text(String(v || '—'), M + 170, f.st.y, { width: CW - 170 });

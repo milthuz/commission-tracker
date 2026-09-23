@@ -159,6 +159,8 @@ function normalizeHire(body, defaults) {
     startDate: str(b.startDate, 10),
     offerDate: str(b.offerDate, 10) || new Date().toISOString().slice(0, 10),
     reportsToTitle: str(b.reportsToTitle, 120),
+    // Titre du supérieur dans la version française de l'offre ; vide = même titre que l'anglais.
+    reportsToTitleFr: str(b.reportsToTitleFr, 120),
     reportsToName: str(b.reportsToName, 120),
     supervisorName: str(b.supervisorName, 120),
     annualSalary: num(b.annualSalary, { min: 0, max: 10000000 }),

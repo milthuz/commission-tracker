@@ -41,6 +41,39 @@ const MAX_ATTACH_COUNT = 8;
 const MAX_SIG_BYTES = 400 * 1024; // une signature dessinée pèse ~10-40 Ko
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// Les documents d'un dossier. `offer`/`agreement` = dans la langue choisie (ce qui est SIGNÉ) ;
+// `-fr` = version française de référence, générée seulement quand le dossier part en anglais.
+const DOCS = {
+  offer: { col: 'offer_pdf', kind: 'offer', hashKey: 'offer', lang: null, reference: false },
+  agreement: { col: 'agreement_pdf', kind: 'agreement', hashKey: 'agreement', lang: null, reference: false },
+  'offer-fr': { col: 'offer_fr_pdf', kind: 'offer', hashKey: 'offerFr', lang: 'fr', reference: true },
+  'agreement-fr': { col: 'agreement_fr_pdf', kind: 'agreement', hashKey: 'agreementFr', lang: 'fr', reference: true },
+};
+const docLang = (hire) => (hire.agreementLang === 'fr' ? 'fr' : 'en');
+function docKeys(hire) {
+  const withAgreement = hire.includeAgreement !== false;
+  const keys = ['offer', ...(withAgreement ? ['agreement'] : [])];
+  if (docLang(hire) === 'en') keys.push('offer-fr', ...(withAgreement ? ['agreement-fr'] : []));
+  return keys;
+}
+function renderDoc(key, snap, sigs = {}) {
+  const d = DOCS[key];
+  const opts = { ...sigs, lang: d.lang };
+  return d.kind === 'offer' ? R.renderOffer(snap, opts) : R.renderAgreement(snap, opts);
+}
+function docFile(key, hire, fb) {
+  const d = DOCS[key];
+  const fr = (d.lang || docLang(hire)) === 'fr';
+  const label = d.kind === 'offer' ? (fr ? 'Offre_emploi' : 'Offer') : (fr ? 'Entente_remuneration' : 'Agreement');
+  return `Cluster_${label}_${fb}.pdf`;
+}
+const positions = (hire) => ({ positionFr: hire.positionFr || hire.position, positionEn: hire.position });
+// Titres bilingues pour le certificat (il sert aux deux parties, quelle que soit la langue).
+const CERT_TITLE = {
+  offer: { en: 'Offer of Employment', fr: 'Offre d’emploi' },
+  agreement: { en: 'Compensation Agreement', fr: 'Entente de rémunération' },
+};
+
 const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 const refOf = (n) => `RH-${String(n).padStart(4, '0')}`;
 
@@ -77,6 +110,9 @@ async function ensureSchema(pool) {
       updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS hr_hires_token ON hr_hires (token_hash) WHERE token_hash IS NOT NULL`);
+  // Versions françaises de référence quand le dossier part en anglais (ajout du 2026-09-23).
+  await pool.query(`ALTER TABLE hr_hires ADD COLUMN IF NOT EXISTS offer_fr_pdf BYTEA`);
+  await pool.query(`ALTER TABLE hr_hires ADD COLUMN IF NOT EXISTS agreement_fr_pdf BYTEA`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS hr_hire_attachments (
       id          SERIAL PRIMARY KEY,
@@ -211,6 +247,11 @@ function registerHrRoutes(app, deps) {
       companySig: r.company_sig_meta,
       hasSigned: r.has_signed,
       docHashes: r.doc_hashes,
+      // Documents du dossier (brouillon : ceux qui SERONT générés ; envoyé : ceux qui l'ont été).
+      documents: (r.status === 'draft' || !r.doc_hashes
+        ? docKeys(r.data)
+        : Object.keys(DOCS).filter((k) => r.doc_hashes[DOCS[k].hashKey])
+      ).map((key) => ({ key, kind: DOCS[key].kind, lang: DOCS[key].lang || docLang(r.data), reference: DOCS[key].reference })),
       attachments: att.rows.map((a) => ({ id: a.id, filename: a.filename, size: a.size_bytes, sha256: a.sha256, uploadedBy: a.uploaded_by, createdAt: a.created_at })),
       events: ev.rows,
     };
@@ -396,15 +437,13 @@ function registerHrRoutes(app, deps) {
         if (!a.rows[0]) return res.status(404).json({ error: 'Not found' });
         return sendPdf(res, a.rows[0].data, a.rows[0].filename);
       }
-      if (doc !== 'offer' && doc !== 'agreement') return res.status(404).json({ error: 'Unknown document' });
+      const d = DOCS[doc];
+      if (!d) return res.status(404).json({ error: 'Unknown document' });
       if (row.status !== 'draft') {
-        const col = doc === 'offer' ? 'offer_pdf' : 'agreement_pdf';
-        const r = await pool.query(`SELECT ${col} AS pdf FROM hr_hires WHERE id = $1`, [row.id]);
-        if (r.rows[0] && r.rows[0].pdf) return sendPdf(res, r.rows[0].pdf, `Cluster_${doc === 'offer' ? 'Offer' : 'Agreement'}_${fb}.pdf`);
+        const r = await pool.query(`SELECT ${d.col} AS pdf FROM hr_hires WHERE id = $1`, [row.id]);
+        if (r.rows[0] && r.rows[0].pdf) return sendPdf(res, r.rows[0].pdf, docFile(doc, row.data, fb));
       }
-      const snap = snapOf(row);
-      const buf = doc === 'offer' ? await R.renderOffer(snap) : await R.renderAgreement(snap);
-      sendPdf(res, buf, `Cluster_${doc === 'offer' ? 'Offer' : 'Agreement'}_${fb}.pdf`);
+      sendPdf(res, await renderDoc(doc, snapOf(row)), docFile(doc, row.data, fb));
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
@@ -418,10 +457,8 @@ function registerHrRoutes(app, deps) {
 
   async function mailCandidate(row, snap, rawToken) {
     const link = `${base()}/sign?token=${encodeURIComponent(rawToken)}`;
-    const lang = snap.hire.agreementLang === 'fr' ? 'fr' : 'en';
     const m = E.signRequestEmail(mailShell, {
-      firstName: snap.hire.firstName, position: lang === 'fr' ? snap.hire.positionFr : snap.hire.position,
-      link, expiresDays: TOKEN_DAYS, lang,
+      firstName: snap.hire.firstName, ...positions(snap.hire), link, expiresDays: TOKEN_DAYS,
     });
     const r = await sendMail(snap.hire.email, m.subject, m.html);
     return { link, mail: r };
@@ -440,18 +477,25 @@ function registerHrRoutes(app, deps) {
         hire: row.data, terms: row.terms, plan: row.plan,
         attachments: att.map((a) => ({ id: a.id, filename: a.filename, sha256: a.sha256 })),
       };
-      const offer = await R.renderOffer(snap);
-      const agreement = row.data.includeAgreement !== false ? await R.renderAgreement(snap) : null;
-      const hashes = {
-        offer: { sha256: sha256(offer), pages: await R.pageCount(offer) },
-        agreement: agreement ? { sha256: sha256(agreement), pages: await R.pageCount(agreement) } : null,
-      };
+      // Documents rendus UNE fois et figés. Dossier en anglais → la version française des mêmes
+      // documents est aussi rendue et présentée (référence, non signée) : un contrat d'adhésion
+      // doit d'abord être remis en français (Charte de la langue française, art. 55).
+      const keys = docKeys(row.data);
+      const bufs = {};
+      const hashes = {};
+      for (const k of keys) {
+        bufs[k] = await renderDoc(k, snap);
+        hashes[DOCS[k].hashKey] = { sha256: sha256(bufs[k]), pages: await R.pageCount(bufs[k]) };
+      }
+      if (!hashes.agreement) hashes.agreement = null;
       const tok = newToken();
       const upd = await pool.query(
         `UPDATE hr_hires SET status = 'sent', snapshot = $2::jsonb, offer_pdf = $3, agreement_pdf = $4, doc_hashes = $5::jsonb,
-           token_hash = $6, token_expires_at = $7, sent_at = NOW(), updated_at = NOW()
+           token_hash = $6, token_expires_at = $7, sent_at = NOW(), updated_at = NOW(),
+           offer_fr_pdf = $8, agreement_fr_pdf = $9
          WHERE id = $1 AND status = 'draft' RETURNING id`,
-        [row.id, JSON.stringify(snap), offer, agreement, JSON.stringify(hashes), tok.hash, tok.expires],
+        [row.id, JSON.stringify(snap), bufs.offer, bufs.agreement || null, JSON.stringify(hashes), tok.hash, tok.expires,
+          bufs['offer-fr'] || null, bufs['agreement-fr'] || null],
       );
       if (!upd.rows[0]) return res.status(409).json({ error: 'Already sent' });
       const out = await mailCandidate(row, snap, tok.raw);
@@ -500,11 +544,18 @@ function registerHrRoutes(app, deps) {
       FROM hr_hires WHERE id = $1`, [id])).rows[0];
     const snap = r.snapshot;
     const opts = { employeeSig: r.employee_sig, companySig: r.company_sig };
-    const offer = await R.renderOffer(snap, opts);
-    const agreement = r.doc_hashes && r.doc_hashes.agreement ? await R.renderAgreement(snap, opts) : null;
+    const offer = await renderDoc('offer', snap, opts);
+    const agreement = r.doc_hashes && r.doc_hashes.agreement ? await renderDoc('agreement', snap, opts) : null;
     const att = (await pool.query('SELECT filename, sha256, data FROM hr_hire_attachments WHERE hire_id = $1 ORDER BY id', [id])).rows;
-    const documents = [{ title: 'Offer of Employment (unsigned original)', sha256: r.doc_hashes.offer.sha256, pages: r.doc_hashes.offer.pages }];
-    if (agreement) documents.push({ title: 'Compensation Agreement (unsigned original)', sha256: r.doc_hashes.agreement.sha256, pages: r.doc_hashes.agreement.pages });
+    // Le certificat liste TOUT ce qui a été présenté, y compris les versions françaises de
+    // référence d'un dossier signé en anglais (preuve qu'elles ont été remises).
+    const L = docLang(snap.hire).toUpperCase();
+    const documents = [];
+    const add = (kind, h, suffix) => { if (h) documents.push({ title: `${CERT_TITLE[kind].en} / ${CERT_TITLE[kind].fr} — ${suffix}`, sha256: h.sha256, pages: h.pages }); };
+    add('offer', r.doc_hashes.offer, `${L}, signed original / original signé`);
+    add('agreement', r.doc_hashes.agreement, `${L}, signed original / original signé`);
+    add('offer', r.doc_hashes.offerFr, 'FR, reference copy presented / version de référence remise');
+    add('agreement', r.doc_hashes.agreementFr, 'FR, reference copy presented / version de référence remise');
     for (const a of att) documents.push({ title: a.filename, sha256: a.sha256 });
     const cert = await R.renderCertificate({
       ref: refOf(r.ref_no), name: r.full_name, documents,
@@ -539,12 +590,12 @@ function registerHrRoutes(app, deps) {
 
       // Copies signées : au candidat et aux destinataires internes.
       const snap = row.snapshot;
-      const lang = snap.hire.agreementLang === 'fr' ? 'fr' : 'en';
       const attachment = [{ filename: `Cluster_Signed_${fileBase(row)}.pdf`, content: pdf, contentType: 'application/pdf' }];
-      const me = E.completedEmployeeEmail(mailShell, { firstName: snap.hire.firstName, lang, startDate: R.longDate(snap.hire.startDate, lang) });
+      const dates = { startDateFr: R.longDate(snap.hire.startDate, 'fr'), startDateEn: R.longDate(snap.hire.startDate, 'en') };
+      const me = E.completedEmployeeEmail(mailShell, { firstName: snap.hire.firstName, ...dates });
       const toEmp = await sendMail(row.email, me.subject, me.html, { attachments: attachment });
       const mi = E.completedInternalEmail(mailShell, {
-        name: row.full_name, position: snap.hire.position, startDate: R.longDate(snap.hire.startDate, 'fr'), link: `${base()}/hr?id=${row.id}`,
+        name: row.full_name, ...positions(snap.hire), ...dates, link: `${base()}/hr?id=${row.id}`,
       });
       const to = await internalTo(row);
       if (to.length) await sendMail(to.join(','), mi.subject, mi.html, { attachments: attachment });
@@ -635,12 +686,17 @@ function registerHrRoutes(app, deps) {
     return row;
   }
 
+  // Le TITRE des documents est traduit par la page (bascule FR/EN) : le serveur ne renvoie que
+  // leur nature, leur langue et s'ils sont une version de référence.
   const publicDocs = (row) => {
     const s = row.snapshot;
-    const fr = s.hire.agreementLang === 'fr';
-    const docs = [{ key: 'offer', title: fr ? 'Offre d’emploi (en anglais)' : 'Offer of Employment', pages: row.doc_hashes.offer.pages }];
-    if (row.doc_hashes.agreement) docs.push({ key: 'agreement', title: fr ? 'Entente de rémunération' : 'Compensation Agreement', pages: row.doc_hashes.agreement.pages });
-    for (const a of s.attachments || []) docs.push({ key: `att-${a.id}`, title: a.filename.replace(/\.pdf$/i, ''), pages: null });
+    const lang = docLang(s.hire);
+    const docs = [];
+    for (const [key, d] of Object.entries(DOCS)) {
+      const h = row.doc_hashes && row.doc_hashes[d.hashKey];
+      if (h) docs.push({ key, kind: d.kind, lang: d.lang || lang, reference: d.reference, pages: h.pages });
+    }
+    for (const a of s.attachments || []) docs.push({ key: `att-${a.id}`, kind: 'attachment', title: a.filename.replace(/\.pdf$/i, ''), pages: null });
     return docs;
   };
 
@@ -659,7 +715,7 @@ function registerHrRoutes(app, deps) {
         status: row.status === 'sent' ? 'viewed' : row.status,
         firstName: s.hire.firstName,
         name: row.full_name,
-        position: s.hire.agreementLang === 'fr' ? s.hire.positionFr : s.hire.position,
+        ...positions(s.hire),
         startDate: s.hire.startDate,
         lang: s.hire.agreementLang,
         documents: publicDocs(row),
@@ -674,11 +730,10 @@ function registerHrRoutes(app, deps) {
       const row = await byToken(req, res);
       if (!row) return;
       const doc = req.params.doc;
-      if (doc === 'offer' || doc === 'agreement') {
-        const col = doc === 'offer' ? 'offer_pdf' : 'agreement_pdf';
-        const r = await pool.query(`SELECT ${col} AS pdf FROM hr_hires WHERE id = $1`, [row.id]);
+      if (DOCS[doc]) {
+        const r = await pool.query(`SELECT ${DOCS[doc].col} AS pdf FROM hr_hires WHERE id = $1`, [row.id]);
         if (!r.rows[0] || !r.rows[0].pdf) return res.status(404).json({ error: 'Not found' });
-        return sendPdf(res, r.rows[0].pdf, `Cluster_${doc === 'offer' ? 'Offer' : 'Agreement'}.pdf`);
+        return sendPdf(res, r.rows[0].pdf, docFile(doc, row.snapshot.hire, 'Cluster').replace('_Cluster.pdf', '.pdf'));
       }
       if (doc.startsWith('att-')) {
         const ids = (row.snapshot.attachments || []).map((a) => a.id);
@@ -714,7 +769,7 @@ function registerHrRoutes(app, deps) {
       await audit(row.id, 'employee_signed', `Employee signed: ${row.full_name}`, row.email);
       const to = await internalTo({ created_by: upd.rows[0].created_by });
       if (to.length) {
-        const m = E.countersignEmail(mailShell, { name: row.full_name, position: row.snapshot.hire.position, link: `${base()}/hr?id=${row.id}` });
+        const m = E.countersignEmail(mailShell, { name: row.full_name, ...positions(row.snapshot.hire), link: `${base()}/hr?id=${row.id}` });
         await sendMail(to.join(','), m.subject, m.html);
       }
       res.json({ ok: true });

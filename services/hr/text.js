@@ -8,9 +8,10 @@
 // se recopie. Seuls les champs entre accolades varient, plus trois retraits encadrés dans
 // offerSalaryExtra() quand une allocation vaut 0.
 //
-// L'offre n'existe qu'en ANGLAIS : le gabarit ne se décline pas, et sa clause 16 dit
-// précisément que l'employé a demandé l'anglais. L'entente de rémunération, elle, existe dans
-// les deux langues (les PDF d'avril 2026 comptaient une version française, celle de Sophie).
+// Les DEUX documents existent en français et en anglais. La version française de l'offre est
+// en bas de ce fichier (OFFER_CLAUSES_FR). Quand un dossier part en anglais, la version
+// française est quand même générée et présentée au candidat (Charte, art. 55 : un contrat
+// d'adhésion doit d'abord être remis en français) — voir routes.js.
 // ============================================================================
 
 const OFFER_CLAUSES = [
@@ -257,4 +258,110 @@ const AGREEMENT = {
   },
 };
 
-module.exports = { OFFER_CLAUSES, OFFER_INTRO, OFFER_CLOSING, OFFER_ACK, offerSalaryExtra, AGREEMENT };
+// ---------------------------------------------------------------------------
+// OFFRE D'EMPLOI — VERSION FRANÇAISE (2026-09-23, à la demande de David : « tout doit être dans
+// les deux langues »).
+//
+// ⚠️ TRADUCTION FAITE PAR CLAUDE, NON RÉVISÉE PAR UN JURISTE. Elle suit l'anglais clause par
+// clause, même numérotation, même structure ([titre, texte, genre]) pour que les deux versions
+// restent superposables. Les coquilles de l'anglais ne sont pas reproduites (« it personnel »
+// devient « son personnel ») : une traduction rend le sens, pas les fautes.
+//
+// Deux écarts VOULUS avec l'anglais :
+//   - Clause 3 : l'anglais dit « reporting to the TITLE, NAME » ; le français place le nom en
+//     premier (« de NOM, TITRE ») pour éviter l'accord du/de la selon le titre.
+//   - Clause 16 : l'anglais constate que l'employé a DEMANDÉ l'anglais. En français, il n'y a
+//     rien à demander : la clause constate que le contrat est rédigé en français et qu'une
+//     version anglaise peut lui avoir été remise. (Charte de la langue française, art. 41 et 55.)
+// ---------------------------------------------------------------------------
+const OFFER_CLAUSES_FR = [
+  ['1. Primauté sur les ententes antérieures.', 'Vous reconnaissez et convenez que le présent contrat remplace toute entente antérieure, écrite ou verbale, intervenue entre Cluster et vous, et que toute telle entente antérieure est par les présentes résiliée et sans autre force ni effet.'],
+  ['2. Date d’entrée en fonction et durée.', 'Votre emploi chez Cluster débutera le {startDate}, pour une durée indéterminée, sous réserve des dispositions relatives à la fin d’emploi énoncées ci-dessous.'],
+  ['3. Fonctions et responsabilités.', 'Vous relèverez de {reportsToName}, {reportsToTitle}. Vos fonctions et responsabilités comprendront, en plus de celles inhérentes à votre titre, celles compatibles avec votre poste, à la discrétion de Cluster.'],
+  [null, 'Pendant la durée du présent contrat, vous consacrerez tout votre temps de travail ainsi que des efforts commerciaux raisonnables, votre jugement professionnel, vos compétences et vos connaissances à l’avancement des affaires et des meilleurs intérêts de Cluster, et vous ne vous livrerez à aucune autre activité commerciale, sauf approbation expresse et écrite de Cluster.'],
+  ['4. Salaire.', 'Votre salaire annuel de départ sera de {annualSalary} CAD, payable conformément aux pratiques de paie habituelles de Cluster.'],
+  [null, '{salaryExtra}'],
+  [null, 'Tous les montants sont assujettis aux retenues et déductions prévues par la loi et seront versés conformément aux pratiques de paie habituelles de Cluster. Votre salaire sera calculé au prorata pour toute année d’emploi incomplète.'],
+  [null, 'Votre horaire de travail correspondra aux heures normales de bureau.'],
+  ['5. Vacances.', 'Vous avez droit à {vacationWeeks} semaines de vacances payées, calculées au prorata à compter de votre date d’entrée en fonction, à prendre aux moments et selon les intervalles convenus d’un commun accord entre Cluster et vous. L’année de référence des vacances s’étend du 1er janvier au 31 décembre.'],
+  ['6. Période de probation.', 'Vos trois (3) premiers mois d’emploi constitueront une période de probation au cours de laquelle Cluster pourra mettre fin au présent contrat sans préavis. À la fin de votre période de probation, vous ferez l’objet d’une évaluation du rendement. Si Cluster a besoin de plus de temps pour évaluer votre capacité à exercer les fonctions du poste et votre aptitude à l’occuper, Cluster pourra, à sa seule discrétion, prolonger la période de probation de trois (3) mois. Cluster vous avisera par écrit de son intention de prolonger la période de probation avant le dernier jour de votre période de probation initiale.'],
+  ['7. Avantages sociaux.', 'Vous deviendrez admissible au régime d’assurance collective de Cluster après avoir complété trois (3) mois d’emploi continu, conformément aux modalités, conditions et exigences d’admissibilité du régime. Cluster se réserve le droit de modifier, de remplacer ou d’abolir, en tout ou en partie, les avantages associés à ce régime en tout temps, sans préavis ni indemnité de quelque nature que ce soit.'],
+  ['8. Confidentialité.', 'Les « Renseignements confidentiels » désignent la Propriété intellectuelle, les clients, les secrets commerciaux, le savoir-faire et les autres renseignements exclusifs et confidentiels de Cluster, qu’ils soient de nature technique ou non, se rapportant aux activités et aux affaires actuelles, futures ou envisagées de Cluster ou de l’un de ses clients, fournisseurs, acheteurs, mandataires ou consultants, y compris, sans limitation, les politiques de sécurité, rapports, vérifications, estimations, évaluations, plans d’action, produits, logiciels et codes sources, la documentation connexe sur support papier, les listes de clients, les stratégies de marketing, les renseignements financiers et pratiques commerciales, les formulaires, lettres de sollicitation et de renouvellement, grilles tarifaires et autres correspondances adressées aux clients ou clients potentiels, anciens clients ou clients potentiels de Cluster, les renseignements financiers, y compris les déclarations de revenus, bilans et documents attestant des revenus ou des dépenses de Cluster, les salaires et autres avantages des employés ou mandataires de Cluster ou de ses actionnaires, administrateurs, dirigeants ou mandants, dont la divulgation directe ou indirecte à des concurrents de Cluster ou au grand public serait gravement préjudiciable aux meilleurs intérêts de Cluster ou à ceux des membres de son groupe et des actionnaires respectifs de chacune des personnes morales susmentionnées. Rien aux présentes n’est limité du fait que la totalité ou une partie des éléments mentionnés aux présentes aient pu être diffusés, en tout ou en partie, au public. Vous reconnaissez que la présente clause a pour objet et pour but de limiter l’utilisation des Renseignements confidentiels à des fins de nuire à Cluster et d’en tirer un avantage important.'],
+  [null, 'Vous vous engagez et convenez de ne jamais, pendant la durée du présent contrat ou en tout temps par la suite, directement ou indirectement, divulguer, publier ou communiquer, ni exploiter ou utiliser à votre profit ou au profit de toute autre partie, personne ou entité, les Renseignements confidentiels dont vous avez pris connaissance pendant votre emploi chez Cluster ou en raison de celui-ci.'],
+  [null, 'Vous vous engagez expressément et convenez, sur demande écrite de Cluster, de remettre toute la documentation, les listes et dossiers de clients, rapports, outils, vérifications, évaluations, codes sources, logiciels, programmes informatiques, codes objets ou spécifications de conception de tels codes sources ou logiciels élaborés par Cluster, ainsi que tous les autres Renseignements confidentiels appartenant à Cluster. Vous ne retirerez des locaux de Cluster aucun de ces éléments ni aucun original, sauf pour faire directement avancer les affaires de Cluster et dans le cadre de vos services auprès de Cluster, à moins d’une autorisation écrite expresse de Cluster. Vous convenez de ne pas transmettre par courrier électronique, à vous-même ou à un tiers, des Renseignements confidentiels, et de ne pas utiliser de disque dur externe ou d’autre support pour recueillir ou copier des Renseignements confidentiels sans le consentement écrit exprès de la Société.'],
+  ['9. Propriété intellectuelle.', 'La « Propriété intellectuelle » désigne l’ensemble des inventions, découvertes, développements, méthodes, applications, procédés, procédures, compositions, œuvres, secrets commerciaux, savoir-faire, méthodes de production, dessins, concepts, idées, recettes, formules, plans, développements de produits, droits d’auteur, marques de commerce, demandes d’enregistrement de marques de commerce, brevets et demandes de brevets, dans la mesure où ils sont : (i) conçus, réalisés, créés, développés, mis en pratique ou autrement apportés par vous pendant votre emploi chez Cluster ou l’un des membres de son groupe, ou relativement à cet emploi, que ce soit avant ou après la date d’entrée en fonction, seul ou avec d’autres, pendant ou en dehors des heures normales de travail, dans les locaux de la Société ou ailleurs; ou (ii) issus de l’utilisation de Renseignements confidentiels ou de l’équipement ou des installations de la Société ou de l’un des membres de son groupe, ou qui s’appuient sur ceux-ci ou les intègrent autrement; ainsi que l’ensemble de leurs réalisations, améliorations, modifications, traductions, adaptations, perfectionnements, dérivés et combinaisons, qu’ils soient ou non brevetables, susceptibles de droits d’auteur ou autrement enregistrables;'],
+  [null, 'Par les présentes, vous cédez et convenez de céder à Cluster l’intégralité de vos droits, titres et intérêts dans toute la Propriété intellectuelle, qu’elle ait été conçue, réalisée, créée, développée, mise en pratique ou autrement apportée par vous avant, au moment ou après le début de votre emploi chez Cluster. Vous convenez de signer toutes les demandes de brevets, de droits d’auteur ou d’autres droits exclusifs, au pays comme à l’étranger, et d’accomplir tout autre acte (y compris, sans limitation, la signature et la remise d’actes de cession, d’assurance, de renonciation ou de confirmation supplémentaires) demandé par Cluster afin de lui céder la Propriété intellectuelle et de lui permettre de faire valoir tout brevet, droit d’auteur ou autre droit exclusif sur la Propriété intellectuelle.'],
+  [null, 'Toutes les œuvres susceptibles de droits d’auteur que vous pourriez créer ou auxquelles vous pourriez contribuer par la suite, ou que vous avez créées ou auxquelles vous avez contribué avant votre date d’entrée en fonction, et qui se rapportent à Cluster, seront considérées comme des « œuvres réalisées dans le cadre d’un emploi » et appartiendront exclusivement à Cluster dès leur création, sans autre formalité.'],
+  [null, 'Par les présentes, vous renoncez irrévocablement à tous les droits moraux et autres droits incessibles que vous détenez ou pourriez détenir à l’avenir sur toute Propriété intellectuelle.'],
+  ['10. Engagement de non-concurrence.', 'Vous vous engagez et convenez, pendant votre emploi et pour une période d’un an suivant la fin de votre emploi, de ne pas, au Canada (le « Territoire »), directement ou indirectement, de quelque manière que ce soit, pour votre propre compte ou pour le compte de toute autre personne ou entité, seul ou en société :'],
+  ['a)', 'exercer des activités, être employé ou engagé, détenir un intérêt financier ou autre, ou participer commercialement de quelque autre façon à la sollicitation de commerçants aux fins de la prestation de services de traitement des paiements par carte de crédit (l’« Entreprise visée »), que ce soit à titre de mandant, de mandataire, d’actionnaire, d’investisseur, d’associé, de détenteur de titres de participation, de consultant, d’employé, de prêteur, de caution ou à quelque autre titre que ce soit; ou', 'item'],
+  ['b)', 'fournir un soutien financier, au moyen d’un prêt, d’une garantie ou autrement, ou permettre que votre image ou votre nom, en tout ou en partie, soit utilisé par toute personne ou entité participant à une Entreprise visée,', 'item'],
+  [null, 'dans chaque cas, sans le consentement écrit préalable de Cluster, lequel peut être refusé pour quelque motif que ce soit, à l’entière et absolue discrétion de Cluster.'],
+  ['11. Engagement de non-sollicitation.', 'Vous vous engagez et convenez, pendant votre emploi et pour une période d’un an suivant la fin de votre emploi, de ne pas, directement ou indirectement, de quelque manière que ce soit, pour votre propre compte ou pour le compte de toute autre personne ou entité, à quelque titre que ce soit, solliciter ou inciter toute personne ayant acheté les produits ou services de Cluster, ou obtenu une licence à leur égard, à quelque moment que ce soit au cours de la période d’un an précédant la fin de votre emploi, à cesser ou à réduire le volume des affaires qu’elle fait avec Cluster, ni tenter de nuire de quelque façon que ce soit à la relation de Cluster avec elle, sans le consentement écrit préalable de Cluster, lequel peut être refusé pour quelque motif que ce soit, à l’entière et absolue discrétion de Cluster.'],
+  [null, 'De plus, vous vous engagez et convenez, pendant votre emploi et pour une période d’un an suivant la fin de votre emploi, de ne pas, directement ou indirectement, de quelque manière que ce soit, pour votre propre compte ou pour le compte de toute autre personne ou entité, à quelque titre que ce soit, solliciter ou inciter tout employé ou entrepreneur employé ou engagé par Cluster, ni offrir un emploi ou un contrat de service à tout employé ou entrepreneur employé ou engagé par Cluster ou l’un des membres de son groupe, ni inciter tout employé ou entrepreneur de Cluster ou de l’un des membres de son groupe à mettre fin à son emploi ou à sa relation avec Cluster ou l’un des membres de son groupe, ni tenter autrement de nuire à la relation entre Cluster ou un tel membre de son groupe et un tel employé ou entrepreneur; dans chaque cas, sans le consentement écrit préalable de Cluster, lequel peut être refusé pour quelque motif que ce soit, à l’entière et absolue discrétion de Cluster.'],
+  ['12. Non-dénigrement.', 'Vous reconnaissez et convenez que Cluster exerce ses activités dans le domaine des services et que sa réputation constitue l’un de ses actifs les plus précieux. En conséquence, vous vous engagez et convenez de ne jamais, directement ou indirectement, pendant votre emploi ou par la suite, diffuser, émettre, publier ou afficher de quelque manière que ce soit, dans quelque média que ce soit, numérique, écrit ou oral, par téléphone ou autrement, des commentaires dénigrants à l’égard de Cluster, de ses activités ou de son personnel, ni des propos qui présentent faussement ou de manière trompeuse les activités de Cluster ou ses produits ou services, que ce soit dans le but d’obtenir des ventes ou pour toute autre raison.'],
+  ['13. Fin d’emploi.', 'Vous pouvez, en tout temps, mettre fin au présent contrat pour quelque motif que ce soit en donnant à Cluster un préavis écrit d’au moins quatre semaines avant la date de cette fin d’emploi. Vous ne pouvez toutefois pas prendre de vacances pendant cette période de préavis sans le consentement écrit de Cluster. Cluster se réserve le droit de renoncer à ce préavis, en tout ou en partie.'],
+  [null, 'Cluster peut, en tout temps, mettre fin au présent contrat :'],
+  ['a)', 'pendant la période de probation, en tout temps et à la seule discrétion de Cluster, sans préavis;', 'item'],
+  ['b)', 'pour un motif sérieux, sans autre préavis;', 'item'],
+  ['c)', 'sans motif sérieux, en vous remettant un préavis écrit conforme aux lois applicables. Cluster peut toutefois, à sa seule discrétion, remplacer ce préavis écrit, en tout ou en partie, par une indemnité de départ calculée selon votre salaire et équivalant à la partie non travaillée de la période de préavis; ou', 'item'],
+  ['d)', 'automatiquement à votre décès.', 'item'],
+  [null, 'Remise des biens :', 'sub'],
+  [null, 'À la fin de l’emploi, qu’elle soit volontaire ou non, l’Employé(e) s’engage à remettre tous les biens de l’entreprise, y compris, sans s’y limiter, l’équipement, les outils, les documents, les clés, les appareils électroniques, la propriété intellectuelle et tout autre actif fourni par Cluster au cours de l’emploi.'],
+  [null, 'Responsabilité à l’égard des biens non remis ou endommagés :', 'sub'],
+  [null, 'Si des biens de l’entreprise ne sont pas remis ou sont remis endommagés, l’Employé(e) reconnaît et convient que Cluster peut déduire la valeur raisonnable des biens non remis ou endommagés de tout salaire dû, y compris la dernière paie, sous réserve des lois applicables.'],
+  [null, 'Valeur des biens non remis ou endommagés :', 'sub'],
+  [null, 'Cluster fournira une liste détaillée des biens non remis ou endommagés, accompagnée d’une estimation de leur valeur. L’Employé(e) s’engage à rembourser Cluster pour ces biens, et Cluster est autorisée à effectuer une déduction sur la dernière paie, pourvu que le montant soit raisonnable et n’excède pas la valeur des biens non remis ou endommagés.'],
+  [null, 'Consentement aux déductions :', 'sub'],
+  [null, 'En signant la présente offre d’emploi, l’Employé(e) reconnaît et convient que, sous réserve des modalités énoncées ci-dessus, Cluster peut déduire de la dernière paie ou de tout autre salaire dû toute somme due pour des biens non remis ou endommagés, dans la mesure permise par la loi applicable.'],
+  ['14. Droit applicable et élection de for.', 'Le présent contrat est régi par les lois de la province de Québec et doit être interprété conformément à celles-ci. Les parties conviennent que toute action ou procédure judiciaire relative à toute question découlant de l’une ou l’autre des obligations prévues au présent contrat sera intentée exclusivement devant les tribunaux compétents de la province de Québec, district de Montréal.'],
+  ['15. Références monétaires.', 'Toutes les mentions de « dollars » ou du symbole « $ » dans le présent contrat désignent la monnaie canadienne.'],
+  ['16. Langue.', 'Le présent contrat est rédigé en français. Une version anglaise a pu vous être remise pour votre commodité; en cas de divergence, la version française prévaut. This agreement is drafted in French; an English version may have been provided for convenience.'],
+];
+
+const OFFER_INTRO_FR = [
+  'Au nom de Cluster, j’ai le plaisir de vous offrir le poste de {position}. Nous sommes convaincus que vos compétences et votre dévouement seront un atout considérable pour notre entreprise, et nous avons hâte de voir l’impact que vous aurez dans ce nouveau rôle.',
+  'En tant qu’employé(e) de Cluster, vous êtes personnellement responsable de l’ensemble des services, gestes, conseils et résultats que vous fournirez tout au long de votre emploi chez nous. En retour, nous nous engageons à vous offrir toutes les occasions d’apprendre et de progresser jusqu’au plus haut niveau de vos capacités et de votre potentiel.',
+  'Si vous acceptez la présente offre, elle constituera votre contrat de travail avec Cluster. Veuillez noter que cette offre est conditionnelle à une vérification des antécédents satisfaisante, le cas échéant.',
+];
+
+const OFFER_CLOSING_FR = [
+  'En signant la présente lettre d’offre, vous reconnaissez et acceptez de vous conformer à toutes les politiques de Cluster.',
+  'Nous sommes convaincus que vous contribuerez de manière importante au succès de notre entreprise et nous avons hâte de vous accueillir au sein de notre équipe!',
+  'Cordialement,',
+];
+
+const OFFER_ACK_FR = 'Par votre signature ci-dessous, vous reconnaissez avoir disposé d’un délai raisonnable pour lire et comprendre le présent contrat et avoir eu l’occasion de poser toutes vos questions, avoir vérifié l’étendue de vos droits et obligations et avoir eu la possibilité de consulter un conseiller juridique. De plus, vous acceptez et comprenez l’emploi qui vous est offert selon les modalités et conditions énoncées aux présentes, notamment celles relatives à la fin de votre emploi et aux engagements restrictifs.';
+
+function offerSalaryExtraFr(terms, money) {
+  const parts = [];
+  if (terms.commissionEligible) parts.push('De plus, vous serez admissible à des commissions.');
+  const car = Number(terms.carAllowance) > 0;
+  const phone = Number(terms.phoneAllowance) > 0;
+  if (car && phone) {
+    parts.push(`Vous recevrez également une allocation automobile de ${money(terms.carAllowance)} par année, versée conformément aux pratiques de paie habituelles de la Société, ainsi qu’une allocation mensuelle de téléphone de ${money(terms.phoneAllowance)}.`);
+  } else if (car) {
+    parts.push(`Vous recevrez également une allocation automobile de ${money(terms.carAllowance)} par année, versée conformément aux pratiques de paie habituelles de la Société.`);
+  } else if (phone) {
+    parts.push(`Vous recevrez également une allocation mensuelle de téléphone de ${money(terms.phoneAllowance)}.`);
+  }
+  return parts.join(' ');
+}
+
+// Les deux versions de l'offre, sous une même forme, pour que pdf.js n'ait qu'un seul rendu.
+const OFFER = {
+  en: {
+    intro: OFFER_INTRO, clauses: OFFER_CLAUSES, closing: OFFER_CLOSING, ack: OFFER_ACK, salaryExtra: offerSalaryExtra,
+    title: 'Offer of Employment', subject: 'Subject: Welcome to Cluster', dear: (n) => `Dear ${n},`,
+    blank: '[Remainder of this page intentionally left blank. The next page is the signature page]',
+    by: 'By:', manager: 'Manager', name: 'Name', date: 'Date', footer: '  |  Offer of Employment  |  Confidential',
+  },
+  fr: {
+    intro: OFFER_INTRO_FR, clauses: OFFER_CLAUSES_FR, closing: OFFER_CLOSING_FR, ack: OFFER_ACK_FR, salaryExtra: offerSalaryExtraFr,
+    title: 'Offre d’emploi', subject: 'Objet : Bienvenue chez Cluster', dear: (n) => `Bonjour ${n},`,
+    blank: '[Le reste de cette page est laissé en blanc intentionnellement. La page suivante est la page de signature]',
+    by: 'Par :', manager: 'Gestionnaire', name: 'Nom', date: 'Date', footer: '  |  Offre d’emploi  |  Confidentiel',
+  },
+};
+
+module.exports = { OFFER, OFFER_CLAUSES, OFFER_INTRO, OFFER_CLOSING, OFFER_ACK, offerSalaryExtra, AGREEMENT };
