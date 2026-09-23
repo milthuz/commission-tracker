@@ -734,6 +734,16 @@ async function initializeDatabase() {
         AND i.approval_status <> 'paid'
     `);
 
+    // Facture mixte (SaaS en renouvellement + matériel qui paie) : recalc-v2 l'étiquette
+    // maintenant 'hardware' (2026-09-23). Rattrape les lignes écrites avant, y compris les
+    // factures payées/gelées que recalc ne réécrit plus — étiquette seulement, aucun montant.
+    // Sans ça, elles restaient hors de tous les filtres « qualifiants » (bulletin, commit, paie,
+    // réconciliation). Idempotent.
+    await pool.query(`
+      UPDATE invoices SET commission_status = 'hardware'
+       WHERE commission_status = 'saas_renewal' AND commission > 0 AND hardware_amount > 0
+    `);
+
     // PERFORMANCE: `invoices` is the busiest table in the app (~105 queries reference it) and had
     // NO indexes at all beyond the implicit PK and UNIQUE(invoice_number) — so every commission
     // page, report, pay stub and reconciliation was a full sequential scan over thousands of rows,
@@ -32107,11 +32117,10 @@ app.get('/api/commissions/unpaid-commissions', authenticateToken, async (req, re
        FROM invoices
        WHERE salesperson_name = $1 AND organization_id = $2
          AND commission > 0
-         -- 'saas_renewal' is included here on purpose: a mixed hardware+SaaS invoice whose SaaS
-         -- portion is a renewal (0%) still earns real hardware commission on top, but the bucket
-         -- label reflects the SaaS side (2026-07-15 fix — Poke Monster Lasalle's hardware $ was
-         -- invisible to this list because of it). Safe: recalc-v2 never adds commission to a
-         -- 'saas_renewal' bucket except via that hardware add-on.
+         -- 'saas_renewal' : filet de sécurité hérité du correctif du 2026-07-15. Depuis le
+         -- 2026-09-23, recalc-v2 étiquette 'hardware' une facture mixte dont le matériel paie
+         -- (et une migration au démarrage a rattrapé l'existant), donc plus aucune ligne
+         -- 'saas_renewal' ne devrait porter de commission.
          AND commission_status IN ('hardware','saas_first','saas_annual','quota_partial','saas_renewal')
          AND approval_status <> 'paid'
        ORDER BY commission_payable_date, invoice_number`,
@@ -34793,6 +34802,11 @@ async function runRecalcV2(source = 'manual') {
           }
           if (firstSaasPaid) {
             commission += hardwareAmount * (hwRate / 100);
+            // SaaS en renouvellement (0 %) + matériel qui paie : toute la commission vient du
+            // matériel, donc l'étiquette doit le dire. Laissée à 'saas_renewal', la facture
+            // était sautée par tous les filtres « qualifiants » (bulletin, commit, paie) et
+            // n'apparaissait sur AUCUN bulletin — INV-084061, 322,75 $ (2026-09-23).
+            if (bucket === 'saas_renewal') bucket = 'hardware';
             // If the SaaS portion didn't already set a payable date (renewal w/ HW), use the
             // later of this invoice's paid_date and the first-SaaS paid_date.
             if (!payableDate) {
