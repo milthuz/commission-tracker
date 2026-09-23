@@ -267,8 +267,53 @@ function registerHrRoutes(app, deps) {
     res.json({
       defaults: defaults(),
       terms: P.BASE_TERMS,
+      managers: await readManagers(),
       can: { manage: await can(req, PERM_MANAGE), countersign: await can(req, PERM_SIGN) },
     });
+  });
+
+  // -------------------------------------------------------------------------
+  // Gestionnaires (« Relève de ») — liste gérée par les RH, avec le titre EN et FR de chacun,
+  // pour que la fiche d'embauche remplisse le titre toute seule (demande de David, 2026-09-23).
+  // ⚠️ Les titres de départ sont VIDES : ils ne sont pas devinés, les RH les saisissent une fois.
+  // -------------------------------------------------------------------------
+  const MANAGERS_KEY = 'hr_managers';
+  const DEFAULT_MANAGERS = ['Jerome Stroobants', 'David Lafleur', 'Jay D’Aoust']
+    .map((name) => ({ name, titleEn: '', titleFr: '' }));
+  async function readManagers() {
+    try {
+      const r = await pool.query('SELECT value FROM app_settings WHERE key = $1', [MANAGERS_KEY]);
+      if (!r.rows[0]) return DEFAULT_MANAGERS;
+      let v = r.rows[0].value;
+      if (typeof v === 'string') v = JSON.parse(v);
+      return Array.isArray(v) ? v : DEFAULT_MANAGERS;
+    } catch { return DEFAULT_MANAGERS; }
+  }
+  app.get('/api/hr/managers', authenticateToken, async (req, res) => {
+    if (!(await requirePerm(req, res, PERM_VIEW))) return;
+    res.json({ managers: await readManagers() });
+  });
+  app.put('/api/hr/managers', authenticateToken, async (req, res) => {
+    if (!(await requirePerm(req, res, PERM_MANAGE))) return;
+    const list = Array.isArray(req.body?.managers) ? req.body.managers : null;
+    if (!list || list.length > 50) return res.status(400).json({ error: 'managers array (max 50) required' });
+    const clean = [];
+    const seen = new Set();
+    for (const m of list) {
+      const name = String(m?.name || '').trim().slice(0, 120);
+      if (!name) continue;
+      if (seen.has(name.toLowerCase())) return res.status(400).json({ error: `duplicate: ${name}` });
+      seen.add(name.toLowerCase());
+      clean.push({ name, titleEn: String(m?.titleEn || '').trim().slice(0, 120), titleFr: String(m?.titleFr || '').trim().slice(0, 120) });
+    }
+    try {
+      await pool.query(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES ($1, $2::jsonb, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+        [MANAGERS_KEY, JSON.stringify(clean)],
+      );
+      res.json({ managers: clean });
+    } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
   app.get('/api/hr/hires', authenticateToken, async (req, res) => {
