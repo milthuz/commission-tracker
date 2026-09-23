@@ -214,7 +214,10 @@ function registerHrRoutes(app, deps) {
     const email = String(sender.email).toLowerCase();
     const name = String(sender.name || email).replace(/["<>\r\n]/g, '').slice(0, 80);
     const domain = email.split('@')[1] || '';
-    const verified = String(process.env.HR_SENDER_DOMAINS || '').split(',').map((d) => d.trim().toLowerCase()).filter(Boolean);
+    // clustersystems.com est authentifié chez SendGrid (confirmé par David le 2026-09-23) : c'est la
+    // valeur par défaut. HR_SENDER_DOMAINS la remplace (liste séparée par des virgules ; « none »
+    // pour revenir à l'adresse Sales Hub partout).
+    const verified = String(process.env.HR_SENDER_DOMAINS || 'clustersystems.com').split(',').map((d) => d.trim().toLowerCase()).filter((d) => d && d !== 'none');
     if (verified.includes(domain)) return { from: `"${name}" <${email}>`, replyTo: email };
     const baseFrom = String(process.env.SMTP_FROM || process.env.SMTP_USER || '');
     const addr = (/<([^>]+)>/.exec(baseFrom) || [null, baseFrom])[1].trim();
