@@ -387,6 +387,9 @@ async function renderOffer(snap, { employeeSig = null, companySig = null, lang: 
     reportsToName: h.reportsToName,
     annualSalary: m(h.annualSalary),
     vacationWeeks: String(snap.terms.vacationWeeks),
+    // Sans valeur : dossier ENVOYÉ avant l'ajout du champ (instantané avec ref) = 4, comme il le
+    // disait ; brouillon ancien = la nouvelle valeur par défaut, 2.
+    noticeWeeks: T.inWords(snap.terms.noticeWeeks != null ? snap.terms.noticeWeeks : (snap.ref ? 4 : 2), lang),
     position,
     salaryExtra: O.salaryExtra(snap.terms, m),
   };
@@ -446,9 +449,23 @@ async function renderOffer(snap, { employeeSig = null, companySig = null, lang: 
   f.st.y += 6;
 
   // --- Clauses : numéro orange + titre, filet léger, texte dessous ---
-  for (const [title, body, kind] of O.clauses) {
+  for (let ci = 0; ci < O.clauses.length; ci++) {
+    const [title, body, kind] = O.clauses[ci];
     const text = fill(body);
     if (!text.trim()) continue;
+    // Premier sous-titre d'une série (« Remise des biens » et ses trois suivants) : le bloc part
+    // d'un seul tenant, sinon il était coupé en bas de page (demande des RH, 2026-09-23).
+    if (kind === 'sub' && (!O.clauses[ci - 1] || O.clauses[ci - 1][2] !== 'sub') && (ci === 0 || O.clauses[ci - 2]?.[2] !== 'sub')) {
+      let blockH = 0;
+      for (let k = ci; k < O.clauses.length; k++) {
+        const [kt, kb, kk] = O.clauses[k];
+        if (kt && kk !== 'item' && kk !== 'sub') break;
+        doc.font(kk === 'sub' ? 'Helvetica-Bold' : 'Helvetica').fontSize(SIZE);
+        blockH += doc.heightOfString(fill(kb), { width: CW, lineGap: 1.5 }) + (kk === 'sub' ? 5 : GAP + 1);
+      }
+      if (blockH < BOTTOM - M - 20) f.ensure(blockH + 4);
+      else if (f.st.y > M + 120) { doc.addPage(); f.st.y = M; }
+    }
     if (kind === 'item') {
       doc.font('Helvetica').fontSize(SIZE);
       const hh = doc.heightOfString(text, { width: CW - 44, lineGap: 1.5 });

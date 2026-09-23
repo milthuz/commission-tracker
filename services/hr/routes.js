@@ -194,6 +194,34 @@ function registerHrRoutes(app, deps) {
       return Array.isArray(v) ? v : [];
     } catch { return []; }
   }
+  // Courriel d'un gestionnaire de la liste d'Admin → RH, par son nom (null s'il n'en a pas).
+  async function managerEmail(name) {
+    if (!name) return null;
+    const m = (await readManagers()).find((x) => x.name === name);
+    return m && m.email ? m.email.toLowerCase() : null;
+  }
+
+  // EXPÉDITEUR des courriels au candidat : la personne RH qui a envoyé l'offre, pas « Sales Hub »
+  // (demande de David, 2026-09-23 — les contrats tombaient dans les indésirables).
+  // ⚠️ Écrire « De : gabriela@clustersystems.com » n'est permis par SendGrid QUE si le domaine est
+  // authentifié (DKIM/SPF). Tant que ce n'est pas fait, un « De » à son adresse serait refusé ou
+  // finirait justement en indésirables. D'où deux régimes, réglés par HR_SENDER_DOMAINS :
+  //   - domaine listé (ex. « clustersystems.com ») → De : « Gabriela Frenkel <gabriela@…> » ;
+  //   - sinon → De : « Gabriela Frenkel (Cluster) <adresse Sales Hub> », Répondre à : gabriela@….
+  // Dans les deux cas, la réponse du candidat arrive chez elle.
+  function senderOpts(sender, emp) {
+    if (!sender || !sender.email) return {};
+    const email = String(sender.email).toLowerCase();
+    const name = String(sender.name || email).replace(/["<>\r\n]/g, '').slice(0, 80);
+    const domain = email.split('@')[1] || '';
+    const verified = String(process.env.HR_SENDER_DOMAINS || '').split(',').map((d) => d.trim().toLowerCase()).filter(Boolean);
+    if (verified.includes(domain)) return { from: `"${name}" <${email}>`, replyTo: email };
+    const baseFrom = String(process.env.SMTP_FROM || process.env.SMTP_USER || '');
+    const addr = (/<([^>]+)>/.exec(baseFrom) || [null, baseFrom])[1].trim();
+    if (!addr) return { replyTo: email };
+    return { from: `"${name} (${(emp || EMP.CLUSTER).shortName})" <${addr}>`, replyTo: email };
+  }
+
   // Avis internes : créateur de la fiche + liste d'Admin → Notifications, sans doublon.
   async function internalTo(row) {
     const list = new Set((await recipients()).map((e) => e.toLowerCase()));
@@ -517,12 +545,13 @@ function registerHrRoutes(app, deps) {
   }
 
   async function mailCandidate(req, row, snap, rawToken) {
+    const sender = { email: req.user.email, name: req.user.name || req.user.email };
     const link = `${base()}/sign?token=${encodeURIComponent(rawToken)}`;
     const emp = snap.employer || EMP.CLUSTER;
     const m = E.signRequestEmail(mailShell, {
       firstName: snap.hire.firstName, ...positions(snap.hire), link, expiresDays: TOKEN_DAYS, employer: emp, logoUrl: logoUrl(req, emp),
     });
-    const r = await sendMail(snap.hire.email, m.subject, m.html);
+    const r = await sendMail(snap.hire.email, m.subject, m.html, senderOpts(sender, emp));
     return { link, mail: r };
   }
 
@@ -539,6 +568,7 @@ function registerHrRoutes(app, deps) {
         hire: row.data, terms: row.terms, plan: row.plan,
         attachments: att.map((a) => ({ id: a.id, filename: a.filename, sha256: a.sha256 })),
         employer: await EMP.getEmployer(pool, row.data.employer),
+        sender: { email: req.user.email, name: req.user.name || req.user.email },
       };
       // Documents rendus UNE fois et figés. Dossier en anglais → la version française des mêmes
       // documents est aussi rendue et présentée (référence, non signée) : un contrat d'adhésion
@@ -657,7 +687,7 @@ function registerHrRoutes(app, deps) {
       const attachment = [{ filename: `${emp.shortName.replace(/[^\w-]/g, '')}_Signed_${fileBase(row)}.pdf`, content: pdf, contentType: 'application/pdf' }];
       const dates = { startDateFr: R.longDate(snap.hire.startDate, 'fr'), startDateEn: R.longDate(snap.hire.startDate, 'en') };
       const me = E.completedEmployeeEmail(mailShell, { firstName: snap.hire.firstName, ...dates, employer: emp, logoUrl: logoUrl(req, emp) });
-      const toEmp = await sendMail(row.email, me.subject, me.html, { attachments: attachment });
+      const toEmp = await sendMail(row.email, me.subject, me.html, { attachments: attachment, ...senderOpts(snap.sender, emp) });
       const mi = E.completedInternalEmail(mailShell, {
         name: row.full_name, ...positions(snap.hire), ...dates, link: `${base()}/hr?id=${row.id}`,
       });
@@ -899,7 +929,9 @@ function registerHrRoutes(app, deps) {
       if (!upd.rows[0]) return res.status(409).json({ error: 'already_signed' });
       await event(row.id, 'employee_signed', row.email, ip, { typedName: typed, ua });
       await audit(row.id, 'employee_signed', `Employee signed: ${row.full_name}`, row.email);
-      const to = await internalTo({ created_by: upd.rows[0].created_by });
+      const signer = await managerEmail(row.snapshot.hire.supervisorName || row.snapshot.hire.reportsToName)
+        || await managerEmail(row.snapshot.hire.reportsToName);
+      const to = [...new Set([...(signer ? [signer] : []), ...(await internalTo({ created_by: upd.rows[0].created_by }))])];
       if (to.length) {
         const m = E.countersignEmail(mailShell, { name: row.full_name, ...positions(row.snapshot.hire), employer: row.snapshot.employer, link: `${base()}/hr?id=${row.id}` });
         await sendMail(to.join(','), m.subject, m.html);

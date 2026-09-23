@@ -47,6 +47,7 @@ const BASE_TERMS = {
   carAllowance: 6000,        // $ par an ; 0 = phrase retirée
   phoneAllowance: 60,        // $ par mois ; 0 = phrase retirée
   vacationWeeks: 2,
+  noticeWeeks: 2,             // préavis de démission (clause 13) — le gabarit disait 4
   commissionEligible: true,
 };
 
@@ -188,9 +189,10 @@ function normalizeHire(body, defaults) {
     carAllowance: num(t.carAllowance, { min: 0, max: 1e6 }),
     phoneAllowance: num(t.phoneAllowance, { min: 0, max: 1e5 }),
     vacationWeeks: num(t.vacationWeeks, { min: 0, max: 12, int: true }),
+    noticeWeeks: num(t.noticeWeeks, { min: 1, max: 12, int: true }),
     commissionEligible: t.commissionEligible !== false,
   };
-  for (const k of ['carAllowance', 'phoneAllowance', 'vacationWeeks']) if (terms[k] == null) errors.push(`terms.${k}`);
+  for (const k of ['carAllowance', 'phoneAllowance', 'vacationWeeks', 'noticeWeeks']) if (terms[k] == null) errors.push(`terms.${k}`);
 
   const p = normalizePlan(b.plan, defaults);
   if (!p.ok) errors.push(...p.errors.map((e) => `plan.${e}`));
