@@ -30,6 +30,9 @@ const DEFAULTS = Object.freeze({
   creditCostPct: 0.05, // 0,05 % du volume (David, 2026-09-22)
   creditCostPerTxn: 0.035, // 0,035 $ par transaction crédit (David, 2026-09-22)
   interacCostPerTxn: 0.035, // 0,035 $ par transaction Interac (David, 2026-09-22)
+  // Coût réseau Interac en % du volume Interac, comme creditCostPct (David, 2026-09-23). 0 tant
+  // que le vrai taux n'est pas saisi : un taux inventé fausserait le profit.
+  interacCostPct: 0,
 
   termRentalRev: 30,
   termWarrantyCost: 3.5,
@@ -45,8 +48,6 @@ const DEFAULTS = Object.freeze({
   commPayPerLoc: 100,
   commHwPct: 10,
   commInstPct: 10,
-  // Bonus de signature versé au vendeur : montant unique pour le deal, facultatif (0 = aucun).
-  signupBonus: 0,
 });
 
 // Les trois paliers SaaS (pastilles + tableau de comparaison Bas / Base / Haut). Valeurs de
@@ -83,6 +84,7 @@ const BOUNDS = Object.freeze({
   creditCostPct: [0, 100],
   creditCostPerTxn: [0, 100],
   interacCostPerTxn: [0, 100],
+  interacCostPct: [0, 100],
   termRentalRev: [0, 100000],
   termWarrantyCost: [0, 100000],
   termUnitCost: [0, 1e6],
@@ -93,7 +95,6 @@ const BOUNDS = Object.freeze({
   commPayPerLoc: [0, 1e6],
   commHwPct: [0, 100],
   commInstPct: [0, 100],
-  signupBonus: [0, 1e7],
 });
 
 const MAX_NAME = 120;
