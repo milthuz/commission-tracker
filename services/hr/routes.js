@@ -290,7 +290,8 @@ function registerHrRoutes(app, deps) {
     } catch { return DEFAULT_MANAGERS; }
   }
   app.get('/api/hr/managers', authenticateToken, async (req, res) => {
-    if (!(await requirePerm(req, res, PERM_VIEW))) return;
+    // Lue par la fiche (hr:view) ET par la page Admin → RH (hr:manage).
+    if (!(await can(req, PERM_VIEW)) && !(await can(req, PERM_MANAGE))) return res.status(403).json({ error: 'Permission required: hr:view' });
     res.json({ managers: await readManagers() });
   });
   app.put('/api/hr/managers', authenticateToken, async (req, res) => {
