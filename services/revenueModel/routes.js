@@ -11,11 +11,11 @@
 // Monté par UNE ligne dans server.js, comme services/icplus : ce fichier-là est énorme et
 // plusieurs sessions l'éditent à la fois.
 //
-// 🔑 PARTAGE PAR LIEN. La liste ne montre que les scénarios de l'usager. Un scénario s'ouvre
-// quand même par son identifiant (UUID aléatoire, non devinable) pour qui détient la
-// permission : c'est ce qu'envoie le bouton « Copier le lien ». Le volume d'un marchand ne
-// passe donc jamais dans une URL — seul l'identifiant y est. Seul l'auteur (ou un admin)
-// peut modifier ou supprimer.
+// 🔑 BIBLIOTHÈQUE D'ÉQUIPE (depuis le 2026-09-23, à la demande de David). Tout détenteur de
+// `revmodel:use` voit TOUS les scénarios, avec leur auteur. Seul l'auteur (ou un admin) peut
+// les écraser ou les supprimer : « Enregistrer » sous le même nom chez un autre usager crée SA
+// copie, sans toucher à l'original. Le lien partagé ne porte que l'identifiant (UUID) — le
+// volume d'un marchand ne passe jamais dans une URL.
 // ============================================================================
 
 const crypto = require('crypto');
@@ -159,8 +159,9 @@ function registerRevenueModelRoutes(app, deps) {
     try {
       await schema();
       const { rows } = await pool.query(
-        `SELECT * FROM revenue_model_scenarios WHERE LOWER(owner_email) = LOWER($1)
-         ORDER BY updated_at DESC`, [req.user.email || '']);
+        // Les siens d'abord, puis ceux de l'équipe ; les plus récents en tête dans chaque groupe.
+        `SELECT * FROM revenue_model_scenarios
+         ORDER BY (LOWER(owner_email) = LOWER($1)) DESC, updated_at DESC`, [req.user.email || '']);
       res.json({ scenarios: rows.map((r) => shape(r, req.user.email)) });
     } catch (e) {
       console.error('revenue-model list:', e.message);
