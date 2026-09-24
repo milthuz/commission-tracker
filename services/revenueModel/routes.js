@@ -121,7 +121,9 @@ function registerRevenueModelRoutes(app, deps) {
     if (!(await requirePerm(req, res, PERM_SETTINGS))) return;
     const v = validateInputs(req.body && req.body.inputs);
     if (!v.ok) return res.status(400).json({ error: 'bad_input', field: v.field });
-    const { saasPerLoc, ...next } = v.inputs;
+    // Ni le prix SaaS (il suit le palier du milieu) ni le logo (propre à UN marchand) ne
+    // deviennent une valeur par défaut.
+    const { saasPerLoc, merchantLogo, ...next } = v.inputs;
     try {
       const before = await readDefaults(pool);
       await pool.query(

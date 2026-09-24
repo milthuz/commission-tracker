@@ -114,6 +114,12 @@ const BOUNDS = Object.freeze({
 });
 
 const MAX_NAME = 120;
+
+// Logo du marchand (vue conseil, en-tête) : image matricielle en data URL, facultative. Le
+// navigateur la réduit avant l'envoi ; ce plafond ne sert qu'à refuser un fichier brut géant.
+// ⛔ Pas de SVG : un SVG peut contenir du script, et ce logo s'affiche chez d'autres usagers.
+const MAX_LOGO = 400000;
+const LOGO_RE = /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/;
 const BOUNDS_SAAS = BOUNDS.saasPerLoc;
 
 // Champs ajoutés le 2026-09-23 : un scénario plus ancien ne les a pas, et doit se relire EXACTEMENT
@@ -149,6 +155,11 @@ function validateInputs(raw) {
   const name = raw.merchantName == null ? DEFAULTS.merchantName : String(raw.merchantName).trim();
   if (name.length > MAX_NAME) return { ok: false, field: 'merchantName' };
   out.merchantName = name;
+  if (raw.merchantLogo != null && raw.merchantLogo !== '') {
+    const logo = String(raw.merchantLogo);
+    if (logo.length > MAX_LOGO || !LOGO_RE.test(logo)) return { ok: false, field: 'merchantLogo' };
+    out.merchantLogo = logo;
+  }
   for (const [key, [min, max]] of Object.entries(BOUNDS)) {
     const v = raw[key] == null ? DEFAULTS[key] : Number(raw[key]);
     if (!Number.isFinite(v) || v < min || v > max) return { ok: false, field: key };
