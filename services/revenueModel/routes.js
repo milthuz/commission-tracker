@@ -1,7 +1,7 @@
 // ============================================================================
 // Modélisateur de revenus — couche HTTP.
 //
-// Outil de vente interne : le rep modélise le P&L sur 3 ans de l'intégration d'une chaîne
+// Outil de vente interne : le rep modélise le P&L sur 5 ans de l'intégration d'une chaîne
 // (SaaS, crédit, Interac, terminaux, matériel, installation, commissions). Les CALCULS se
 // font dans le navigateur, à chaque frappe — c'est une simulation, rien ici n'est facturé ni
 // payé, et rien ne part chez un client. Le serveur ne fait que deux choses :
