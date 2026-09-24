@@ -109,5 +109,51 @@ const tot = K.auditTotals([
 ok('theoretical sums verified only', near(tot.theoretical, 9), tot);
 ok('suspect annualized', near(tot.suspectAnnual, 300), tot);
 
+// ---------------------------------------------------------------------------
+// L'OFFRE STANDARD CLUSTER — ce qui empêche le pire bogue rencontré sur cet outil.
+//
+// ⚠️ `populate()` retombait sur des taux Cluster À ZÉRO quand l'appelant n'en fournissait
+// pas, et le frontend n'en a jamais fourni. Cluster ressortait donc comme ne facturant
+// RIEN, ce qui ne vide pas un panneau : ça fausse le chiffre EN TÊTE du document remis au
+// client. Sur le relevé PATISSERIE AFRODITI (2026-09-24), Sales Hub annonçait 883,81 $
+// d'économies par mois quand la vraie offre en donnait -76,17 : un rep serait parti vendre
+// une économie qui n'existe pas.
+//
+// Ces assertions n'ont pas d'autre rôle que d'empêcher le retour du zéro.
+// ---------------------------------------------------------------------------
+{
+  const offre = require('../clusterOffer');
+  const MIN = { current_processor: {}, volume: { visa_count: 100, visa_amt: 10000, mc_count: 50, mc_amt: 5000 }, line_audit: {} };
+  const stZero = K.populate(MIN, {});
+  const rZero = K.recalc(stZero);
+
+  ok('Cluster ne facture JAMAIS zéro par défaut',
+    stZero.cluster.rates.visa.pct > 0 && stZero.cluster.rates.visa.perItem > 0,
+    stZero.cluster.rates.visa);
+  ok('ses frais fixes non plus', rZero.cluster.fixed > 0, rZero.cluster.fixed);
+
+  // ⚠️ Et le coût, sinon la marge ressort égale au facturé — faux dans l'autre sens.
+  ok('la marge a un coût, donc un revenu inférieur au facturé',
+    rZero.margin && rZero.margin.totalCost > 0 && rZero.margin.revenue < rZero.margin.totalBilled,
+    rZero.margin && { billed: rZero.margin.totalBilled, cost: rZero.margin.totalCost });
+
+  // Les valeurs de l'offre restent celles du fichier, pas une copie qui aurait dérivé.
+  ok('les taux servis sont bien ceux de l\'offre standard',
+    stZero.cluster.rates.visa.pct === offre.STANDARD_RATES.visa.pct, stZero.cluster.rates.visa.pct);
+
+  // ⚠️ Une analyse ne doit pas pouvoir écraser l'offre pour les suivantes du même
+  // processus : populate range une COPIE, pas la référence du module.
+  stZero.cluster.rates.visa.pct = 0.99;
+  const stApres = K.populate(MIN, {});
+  ok('modifier un état n\'altère pas l\'offre standard',
+    stApres.cluster.rates.visa.pct === offre.STANDARD_RATES.visa.pct, stApres.cluster.rates.visa.pct);
+
+  // L'appelant garde la main : une tarification fournie l'emporte toujours.
+  const stCustom = K.populate(MIN, { clusterRates: { visa: { pct: 0.005, perItem: 0.02 } } });
+  ok('une tarification fournie par l\'appelant l\'emporte',
+    stCustom.cluster.rates.visa.pct === 0.005, stCustom.cluster.rates.visa.pct);
+}
+
+
 console.log(fail ? `\n${fail} FAILING` : '\nall green');
 process.exit(fail ? 1 : 0);

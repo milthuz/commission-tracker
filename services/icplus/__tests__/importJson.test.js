@@ -129,13 +129,19 @@ ok('round trip preserves the Cluster subtraction', near(fromParse.cluster.interc
 // ---------------------------------------------------------------------------
 let st = K.populate(MINIMAL, {});
 const base = K.recalc(st).current.fixed;
+// ⚠️ Le côté Cluster ne part plus de ZÉRO : depuis le 2026-09-24 il est amorcé avec
+// l'offre standard (clusterOffer.js), sans quoi le calculateur présentait Cluster comme
+// ne facturant rien et l'économie annoncée au marchand était fausse. Ce que ces
+// assertions mesurent n'est pas la valeur absolue mais l'INDÉPENDANCE des deux côtés :
+// elles se comparent donc à leur propre base.
+const baseCluster = K.recalc(st).cluster.fixed;
 
 st = K.addFixedRow(st, 'current', { label: 'Frais de portail', qty: 1, unit: 25 });
 ok('a current-side row adds to the current total', near(K.recalc(st).current.fixed, base + 25), K.recalc(st).current.fixed);
-ok('and leaves the Cluster side alone', K.recalc(st).cluster.fixed === 0, K.recalc(st).cluster.fixed);
+ok('and leaves the Cluster side alone', K.recalc(st).cluster.fixed === baseCluster, K.recalc(st).cluster.fixed);
 
 st = K.addFixedRow(st, 'cluster', { label: 'Terminal', qty: 2, unit: 29.99 });
-ok('the Cluster side is mirrored but independent', near(K.recalc(st).cluster.fixed, 59.98), K.recalc(st).cluster.fixed);
+ok('the Cluster side is mirrored but independent', near(K.recalc(st).cluster.fixed, baseCluster + 59.98), K.recalc(st).cluster.fixed);
 ok('adding to Cluster did not touch the current side', near(K.recalc(st).current.fixed, base + 25));
 
 st = K.updateFixedRow(st, 'current', 0, { unit: 40 });

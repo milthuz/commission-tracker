@@ -22,6 +22,7 @@
 // into one shared treatment, the comparison silently stops being true.
 // ============================================================================
 
+const clusterOffer = require('./clusterOffer');
 const { STATUS } = require('./classify');
 
 // Québec: GST 5 % + QST 9.975 %. Configurable because the tool is used outside QC, but
@@ -112,12 +113,17 @@ function populate(parsed, opts = {}) {
     },
 
     cluster: {
-      rates: opts.clusterRates ? mergeRates(opts.clusterRates) : emptyRates(),
+      // ⚠️ L'OFFRE STANDARD, PAS ZÉRO. Le repli était emptyRates(), et le frontend n'a
+      // jamais envoyé clusterRates : Cluster ressortait donc comme ne facturant RIEN, ce
+      // qui gonfle l'économie annoncée au marchand. Sur un vrai relevé, l'écart entre les
+      // deux hypothèses valait 883,81 $/mois annoncés contre -76,17 $ réels — un rep
+      // serait parti vendre une économie inexistante. Voir clusterOffer.js.
+      rates: opts.clusterRates ? mergeRates(opts.clusterRates) : mergeRates(clusterOffer.standardRates()),
       // Recomputed by recalc() unless an estimate mode put a manual value here.
       interchange: 0,
       interchangeOverride: false,
       interchangeNote: null,
-      fixed: opts.clusterFixed ? mergeFixed(opts.clusterFixed) : emptyFixed(),
+      fixed: opts.clusterFixed ? mergeFixed(opts.clusterFixed) : mergeFixed(clusterOffer.standardFixed()),
       extraFixed: [],
     },
 
@@ -328,7 +334,9 @@ function fixedTotal(side) {
 // "corrected" — a rep comparing this screen against the Excel has to see the same numbers.
 // ---------------------------------------------------------------------------
 function recalcMargin(state, totals) {
-  const cost = state.clusterCost || {};
+  // Meme repli que les taux : sans cout, la marge ressortait egale au facture, donc fausse
+  // dans l'autre sens. L'appelant peut toujours fournir le sien.
+  const cost = state.clusterCost || clusterOffer.standardCost();
   const totalVolume = num(totals.totalVolume);
   const totalCount  = num(totals.totalCount);
 

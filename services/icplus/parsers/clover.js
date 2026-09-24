@@ -74,6 +74,17 @@ const FISERV_MARKUP_RE = new RegExp([
   'FRAIS-(DEBIT|FLASH|VDBT) TRANSACTION',
   'TRANSACTION FEE',
   'PER TRANSACTION FEE',
+  // ⚠️ LA MISE EN PAGE ANGLAISE ABRÈGE : « INTERAC PER TRAN FEE - FLASH », pas « PER
+  // TRANSACTION FEE ». Le français « FRAIS PAR TRAN » est couvert depuis le début et
+  // l'anglais ne l'était pas — le même angle mort que « MC / MASTERCARD CYBER SECURE ».
+  //
+  // Ce que ça coûtait, constaté en confrontant notre sortie à celle du calculateur de
+  // Christine sur PATISSERIE AFRODITI (2026-09-24) : 17,35 $ + 121,05 $ = 138,40 $ par
+  // mois comptés en transfert Interac au lieu de la majoration Fiserv. Or c'est
+  // exactement la ligne « Débit 138,40 $ » de son tableau de majoration. Un dollar rangé
+  // en pass-through est un dollar que Cluster ne remplace PAS : l'économie annoncée au
+  // marchand en était sous-estimée d'autant, soit 1 660,80 $ par année.
+  'PER TRAN FEE',
 ].join('|'), 'i');
 
 // Interac pass-through. The English layout glues the words together
