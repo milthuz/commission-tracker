@@ -53,9 +53,18 @@ async function renderChainPricingPdf(inputs, { lang = 'fr', startPage = 1 } = {}
 // Liste des scénarios utilisables pour une proposition — le strict nécessaire pour les choisir.
 async function listChainScenarios(pool) {
   const { rows } = await pool.query(
-    `SELECT id, name, inputs->>'merchantName' AS merchant, inputs->>'numLocs' AS locs, updated_at
+    `SELECT id, name, inputs->>'merchantName' AS merchant, inputs->>'numLocs' AS locs,
+            (inputs ? 'merchantLogo') AS has_logo, updated_at
        FROM revenue_model_scenarios ORDER BY updated_at DESC LIMIT 500`);
-  return rows.map((r) => ({ id: r.id, name: r.name, merchantName: r.merchant || '', numLocs: Number(r.locs) || 0, updatedAt: r.updated_at }));
+  // Le logo lui-même n'est PAS dans la liste (jusqu'à 400 k caractères chacun) : seulement s'il existe.
+  return rows.map((r) => ({ id: r.id, name: r.name, merchantName: r.merchant || '', numLocs: Number(r.locs) || 0, hasLogo: !!r.has_logo, updatedAt: r.updated_at }));
 }
 
-module.exports = { loadChainScenario, renderChainPricingPdf, listChainScenarios, renderHtmlUrl };
+// Le logo du marchand d'un scénario, pour la couverture de la proposition. null s'il n'y en a pas.
+async function chainScenarioLogo(pool, id) {
+  if (!UUID_RE.test(String(id || ''))) return null;
+  const { rows } = await pool.query(`SELECT inputs->>'merchantLogo' AS logo FROM revenue_model_scenarios WHERE id = $1`, [id]);
+  return (rows[0] && rows[0].logo) || null;
+}
+
+module.exports = { loadChainScenario, renderChainPricingPdf, listChainScenarios, chainScenarioLogo, renderHtmlUrl };

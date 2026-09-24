@@ -180,6 +180,18 @@ function registerRevenueModelRoutes(app, deps) {
     }
   });
 
+  // Le logo du marchand d'un scénario, repris sur la couverture de la proposition de chaîne.
+  app.get('/api/proposals/chain-scenarios/:id/logo', authenticateToken, async (req, res) => {
+    if (!(await requirePerm(req, res, 'proposals:chain'))) return;
+    try {
+      await schema();
+      res.json({ logo: await require('./chainProposal').chainScenarioLogo(pool, req.params.id) });
+    } catch (e) {
+      console.error('chain-scenario logo:', e.message);
+      res.status(500).json({ error: 'load_failed' });
+    }
+  });
+
   app.get('/api/revenue-model/scenarios', authenticateToken, async (req, res) => {
     if (!(await requirePerm(req, res, PERM_USE))) return;
     try {
