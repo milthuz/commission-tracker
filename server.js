@@ -150,6 +150,9 @@ const PERMISSION_CATALOG = [
 
   // Proposals (build + send a client proposal from a Zoho Books estimate)
   { key: 'proposals:send',             label: 'Build & send client proposals (from Zoho estimates)',            category: 'Proposals' },
+  // Proposition de CHAÎNE : la tarification vient d'un scénario du modélisateur de revenus (prix
+  // client seulement). Exige AUSSI proposals:send pour préparer et envoyer.
+  { key: 'proposals:chain',            label: 'Build chain proposals from a Revenue Modeler scenario (customer prices only)', category: 'Proposals' },
 
   // Hardware (product catalog reference tool)
   { key: 'hardware:view',              label: 'View the Hardware Overview catalog',                             category: 'Hardware' },
@@ -21904,7 +21907,10 @@ async function resolveSignatureHtml(reqUser, repName) {
 // includeEstimate: skip even FETCHING the Zoho estimate when false (estimateId may still be set — e.g.
 // the rep unchecked "attach the quote", but the estimate is still what gets marked "sent" in Zoho).
 // estimateId is optional — a proposal can be presentation-only (cover+deck), no Zoho estimate at all.
-async function buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes, logoDataUrl, pageOrder, includeEstimate = true }) {
+// appendix: optional async (startPage) => PDF Buffer — the chain-proposal pricing page, which takes
+// the estimate's place (same slot, same page selection/ordering). startPage = first page number
+// after the presentation, so its footer numbering follows on.
+async function buildProposalPdf({ estimateId, lang, clientName, repName, title, logoBytes, logoDataUrl, pageOrder, includeEstimate = true, appendix = null }) {
   const fs = require('fs');
   const { PDFDocument } = require('pdf-lib');
   const out = await PDFDocument.create();
@@ -21933,7 +21939,11 @@ async function buildProposalPdf({ estimateId, lang, clientName, repName, title, 
 
   // (2) The Zoho estimate (best-effort), unless the rep excluded it entirely or there is none.
   let estDoc = null, estimatePageCount = 0;
-  if (includeEstimate && estimateId) {
+  if (includeEstimate && appendix) {
+    // Pas de repli silencieux : une proposition de chaîne sans sa tarification ne doit pas partir.
+    estDoc = await PDFDocument.load(await appendix(presentationPageCount + 1));
+    estimatePageCount = estDoc.getPageCount();
+  } else if (includeEstimate && estimateId) {
     const est = await fetchEstimatePdfBytes(estimateId);
     if (est && est.buffer) {
       try { estDoc = await PDFDocument.load(est.buffer); estimatePageCount = estDoc.getPageCount(); }
@@ -22611,6 +22621,18 @@ app.get('/api/admin/mail-test', requireOpsSecret, async (req, res) => {
 // POST /api/proposals/prepare — build the merged PDF + a prefilled email draft (rep reviews before sending).
 // estimateId is optional — omit it to build a presentation-only proposal (cover+deck, no Zoho quote).
 // clientName is also optional in that case — a generic placeholder fills the cover when left blank.
+// Proposition de chaîne : résout req.body.scenarioId. Renvoie null (pas de chaîne), false (réponse
+// déjà envoyée : permission ou scénario introuvable), ou { scenario, appendix }.
+const chainProposal = require('./services/revenueModel/chainProposal');
+async function resolveChainProposal(req, res, lang) {
+  const scenarioId = String(req.body.scenarioId || '').trim();
+  if (!scenarioId) return null;
+  if (!(await requirePerm(req, res, 'proposals:chain'))) return false;
+  const scenario = await chainProposal.loadChainScenario(pool, scenarioId);
+  if (!scenario) { res.status(404).json({ error: 'scenario_not_found' }); return false; }
+  return { scenario, appendix: (startPage) => chainProposal.renderChainPricingPdf(scenario.inputs, { lang, startPage }) };
+}
+
 app.post('/api/proposals/prepare', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'proposals:send'))) return;
   const lang = String(req.body.lang || 'fr').toLowerCase() === 'en' ? 'en' : 'fr';
@@ -22623,18 +22645,20 @@ app.post('/api/proposals/prepare', authenticateToken, async (req, res) => {
       det = await getEstimateDetail(estimateId);
       if (!(await assertEstimateOwnership(req, res, det))) return;
     }
-    const clientName = bodyClientName || (det && det.customerName) || (lang === 'en' ? 'your business' : 'votre entreprise');
+    const chain = estimateId ? null : await resolveChainProposal(req, res, lang);
+    if (chain === false) return;
+    const clientName = bodyClientName || (det && det.customerName) || (chain && chain.scenario.inputs.merchantName) || (lang === 'en' ? 'your business' : 'votre entreprise');
     const repName = req.user.name || req.user.email || '';
     const pageOrder = Array.isArray(req.body.pageOrder) ? req.body.pageOrder.map(Number).filter(Boolean) : null;
     const includeEstimate = req.body.includeEstimate !== false;
-    const built = await buildProposalPdf({ estimateId: estimateId || null, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64), logoDataUrl: req.body.logoBase64, pageOrder, includeEstimate });
+    const built = await buildProposalPdf({ estimateId: estimateId || null, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64), logoDataUrl: req.body.logoBase64, pageOrder, includeEstimate, appendix: chain && chain.appendix });
     const subject = lang === 'en' ? `Cluster POS proposal — ${clientName}` : `Proposition Cluster POS — ${clientName}`;
     // No name/company after the sign-off line — the signature block appended below (or the
     // "Cluster Systems" footer when no signature is set) already covers that; repeating it here
     // duplicated the rep's name right above their own signature.
     const body = lang === 'en'
-      ? `Hello,\n\nThank you for your interest in Cluster POS. Please find attached our proposal prepared for ${clientName}${estimateId ? ', including your quote' : ''}.\n\nI'd be glad to walk you through it — just reply to this email.\n\nBest regards,`
-      : `Bonjour,\n\nMerci de votre intérêt envers Cluster POS. Vous trouverez ci-joint notre proposition préparée pour ${clientName}${estimateId ? ', incluant votre soumission' : ''}.\n\nJe me ferai un plaisir de vous la présenter — répondez simplement à ce courriel.\n\nCordialement,`;
+      ? `Hello,\n\nThank you for your interest in Cluster POS. Please find attached our proposal prepared for ${clientName}${estimateId ? ', including your quote' : (chain ? ', including your pricing' : '')}.\n\nI'd be glad to walk you through it — just reply to this email.\n\nBest regards,`
+      : `Bonjour,\n\nMerci de votre intérêt envers Cluster POS. Vous trouverez ci-joint notre proposition préparée pour ${clientName}${estimateId ? ', incluant votre soumission' : (chain ? ', incluant votre tarification' : '')}.\n\nJe me ferai un plaisir de vous la présenter — répondez simplement à ce courriel.\n\nCordialement,`;
     res.json({
       pdfBase64: Buffer.from(built.bytes).toString('base64'), fileName: proposalFileName(clientName),
       presentationPageCount: built.presentationPageCount, estimatePageCount: built.estimatePageCount,
@@ -22692,11 +22716,13 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
     }
     // Same fallback as /prepare — without it, a blank client name here would rebuild the PDF with
     // different cover text than what the rep just previewed.
-    const clientName = bodyClientName || (det && det.customerName) || (lang === 'en' ? 'your business' : 'votre entreprise');
+    const chain = estimateId ? null : await resolveChainProposal(req, res, lang);
+    if (chain === false) return;
+    const clientName = bodyClientName || (det && det.customerName) || (chain && chain.scenario.inputs.merchantName) || (lang === 'en' ? 'your business' : 'votre entreprise');
     const repName = req.user.name || req.user.email || '';
     const pageOrder = Array.isArray(req.body.pageOrder) ? req.body.pageOrder.map(Number).filter(Boolean) : null;
     const includeEstimate = req.body.includeEstimate !== false;
-    const built = await buildProposalPdf({ estimateId: estimateId || null, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64), logoDataUrl: req.body.logoBase64, pageOrder, includeEstimate });
+    const built = await buildProposalPdf({ estimateId: estimateId || null, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64), logoDataUrl: req.body.logoBase64, pageOrder, includeEstimate, appendix: chain && chain.appendix });
     const pdf = built.bytes;
     // Mark the estimate "sent" in Zoho (enables client acceptance + viewed/accepted tracking),
     // then try to surface its accept link to add as a button in our email. Only applies when a
@@ -22742,7 +22768,7 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
     try {
       const ins = await pool.query(
         `INSERT INTO proposals_sent (estimate_id, estimate_number, customer_name, rep_email, to_email, lang, track_token, accept_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
-        [estimateId || null, (det && det.number) || '', clientName, proposalActor, to, lang, trackToken, acceptUrl || null]);
+        [estimateId || null, (det && det.number) || (chain ? chain.scenario.name : ''), clientName, proposalActor, to, lang, trackToken, acceptUrl || null]);
       insertedId = ins.rows[0]?.id || null;
     } catch (e) { console.warn('[proposal/send] record:', e.message); }
     // A presentation-only proposal has no Zoho estimate id to key the activity log on — fall back

@@ -164,6 +164,20 @@ function registerRevenueModelRoutes(app, deps) {
     }
   });
 
+  // Pour le générateur de propositions : les scénarios utilisables pour une proposition de chaîne.
+  // Gardé par proposals:chain, PAS par revmodel:use — un rep qui monte une proposition n'a pas
+  // besoin d'accéder au modélisateur (et à ses coûts). On ne renvoie que de quoi choisir.
+  app.get('/api/proposals/chain-scenarios', authenticateToken, async (req, res) => {
+    if (!(await requirePerm(req, res, 'proposals:chain'))) return;
+    try {
+      await schema();
+      res.json({ scenarios: await require('./chainProposal').listChainScenarios(pool) });
+    } catch (e) {
+      console.error('chain-scenarios:', e.message);
+      res.status(500).json({ error: 'load_failed' });
+    }
+  });
+
   app.get('/api/revenue-model/scenarios', authenticateToken, async (req, res) => {
     if (!(await requirePerm(req, res, PERM_USE))) return;
     try {
