@@ -19148,6 +19148,163 @@ async function sendSaasIncreaseInternalNotice({ sentRows, scenarioName, actor, f
   return { sent: ok > 0, recipients: to.length, delivered: ok };
 }
 
+// =============================================================================================
+// SUIVI DE CAMPAGNE — GET /api/admin/saas-increase/scenarios/:id/campaign
+//
+// Une hausse de prix n'est pas finie quand on clique « Appliquer ». Elle commence la. Chaque
+// abonnement change de prix a SON renouvellement, donc la campagne se deroule sur douze mois et
+// la seule question qui compte pendant ce temps est : est-ce que l'argent arrive, et est-ce que
+// des clients partent ?
+//
+// Tout est DERIVE des faits deja enregistres — statut de push, date d'avis, date d'effet,
+// annulations. Aucun champ « avancement » a tenir a jour a la main : un compteur qu'il faut
+// penser a mettre a jour finit toujours par mentir.
+// =============================================================================================
+app.get('/api/admin/saas-increase/scenarios/:id/campaign', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  try {
+    const sc = (await pool.query(
+      `SELECT * FROM saas_increase_scenarios WHERE id = $1`, [req.params.id])).rows[0];
+    if (!sc) return res.status(404).json({ error: 'scenario not found' });
+
+    const items = (await pool.query(
+      `SELECT * FROM saas_increase_items WHERE scenario_id = $1`, [req.params.id])).rows;
+
+    // Les montants par periode viennent de la meme source que l'avis envoye au marchand : ce
+    // tableau de bord ne doit jamais annoncer un chiffre different de celui qu'il a recu.
+    const periodByKey = new Map((await pool.query(
+      `SELECT org_id, subscription_number, plan_price_period FROM saas_subscription_insights
+        WHERE plan_price_period IS NOT NULL`)).rows
+      .map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
+
+    const moisDe = (d) => (d ? ymd(d).slice(0, 7) : null);
+    const aujourdhui = ymd(new Date());
+
+    const vif = items.filter(i => !i.skipped);
+    const augmentes = vif.filter(i => Number(i.increase_value) > 0);
+    const deltaMensuel = (i) => {
+      const cur = periodByKey.get(`${i.org_id}||${i.subscription_number}`);
+      if (cur == null) return Number(i.new_monthly) - Number(i.current_monthly);
+      const next = saasNewPeriodPrice(cur, i.increase_type, i.increase_value);
+      // Delta PAR PERIODE. La cadence le ramenera au mois plus bas : un +115,65 $/an vaut
+      // 9,64 $ de MRR, pas 115,65 $. Les confondre gonflerait la campagne d'un facteur douze
+      // sur chaque abonnement annuel.
+      return { period: next - cur, key: `${i.org_id}||${i.subscription_number}` };
+    };
+
+    // La cadence (mensuel / annuel) decide comment un delta par periode devient du MRR. Elle
+    // vient de la liste d'abonnements, deja en cache. Injoignable, on retombe sur les montants
+    // mensuels stockes plutot que de compter un montant annuel comme du mensuel.
+    let cadenceByKey = new Map();
+    try {
+      cadenceByKey = new Map((await getSaasIncreaseSubscriptions())
+        .map(x => [`${x.orgId}||${x.subscriptionNumber}`, x]));
+    } catch (e) { console.warn('[saas-campagne] cadences indisponibles:', e.message); }
+
+    const mrrDe = (i) => {
+      const d = deltaMensuel(i);
+      if (typeof d === 'number') return d;
+      const live = cadenceByKey.get(d.key);
+      return subMonthlyAmount(d.period, live?.interval, live?.intervalUnit);
+    };
+
+    const compte = {
+      total: items.length,
+      skipped: items.filter(i => i.skipped).length,
+      raised: augmentes.length,
+      pending: augmentes.filter(i => i.status !== 'pushed').length,
+      pushed: augmentes.filter(i => i.status === 'pushed').length,
+      pushFailed: augmentes.filter(i => i.status === 'push_failed').length,
+      notified: augmentes.filter(i => i.notify_status === 'sent').length,
+      notifyFailed: augmentes.filter(i => i.notify_status === 'send_failed').length,
+    };
+
+    // ENGAGE = ecrit dans Zoho. REALISE = sa date d'effet est passee, donc le marchand a
+    // reellement ete facture au nouveau prix au moins une fois. La difference entre les deux est
+    // toute l'histoire de cette campagne, et c'est exactement ce qu'un compteur de « MRR ajoute »
+    // cache quand il n'affiche qu'un seul nombre.
+    const pousses = augmentes.filter(i => i.status === 'pushed');
+    const estRealise = (i) => i.effective_date && ymd(i.effective_date) <= aujourdhui;
+    const somme = (arr) => r2Money(arr.reduce((t, i) => t + mrrDe(i), 0));
+
+    const mrr = {
+      target: Number(sc.target_mrr) || 0,
+      planned: somme(augmentes),
+      committed: somme(pousses),
+      realized: somme(pousses.filter(estRealise)),
+      upcoming: somme(pousses.filter(i => !estRealise(i))),
+    };
+
+    // Le calendrier des renouvellements : quand l'argent entre, mois par mois, d'apres les dates
+    // que les avis ont ANNONCEES aux marchands.
+    const parMois = new Map();
+    for (const i of pousses) {
+      const m = moisDe(i.effective_date);
+      if (!m) continue;
+      const e = parMois.get(m) || { month: m, subs: 0, mrr: 0 };
+      e.subs += 1; e.mrr = r2Money(e.mrr + mrrDe(i));
+      parMois.set(m, e);
+    }
+    const timeline = Array.from(parMois.values()).sort((a, b) => a.month.localeCompare(b.month))
+      .map(e => ({ ...e, past: e.month <= aujourdhui.slice(0, 7) }));
+
+    // ── CE QUI FAIT MAL ────────────────────────────────────────────────────────────────────
+    // Des marchands augmentes qui ont annule DEPUIS. On ne pretend pas que la hausse en est la
+    // cause — un client annule pour mille raisons — mais c'est le chiffre que personne ne
+    // regarde et le seul qui puisse retourner le resultat de la campagne.
+    let churn = { count: 0, mrrLost: 0, list: [] };
+    try {
+      const paires = pousses.map(i => `${i.org_id}||${i.subscription_number}`);
+      const annules = (await pool.query(`
+        SELECT subscription_number, org_id, cancelled_at
+          FROM saas_churn_events
+         WHERE cancelled_at IS NOT NULL
+           AND (org_id || '||' || subscription_number) = ANY($1::text[])`, [paires])).rows;
+      const parCle = new Map(pousses.map(i => [`${i.org_id}||${i.subscription_number}`, i]));
+      const touches = annules
+        .map(a => ({ a, i: parCle.get(`${a.org_id}||${a.subscription_number}`) }))
+        .filter(x => x.i && x.i.pushed_at && ymd(x.a.cancelled_at) >= ymd(x.i.pushed_at));
+      churn = {
+        count: touches.length,
+        mrrLost: r2Money(touches.reduce((t, x) => t + Number(x.i.current_monthly) + mrrDe(x.i), 0)),
+        list: touches.slice(0, 25).map(x => ({
+          customerName: x.i.customer_name, subscriptionNumber: x.i.subscription_number,
+          orgName: ZOHO_BILLING_ORG_NAMES[x.i.org_id] || x.i.org_id,
+          cancelledAt: ymd(x.a.cancelled_at), pushedAt: ymd(x.i.pushed_at),
+          monthly: r2Money(Number(x.i.current_monthly) + mrrDe(x.i)),
+        })),
+      };
+    } catch (e) { console.warn('[saas-campagne] churn illisible:', e.message); }
+
+    // Les appels que la campagne a provoques, et ce qu'ils ont rapporte : une piste de vente
+    // ouverte pendant un appel de contestation est le meilleur signe que l'avis a ete lu.
+    let leads = 0;
+    try {
+      leads = parseInt((await pool.query(`
+        SELECT COUNT(DISTINCT entity_id)::int AS n FROM activity_log
+         WHERE entity_type = 'saas_increase' AND event_type = 'payment_deal_created'
+           AND entity_id = ANY($1::text[])`, [items.map(i => String(i.id))])).rows[0].n) || 0;
+    } catch (e) { console.warn('[saas-campagne] pistes illisibles:', e.message); }
+
+    // La phase est DEDUITE, jamais saisie. Un statut qu'il faut penser a changer a la main finit
+    // toujours par afficher « en preparation » sur une campagne qui facture depuis deux mois.
+    const phase = compte.pushed === 0
+      ? (compte.notified > 0 ? 'notifying' : 'draft')
+      : compte.pending > 0 ? 'applying'
+      : mrr.upcoming > 0 ? 'live'
+      : 'complete';
+
+    res.json({
+      scenario: { id: sc.id, name: sc.name, status: sc.status, createdAt: sc.created_at },
+      phase, counts: compte, mrr, timeline, churn, leads,
+      firstPushAt: pousses.reduce((min, i) => {
+        const d = i.pushed_at ? ymd(i.pushed_at) : null;
+        return d && (!min || d < min) ? d : min;
+      }, null),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/saas-increase/lookup?q= — the support desk's answer to "a merchant is calling about
 // their price increase". Read-only and on its own permission: an agent needs the facts for ONE
 // account, never the ability to build a scenario, email anyone or write to Zoho.
