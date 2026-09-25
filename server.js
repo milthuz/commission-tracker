@@ -32681,9 +32681,23 @@ app.post('/api/commissions/pay-stub/email', authenticateToken, async (req, res) 
   const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   try {
+    // Type SaaS / matériel — liste fermée : `category` arrive du corps de la requête, on n'en
+    // imprime jamais la valeur brute. Mêmes couleurs que le bulletin à l'écran.
+    const CAT = {
+      saas:     ['SaaS', '#eff6ff', '#1d4ed8'],
+      hardware: ['Matériel / Hardware', '#fff7ed', '#c2410c'],
+      mixed:    ['SaaS + matériel / Hardware', '#f5f3ff', '#6d28d9'],
+    };
+    const catCell = (c) => {
+      const k = Object.prototype.hasOwnProperty.call(CAT, c) ? CAT[c] : null;
+      return k
+        ? `<span style="display:inline-block;padding:1px 8px;border-radius:99px;background:${k[1]};color:${k[2]};font-size:11px;font-weight:700;white-space:nowrap">${k[0]}</span>`
+        : '<span style="color:#94a3b8">—</span>';
+    };
     const lineRows = (lines || []).map(l =>
       `<tr><td style="padding:6px 10px;border-top:1px solid #eef1f6;font-family:monospace">${esc(l.invoice_number)}</td>
            <td style="padding:6px 10px;border-top:1px solid #eef1f6">${esc(l.customer) || '—'}</td>
+           <td style="padding:6px 10px;border-top:1px solid #eef1f6">${catCell(l.category)}</td>
            <td style="padding:6px 10px;border-top:1px solid #eef1f6;text-align:right">${money(l.paid_amount)}</td></tr>`).join('');
     // Adjustments (corrections on past periods) get their own section, not mixed with bonuses.
     const realBonuses = (bonuses || []).filter(b => b.bonus_type !== 'adjustment');
@@ -34118,9 +34132,10 @@ async function payrollDataForMonth(year, month) {
     if (imp) {
       source = 'imported';
       lines = (await pool.query(
-        `SELECT invoice_number, customer, paid_amount::float AS paid_amount, quota_partial, quota_forfeited::float AS quota_forfeited
-         FROM commission_payment_lines
-         WHERE import_id = $1 ORDER BY paid_amount DESC`, [imp.id])).rows;
+        `SELECT l.invoice_number, l.customer, l.paid_amount::float AS paid_amount, l.quota_partial, l.quota_forfeited::float AS quota_forfeited,
+                i.commission_status, i.hardware_amount, i.saas_amount
+         FROM commission_payment_lines l LEFT JOIN invoices i ON i.invoice_number = l.invoice_number
+         WHERE l.import_id = $1 ORDER BY l.paid_amount DESC`, [imp.id])).rows;
       bonuses = (await pool.query(
         `SELECT bonus_type, merchant_name, amount::float AS amount FROM commission_bonuses
          WHERE import_id = $1 ORDER BY bonus_type`, [imp.id])).rows;
@@ -34129,7 +34144,8 @@ async function payrollDataForMonth(year, month) {
       source = 'generated';
       lines = (await pool.query(
         `SELECT invoice_number, customer_name AS customer, commission::float AS paid_amount,
-                (commission_status = 'quota_partial') AS quota_partial, quota_forfeited_amount::float AS quota_forfeited
+                (commission_status = 'quota_partial') AS quota_partial, quota_forfeited_amount::float AS quota_forfeited,
+                commission_status, hardware_amount, saas_amount
          FROM invoices
          WHERE salesperson_name = $1 AND organization_id = $2
            AND commission_payable_date >= $3 AND commission_payable_date < $4
@@ -34196,6 +34212,10 @@ async function payrollDataForMonth(year, month) {
       total = lines.reduce((s, l) => s + (l.paid_amount || 0), 0) + bonuses.reduce((s, b) => s + (b.amount || 0), 0);
     }
     total = Math.round(total * 100) / 100;
+    // Même étiquette SaaS / matériel que le bulletin à l'écran (payStubLineCategory).
+    lines = lines.map(({ commission_status, hardware_amount, saas_amount, ...l }) => ({
+      ...l, category: payStubLineCategory({ commission_status, hardware_amount, saas_amount }),
+    }));
     if (total > 0 || lines.length || bonuses.length) out.push({ rep, source, lines, bonuses, total });
   }
   return out;
@@ -34215,6 +34235,7 @@ function payrollI18n(lang) {
     totalPaid: 'TOTAL PAID', grossNote: 'Gross amounts, before taxes and deductions.',
     blSignup: 'Signup bonus', blMonthly: 'Monthly bonus', blProcessing: 'Processing bonus', blAdjustment: 'Adjustment',
     blReview: 'Google review',
+    catSaas: 'SaaS', catHardware: 'Hardware', catMixed: 'SaaS + Hardware',
     payRun: 'PAID ON', payRunLabel: 'Paid on the pay of',
   } : {
     emailSubject: 'Commissions à verser', emailFooter: 'Bulletins détaillés en pièce jointe (PDF). Montants bruts, avant impôts et retenues.',
@@ -34226,6 +34247,7 @@ function payrollI18n(lang) {
     totalPaid: 'TOTAL VERSÉ', grossNote: 'Montants bruts, avant impôts et retenues.',
     blSignup: "Bonus d'inscription", blMonthly: 'Bonus mensuel', blProcessing: 'Bonus de processing', blAdjustment: 'Ajustement',
     blReview: 'Avis Google',
+    catSaas: 'SaaS', catHardware: 'Matériel', catMixed: 'SaaS + matériel',
     payRun: 'VERSÉ SUR LA PAIE DU', payRunLabel: 'Versé sur la paie du',
   };
 }
@@ -34289,7 +34311,16 @@ function buildPayrollPdf(periodLabel, reps, lang, payDate) {
       const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
       const bl = (t) => t === 'signup' ? T.blSignup : (t === 'monthly' || t === 'monthly_performance') ? T.blMonthly : t === 'processing' ? T.blProcessing : t === 'adjustment' ? T.blAdjustment : t === 'review' ? T.blReview : t;
       const L = 40, R = 572, W = R - L, AMT_X = R - 96;     // content area + amount column
+      // Colonne TYPE (commissions seulement) : finit à AMT_X − 42, avant la pastille de quota
+      // partiel (AMT_X − 34) — les deux peuvent coexister sur une même ligne.
+      const TYPE_X = AMT_X - 130, TYPE_W = 88;
       const C = { dark: '#1c2434', orange: '#f2682c', gray: '#475569', light: '#94a3b8', zebra: '#fafbfd', line: '#e8edf3' };
+      // Mêmes couleurs que le bulletin imprimable du navigateur (PayStubModal).
+      const CAT = {
+        saas:     { label: T.catSaas,     bg: '#eff6ff', fg: '#1d4ed8' },
+        hardware: { label: T.catHardware, bg: '#fff7ed', fg: '#c2410c' },
+        mixed:    { label: T.catMixed,    bg: '#f5f3ff', fg: '#6d28d9' },
+      };
       const ensure = (h) => { if (doc.y + h > 748) doc.addPage(); };
       const header = (r) => {
         doc.rect(0, 0, 612, 6).fill(C.orange);
@@ -34328,7 +34359,7 @@ function buildPayrollPdf(periodLabel, reps, lang, payDate) {
         doc.y += 16;
       };
 
-      const sectionHead = (title, c0, c1) => {
+      const sectionHead = (title, c0, c1, c2) => {
         ensure(46);
         doc.fillColor(C.orange).font('Helvetica-Bold').fontSize(9).text(title, L, doc.y, { characterSpacing: 1.5 });
         doc.y += 15;
@@ -34336,18 +34367,35 @@ function buildPayrollPdf(periodLabel, reps, lang, payDate) {
         doc.fillColor(C.light).font('Helvetica-Bold').fontSize(7);
         doc.text(c0, L + 2, hy, { characterSpacing: 0.5 });
         doc.text(c1, L + 130, hy, { characterSpacing: 0.5 });
+        if (c2) doc.text(c2, TYPE_X, hy, { characterSpacing: 0.5 });
         doc.text(T.amount, AMT_X, hy, { width: 92, align: 'right', characterSpacing: 0.5 });
         doc.y = hy + 11;
         doc.moveTo(L, doc.y).lineTo(R, doc.y).strokeColor(C.dark).lineWidth(1).stroke();
         doc.y += 5;
       };
-      const row = (c0, c1, amt, i, neg, badgePct) => {
+      // cat : undefined = pas de colonne TYPE (bonus, ajustements) ; null = facture hors base (—).
+      const row = (c0, c1, amt, i, neg, badgePct, cat) => {
         ensure(18);
         const y = doc.y;
         if (i % 2) doc.rect(L, y - 3, W, 17).fill(C.zebra);
         doc.fillColor(C.dark).font('Helvetica').fontSize(9).text(String(c0 || ''), L + 2, y, { width: 122, ellipsis: true });
-        const custW = AMT_X - (L + 130) - (badgePct != null ? 40 : 8);
-        doc.fillColor(C.gray).text(String(c1 || '—'), L + 130, y, { width: custW, ellipsis: true });
+        const custW = cat !== undefined
+          ? TYPE_X - (L + 130) - 8
+          : AMT_X - (L + 130) - (badgePct != null ? 40 : 8);
+        // height = UNE ligne : sans elle pdfkit ignore `ellipsis` et replie un long nom de client
+        // par-dessus la ligne suivante (visible depuis que la colonne TYPE rétrécit le client).
+        doc.fillColor(C.gray).text(String(c1 || '—'), L + 130, y, { width: custW, height: 11, ellipsis: true });
+        if (cat !== undefined) {
+          const c = CAT[cat];
+          if (c) {
+            doc.font('Helvetica-Bold').fontSize(6.5);
+            const pw = Math.min(TYPE_W, doc.widthOfString(c.label) + 12);
+            doc.roundedRect(TYPE_X, y - 1, pw, 12, 6).fill(c.bg);
+            doc.fillColor(c.fg).text(c.label, TYPE_X, y + 1.5, { width: pw, align: 'center', lineBreak: false });
+          } else {
+            doc.fillColor(C.light).font('Helvetica').fontSize(9).text('—', TYPE_X, y, { lineBreak: false });
+          }
+        }
         // Quota-gate partial-release marker — a rep should see WHY this line is less than
         // the full commission, not just a smaller number (user report 2026-07-08).
         if (badgePct != null) {
@@ -34371,10 +34419,10 @@ function buildPayrollPdf(periodLabel, reps, lang, payDate) {
         if (idx > 0) doc.addPage();
         header(r);
         if (r.lines.length) {
-          sectionHead(T.commissions, T.invoice, T.customer);
+          sectionHead(T.commissions, T.invoice, T.customer, T.type);
           r.lines.forEach((l, i) => {
             const pct = l.quota_partial ? Math.round((l.paid_amount / ((l.paid_amount || 0) + (l.quota_forfeited || 0))) * 100) : null;
-            row(l.invoice_number, l.customer, money(l.paid_amount), i, false, pct);
+            row(l.invoice_number, l.customer, money(l.paid_amount), i, false, pct, l.category || null);
           });
           subtotal(T.subtotalCommissions, money(r.lines.reduce((s, l) => s + (l.paid_amount || 0), 0)));
         }
