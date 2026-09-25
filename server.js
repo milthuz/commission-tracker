@@ -19355,8 +19355,13 @@ async function saasCsDepartment() {
 // Inquiry/Update ». C'est un identifiant DIRECT — il rend le rapprochement par nom inutile pour
 // compter, et le compte cesse de dependre de la qualite de ce rapprochement.
 // Modifiable sans deploiement : une equipe qui renomme sa categorie ne doit pas casser le chiffre.
+// Les deux libelles sont compares sous forme NORMALISEE — minuscules, « & » lu comme « and »,
+// ponctuation ignoree — et cherches indifferemment dans issue_type OU cs_category. Samantha a
+// ecrit « Statements & Billing Inquiries » de memoire alors que Zoho stocke « Statements and
+// Billing Inquiries » : une egalite stricte rendait zero sur une campagne qui avait deja ses
+// billets, et rien a l'ecran ne pouvait le faire soupconner.
 const SAAS_TICKET_CATEGORY_DEFAULT = {
-  issueType: 'Statements & Billing Inquiries',
+  issueType: 'Statements and Billing Inquiries',
   csCategory: 'Pricing Inquiry/Update',
 };
 async function saasTicketCategory() {
@@ -19476,8 +19481,12 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
          WHERE COALESCE(t.is_spam, FALSE) = FALSE
            AND t.created_time >= $1
            AND ($2::text IS NULL OR t.department_id = $2)
-           AND ($3::text = '' OR t.issue_type  = $3)
-           AND ($4::text = '' OR t.cs_category = $4)
+           AND ($3::text = '' OR sh_norm_name(replace($3, '&', 'and'))
+                 IN (sh_norm_name(replace(t.issue_type, '&', 'and')),
+                     sh_norm_name(replace(t.cs_category, '&', 'and'))))
+           AND ($4::text = '' OR sh_norm_name(replace($4, '&', 'and'))
+                 IN (sh_norm_name(replace(t.issue_type, '&', 'and')),
+                     sh_norm_name(replace(t.cs_category, '&', 'and'))))
          ORDER BY t.created_time DESC`,
         [depuis, dept, cat.issueType || '', cat.csCategory || ''])).rows;
 
