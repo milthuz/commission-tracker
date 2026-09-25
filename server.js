@@ -19365,8 +19365,16 @@ async function saasCsDepartment() {
 // demande une explication » est le cout normal d'une hausse. « Le marchand demande a suspendre
 // ou annuler » est le debut d'une perte de revenu, et il se classe AILLEURS dans Desk — noyer
 // les deux dans un seul compteur rendrait le second invisible.
+//
+// ⚠️ La SOUS-CATEGORIE n'est pas dans la copie locale. Samantha donne « Pricing Inquiry/Update »,
+// mais cette valeur n'apparait dans AUCUN des 103 billets releves — la synchro ne copie que les
+// champs personnalises cf_issue_type et cf_cs_category, et « Pricing Inquiry/Update » vit
+// ailleurs (vraisemblablement la sous-categorie NATIVE de Desk, jamais synchronisee). Exiger les
+// deux libelles rendrait donc zero pour toujours, en silence.
+// On compte donc sur la CATEGORIE seule. Le champ sous-categorie reste la, vide : le jour ou la
+// synchro rapportera la valeur, il suffira de la renseigner pour resserrer le compte.
 const SAAS_TICKET_FAMILIES_DEFAULT = [
-  { key: 'pricing', issueType: 'Statements and Billing Inquiries', csCategory: 'Pricing Inquiry/Update' },
+  { key: 'pricing', issueType: 'Statements and Billing Inquiries', csCategory: '' },
   { key: 'churn',   issueType: 'Account Status Modification',      csCategory: '' },
 ];
 
