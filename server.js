@@ -19355,40 +19355,65 @@ async function saasCsDepartment() {
 // Inquiry/Update ». C'est un identifiant DIRECT — il rend le rapprochement par nom inutile pour
 // compter, et le compte cesse de dependre de la qualite de ce rapprochement.
 // Modifiable sans deploiement : une equipe qui renomme sa categorie ne doit pas casser le chiffre.
-// Les deux libelles sont compares sous forme NORMALISEE — minuscules, « & » lu comme « and »,
+// Les libelles sont compares sous forme NORMALISEE — minuscules, « & » lu comme « and »,
 // ponctuation ignoree — et cherches indifferemment dans issue_type OU cs_category. Samantha a
 // ecrit « Statements & Billing Inquiries » de memoire alors que Zoho stocke « Statements and
 // Billing Inquiries » : une egalite stricte rendait zero sur une campagne qui avait deja ses
 // billets, et rien a l'ecran ne pouvait le faire soupconner.
-const SAAS_TICKET_CATEGORY_DEFAULT = {
-  issueType: 'Statements and Billing Inquiries',
-  csCategory: 'Pricing Inquiry/Update',
-};
-async function saasTicketCategory() {
+//
+// DEUX familles, comptees separement, parce qu'elles ne disent pas la meme chose. « Le marchand
+// demande une explication » est le cout normal d'une hausse. « Le marchand demande a suspendre
+// ou annuler » est le debut d'une perte de revenu, et il se classe AILLEURS dans Desk — noyer
+// les deux dans un seul compteur rendrait le second invisible.
+const SAAS_TICKET_FAMILIES_DEFAULT = [
+  { key: 'pricing', issueType: 'Statements and Billing Inquiries', csCategory: 'Pricing Inquiry/Update' },
+  { key: 'churn',   issueType: 'Account Status Modification',      csCategory: '' },
+];
+
+async function saasTicketFamilies() {
+  const propre = (f, defaut) => ({
+    key: typeof f?.key === 'string' && f.key ? f.key : defaut.key,
+    issueType: typeof f?.issueType === 'string' ? f.issueType : defaut.issueType,
+    csCategory: typeof f?.csCategory === 'string' ? f.csCategory : defaut.csCategory,
+  });
   try {
-    const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'saas_increase_ticket_category'`);
-    const v = r.rows[0]?.value;
-    if (v && typeof v === 'object') {
-      return {
-        issueType: typeof v.issueType === 'string' ? v.issueType : SAAS_TICKET_CATEGORY_DEFAULT.issueType,
-        csCategory: typeof v.csCategory === 'string' ? v.csCategory : SAAS_TICKET_CATEGORY_DEFAULT.csCategory,
-      };
+    const r = await pool.query(
+      `SELECT key, value FROM app_settings
+        WHERE key IN ('saas_increase_ticket_families', 'saas_increase_ticket_category')`);
+    const par = new Map(r.rows.map(x => [x.key, x.value]));
+    const v = par.get('saas_increase_ticket_families');
+    if (Array.isArray(v) && v.length) {
+      return v.slice(0, 6).map((x, i) => propre(x, SAAS_TICKET_FAMILIES_DEFAULT[i] || SAAS_TICKET_FAMILIES_DEFAULT[0]));
     }
-  } catch { /* reglage illisible : le defaut est meilleur que rien */ }
-  return { ...SAAS_TICKET_CATEGORY_DEFAULT };
+    // Reglage de l'ancienne forme (une seule famille) : il devient la premiere, et la seconde
+    // reprend son defaut. Personne ne perd son choix en passant a deux familles.
+    const seul = par.get('saas_increase_ticket_category');
+    if (seul && typeof seul === 'object') {
+      return [propre({ ...seul, key: 'pricing' }, SAAS_TICKET_FAMILIES_DEFAULT[0]),
+              { ...SAAS_TICKET_FAMILIES_DEFAULT[1] }];
+    }
+  } catch { /* reglage illisible : les defauts valent mieux que rien */ }
+  return SAAS_TICKET_FAMILIES_DEFAULT.map(x => ({ ...x }));
 }
+
 app.put('/api/admin/saas-increase/ticket-category', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
-  // '' est volontairement permis sur chacun des deux : compter sur la seule categorie, ou sur la
-  // seule sous-categorie, est une facon legitime d'elargir quand un agent a oublie l'une des deux.
-  const issueType = String(req.body?.issueType ?? '').trim();
-  const csCategory = String(req.body?.csCategory ?? '').trim();
+  // '' est volontairement permis sur chacun des deux libelles : compter sur la seule categorie,
+  // ou sur la seule sous-categorie, est une facon legitime d'elargir quand un agent a oublie
+  // l'une des deux.
+  const brut = Array.isArray(req.body?.families) ? req.body.families : null;
+  if (!brut) return res.status(400).json({ error: 'families must be an array' });
+  const familles = brut.slice(0, 6).map((f, i) => ({
+    key: String(f?.key || SAAS_TICKET_FAMILIES_DEFAULT[i]?.key || `f${i}`).slice(0, 24),
+    issueType: String(f?.issueType ?? '').trim(),
+    csCategory: String(f?.csCategory ?? '').trim(),
+  }));
   try {
     await pool.query(
-      `INSERT INTO app_settings (key, value, updated_at) VALUES ('saas_increase_ticket_category', $1::jsonb, NOW())
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('saas_increase_ticket_families', $1::jsonb, NOW())
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
-      [JSON.stringify({ issueType, csCategory })]);
-    res.json({ issueType, csCategory });
+      [JSON.stringify(familles)]);
+    res.json({ families: familles });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -19421,7 +19446,7 @@ app.get('/api/admin/saas-increase/cs-department', authenticateToken, async (req,
   } catch (e) { console.warn('[saas-desk] valeurs de categorie illisibles:', e.message); }
   res.json({
     departmentId: await saasCsDepartment(), departments,
-    category: await saasTicketCategory(), issueTypes, csCategories,
+    families: await saasTicketFamilies(), issueTypes, csCategories,
   });
 });
 app.put('/api/admin/saas-increase/cs-department', authenticateToken, async (req, res) => {
@@ -19465,14 +19490,17 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
         WHERE scenario_id = $1 AND notified_at IS NOT NULL`, [req.params.id])).rows[0];
     const totalAvises = parseInt(bornes.n) || 0;
 
-    // ── LE COMPTE DIRECT ───────────────────────────────────────────────────────────────────
+    // ── LE COMPTE DIRECT, PAR FAMILLE ──────────────────────────────────────────────────────
     // Ces billets portent une categorie qui les designe. Ce compte-ci ne depend donc NI du
-    // rapprochement de noms entre Desk et la facturation, NI d'une fenetre : il porte sur tous
-    // les billets ainsi classes depuis le premier avis de la campagne. C'est le chiffre officiel.
-    const cat = await saasTicketCategory();
+    // rapprochement de noms entre Desk et la facturation, NI d'une fenetre : tous les billets
+    // ainsi classes depuis le premier avis de la campagne. C'est le chiffre officiel.
+    const familles = await saasTicketFamilies();
     const depuis = bornes.plus_ancien || null;
-    let categorized = null;
-    if (depuis && (cat.issueType || cat.csCategory)) {
+    const avisesNorm = new Set(tousAvisesNoms.map(n => n.toLowerCase().replace(/[^a-z0-9]+/g, '')));
+    const norm = (x) => String(x || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+
+    const calculerFamille = async (fam) => {
+      if (!depuis || (!fam.issueType && !fam.csCategory)) return { ...fam, total: 0, list: [] };
       const lignes = (await pool.query(`
         SELECT t.id, t.ticket_number, t.subject, t.created_time, t.closed_time, t.status_type,
                t.cs_category, t.issue_type, t.channel, t.web_url, a.name AS account_name
@@ -19488,14 +19516,7 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
                  IN (sh_norm_name(replace(t.issue_type, '&', 'and')),
                      sh_norm_name(replace(t.cs_category, '&', 'and'))))
          ORDER BY t.created_time DESC`,
-        [depuis, dept, cat.issueType || '', cat.csCategory || ''])).rows;
-
-      // Combien tombent sur un marchand REELLEMENT avise. L'ecart avec le total n'est pas une
-      // erreur : un marchand peut appeler sans avoir ete avise, et le rapprochement par nom est
-      // partiel. Le dire evite qu'on lise l'ecart comme un bogue.
-      const avisesNorm = new Set(tousAvisesNoms.map(n => n.toLowerCase().replace(/[^a-z0-9]+/g, '')));
-      const norm = (x) => String(x || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
-      const apparies = lignes.filter(l => avisesNorm.has(norm(l.account_name)));
+        [depuis, dept, fam.issueType || '', fam.csCategory || ''])).rows;
 
       const parMois = new Map();
       for (const l of lignes) {
@@ -19506,11 +19527,13 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
       const heures = fermes
         .map(l => (new Date(l.closed_time) - new Date(l.created_time)) / 3600000)
         .sort((a, b) => a - b);
-      categorized = {
-        issueType: cat.issueType, csCategory: cat.csCategory,
+      return {
+        ...fam,
         since: ymd(depuis),
         total: lignes.length,
-        matchedToCampaign: apparies.length,
+        // Combien tombent sur un marchand REELLEMENT avise. L'ecart n'est pas une erreur : un
+        // marchand peut appeler sans avoir ete avise, et le rapprochement par nom est partiel.
+        matchedToCampaign: lignes.filter(l => avisesNorm.has(norm(l.account_name))).length,
         open: lignes.length - fermes.length,
         closed: fermes.length,
         medianHoursToClose: heures.length ? Math.round(heures[Math.floor(heures.length / 2)] * 10) / 10 : null,
@@ -19524,7 +19547,10 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
           inCampaign: avisesNorm.has(norm(l.account_name)),
         })),
       };
-    }
+    };
+
+    const categorized = [];
+    for (const fam of familles) categorized.push(await calculerFamille(fam));
 
     // ── LA QUESTION SIMPLE, TOUJOURS REPONDUE ──────────────────────────────────────────────
     // « Est-ce qu'on a des billets la-dessus ? » n'a pas besoin d'une fenetre symetrique. Tous
