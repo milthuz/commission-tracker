@@ -19337,7 +19337,19 @@ async function saasCsDepartment() {
 }
 app.get('/api/admin/saas-increase/cs-department', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
-  res.json({ departmentId: await saasCsDepartment() });
+  // La LISTE part avec le reglage. Elle vivait dans la reponse du croisement Desk, donc le menu
+  // de choix n'existait qu'apres avoir charge des milliers de billets : il fallait deja savoir
+  // que le choix existait pour le faire apparaitre. Cette requete-ci ne touche que deux tables.
+  let departments = [];
+  try {
+    departments = (await pool.query(`
+      SELECT d.id, d.name, COUNT(t.id)::int AS n
+        FROM desk_departments d
+        LEFT JOIN desk_tickets t ON t.department_id = d.id
+         AND t.created_time >= NOW() - INTERVAL '180 days'
+       GROUP BY 1, 2 ORDER BY 3 DESC`)).rows;
+  } catch (e) { console.warn('[saas-desk] pupitres illisibles:', e.message); }
+  res.json({ departmentId: await saasCsDepartment(), departments });
 });
 app.put('/api/admin/saas-increase/cs-department', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
