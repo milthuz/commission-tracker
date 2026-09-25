@@ -24,15 +24,6 @@ const PRICE_KEYS = [
   'termRentalRev', 'aofRev', 'pciRev', 'bankRev', 'hwPrice', 'instPrice',
 ];
 
-// Exemple de restaurant type, PAR MOIS (chiffres fournis par David, 2026-09-25). Il illustre les
-// frais Cluster avec les taux du scénario. ⛔ AMEX volontairement absent (décision de David).
-// L'interchange n'y figure pas : il est refacturé au coût réel.
-const TYPICAL_RESTAURANT = [
-  { brand: 'VISA', volume: 31500, txns: 700, kind: 'credit' },
-  { brand: 'Mastercard', volume: 36000, txns: 800, kind: 'credit' },
-  { brand: 'Interac', volume: 48100, txns: 1300, kind: 'interac' },
-];
-
 // Durée présentée au client — la même que l'horizon du modélisateur (YEARS dans model.ts).
 const TERM_YEARS = 5;
 
@@ -67,15 +58,6 @@ function buildPricing(scenario) {
     oneTime, oneTimePerLoc,
     termPerLoc: oneTimePerLoc + monthlyPerLoc * 12 * TERM_YEARS,
     monthlyTermPerLoc: monthlyPerLoc * 12 * TERM_YEARS, // bandeau du mensuel (David, 2026-09-25)
-    example: (() => {
-      const rows = TYPICAL_RESTAURANT.map((r) => ({
-        ...r,
-        fees: r.kind === 'credit'
-          ? r.volume * (i.markupRate / 100) + r.txns * i.txnFeeCredit
-          : r.txns * i.txnFeeInterac,
-      }));
-      return { rows, volume: rows.reduce((a, r) => a + r.volume, 0), txns: rows.reduce((a, r) => a + r.txns, 0), fees: rows.reduce((a, r) => a + r.fees, 0) };
-    })(),
   };
 }
 
@@ -92,14 +74,10 @@ const COPY = {
     },
     perLoc: 'Total par emplacement', perLocMonth: 'Total mensuel par emplacement',
     chain: 'Pour les {n} emplacements', perMonth: '/ mois',
-    eyebrow2: 'Paiements', title2: 'Des paiements transparents.',
-    lead2: 'Tarification Interchange+ : l’interchange des réseaux vous est refacturé au coût réel. Cluster ajoute une seule majoration, fixe et affichée, et des frais par transaction.',
-    rates: 'Vos taux — Interchange+', markup: 'Majoration sur les transactions crédit',
+    rates: 'Paiements — Interchange+', markup: 'Majoration sur les transactions crédit',
     feeCredit: 'Frais par transaction — crédit', feeInterac: 'Frais par transaction — Interac',
     ratesNote: 'L’interchange des réseaux vous est refacturé au coût réel, sans majoration cachée.',
     monthlyTerm: 'Sur {y} ans, pour un emplacement ({m} mois)',
-    exTitle: 'Exemple : restaurant type, par mois', exCard: 'Carte', exVolume: 'Volume', exTxns: 'Transactions', exFees: 'Frais Cluster',
-    exTotal: 'Total par mois', exNote: 'Exemple illustratif calculé avec vos taux. Hors interchange, refacturé au coût réel.',
     termTitle: 'Total par emplacement sur {y} ans', termDetail: '{once} unique + {month} par mois × {m} mois',
     termNote: 'Hors frais de paiement, qui varient selon votre volume.',
     validity: 'Prix en dollars canadiens, taxes en sus. Proposition valable 30 jours.',
@@ -117,14 +95,10 @@ const COPY = {
     },
     perLoc: 'Total per location', perLocMonth: 'Monthly total per location',
     chain: 'For all {n} locations', perMonth: '/ month',
-    eyebrow2: 'Payments', title2: 'Transparent payments.',
-    lead2: 'Interchange+ pricing: card-network interchange is passed through at actual cost. Cluster adds a single, fixed and disclosed markup, plus a per-transaction fee.',
-    rates: 'Your rates — Interchange+', markup: 'Markup on credit transactions',
+    rates: 'Payments — Interchange+', markup: 'Markup on credit transactions',
     feeCredit: 'Per-transaction fee — credit', feeInterac: 'Per-transaction fee — Interac',
     ratesNote: 'Card-network interchange is passed through at actual cost, with no hidden markup.',
     monthlyTerm: 'Over {y} years, for one location ({m} months)',
-    exTitle: 'Example: typical restaurant, per month', exCard: 'Card', exVolume: 'Volume', exTxns: 'Transactions', exFees: 'Cluster fees',
-    exTotal: 'Total per month', exNote: 'Illustrative example using your rates. Excludes interchange, passed through at actual cost.',
     termTitle: '{y}-year total per location', termDetail: '{once} one-time + {month} per month × {m} months',
     termNote: 'Excludes payment processing fees, which vary with your volume.',
     validity: 'Prices in Canadian dollars, taxes extra. Proposal valid for 30 days.',
@@ -216,11 +190,6 @@ h1 { font-size: 25pt; font-weight: 700; line-height: 1.08; letter-spacing: -.01e
 .term .d { font-size: 7.6pt; opacity: .7; margin-top: 4pt; }
 .term .n { font-size: 6.6pt; opacity: .5; margin-top: 2pt; }
 .term .v { font-size: 22pt; font-weight: 700; color: #FE8A55; white-space: nowrap; }
-.ex { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-.ex th { font-size: 6.6pt; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: #8A867E; text-align: right; padding: 0 0 5pt; }
-.ex th:first-child, .ex td:first-child { text-align: left; }
-.ex td { font-size: 9pt; text-align: right; padding: 7pt 0; border-top: .6pt solid #F0EEEA; white-space: nowrap; }
-.ex tr.tot td { font-weight: 700; font-size: 9.4pt; border-top: 1pt solid #E6E3DD; }
 .note { font-size: 6.8pt; color: #8A867E; margin-top: 8pt; line-height: 1.45; }
 .footer { position: absolute; left: 36pt; right: 36pt; bottom: 22pt; display: flex; justify-content: space-between; font-size: 6.5pt; color: #A5A19A; }
 </style></head><body>
@@ -240,10 +209,19 @@ h1 { font-size: 25pt; font-weight: 700; line-height: 1.08; letter-spacing: -.01e
     <div class="sub"><span class="k">${esc(L.perLocMonth)}</span><span class="v">${money(d.monthlyPerLoc)} ${esc(L.perMonth)}</span></div>
     <div class="chain"><span class="k">${esc(fill(L.monthlyTerm, { y: TERM_YEARS, m: TERM_YEARS * 12 }))}</span><span class="v">${money(d.monthlyTermPerLoc, 0)}</span></div>
   </div>
-  <div class="card">
-    <h2>${esc(L.oneTimeTitle)}</h2>
-    ${oneTimeLines}
-    <div class="sub"><span class="k">${esc(L.perLoc)}</span><span class="v">${money(d.oneTimePerLoc)}</span></div>
+  <div class="cols">
+    <div class="card">
+      <h2>${esc(L.oneTimeTitle)}</h2>
+      ${oneTimeLines}
+      <div class="sub"><span class="k">${esc(L.perLoc)}</span><span class="v">${money(d.oneTimePerLoc)}</span></div>
+    </div>
+    <div class="card">
+      <h2>${esc(L.rates)}</h2>
+      ${line(esc(L.markup), '', `${n(i.markupRate, 6)} %`)}
+      ${line(esc(L.feeCredit), '', fee(i.txnFeeCredit))}
+      ${line(esc(L.feeInterac), '', fee(i.txnFeeInterac))}
+      <div class="note">${esc(L.ratesNote)}</div>
+    </div>
   </div>
   <div class="term">
     <div>
@@ -253,33 +231,8 @@ h1 { font-size: 25pt; font-weight: 700; line-height: 1.08; letter-spacing: -.01e
     </div>
     <div class="v">${money(d.termPerLoc, 0)}</div>
   </div>
-  ${footer(0)}
-</section>
-
-<section class="page">
-  <div class="eyebrow">${esc(L.eyebrow2)}</div>
-  <h1>${esc(L.title2)}</h1>
-  <p class="lead">${esc(L.lead2)}</p>
-  <div class="card">
-    <h2>${esc(L.rates)}</h2>
-    ${line(esc(L.markup), '', `${n(i.markupRate, 6)} %`)}
-    ${line(esc(L.feeCredit), '', fee(i.txnFeeCredit))}
-    ${line(esc(L.feeInterac), '', fee(i.txnFeeInterac))}
-    <div class="note">${esc(L.ratesNote)}</div>
-  </div>
-  <div class="card">
-    <h2>${esc(L.exTitle)}</h2>
-    <table class="ex">
-      <thead><tr><th>${esc(L.exCard)}</th><th>${esc(L.exVolume)}</th><th>${esc(L.exTxns)}</th><th>${esc(L.exFees)}</th></tr></thead>
-      <tbody>
-        ${d.example.rows.map((r) => `<tr><td>${esc(r.brand)}</td><td>${money(r.volume, 0)}</td><td>${n(r.txns)}</td><td>${money(r.fees, 2)}</td></tr>`).join('')}
-        <tr class="tot"><td>${esc(L.exTotal)}</td><td>${money(d.example.volume, 0)}</td><td>${n(d.example.txns)}</td><td>${money(d.example.fees, 2)}</td></tr>
-      </tbody>
-    </table>
-    <div class="note">${esc(L.exNote)}</div>
-  </div>
   <p class="note" style="margin-top:12pt">${esc(L.validity)}</p>
-  ${footer(1)}
+  ${footer(0)}
 </section>
 </body></html>`;
 }
