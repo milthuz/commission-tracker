@@ -43,6 +43,9 @@ for (const lang of ['fr', 'en']) {
   for (const [k, v] of Object.entries(INTERNAL)) {
     for (const f of forms(v)) { assert(!body.includes(norm(f)), `[${lang}] FUITE de ${k} (« ${f} ») dans le document client`); n++; }
   }
+  // 2 bis) Le volume de paiement annuel du marchand n'est plus affiché (retiré par David, 2026-09-25).
+  const gmv = scenario.gmvCredit + scenario.gmvInterac;
+  for (const f of [...forms(gmv), ...forms(Math.round(gmv / 1e4) / 100)]) { assert(!body.includes(norm(f)), `[${lang}] volume annuel affiché (« ${f} »)`); n++; }
   // 3) Ni coût, ni marge, ni commission dans le vocabulaire.
   //    Seule exception voulue : l'interchange « refacturé au coût réel » / « at actual cost », qui
   //    parle du coût du RÉSEAU refacturé au client, pas d'un coût de Cluster.

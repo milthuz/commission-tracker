@@ -19,7 +19,6 @@ const path = require('path');
 // Les seuls champs du scénario qui atteignent le document client.
 const PRICE_KEYS = [
   'merchantName', 'numLocs', 'termsPerLoc',
-  'gmvCredit', 'gmvInterac',
   'saasPerLoc', 'markupRate', 'txnFeeCredit', 'txnFeeInterac',
   'termRentalRev', 'aofRev', 'pciRev', 'bankRev', 'hwPrice', 'instPrice',
 ];
@@ -65,7 +64,7 @@ const COPY = {
   fr: {
     eyebrow1: 'Votre tarification', title1: 'Une offre pensée pour vos {n} emplacements.',
     lead1: 'Un prix clair par emplacement, le même partout dans votre réseau. Voici ce que représente le déploiement de Cluster pour {name}.',
-    stats: { locs: 'Emplacements', terms: 'Terminaux de paiement', volume: 'Volume de paiement annuel' },
+    stats: { locs: 'Emplacements', terms: 'Terminaux de paiement' },
     monthlyTitle: 'Mensuel, par emplacement', oneTimeTitle: 'Unique, par emplacement',
     lines: {
       saas: 'Logiciel PDV Cluster', rental: 'Location des terminaux de paiement',
@@ -86,7 +85,7 @@ const COPY = {
   en: {
     eyebrow1: 'Your pricing', title1: 'An offer built for your {n} locations.',
     lead1: 'One clear price per location, the same across your whole network. Here is what rolling out Cluster represents for {name}.',
-    stats: { locs: 'Locations', terms: 'Payment terminals', volume: 'Annual payment volume' },
+    stats: { locs: 'Locations', terms: 'Payment terminals' },
     monthlyTitle: 'Monthly, per location', oneTimeTitle: 'One-time, per location',
     lines: {
       saas: 'Cluster POS software', rental: 'Payment terminal rental',
@@ -135,9 +134,6 @@ function renderPricingHtml(scenario, { lang = 'fr', startPage = 1 } = {}) {
     return Number(v).toLocaleString(loc, { style: 'currency', currency: 'CAD', currencyDisplay: 'narrowSymbol', minimumFractionDigits: frac, maximumFractionDigits: frac });
   };
   const n = (v, dec = 0) => Number(v).toLocaleString(loc, { maximumFractionDigits: dec });
-  const big = (v) => (v >= 1e6
-    ? (lang === 'en' ? `$${n(v / 1e6, 2)}M` : `${n(v / 1e6, 2)} M$`)
-    : money(v, 0));
   // Frais par transaction : jusqu'à 6 décimales (0,0365 $ reste 0,0365 $).
   const fee = (v) => (lang === 'en' ? `$${n(v, 6)}` : `${n(v, 6)} $`);
   const page = (k) => String(startPage + k).padStart(2, '0');
@@ -167,7 +163,7 @@ body { font-family: 'Satoshi', system-ui, sans-serif; color: #111; -webkit-print
 .eyebrow { color: #FE6523; font-size: 7pt; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; }
 h1 { font-size: 25pt; font-weight: 700; line-height: 1.08; letter-spacing: -.01em; margin-top: 8pt; max-width: 470pt; }
 .lead { font-size: 8.6pt; color: #555; line-height: 1.45; margin-top: 7pt; max-width: 440pt; }
-.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9pt; margin-top: 18pt; }
+.stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 9pt; margin-top: 18pt; }
 .stat { background: #fff; border: .6pt solid #E6E3DD; border-radius: 7pt; padding: 9pt 13pt; }
 .stat.accent { background: #FE6523; border-color: #FE6523; color: #fff; }
 .stat .v { font-size: 17pt; font-weight: 700; }
@@ -201,7 +197,6 @@ h1 { font-size: 25pt; font-weight: 700; line-height: 1.08; letter-spacing: -.01e
   <div class="stats">
     <div class="stat accent"><div class="v">${n(i.numLocs)}</div><div class="k">${esc(L.stats.locs)}</div></div>
     <div class="stat"><div class="v">${n(i.numLocs * i.termsPerLoc)}</div><div class="k">${esc(L.stats.terms)}</div></div>
-    <div class="stat"><div class="v">${big(i.gmvCredit + i.gmvInterac)}</div><div class="k">${esc(L.stats.volume)}</div></div>
   </div>
   <div class="card">
     <h2>${esc(L.monthlyTitle)}</h2>
