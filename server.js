@@ -19332,7 +19332,10 @@ async function saasCsDepartment() {
   try {
     const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'saas_increase_cs_department'`);
     const v = r.rows[0]?.value;
-    return typeof v === 'string' ? v : (v && typeof v.id === 'string' ? v.id : null);
+    // '' veut dire « tous les pupitres » et doit ressortir NULL : rendu tel quel, il devenait un
+    // filtre `department_id = ''` qui ne correspond a aucun billet — zero resultat sans raison.
+    const id = typeof v === 'string' ? v : (v && typeof v.id === 'string' ? v.id : '');
+    return id.trim() ? id.trim() : null;
   } catch { return null; }
 }
 app.get('/api/admin/saas-increase/cs-department', authenticateToken, async (req, res) => {
@@ -19394,10 +19397,18 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
           LEFT JOIN desk_tickets t ON t.department_id = d.id
            AND t.created_time >= NOW() - ($1 || ' days')::interval
          GROUP BY 1, 2 ORDER BY 3 DESC`, [String(jours * 2)])).rows;
+      // Un panneau vide qui ne dit pas POURQUOI il est vide ne sert a rien : « aucun avis
+      // envoye » et « avis envoyes trop recemment pour une fenetre complete » demandent deux
+      // gestes opposes, attendre ou raccourcir la fenetre.
+      const plusRecent = totalAvises ? (await pool.query(
+        `SELECT MAX(notified_at) AS m FROM saas_increase_items WHERE scenario_id = $1`,
+        [req.params.id])).rows[0].m : null;
       return res.json({
         days: jours, departmentId: dept, notifiedTotal: totalAvises, eligible: 0,
         merchantsMatched: 0, before: 0, after: 0, tickets: [], byCategory: [],
         keyword: { count: 0, samples: [] }, departments: dispo,
+        reason: totalAvises === 0 ? 'no_notices' : 'window_too_long',
+        lastNotifiedAt: plusRecent || null,
       });
     }
 
@@ -19424,6 +19435,47 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
 
     const apres = billets.filter(b => b.fenetre === 'after');
     const avant = billets.filter(b => b.fenetre === 'before');
+
+    // ── POURQUOI C'EST VIDE ────────────────────────────────────────────────────────────────
+    // Trois causes possibles et trois gestes differents : le nom ne se rapproche pas, ces
+    // marchands n'ecrivent pas au soutien, ou ils ecrivent AILLEURS que sur le pupitre choisi.
+    // Les distinguer demande de recompter sans la contrainte qu'on soupconne, une fois chacune.
+    let diag = null;
+    if (!billets.length) {
+      const comptes = parseInt((await pool.query(`
+        SELECT COUNT(DISTINCT a.id)::int AS n
+          FROM UNNEST($1::text[]) AS v(customer_name)
+          JOIN desk_accounts a ON sh_norm_name(a.name) = sh_norm_name(v.customer_name)`,
+        [noms])).rows[0].n) || 0;
+      const sansPupitre = parseInt((await pool.query(`
+        WITH avises AS (
+          SELECT UNNEST($1::text[]) AS customer_name, UNNEST($2::timestamptz[]) AS notified_at
+        )
+        SELECT COUNT(*)::int AS n
+          FROM avises v
+          JOIN desk_accounts a ON sh_norm_name(a.name) = sh_norm_name(v.customer_name)
+          JOIN desk_tickets  t ON t.account_id = a.id
+         WHERE COALESCE(t.is_spam, FALSE) = FALSE
+           AND t.created_time >= v.notified_at - ($3 || ' days')::interval
+           AND t.created_time <  v.notified_at + ($3 || ' days')::interval`,
+        [noms, avises.map(a => a.notified_at), String(jours)])).rows[0].n) || 0;
+      const horsFenetre = parseInt((await pool.query(`
+        SELECT COUNT(*)::int AS n
+          FROM UNNEST($1::text[]) AS v(customer_name)
+          JOIN desk_accounts a ON sh_norm_name(a.name) = sh_norm_name(v.customer_name)
+          JOIN desk_tickets  t ON t.account_id = a.id
+         WHERE COALESCE(t.is_spam, FALSE) = FALSE
+           AND ($2::text IS NULL OR t.department_id = $2)`, [noms, dept])).rows[0].n) || 0;
+      diag = {
+        accountsMatched: comptes,          // combien de marchands existent dans Desk
+        ticketsAnyDept: sansPupitre,       // meme fenetre, tous pupitres
+        ticketsAnyWindow: horsFenetre,     // meme pupitre, sans fenetre
+        reason: comptes === 0 ? 'no_name_match'
+          : sansPupitre > 0 ? 'wrong_desk'
+          : horsFenetre > 0 ? 'outside_window'
+          : 'no_tickets',
+      };
+    }
 
     // Sur combien de marchands la mesure porte vraiment. Sans ce chiffre, « 12 billets » ne veut
     // rien dire : 12 sur 40 marchands retrouves n'est pas 12 sur 3 000.
@@ -19475,6 +19527,7 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
       after: apres.length,
       byCategory,
       keyword: { count: parles.length, samples: parles.slice(0, 15).map(vue) },
+      diag,
       tickets: apres.sort((a, b) => new Date(b.created_time) - new Date(a.created_time))
         .slice(0, 50).map(vue),
       departments,
