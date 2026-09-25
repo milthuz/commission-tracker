@@ -18225,6 +18225,43 @@ app.get('/api/saas-increase/lookup/fees', authenticateToken, async (req, res) =>
 });
 
 // =============================================================================================
+// « Choisir la date » ne peut pas vouloir dire une date arbitraire : l'appel Zoho est
+// PUT /subscriptions/{id} avec `end_of_term: true` — un booleen, sans aucun champ de date. Zoho
+// ne sait faire que « tout de suite » ou « au prochain renouvellement ».
+//
+// Ce qu'on peut donc decider, c'est le PLUS TOT. Et ce qu'il faut pouvoir dire au marchand au
+// telephone, c'est la vraie date qui en decoule : son premier renouvellement a partir de la.
+// Sans ce calcul, Samantha annoncerait la date du gel, et le marchand verrait son prix changer
+// des semaines plus tard — une promesse tenue de travers vaut a peine mieux qu'une promesse
+// rompue.
+function saasPremierRenouvellementDepuis(prochain, interval, unit, apres) {
+  if (!prochain || !apres) return null;
+  const parse = (v) => {
+    const [y, m, d] = String(ymd(v) || '').split('-').map(Number);
+    return y ? new Date(y, m - 1, d) : null;
+  };
+  const cible = parse(apres), depart = parse(prochain);
+  if (!cible || !depart) return null;
+  let d = depart;
+  const iv = Math.max(1, parseInt(interval) || 1);
+  const u = String(unit || 'months').toLowerCase();
+  const jour = d.getDate();
+  let garde = 0;
+  while (d < cible && garde++ < 400) {
+    if (u.startsWith('year')) d.setFullYear(d.getFullYear() + iv);
+    else if (u.startsWith('week')) d.setDate(d.getDate() + 7 * iv);
+    else if (u.startsWith('day')) d.setDate(d.getDate() + iv);
+    else {
+      // Mois CALENDAIRES. En repartant du jour voulu borne au dernier jour du mois vise, un
+      // abonnement du 31 passe par le 28 fevrier sans y rester coince les mois suivants.
+      const m = d.getMonth() + iv, y = d.getFullYear();
+      const fin = new Date(y, m + 1, 0).getDate();
+      d = new Date(y, m, Math.min(jour, fin));
+    }
+  }
+  return ymd(d);
+}
+
 // =============================================================================================
 // GELER UNE HAUSSE — POST /api/saas-increase/lookup/freeze
 //
@@ -18322,9 +18359,22 @@ app.post('/api/saas-increase/lookup/freeze', authenticateToken, async (req, res)
                         cancelledInZoho: annuleChezZoho === true })]
     ).catch(e => console.warn('[saas-freeze] journal non ecrit:', e.message));
 
+    // La date que le marchand verra reellement sur sa facture.
+    let effetReel = null;
+    if (jusqua) {
+      try {
+        const live = (await getSaasIncreaseSubscriptions())
+          .find(x => x.orgId === orgId && x.subscriptionNumber === number);
+        effetReel = saasPremierRenouvellementDepuis(
+          live?.nextBillingAt, live?.interval, live?.intervalUnit, jusqua);
+      } catch (e) { console.warn('[saas-freeze] date d effet incalculable:', e.message); }
+    }
+
     res.json({
       ok: true, frozenUntil: ymd(row.frozen_until), frozenBy: row.frozen_by,
       frozenReason: row.frozen_reason, status: row.status,
+      // Ce que Samantha annonce au telephone : pas la date du gel, la date de facturation.
+      effectiveAfterFreeze: effetReel,
       // Dit en clair si un changement a REELLEMENT ete retire de Zoho : c'est la difference
       // entre « on ne le poussera pas » et « il ne sera pas facture ».
       cancelledInZoho: annuleChezZoho === true,
@@ -20062,6 +20112,13 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
         // Le gel, pour que la fiche dise a l'agent ce qui a deja ete promis a ce marchand.
         frozenUntil: ymd(r.frozen_until), frozenBy: r.frozen_by || null,
         frozenReason: r.frozen_reason || null,
+        effectiveAfterFreeze: r.frozen_until
+          ? saasPremierRenouvellementDepuis(
+              liveByKey.get(`${r.org_id}||${r.subscription_number}`)?.nextBillingAt,
+              liveByKey.get(`${r.org_id}||${r.subscription_number}`)?.interval,
+              liveByKey.get(`${r.org_id}||${r.subscription_number}`)?.intervalUnit,
+              ymd(r.frozen_until))
+          : null,
         currentPrice: cur, newPrice: next,
         // Pour un marchand DEJA avise, la seule bonne reponse est la date que son courriel
         // annonce. La recalculer donnerait une date plus tardive de jour en jour — un agent
