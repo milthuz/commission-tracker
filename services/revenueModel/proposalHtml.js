@@ -24,6 +24,9 @@ const PRICE_KEYS = [
   'termRentalRev', 'aofRev', 'pciRev', 'bankRev', 'hwPrice', 'instPrice',
 ];
 
+// Durée présentée au client — la même que l'horizon du modélisateur (YEARS dans model.ts).
+const TERM_YEARS = 5;
+
 // Chiffres du document, calculés UNIQUEMENT à partir des champs de prix.
 function buildPricing(scenario) {
   const i = {};
@@ -45,10 +48,13 @@ function buildPricing(scenario) {
   const oneTimePerLoc = oneTime.reduce((a, l) => a + l.amount, 0);
 
   // ⛔ Volontairement ABSENTS (décision de David, 2026-09-24 : « pas trop de détail ») :
-  // l'estimation des frais de paiement sur le volume du marchand et le total sur 5 ans.
+  // l'estimation des frais de paiement sur le volume du marchand, et le total sur 5 ans de TOUTE
+  // la chaîne. ✅ Le total sur 5 ans PAR EMPLACEMENT, lui, est demandé (David, 2026-09-25) :
+  // unique + mensuel × 12 × TERM_YEARS, hors frais de paiement (ils dépendent du volume).
   return {
     i, monthly, monthlyPerLoc, monthlyChain: monthlyPerLoc * i.numLocs,
     oneTime, oneTimePerLoc, oneTimeChain: oneTimePerLoc * i.numLocs,
+    termPerLoc: oneTimePerLoc + monthlyPerLoc * 12 * TERM_YEARS,
   };
 }
 
@@ -68,6 +74,8 @@ const COPY = {
     rates: 'Paiements — Interchange+', markup: 'Majoration sur les transactions crédit',
     feeCredit: 'Frais par transaction — crédit', feeInterac: 'Frais par transaction — Interac',
     ratesNote: 'L’interchange des réseaux vous est refacturé au coût réel, sans majoration cachée.',
+    termTitle: 'Total par emplacement sur {y} ans', termDetail: '{once} unique + {month} par mois × {m} mois',
+    termNote: 'Hors frais de paiement, qui varient selon votre volume.',
     validity: 'Prix en dollars canadiens, taxes en sus. Proposition valable 30 jours.',
     confidential: 'Confidentiel',
   },
@@ -86,6 +94,8 @@ const COPY = {
     rates: 'Payments — Interchange+', markup: 'Markup on credit transactions',
     feeCredit: 'Per-transaction fee — credit', feeInterac: 'Per-transaction fee — Interac',
     ratesNote: 'Card-network interchange is passed through at actual cost, with no hidden markup.',
+    termTitle: '{y}-year total per location', termDetail: '{once} one-time + {month} per month × {m} months',
+    termNote: 'Excludes payment processing fees, which vary with your volume.',
     validity: 'Prices in Canadian dollars, taxes extra. Proposal valid for 30 days.',
     confidential: 'Confidential',
   },
@@ -170,6 +180,11 @@ h1 { font-size: 25pt; font-weight: 700; line-height: 1.08; letter-spacing: -.01e
 .chain .k { font-size: 8pt; opacity: .8; }
 .chain .v { font-size: 14pt; font-weight: 700; color: #FE8A55; white-space: nowrap; }
 .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 10pt; }
+.term { display: flex; justify-content: space-between; align-items: center; gap: 16pt; margin-top: 12pt; background: #1B1B1D; color: #fff; border-radius: 9pt; padding: 15pt 18pt; }
+.term .k { font-size: 7pt; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: #FE8A55; }
+.term .d { font-size: 7.6pt; opacity: .7; margin-top: 4pt; }
+.term .n { font-size: 6.6pt; opacity: .5; margin-top: 2pt; }
+.term .v { font-size: 22pt; font-weight: 700; color: #FE8A55; white-space: nowrap; }
 .note { font-size: 6.8pt; color: #8A867E; margin-top: 8pt; line-height: 1.45; }
 .footer { position: absolute; left: 36pt; right: 36pt; bottom: 22pt; display: flex; justify-content: space-between; font-size: 6.5pt; color: #A5A19A; }
 </style></head><body>
@@ -203,6 +218,14 @@ h1 { font-size: 25pt; font-weight: 700; line-height: 1.08; letter-spacing: -.01e
       ${line(esc(L.feeInterac), '', fee(i.txnFeeInterac))}
       <div class="note">${esc(L.ratesNote)}</div>
     </div>
+  </div>
+  <div class="term">
+    <div>
+      <div class="k">${esc(fill(L.termTitle, { y: TERM_YEARS }))}</div>
+      <div class="d">${esc(fill(L.termDetail, { once: money(d.oneTimePerLoc), month: money(d.monthlyPerLoc), m: TERM_YEARS * 12 }))}</div>
+      <div class="n">${esc(L.termNote)}</div>
+    </div>
+    <div class="v">${money(d.termPerLoc, 0)}</div>
   </div>
   <p class="note" style="margin-top:12pt">${esc(L.validity)}</p>
   ${footer(0)}
