@@ -28218,10 +28218,14 @@ app.get('/api/admin/commission-imports/:id', authenticateToken, async (req, res)
     const imp = (await pool.query(`SELECT * FROM commission_payment_imports WHERE id = $1`, [id])).rows[0];
     if (!imp) return res.status(404).json({ error: 'Import not found' });
     const lines = (await pool.query(
-      `SELECT invoice_number, customer, paid_amount::float AS paid_amount, app_commission::float AS app_commission, not_in_db
-       FROM commission_payment_lines WHERE import_id = $1 ORDER BY not_in_db ASC, paid_amount DESC`,
+      `SELECT l.invoice_number, l.customer, l.paid_amount::float AS paid_amount, l.app_commission::float AS app_commission, l.not_in_db,
+              i.commission_status, i.hardware_amount, i.saas_amount
+       FROM commission_payment_lines l LEFT JOIN invoices i ON i.invoice_number = l.invoice_number
+       WHERE l.import_id = $1 ORDER BY l.not_in_db ASC, l.paid_amount DESC`,
       [id]
-    )).rows;
+    )).rows.map(({ commission_status, hardware_amount, saas_amount, ...l }) => ({
+      ...l, category: payStubLineCategory({ commission_status, hardware_amount, saas_amount }),
+    }));
     const bonuses = (await pool.query(
       `SELECT bonus_type, merchant_name, amount::float AS amount, report_date::date AS report_date
        FROM commission_bonuses WHERE import_id = $1 ORDER BY bonus_type, amount DESC`,
@@ -32390,6 +32394,24 @@ app.post('/api/commissions/mark-paid', authenticateToken, async (req, res) => {
 //     activations in the period.
 // Access: admins see any rep; non-admins need report:view_paystub and (by rep resolution) only
 // ever see their OWN stub. Read-only — no DB writes here.
+// SaaS ou matériel ? — l'étiquette de chaque ligne de commission du bulletin (demande de David,
+// 2026-09-25). Le seau de recalc-v2 d'abord : 'hardware' veut dire que TOUTE la commission vient
+// du matériel (y compris la facture mixte dont le SaaS est en renouvellement à 0 %) ; 'saas_first'
+// / 'saas_annual' paient le SaaS, et aussi le matériel s'il y en a sur la facture → 'mixed'.
+// Sinon (quota_partial, qui efface le seau d'origine, ou un ancien fichier importé payé selon
+// l'ancien modèle) on se rabat sur ce que la facture CONTIENT. Null = facture hors base.
+function payStubLineCategory(r) {
+  if (!r) return null;
+  const hw = (parseFloat(r.hardware_amount) || 0) > 0;
+  const saas = (parseFloat(r.saas_amount) || 0) > 0;
+  if (r.commission_status === 'hardware') return 'hardware';
+  if (r.commission_status === 'saas_first' || r.commission_status === 'saas_annual') return hw ? 'mixed' : 'saas';
+  if (hw && saas) return 'mixed';
+  if (hw) return 'hardware';
+  if (saas) return 'saas';
+  return null;
+}
+
 app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
   const { email, isAdmin, name: jwtName } = req.user;
   const { repName, year, month } = req.query;
@@ -32421,7 +32443,8 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
     const genLines = async () => {
       const rows = (await pool.query(
         `SELECT invoice_number, customer_name, commission::float AS commission, approval_status,
-                commission_status, quota_forfeited_amount::float AS quota_forfeited_amount
+                commission_status, quota_forfeited_amount::float AS quota_forfeited_amount,
+                hardware_amount, saas_amount
          FROM invoices
          WHERE salesperson_name = $1 AND organization_id = $2
            AND commission_payable_date >= $3 AND commission_payable_date < $4
@@ -32437,6 +32460,7 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
         approval_status: r.approval_status || 'pending',
         quota_partial: r.commission_status === 'quota_partial',
         quota_forfeited: r.quota_forfeited_amount || 0,
+        category:       payStubLineCategory(r),
       }));
     };
     // The bi-annual processing bonus is deliberately NOT part of the monthly pay stub (see
@@ -32542,11 +32566,15 @@ app.get('/api/commissions/pay-stub', authenticateToken, async (req, res) => {
 
     if (imp) {
       const lines = (await pool.query(
-        `SELECT invoice_number, customer, paid_amount::float AS paid_amount, app_commission::float AS app_commission,
-                not_in_db, quota_partial, quota_forfeited::float AS quota_forfeited
-         FROM commission_payment_lines WHERE import_id = $1 ORDER BY not_in_db ASC, paid_amount DESC`,
+        `SELECT l.invoice_number, l.customer, l.paid_amount::float AS paid_amount, l.app_commission::float AS app_commission,
+                l.not_in_db, l.quota_partial, l.quota_forfeited::float AS quota_forfeited,
+                i.commission_status, i.hardware_amount, i.saas_amount
+         FROM commission_payment_lines l LEFT JOIN invoices i ON i.invoice_number = l.invoice_number
+         WHERE l.import_id = $1 ORDER BY l.not_in_db ASC, l.paid_amount DESC`,
         [imp.id]
-      )).rows;
+      )).rows.map(({ commission_status, hardware_amount, saas_amount, ...l }) => ({
+        ...l, category: payStubLineCategory({ commission_status, hardware_amount, saas_amount }),
+      }));
       const bonuses = (await pool.query(
         `SELECT bonus_type, merchant_name, amount::float AS amount, report_date::date AS report_date
          FROM commission_bonuses WHERE import_id = $1 ORDER BY bonus_type, amount DESC`,
