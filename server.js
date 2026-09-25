@@ -20354,7 +20354,12 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
     // subscriptions that no longer exist/changed since the scenario was built.
     const liveSubs = await getSaasIncreaseSubscriptions();
     const liveBySub = new Map(liveSubs.map(s => [`${s.orgId}||${s.subscriptionNumber}`, s]));
-    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    // Un SEUL jeton pris avant la boucle tenait tant que les lots faisaient dix lignes. Une passe
+    // de plusieurs milliers d'abonnements dure des dizaines de minutes, et le jeton Zoho est
+    // PARTAGE : n'importe quel autre travail qui le renouvelle invalide celui-ci, et tout le
+    // reste du lot echouait alors en 401 — sur une action qui ecrit dans la facturation reelle.
+    // Meme traitement que les scans : renouvellement sur l'AGE, et une reprise sur 401 ou 429.
+    const auth = { ...(await getAdminBooksAuth()), fetchedAt: Date.now() };
     // Which subscriptions have had their plan price separated from their addons by the insights
     // scan. Anything missing here cannot be pushed safely — see the per-item guard below.
     // The exact price Zoho bills per period, keyed per org. Anything missing here cannot be
@@ -20404,11 +20409,27 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
         results.push({ itemId: item.id, ok: false, deferred: true, error: msg });
         continue;
       }
-      const billing = new ZohoBillingService(accessToken, apiDomain, item.org_id);
+      if (Date.now() - auth.fetchedAt > SAAS_TOKEN_MAX_AGE_MS) {
+        Object.assign(auth, await getAdminBooksAuth(), { fetchedAt: Date.now() });
+      }
       // Computed from the exact per-period price and the stored increase — never converted from
       // a monthly figure, so nothing is lost to rounding.
       const pricePerPeriod = saasNewPeriodPrice(currentPeriod, item.increase_type, item.increase_value);
-      const r = await billing.scheduleSubscriptionPriceChange(live.subscriptionId, item.plan_code, pricePerPeriod);
+      const ecrire = () => new ZohoBillingService(auth.accessToken, auth.apiDomain, item.org_id)
+        .scheduleSubscriptionPriceChange(live.subscriptionId, item.plan_code, pricePerPeriod);
+      let r = await ecrire();
+      // Une SEULE reprise, et seulement sur les deux echecs qui ne disent rien du prix : jeton
+      // mort, ou Zoho qui demande d'attendre. Tout autre refus est un vrai refus et se consigne.
+      if (!r.ok) {
+        const brut = typeof r.error === 'string' ? r.error : JSON.stringify(r.error || {});
+        if (/401|invalid.?token|expired/i.test(brut)) {
+          Object.assign(auth, await getAdminBooksAuth(), { fetchedAt: Date.now() });
+          r = await ecrire();
+        } else if (/429|too many|rate limit/i.test(brut)) {
+          await new Promise(r2 => setTimeout(r2, SAAS_RATE_LIMIT_BACKOFF_MS));
+          r = await ecrire();
+        }
+      }
       if (r.ok) {
         await pool.query(
           `UPDATE saas_increase_items SET status = 'pushed', push_error = NULL, pushed_by = $1, pushed_at = NOW() WHERE id = $2`,
