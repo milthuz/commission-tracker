@@ -19482,9 +19482,26 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign', authenticateToken, as
       : mrr.upcoming > 0 ? 'live'
       : 'complete';
 
+    // ── LE MOTEUR DE LA CAMPAGNE ───────────────────────────────────────────────────────────
+    // C'est le pilote quotidien qui applique les hausses au fil des renouvellements, pas un
+    // geste manuel. Son etat manquait a la page qui pretend suivre la campagne — on pouvait donc
+    // regarder un compteur immobile sans savoir s'il attendait son tour ou si le moteur etait
+    // arrete. Le DRAPEAU dit ce qui devrait se passer ; `lastPushAt` dit ce qui s'est
+    // reellement passe, et c'est le second qui tranche.
+    let autopilot = { enabled: null, lastPushAt: null };
+    try {
+      autopilot = {
+        enabled: await saasAutoEnabled(),
+        lastPushAt: ymd((await pool.query(
+          `SELECT MAX(pushed_at) AS m FROM saas_increase_items WHERE scenario_id = $1`,
+          [req.params.id])).rows[0].m),
+        waiting: augmentes.filter(i => i.notify_status === 'sent' && i.status !== 'pushed').length,
+      };
+    } catch (e) { console.warn('[saas-campagne] etat du pilote illisible:', e.message); }
+
     res.json({
       scenario: { id: sc.id, name: sc.name, status: sc.status, createdAt: sc.created_at },
-      phase, counts: compte, mrr, timeline, churn, leads,
+      phase, counts: compte, mrr, timeline, churn, leads, autopilot,
       firstPushAt: pousses.reduce((min, i) => {
         const d = i.pushed_at ? ymd(i.pushed_at) : null;
         return d && (!min || d < min) ? d : min;
