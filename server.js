@@ -19384,9 +19384,60 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
          AND notified_at <= NOW() - ($2 || ' days')::interval`,
       [req.params.id, String(jours)])).rows;
 
-    const totalAvises = parseInt((await pool.query(
-      `SELECT COUNT(*)::int AS n FROM saas_increase_items
-        WHERE scenario_id = $1 AND notified_at IS NOT NULL`, [req.params.id])).rows[0].n) || 0;
+    const bornes = (await pool.query(
+      `SELECT COUNT(*)::int AS n, MIN(notified_at) AS plus_ancien, MAX(notified_at) AS plus_recent
+         FROM saas_increase_items
+        WHERE scenario_id = $1 AND notified_at IS NOT NULL`, [req.params.id])).rows[0];
+    const totalAvises = parseInt(bornes.n) || 0;
+
+    // ── LA QUESTION SIMPLE, TOUJOURS REPONDUE ──────────────────────────────────────────────
+    // « Est-ce qu'on a des billets la-dessus ? » n'a pas besoin d'une fenetre symetrique. Tous
+    // les marchands avises comptent ici, meme ceux avises hier : on veut le VOLUME depuis l'avis.
+    // La comparaison appariee plus bas est un raffinement qui exige du recul ; exiger ce recul
+    // pour repondre a la question de base rendait le panneau muet sur une campagne qui generait
+    // deja des appels — ce qui se lit, a juste titre, comme « c'est impossible ».
+    const tousAvises = (await pool.query(
+      `SELECT customer_name, notified_at FROM saas_increase_items
+        WHERE scenario_id = $1 AND notified_at IS NOT NULL`, [req.params.id])).rows;
+
+    let depuisAvis = { tickets: 0, merchants: 0, list: [], byCategory: [] };
+    if (tousAvises.length) {
+      const lignes = (await pool.query(`
+        WITH avises AS (
+          SELECT UNNEST($1::text[]) AS customer_name, UNNEST($2::timestamptz[]) AS notified_at
+        )
+        SELECT t.id, t.ticket_number, t.subject, t.created_time, t.closed_time, t.status_type,
+               t.cs_category, t.issue_type, t.channel, t.web_url,
+               a.name AS account_name, v.customer_name, v.notified_at
+          FROM avises v
+          JOIN desk_accounts a ON sh_norm_name(a.name) = sh_norm_name(v.customer_name)
+          JOIN desk_tickets  t ON t.account_id = a.id
+         WHERE COALESCE(t.is_spam, FALSE) = FALSE
+           AND t.created_time >= v.notified_at
+           AND ($3::text IS NULL OR t.department_id = $3)`,
+        [tousAvises.map(a => a.customer_name || ''), tousAvises.map(a => a.notified_at), dept])).rows;
+
+      const cats = new Map();
+      for (const l of lignes) {
+        const cle = l.cs_category || l.issue_type || '(sans categorie)';
+        cats.set(cle, (cats.get(cle) || 0) + 1);
+      }
+      depuisAvis = {
+        tickets: lignes.length,
+        merchants: new Set(lignes.map(l => String(l.customer_name || '').toLowerCase())).size,
+        byCategory: Array.from(cats.entries()).map(([category, n]) => ({ category, n }))
+          .sort((a, b) => b.n - a.n),
+        list: lignes
+          .sort((a, b) => new Date(b.created_time) - new Date(a.created_time))
+          .slice(0, 50)
+          .map(l => ({
+            id: l.id, number: l.ticket_number, subject: l.subject,
+            createdAt: l.created_time, category: l.cs_category || l.issue_type || null,
+            channel: l.channel, url: l.web_url, customerName: l.customer_name,
+            daysAfterNotice: Math.round((new Date(l.created_time) - new Date(l.notified_at)) / 86400000),
+          })),
+      };
+    }
 
     if (!avises.length) {
       // Meme sans marchand admissible, on rend la liste des pupitres : sans elle, l'ecran
@@ -19400,15 +19451,19 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
       // Un panneau vide qui ne dit pas POURQUOI il est vide ne sert a rien : « aucun avis
       // envoye » et « avis envoyes trop recemment pour une fenetre complete » demandent deux
       // gestes opposes, attendre ou raccourcir la fenetre.
-      const plusRecent = totalAvises ? (await pool.query(
-        `SELECT MAX(notified_at) AS m FROM saas_increase_items WHERE scenario_id = $1`,
-        [req.params.id])).rows[0].m : null;
       return res.json({
         days: jours, departmentId: dept, notifiedTotal: totalAvises, eligible: 0,
         merchantsMatched: 0, before: 0, after: 0, tickets: [], byCategory: [],
         keyword: { count: 0, samples: [] }, departments: dispo,
+        // La comparaison appariee manque de recul, mais le volume brut est la : c'est lui qui
+        // repond a « est-ce qu'on a des billets la-dessus ».
+        sinceNotice: depuisAvis,
         reason: totalAvises === 0 ? 'no_notices' : 'window_too_long',
-        lastNotifiedAt: plusRecent || null,
+        // C'est le PLUS ANCIEN avis qui decide de l'admissibilite. Afficher le plus recent
+        // rendait le message contradictoire : « aucun depuis plus de 30 jours » suivi d'une
+        // date vieille de sept jours.
+        oldestNotifiedAt: bornes.plus_ancien || null,
+        lastNotifiedAt: bornes.plus_recent || null,
       });
     }
 
@@ -19527,6 +19582,9 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
       after: apres.length,
       byCategory,
       keyword: { count: parles.length, samples: parles.slice(0, 15).map(vue) },
+      sinceNotice: depuisAvis,
+      oldestNotifiedAt: bornes.plus_ancien || null,
+      lastNotifiedAt: bornes.plus_recent || null,
       diag,
       tickets: apres.sort((a, b) => new Date(b.created_time) - new Date(a.created_time))
         .slice(0, 50).map(vue),
