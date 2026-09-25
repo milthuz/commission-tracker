@@ -18262,6 +18262,54 @@ function saasPremierRenouvellementDepuis(prochain, interval, unit, apres) {
   return ymd(d);
 }
 
+// VERIFIER CE QUE ZOHO A VRAIMENT — GET /api/saas-increase/lookup/scheduled
+//
+// Le meme controle existait deja, mais enterre : page SAAS increase, panneau du bas, deplier le
+// segment, deplier la ligne. Pour un abonnement parmi trois mille cinq cents, c'est une chasse —
+// et c'est le controle qui suit immediatement un gel. Il appartient donc a la fiche du marchand,
+// la ou le gel vient d'etre pose.
+//
+// ⚠️ C'est la SEULE preuve qu'un gel a mordu. La base peut dire « gele » pendant que Zoho
+// facture quand meme : seule une relecture chez Zoho tranche. L'interface de Zoho, elle,
+// n'affiche le prix futur nulle part.
+app.get('/api/saas-increase/lookup/scheduled', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:lookup'))) return;
+  const orgId = String(req.query.orgId || '').trim();
+  const number = String(req.query.subscriptionNumber || '').trim();
+  if (!orgId || !number) return res.status(400).json({ error: 'orgId and subscriptionNumber required' });
+  try {
+    const live = (await getSaasIncreaseSubscriptions())
+      .find(x => x.orgId === orgId && x.subscriptionNumber === number);
+    if (!live?.subscriptionId) return res.status(404).json({ error: 'subscription not found in Zoho' });
+
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    const r = await axios.get(
+      `${apiDomain}/billing/v1/subscriptions/${live.subscriptionId}/scheduledchanges`, {
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}`,
+                   'X-com-zoho-subscriptions-organizationid': orgId },
+        validateStatus: () => true, timeout: 20000,
+      });
+    // Zoho repond « aucun changement planifie » par un HTTP 400 code 107222, pas par un 200 vide.
+    // C'est l'etat ATTENDU apres un gel, et le confondre avec une erreur ferait passer un gel
+    // reussi pour un echec.
+    if (r.status !== 200) {
+      if (Number(r.data?.code) === 107222 || /doesn't have scheduled changes/i.test(String(r.data?.message || ''))) {
+        return res.json({ scheduled: false, price: null, effectiveAt: null });
+      }
+      return res.status(502).json({ error: `Zoho HTTP ${r.status}`, raw: JSON.stringify(r.data).slice(0, 400) });
+    }
+    const d = r.data || {};
+    const box = d.scheduled_changes || d.scheduled_change || d.subscription || d;
+    const price = box?.plan?.price ?? box?.price ?? null;
+    const at = box?.scheduled_at || box?.effective_from || box?.next_billing_at || box?.current_term_ends_at || null;
+    res.json({
+      scheduled: price != null || at != null,
+      price: price != null ? Number(price) : null,
+      effectiveAt: at,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // =============================================================================================
 // GELER UNE HAUSSE — POST /api/saas-increase/lookup/freeze
 //
