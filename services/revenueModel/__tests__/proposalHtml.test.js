@@ -47,7 +47,7 @@ for (const lang of ['fr', 'en']) {
   //    Seule exception voulue : l'interchange « refacturé au coût réel » / « at actual cost », qui
   //    parle du coût du RÉSEAU refacturé au client, pas d'un coût de Cluster.
   // Texte VISIBLE seulement : « margin » d'un attribut style= n'est pas un mot du document.
-  const prose = body.replace(/<[^>]*>/g, ' ').toLowerCase().replace('au coût réel', '').replace('at actual cost', '');
+  const prose = body.replace(/<[^>]*>/g, ' ').toLowerCase().replaceAll('au coût réel', '').replaceAll('at actual cost', ''); // TOUTES les occurrences
   for (const w of lang === 'fr' ? ['coût', 'marge', 'commission', 'garantie'] : ['cost', 'margin', 'commission', 'warranty']) {
     assert(!prose.includes(w), `[${lang}] mot interne « ${w} » dans le document client`); n++;
   }
