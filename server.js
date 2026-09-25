@@ -19305,6 +19305,129 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign', authenticateToken, as
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// =============================================================================================
+// CE QUE LA HAUSSE A COUTE AU SOUTIEN — GET .../scenarios/:id/campaign/desk?days=30
+//
+// « Combien de billets la hausse a-t-elle generes » n'a pas de reponse directe : aucun champ de
+// Zoho Desk ne dit « ce billet parle de la hausse de prix ». On peut deviner par mots-cles, et on
+// le fait plus bas, mais un mot-cle rate les appels ou le marchand parle d'autre chose et glisse
+// la hausse au passage, et attrape les billets qui citent « prix » sans rapport.
+//
+// La mesure SOLIDE est ailleurs : comparer CHAQUE marchand avise a LUI-MEME. Combien de billets
+// a-t-il ouverts dans les N jours SUIVANT son avis, contre les N jours qui l'ont precede. Meme
+// marchand, meme duree, meme saison a quelques semaines pres. La difference est attribuable.
+//
+// ⚠️ Seuls les marchands dont l'avis a plus de N jours sont comptes. Inclure ceux avises hier
+// donnerait une fenetre « apres » tronquee et ferait paraitre la hausse sans effet — l'erreur qui
+// rend la plupart des comparaisons avant/apres rassurantes et fausses.
+//
+// Le rapprochement Desk <-> facturation se fait par NOM normalise (sh_norm_name), le meme chemin
+// que le croisement soutien x revenus. Il est partiel par nature : `merchantsMatched` dit sur
+// combien de marchands la mesure porte reellement, et c'est ce denominateur qu'il faut lire.
+// =============================================================================================
+app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  const jours = Math.min(180, Math.max(7, parseInt(req.query.days) || 30));
+  try {
+    // Les marchands avises depuis assez longtemps pour que les DEUX fenetres soient completes.
+    const avises = (await pool.query(`
+      SELECT id, customer_name, subscription_number, org_id, notified_at
+        FROM saas_increase_items
+       WHERE scenario_id = $1 AND notified_at IS NOT NULL
+         AND notified_at <= NOW() - ($2 || ' days')::interval`,
+      [req.params.id, String(jours)])).rows;
+
+    const totalAvises = parseInt((await pool.query(
+      `SELECT COUNT(*)::int AS n FROM saas_increase_items
+        WHERE scenario_id = $1 AND notified_at IS NOT NULL`, [req.params.id])).rows[0].n) || 0;
+
+    if (!avises.length) {
+      return res.json({
+        days: jours, notifiedTotal: totalAvises, eligible: 0, merchantsMatched: 0,
+        before: 0, after: 0, tickets: [], byCategory: [], keyword: { count: 0, samples: [] },
+        departments: [],
+      });
+    }
+
+    const noms = avises.map(a => a.customer_name || '');
+    const parNom = new Map(avises.map(a => [String(a.customer_name || '').toLowerCase(), a]));
+
+    // Une seule requete : les billets de ces marchands dans les deux fenetres, etiquetes.
+    const billets = (await pool.query(`
+      WITH avises AS (
+        SELECT UNNEST($1::text[]) AS customer_name, UNNEST($2::timestamptz[]) AS notified_at
+      )
+      SELECT t.id, t.ticket_number, t.subject, t.created_time, t.status_type, t.closed_time,
+             t.cs_category, t.issue_type, t.channel, t.web_url,
+             a.name AS account_name, v.customer_name, v.notified_at,
+             CASE WHEN t.created_time >= v.notified_at THEN 'after' ELSE 'before' END AS fenetre
+        FROM avises v
+        JOIN desk_accounts a ON sh_norm_name(a.name) = sh_norm_name(v.customer_name)
+        JOIN desk_tickets  t ON t.account_id = a.id
+       WHERE COALESCE(t.is_spam, FALSE) = FALSE
+         AND t.created_time >= v.notified_at - ($3 || ' days')::interval
+         AND t.created_time <  v.notified_at + ($3 || ' days')::interval`,
+      [noms, avises.map(a => a.notified_at), String(jours)])).rows;
+
+    const apres = billets.filter(b => b.fenetre === 'after');
+    const avant = billets.filter(b => b.fenetre === 'before');
+
+    // Sur combien de marchands la mesure porte vraiment. Sans ce chiffre, « 12 billets » ne veut
+    // rien dire : 12 sur 40 marchands retrouves n'est pas 12 sur 3 000.
+    const retrouves = new Set(billets.map(b => String(b.customer_name || '').toLowerCase()));
+
+    // La categorie qui BOUGE se designe elle-meme. On ne cherche pas un libelle devine d'avance :
+    // on montre l'ecart avant/apres par categorie, et celle qui ressort est la bonne.
+    const parCat = new Map();
+    for (const b of billets) {
+      const cle = b.cs_category || b.issue_type || '(sans categorie)';
+      const e = parCat.get(cle) || { category: cle, before: 0, after: 0 };
+      e[b.fenetre] += 1;
+      parCat.set(cle, e);
+    }
+    const byCategory = Array.from(parCat.values())
+      .map(e => ({ ...e, delta: e.after - e.before }))
+      .sort((a, b) => b.delta - a.delta || b.after - a.after);
+
+    // Le filet a mots-cles, en PLUS et jamais a la place : il sert a lire des sujets reels pour
+    // decider quelle categorie compter, pas a produire le chiffre officiel.
+    const MOTS = /augment|hausse|price increase|increase|prix|pricing|rate change|facturation|billing/i;
+    const parles = apres.filter(b => MOTS.test(String(b.subject || '')));
+
+    // Les pupitres, pour que David designe lequel est celui du service a la clientele : le
+    // deviner d'ici serait une hypothese de plus dans un chiffre qui doit etre sur.
+    const departments = (await pool.query(`
+      SELECT d.id, d.name, COUNT(t.id)::int AS n
+        FROM desk_departments d
+        LEFT JOIN desk_tickets t ON t.department_id = d.id
+         AND t.created_time >= NOW() - ($1 || ' days')::interval
+       GROUP BY 1, 2 ORDER BY 3 DESC`, [String(jours * 2)])).rows;
+
+    const vue = (b) => ({
+      id: b.id, number: b.ticket_number, subject: b.subject,
+      createdAt: b.created_time, closedAt: b.closed_time, statusType: b.status_type,
+      category: b.cs_category || b.issue_type || null, channel: b.channel,
+      url: b.web_url, accountName: b.account_name, customerName: b.customer_name,
+      notifiedAt: b.notified_at,
+      daysAfterNotice: Math.round((new Date(b.created_time) - new Date(b.notified_at)) / 86400000),
+    });
+
+    res.json({
+      days: jours,
+      notifiedTotal: totalAvises,
+      eligible: avises.length,
+      merchantsMatched: retrouves.size,
+      before: avant.length,
+      after: apres.length,
+      byCategory,
+      keyword: { count: parles.length, samples: parles.slice(0, 15).map(vue) },
+      tickets: apres.sort((a, b) => new Date(b.created_time) - new Date(a.created_time))
+        .slice(0, 50).map(vue),
+      departments,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/saas-increase/lookup?q= — the support desk's answer to "a merchant is calling about
 // their price increase". Read-only and on its own permission: an agent needs the facts for ONE
 // account, never the ability to build a scenario, email anyone or write to Zoho.
