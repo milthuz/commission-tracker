@@ -19325,9 +19325,41 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign', authenticateToken, as
 // que le croisement soutien x revenus. Il est partiel par nature : `merchantsMatched` dit sur
 // combien de marchands la mesure porte reellement, et c'est ce denominateur qu'il faut lire.
 // =============================================================================================
+// Le pupitre du service a la clientele, choisi une fois et partage. Vit dans app_settings comme
+// les autres reglages d'equipe : chacun le redecouvrant dans son propre menu donnerait des
+// chiffres differents d'une personne a l'autre pour la meme campagne.
+async function saasCsDepartment() {
+  try {
+    const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'saas_increase_cs_department'`);
+    const v = r.rows[0]?.value;
+    return typeof v === 'string' ? v : (v && typeof v.id === 'string' ? v.id : null);
+  } catch { return null; }
+}
+app.get('/api/admin/saas-increase/cs-department', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  res.json({ departmentId: await saasCsDepartment() });
+});
+app.put('/api/admin/saas-increase/cs-department', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  // '' = tous les pupitres. Un choix vide est une decision legitime, pas une absence de choix.
+  const id = String(req.body?.departmentId ?? '').trim();
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('saas_increase_cs_department', $1::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [JSON.stringify(id)]);
+    res.json({ departmentId: id || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
   const jours = Math.min(180, Math.max(7, parseInt(req.query.days) || 30));
+  // Le parametre l'emporte sur le reglage : la page s'en sert pour montrer l'effet d'un autre
+  // choix AVANT de l'enregistrer.
+  const dept = req.query.dept !== undefined
+    ? String(req.query.dept || '').trim() || null
+    : await saasCsDepartment();
   try {
     // Les marchands avises depuis assez longtemps pour que les DEUX fenetres soient completes.
     const avises = (await pool.query(`
@@ -19342,10 +19374,18 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
         WHERE scenario_id = $1 AND notified_at IS NOT NULL`, [req.params.id])).rows[0].n) || 0;
 
     if (!avises.length) {
+      // Meme sans marchand admissible, on rend la liste des pupitres : sans elle, l'ecran
+      // n'offrirait aucun moyen de choisir, et le choix est justement ce qui manque au depart.
+      const dispo = (await pool.query(`
+        SELECT d.id, d.name, COUNT(t.id)::int AS n
+          FROM desk_departments d
+          LEFT JOIN desk_tickets t ON t.department_id = d.id
+           AND t.created_time >= NOW() - ($1 || ' days')::interval
+         GROUP BY 1, 2 ORDER BY 3 DESC`, [String(jours * 2)])).rows;
       return res.json({
-        days: jours, notifiedTotal: totalAvises, eligible: 0, merchantsMatched: 0,
-        before: 0, after: 0, tickets: [], byCategory: [], keyword: { count: 0, samples: [] },
-        departments: [],
+        days: jours, departmentId: dept, notifiedTotal: totalAvises, eligible: 0,
+        merchantsMatched: 0, before: 0, after: 0, tickets: [], byCategory: [],
+        keyword: { count: 0, samples: [] }, departments: dispo,
       });
     }
 
@@ -19366,8 +19406,9 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
         JOIN desk_tickets  t ON t.account_id = a.id
        WHERE COALESCE(t.is_spam, FALSE) = FALSE
          AND t.created_time >= v.notified_at - ($3 || ' days')::interval
-         AND t.created_time <  v.notified_at + ($3 || ' days')::interval`,
-      [noms, avises.map(a => a.notified_at), String(jours)])).rows;
+         AND t.created_time <  v.notified_at + ($3 || ' days')::interval
+         AND ($4::text IS NULL OR t.department_id = $4)`,
+      [noms, avises.map(a => a.notified_at), String(jours), dept])).rows;
 
     const apres = billets.filter(b => b.fenetre === 'after');
     const avant = billets.filter(b => b.fenetre === 'before');
@@ -19414,6 +19455,7 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
 
     res.json({
       days: jours,
+      departmentId: dept,
       notifiedTotal: totalAvises,
       eligible: avises.length,
       merchantsMatched: retrouves.size,
