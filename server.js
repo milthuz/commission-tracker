@@ -169,6 +169,10 @@ const PERMISSION_CATALOG = [
   // Deliberately separate and read-only: support agents need to answer "what changed for THIS
   // merchant" without any ability to build, notify or push.
   { key: 'saas_increase:lookup',       label: 'Look up a merchant price change (support reference)',        category: 'SaaS Increase' },
+  // Reporter une hausse est une decision de service a la clientele, pas d'administration : la
+  // gestionnaire CS doit pouvoir la prendre au telephone sans la demander a chaque fois.
+  // Separee de `execute` — geler n'est PAS pousser — et de `manage`, qui donne tout le reste.
+  { key: 'saas_increase:freeze',       label: 'Freeze a merchant price increase until a date',                 category: 'SaaS Increase' },
   { key: 'saas_increase:payment_deal', label: 'Open a payments opportunity from the support reference',    category: 'SaaS Increase' },
 
   // Partner Portal (internal staff side — manage partner companies + review submissions;
@@ -2927,6 +2931,14 @@ async function initializeDatabase() {
     // La date a partir de laquelle un ANNUEL peut etre avise (renouvellement effectif moins
     // 30 jours). Nulle pour un mensuel, qu'on avise tout de suite.
     await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS notify_after DATE`);
+
+    // GEL D'UNE HAUSSE. Distinct de `skipped`, qui veut dire « jamais » : un gel a une DATE, et
+    // la ligne revient d'elle-meme dans le travail a faire quand elle est passee. C'est ce dont
+    // le service a la clientele a besoin au telephone — reporter, pas annuler.
+    await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS frozen_until DATE`);
+    await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS frozen_by VARCHAR(255)`);
+    await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS frozen_at TIMESTAMP`);
+    await pool.query(`ALTER TABLE saas_increase_items ADD COLUMN IF NOT EXISTS frozen_reason TEXT`);
     // Widen scenario-item uniqueness to include the org. Zoho subscription numbers are per-ORG,
     // so (scenario_id, subscription_number) meant two different customers sharing a number could
     // not both be in one scenario — the second silently overwrote the first, losing a real
@@ -17890,6 +17902,8 @@ function serializeSaasIncreaseItem(row) {
     currentMonthly: Number(row.current_monthly), increaseType: row.increase_type, increaseValue: Number(row.increase_value),
     newMonthly: Number(row.new_monthly), status: row.status, pushError: row.push_error,
     skipped: row.skipped === true,
+    frozenUntil: ymd(row.frozen_until), frozenBy: row.frozen_by || null,
+    frozenReason: row.frozen_reason || null,
     pushedBy: row.pushed_by, pushedAt: row.pushed_at,
     notifyTo: row.notify_to, notifySubject: row.notify_subject, notifyBody: row.notify_body,
     notifyStatus: row.notify_status, notifyError: row.notify_error, notifyHeading: row.notify_heading,
@@ -18211,6 +18225,113 @@ app.get('/api/saas-increase/lookup/fees', authenticateToken, async (req, res) =>
 });
 
 // =============================================================================================
+// =============================================================================================
+// GELER UNE HAUSSE — POST /api/saas-increase/lookup/freeze
+//
+// Samantha est au telephone avec un marchand qui demande un delai. Jusqu'ici elle devait
+// rappeler David a chaque fois. Ce geste-la lui appartient : c'est une decision de service a la
+// clientele, pas d'administration, et elle porte sa propre permission.
+//
+// ⚠️ DEUX ETATS TRES DIFFERENTS derriere un meme bouton :
+//
+//  1. La hausse n'est PAS encore appliquee. Geler = poser une date, et le push l'ignorera
+//     jusque-la. Rien ne part chez Zoho.
+//  2. La hausse EST deja planifiee chez Zoho, au renouvellement du marchand. Poser une date en
+//     base ne l'empecherait PAS de se produire : la promesse faite au telephone serait fausse.
+//     Il faut donc ANNULER le changement planifie chez Zoho, et la ligne repasse en `pending`
+//     pour etre re-poussee apres la date.
+//
+// Confondre les deux serait la pire issue possible : l'ecran dirait « gele » et le marchand
+// serait facture quand meme.
+// =============================================================================================
+app.post('/api/saas-increase/lookup/freeze', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:freeze'))) return;
+  const orgId = String(req.body?.orgId || '').trim();
+  const number = String(req.body?.subscriptionNumber || '').trim();
+  const raison = String(req.body?.reason || '').trim().slice(0, 500);
+  const brut = String(req.body?.until || '').trim();
+  if (!orgId || !number) return res.status(400).json({ error: 'orgId and subscriptionNumber required' });
+
+  // '' leve le gel. Sinon la date doit etre dans le FUTUR : un gel deja expire est un gel qui
+  // n'existe pas, et l'annoncer a un marchand serait une promesse vide.
+  let jusqua = null;
+  if (brut) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(brut)) return res.status(400).json({ error: 'until must be YYYY-MM-DD' });
+    if (brut <= ymd(new Date())) return res.status(400).json({ error: 'until_must_be_future' });
+    jusqua = brut;
+  }
+
+  try {
+    const item = (await pool.query(
+      `SELECT * FROM saas_increase_items
+        WHERE org_id = $1 AND subscription_number = $2
+        ORDER BY id DESC LIMIT 1`, [orgId, number])).rows[0];
+    if (!item) return res.status(404).json({ error: 'subscription not found in any scenario' });
+
+    const acteur = req.user.realAdminEmail || req.user.email || 'unknown';
+    let annuleChezZoho = null;
+
+    // Cas 2 : la hausse vit deja chez Zoho. On la retire AVANT d'ecrire le gel — si Zoho refuse,
+    // on n'aura pas affiche un gel qui n'en est pas un.
+    if (jusqua && item.status === 'pushed') {
+      try {
+        const live = (await getSaasIncreaseSubscriptions())
+          .find(x => x.orgId === orgId && x.subscriptionNumber === number);
+        if (!live) return res.status(409).json({ error: 'subscription_not_in_zoho' });
+        const { accessToken, apiDomain } = await getAdminBooksAuth();
+        // Meme appel que « Annuler le changement planifie » : DELETE sur scheduledchanges. Ce
+        // n'est pas une methode du service Zoho, c'est un appel direct — le reproduire ici plutot
+        // que d'inventer un nom de methode qui n'existe pas.
+        const r = await axios.delete(
+          `${apiDomain}/billing/v1/subscriptions/${live.subscriptionId}/scheduledchanges`, {
+            headers: { Authorization: `Zoho-oauthtoken ${accessToken}`,
+                       'X-com-zoho-subscriptions-organizationid': orgId },
+            validateStatus: () => true, timeout: 20000,
+          });
+        // 400 / 107222 = « rien n'etait planifie » : c'est le resultat voulu, pas un echec.
+        const rien = r.status === 400 && /107222/.test(JSON.stringify(r.data || {}));
+        if (r.status !== 200 && !rien) {
+          return res.status(502).json({ error: `Zoho HTTP ${r.status}`,
+            raw: JSON.stringify(r.data).slice(0, 400) });
+        }
+        annuleChezZoho = r.status === 200;
+      } catch (e) {
+        return res.status(502).json({ error: `annulation impossible chez Zoho : ${e.message}` });
+      }
+    }
+
+    const row = (await pool.query(
+      `UPDATE saas_increase_items
+          SET frozen_until = $1::date, frozen_by = $2, frozen_at = CASE WHEN $1::date IS NULL THEN NULL ELSE NOW() END,
+              frozen_reason = NULLIF($3, ''),
+              -- Une ligne dont le changement vient d'etre retire de Zoho n'est plus « appliquee ».
+              status = CASE WHEN $4 THEN 'pending' ELSE status END,
+              push_error = CASE WHEN $4 THEN NULL ELSE push_error END
+        WHERE id = $5 RETURNING *`,
+      [jusqua, jusqua ? acteur : null, raison, annuleChezZoho === true, item.id])).rows[0];
+
+    await pool.query(
+      `INSERT INTO activity_log (entity_type, entity_id, event_type, description, actor, metadata)
+       VALUES ('saas_increase', $1, $2, $3, $4, $5::jsonb)`,
+      [String(item.id), jusqua ? 'increase_frozen' : 'increase_unfrozen',
+       jusqua
+         ? `Hausse gelee jusqu'au ${jusqua} pour ${item.customer_name}${annuleChezZoho ? ' (changement retire de Zoho)' : ''}`
+         : `Gel leve pour ${item.customer_name}`,
+       acteur,
+       JSON.stringify({ subscriptionNumber: number, orgId, until: jusqua, reason: raison || null,
+                        cancelledInZoho: annuleChezZoho === true })]
+    ).catch(e => console.warn('[saas-freeze] journal non ecrit:', e.message));
+
+    res.json({
+      ok: true, frozenUntil: ymd(row.frozen_until), frozenBy: row.frozen_by,
+      frozenReason: row.frozen_reason, status: row.status,
+      // Dit en clair si un changement a REELLEMENT ete retire de Zoho : c'est la difference
+      // entre « on ne le poussera pas » et « il ne sera pas facture ».
+      cancelledInZoho: annuleChezZoho === true,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // CREER UNE OPPORTUNITE DE PAIEMENT — POST /api/saas-increase/lookup/deal
 //
 // L'agent est au telephone avec un marchand qui conteste sa hausse et qui n'a pas le paiement
@@ -18953,7 +19074,12 @@ app.post('/api/admin/saas-increase/scenarios/:id/notifications/draft', authentic
       // A skipped item is an explicit "do not touch this customer" for this scenario. Filtering
       // it here, rather than trusting the caller's id list, means the decision holds even if a
       // stale page or a hand-made request asks for it.
-      `SELECT * FROM saas_increase_items WHERE scenario_id = $1 AND id = ANY($2::int[]) AND skipped = FALSE`,
+      // Le gel est filtre ICI, pas seulement sur le bouton : une page restee ouverte avant le
+      // gel, ou un lot relance, ne doit ni pousser ni annoncer une hausse que le service a la
+      // clientele vient de promettre de reporter a un marchand au telephone.
+      `SELECT * FROM saas_increase_items
+        WHERE scenario_id = $1 AND id = ANY($2::int[]) AND skipped = FALSE
+          AND (frozen_until IS NULL OR frozen_until <= CURRENT_DATE)`,
       [req.params.id, itemIds]
     )).rows;
     // La date d'effet n'est pas la date de renouvellement brute de Zoho : c'est le premier
@@ -19933,6 +20059,9 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
         planName: saasPlanLabel(r.plan_name),
         // Null quand aucune piste n'est partie pour cet abonnement.
         dealCreated: pisteParItem.get(String(r.id)) || null,
+        // Le gel, pour que la fiche dise a l'agent ce qui a deja ete promis a ce marchand.
+        frozenUntil: ymd(r.frozen_until), frozenBy: r.frozen_by || null,
+        frozenReason: r.frozen_reason || null,
         currentPrice: cur, newPrice: next,
         // Pour un marchand DEJA avise, la seule bonne reponse est la date que son courriel
         // annonce. La recalculer donnerait une date plus tardive de jour en jour — un agent
@@ -20346,7 +20475,12 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
       // A skipped item is an explicit "do not touch this customer" for this scenario. Filtering
       // it here, rather than trusting the caller's id list, means the decision holds even if a
       // stale page or a hand-made request asks for it.
-      `SELECT * FROM saas_increase_items WHERE scenario_id = $1 AND id = ANY($2::int[]) AND skipped = FALSE`,
+      // Le gel est filtre ICI, pas seulement sur le bouton : une page restee ouverte avant le
+      // gel, ou un lot relance, ne doit ni pousser ni annoncer une hausse que le service a la
+      // clientele vient de promettre de reporter a un marchand au telephone.
+      `SELECT * FROM saas_increase_items
+        WHERE scenario_id = $1 AND id = ANY($2::int[]) AND skipped = FALSE
+          AND (frozen_until IS NULL OR frozen_until <= CURRENT_DATE)`,
       [req.params.id, itemIds]
     )).rows;
     // Live lookup for Zoho's real internal subscription_id — not persisted on the item (which
@@ -20513,6 +20647,7 @@ async function runSaasScheduledNotices() {
       WHERE id IN (
         SELECT id FROM saas_increase_items
          WHERE notify_status = 'scheduled' AND skipped = FALSE
+           AND (frozen_until IS NULL OR frozen_until <= CURRENT_DATE)
            AND notify_after IS NOT NULL AND notify_after <= $1::date
          ORDER BY notify_after, id LIMIT $2
          FOR UPDATE SKIP LOCKED)
