@@ -14917,12 +14917,24 @@ async function syncZentactMerchants() {
   // One-time cleanup: clear activated_at values that look like a bulk-import stamp
   // (activated_at = created_at, both on today's date) so we can replace them with the
   // real earliest-transaction date.
+  // Manual activations are excluded: entered with today's date, they look exactly like a
+  // bulk-import stamp, but Zentact will never supply a replacement date for them — clearing
+  // theirs wiped the date AND dropped the activation out of points/bonus.
   const cleaned = await pool.query(`
     UPDATE zentact_merchants
     SET activated_at = NULL
     WHERE activated_at IS NOT NULL
+      AND is_manual = false
       AND DATE(activated_at) = DATE(created_at)
       AND DATE(activated_at) >= CURRENT_DATE - INTERVAL '7 days'
+  `);
+  // Repair manual rows the unguarded cleanup above already wiped. A manual row is always
+  // inserted WITH a date, and it was only wiped when that date equalled DATE(created_at) —
+  // so DATE(created_at) is exactly the date that was entered.
+  await pool.query(`
+    UPDATE zentact_merchants
+    SET activated_at = DATE(created_at), updated_at = CURRENT_TIMESTAMP
+    WHERE is_manual = true AND activated_at IS NULL
   `);
   if (cleaned.rowCount > 0) {
     console.log(`🧹 Cleared ${cleaned.rowCount} bulk-import activated_at stamps — will replace with real transaction dates`);
@@ -19338,6 +19350,43 @@ async function saasCsDepartment() {
     return id.trim() ? id.trim() : null;
   } catch { return null; }
 }
+// La categorie sous laquelle le service a la clientele classe CES billets. Confirmee par Samantha
+// le 2026-09-25 : categorie « Statements & Billing Inquiries », sous-categorie « Pricing
+// Inquiry/Update ». C'est un identifiant DIRECT — il rend le rapprochement par nom inutile pour
+// compter, et le compte cesse de dependre de la qualite de ce rapprochement.
+// Modifiable sans deploiement : une equipe qui renomme sa categorie ne doit pas casser le chiffre.
+const SAAS_TICKET_CATEGORY_DEFAULT = {
+  issueType: 'Statements & Billing Inquiries',
+  csCategory: 'Pricing Inquiry/Update',
+};
+async function saasTicketCategory() {
+  try {
+    const r = await pool.query(`SELECT value FROM app_settings WHERE key = 'saas_increase_ticket_category'`);
+    const v = r.rows[0]?.value;
+    if (v && typeof v === 'object') {
+      return {
+        issueType: typeof v.issueType === 'string' ? v.issueType : SAAS_TICKET_CATEGORY_DEFAULT.issueType,
+        csCategory: typeof v.csCategory === 'string' ? v.csCategory : SAAS_TICKET_CATEGORY_DEFAULT.csCategory,
+      };
+    }
+  } catch { /* reglage illisible : le defaut est meilleur que rien */ }
+  return { ...SAAS_TICKET_CATEGORY_DEFAULT };
+}
+app.put('/api/admin/saas-increase/ticket-category', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
+  // '' est volontairement permis sur chacun des deux : compter sur la seule categorie, ou sur la
+  // seule sous-categorie, est une facon legitime d'elargir quand un agent a oublie l'une des deux.
+  const issueType = String(req.body?.issueType ?? '').trim();
+  const csCategory = String(req.body?.csCategory ?? '').trim();
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('saas_increase_ticket_category', $1::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [JSON.stringify({ issueType, csCategory })]);
+    res.json({ issueType, csCategory });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/admin/saas-increase/cs-department', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
   // La LISTE part avec le reglage. Elle vivait dans la reponse du croisement Desk, donc le menu
@@ -19352,7 +19401,23 @@ app.get('/api/admin/saas-increase/cs-department', authenticateToken, async (req,
          AND t.created_time >= NOW() - INTERVAL '180 days'
        GROUP BY 1, 2 ORDER BY 3 DESC`)).rows;
   } catch (e) { console.warn('[saas-desk] pupitres illisibles:', e.message); }
-  res.json({ departmentId: await saasCsDepartment(), departments });
+  // Les valeurs reellement presentes dans Desk, pour que le reglage se choisisse dans une liste
+  // plutot que se tape de memoire — un libelle mal orthographie rendrait zero sans rien dire.
+  let issueTypes = [], csCategories = [];
+  try {
+    issueTypes = (await pool.query(`
+      SELECT issue_type AS v, COUNT(*)::int AS n FROM desk_tickets
+       WHERE issue_type IS NOT NULL AND created_time >= NOW() - INTERVAL '365 days'
+       GROUP BY 1 ORDER BY 2 DESC LIMIT 40`)).rows;
+    csCategories = (await pool.query(`
+      SELECT cs_category AS v, COUNT(*)::int AS n FROM desk_tickets
+       WHERE cs_category IS NOT NULL AND created_time >= NOW() - INTERVAL '365 days'
+       GROUP BY 1 ORDER BY 2 DESC LIMIT 60`)).rows;
+  } catch (e) { console.warn('[saas-desk] valeurs de categorie illisibles:', e.message); }
+  res.json({
+    departmentId: await saasCsDepartment(), departments,
+    category: await saasTicketCategory(), issueTypes, csCategories,
+  });
 });
 app.put('/api/admin/saas-increase/cs-department', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'saas_increase:manage'))) return;
@@ -19384,11 +19449,73 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
          AND notified_at <= NOW() - ($2 || ' days')::interval`,
       [req.params.id, String(jours)])).rows;
 
+    const tousAvises = (await pool.query(
+      `SELECT customer_name, notified_at FROM saas_increase_items
+        WHERE scenario_id = $1 AND notified_at IS NOT NULL`, [req.params.id])).rows;
+    const tousAvisesNoms = tousAvises.map(a => String(a.customer_name || ''));
+
     const bornes = (await pool.query(
       `SELECT COUNT(*)::int AS n, MIN(notified_at) AS plus_ancien, MAX(notified_at) AS plus_recent
          FROM saas_increase_items
         WHERE scenario_id = $1 AND notified_at IS NOT NULL`, [req.params.id])).rows[0];
     const totalAvises = parseInt(bornes.n) || 0;
+
+    // ── LE COMPTE DIRECT ───────────────────────────────────────────────────────────────────
+    // Ces billets portent une categorie qui les designe. Ce compte-ci ne depend donc NI du
+    // rapprochement de noms entre Desk et la facturation, NI d'une fenetre : il porte sur tous
+    // les billets ainsi classes depuis le premier avis de la campagne. C'est le chiffre officiel.
+    const cat = await saasTicketCategory();
+    const depuis = bornes.plus_ancien || null;
+    let categorized = null;
+    if (depuis && (cat.issueType || cat.csCategory)) {
+      const lignes = (await pool.query(`
+        SELECT t.id, t.ticket_number, t.subject, t.created_time, t.closed_time, t.status_type,
+               t.cs_category, t.issue_type, t.channel, t.web_url, a.name AS account_name
+          FROM desk_tickets t
+          LEFT JOIN desk_accounts a ON a.id = t.account_id
+         WHERE COALESCE(t.is_spam, FALSE) = FALSE
+           AND t.created_time >= $1
+           AND ($2::text IS NULL OR t.department_id = $2)
+           AND ($3::text = '' OR t.issue_type  = $3)
+           AND ($4::text = '' OR t.cs_category = $4)
+         ORDER BY t.created_time DESC`,
+        [depuis, dept, cat.issueType || '', cat.csCategory || ''])).rows;
+
+      // Combien tombent sur un marchand REELLEMENT avise. L'ecart avec le total n'est pas une
+      // erreur : un marchand peut appeler sans avoir ete avise, et le rapprochement par nom est
+      // partiel. Le dire evite qu'on lise l'ecart comme un bogue.
+      const avisesNorm = new Set(tousAvisesNoms.map(n => n.toLowerCase().replace(/[^a-z0-9]+/g, '')));
+      const norm = (x) => String(x || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+      const apparies = lignes.filter(l => avisesNorm.has(norm(l.account_name)));
+
+      const parMois = new Map();
+      for (const l of lignes) {
+        const m = ymd(l.created_time).slice(0, 7);
+        parMois.set(m, (parMois.get(m) || 0) + 1);
+      }
+      const fermes = lignes.filter(l => l.closed_time);
+      const heures = fermes
+        .map(l => (new Date(l.closed_time) - new Date(l.created_time)) / 3600000)
+        .sort((a, b) => a - b);
+      categorized = {
+        issueType: cat.issueType, csCategory: cat.csCategory,
+        since: ymd(depuis),
+        total: lignes.length,
+        matchedToCampaign: apparies.length,
+        open: lignes.length - fermes.length,
+        closed: fermes.length,
+        medianHoursToClose: heures.length ? Math.round(heures[Math.floor(heures.length / 2)] * 10) / 10 : null,
+        byMonth: Array.from(parMois.entries()).map(([month, n]) => ({ month, n }))
+          .sort((a, b) => a.month.localeCompare(b.month)),
+        list: lignes.slice(0, 50).map(l => ({
+          id: l.id, number: l.ticket_number, subject: l.subject,
+          createdAt: l.created_time, closedAt: l.closed_time, statusType: l.status_type,
+          category: l.cs_category || l.issue_type || null, channel: l.channel,
+          url: l.web_url, customerName: l.account_name,
+          inCampaign: avisesNorm.has(norm(l.account_name)),
+        })),
+      };
+    }
 
     // ── LA QUESTION SIMPLE, TOUJOURS REPONDUE ──────────────────────────────────────────────
     // « Est-ce qu'on a des billets la-dessus ? » n'a pas besoin d'une fenetre symetrique. Tous
@@ -19396,9 +19523,6 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
     // La comparaison appariee plus bas est un raffinement qui exige du recul ; exiger ce recul
     // pour repondre a la question de base rendait le panneau muet sur une campagne qui generait
     // deja des appels — ce qui se lit, a juste titre, comme « c'est impossible ».
-    const tousAvises = (await pool.query(
-      `SELECT customer_name, notified_at FROM saas_increase_items
-        WHERE scenario_id = $1 AND notified_at IS NOT NULL`, [req.params.id])).rows;
 
     let depuisAvis = { tickets: 0, merchants: 0, list: [], byCategory: [] };
     if (tousAvises.length) {
@@ -19455,8 +19579,9 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
         days: jours, departmentId: dept, notifiedTotal: totalAvises, eligible: 0,
         merchantsMatched: 0, before: 0, after: 0, tickets: [], byCategory: [],
         keyword: { count: 0, samples: [] }, departments: dispo,
-        // La comparaison appariee manque de recul, mais le volume brut est la : c'est lui qui
-        // repond a « est-ce qu'on a des billets la-dessus ».
+        // La comparaison appariee manque de recul, mais le compte direct et le volume brut sont
+        // la : ce sont eux qui repondent a « est-ce qu'on a des billets la-dessus ».
+        categorized,
         sinceNotice: depuisAvis,
         reason: totalAvises === 0 ? 'no_notices' : 'window_too_long',
         // C'est le PLUS ANCIEN avis qui decide de l'admissibilite. Afficher le plus recent
@@ -19582,6 +19707,7 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
       after: apres.length,
       byCategory,
       keyword: { count: parles.length, samples: parles.slice(0, 15).map(vue) },
+      categorized,
       sinceNotice: depuisAvis,
       oldestNotifiedAt: bornes.plus_ancien || null,
       lastNotifiedAt: bornes.plus_recent || null,
@@ -32604,7 +32730,10 @@ app.get('/api/zentact/merchants/manual', authenticateToken, async (req, res) => 
   if (!(await requirePerm(req, res, 'tracker:manual_activation'))) return;
   try {
     const rows = (await pool.query(
-      `SELECT merchant_account_id, business_name, sales_rep_name, activated_at,
+      // activated_at is a DATE: send it as 'YYYY-MM-DD' — a JS Date serialises to UTC
+      // midnight and the browser (Montréal) would show the previous day.
+      `SELECT merchant_account_id, business_name, sales_rep_name,
+              to_char(activated_at, 'YYYY-MM-DD') AS activated_at,
               points, bonus_amount::float AS bonus_amount, created_at
        FROM zentact_merchants WHERE is_manual = true ORDER BY created_at DESC`
     )).rows;
