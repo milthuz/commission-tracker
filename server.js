@@ -20047,6 +20047,15 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
       conds.push(`AND i.notify_status = ${$()}`);
     }
 
+    // Ou en est la hausse chez Zoho. Sans ce filtre, trouver les quelques lignes DEJA appliquees
+    // parmi des milliers relevait de la chance — et ce sont justement celles ou un gel doit
+    // retirer un changement existant, donc celles qu'il faut pouvoir atteindre.
+    const pousse = String(req.query.push || '').trim();
+    if (['pushed', 'pending', 'push_failed', 'deferred', 'closed'].includes(pousse)) {
+      params.push(pousse);
+      conds.push(`AND i.status = ${$()}`);
+    }
+
     // « Aucune hausse » = ligne retiree de la campagne OU abonnement portant la case « Prix
     // gele » chez Zoho. Le gel ne vit pas en base : il est lu sur la liste d'abonnements, deja
     // en cache, donc ce filtre ne coute aucun appel. Le faire en JS apres la requete casserait
