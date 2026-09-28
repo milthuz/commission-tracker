@@ -4320,7 +4320,7 @@ async function sendMail(to, subject, html, opts = {}) {
 // font affaire avec Cluster, pas avec l'outil interne qui sert le portail : c'est Cluster
 // qu'ils doivent lire en premier, Sales Hub venant en mention. Sans le parametre, rien ne
 // change — tous les envois internes gardent leur en-tete a l'identique.
-function mailChrome(inner, preheaderRaw, brand, lang, home) {
+function mailChrome(inner, preheaderRaw, brand, lang, home, contact) {
   // `cluster-plain` (SH-20) : le logo Cluster SANS la ligne « Portail partenaire ». Un prospect
   // qui vient de remplir le formulaire du site fait affaire avec Cluster et n'a jamais entendu
   // parler ni de Sales Hub ni du portail partenaire — lui montrer l'un ou l'autre le perdrait.
@@ -4364,12 +4364,12 @@ function mailChrome(inner, preheaderRaw, brand, lang, home) {
           <tr><td style="padding:26px 36px 0"><div style="border-top:1px solid #eef1f6;font-size:0;line-height:0">&nbsp;</div></td></tr>
           <tr><td style="padding:16px 36px 30px">
             <p style="margin:0;color:#94a3b8;font-size:12px;line-height:1.7">
-              ${lang === undefined ? 'Une question ? / Questions?' : (isFrLocale(lang) ? 'Une question ?' : 'Questions?')} <a href="mailto:saleshub@clustersystems.com" style="color:#3c50e0;text-decoration:none">saleshub@clustersystems.com</a><br>
+              ${lang === undefined ? 'Une question ? / Questions?' : (isFrLocale(lang) ? 'Une question ?' : 'Questions?')} <a href="mailto:${contact || 'saleshub@clustersystems.com'}" style="color:#3c50e0;text-decoration:none">${contact || 'saleshub@clustersystems.com'}</a><br>
               © ${year} Cluster Systems — <a href="${home}" style="color:#94a3b8;text-decoration:none">${String(home).replace(/^https?:\/\//, '')}</a>
             </p>
           </td></tr>
         </table>
-        <p style="color:#aab4c4;font-size:11px;margin:18px 0 0">Sales Hub · Cluster Systems</p>
+        ${brand === 'cluster-plain' ? '' /* le marchand ne connait pas l'outil interne */ : `<p style="color:#aab4c4;font-size:11px;margin:18px 0 0">Sales Hub · Cluster Systems</p>`}
       </td></tr>
     </table>
   </body></html>`;
@@ -4641,7 +4641,11 @@ function sampleEmail(type, lang) {
       created_at: now, created_by: null, suggested_rep_name: 'Amy Tremblay',
       suggested_rule_name: fr ? 'Québec — français' : 'Quebec — French',
     };
-    const rep = { name: 'Amy Tremblay', email: 'amy@clustersystems.com', crmUserId: null };
+    const rep = {
+      name: 'Amy Tremblay', email: 'amy@clustersystems.com', crmUserId: null,
+      signatureRole: fr ? 'Conseillère en solutions' : 'Solutions Advisor', signaturePhone: '(514) 555-0199',
+    };
+    rep.signatureHtml = buildSignatureHtml({ name: rep.name, role: rep.signatureRole, phone: rep.signaturePhone, email: rep.email });
     const callbackAt = leadCallbackAt(LEAD_SETTINGS_DEFAULTS, now);
     if (type === 'lead_review') return leadReviewEmail(lead, `${lead.suggested_rep_name} — règle « ${lead.suggested_rule_name} »`);
     const bookingUrl = `${base}/rdv?token=exemple`;
@@ -36769,7 +36773,7 @@ async function crmRepDirectory(force = false) {
 async function leadRepContact(repName) {
   if (!repName) return null;
   const row = (await pool.query(
-    `SELECT s.name,
+    `SELECT s.name, s.signature_role, s.signature_role2, s.signature_phone,
             COALESCE((SELECT email FROM user_tokens WHERE LOWER(display_name) = LOWER(s.name) LIMIT 1), s.email) AS email
        FROM salespeople s WHERE LOWER(s.name) = LOWER($1) LIMIT 1`,
     [repName]
@@ -36779,7 +36783,14 @@ async function leadRepContact(repName) {
   const dir = await crmRepDirectory();
   const hit = dir.find((u) => String(u.name || '').trim().toLowerCase() === name.trim().toLowerCase())
     || (email ? dir.find((u) => String(u.email || '').trim().toLowerCase() === email.toLowerCase()) : null);
-  return { name, email: email || hit?.email || null, crmUserId: hit?.id || null };
+  const finalEmail = email || hit?.email || null;
+  // Signature de profil (Profil → Signature courriel) : titre et téléphone pour le courriel de
+  // bienvenue au marchand. Vide tant que le représentant ne l'a pas configurée.
+  return {
+    name, email: finalEmail, crmUserId: hit?.id || null,
+    signatureRole: row?.signature_role || null, signaturePhone: row?.signature_phone || null,
+    signatureHtml: buildSignatureHtml({ name, role: row?.signature_role, role2: row?.signature_role2, phone: row?.signature_phone, email: finalEmail }),
+  };
 }
 
 // ── Le moteur d'attribution ─────────────────────────────────────────────────
@@ -37195,48 +37206,22 @@ async function notifierRepOpportunite(opportuniteId) {
 // piste : c'est le seul de la trilogie qui sorte de l'entreprise, et un client ne doit pas lire
 // sa propre langue en deuxieme. Marque CLUSTER, pas Sales Hub : le prospect fait affaire avec
 // Cluster et n'a jamais entendu parler de l'outil interne.
-// `bookingUrl` (services/leadBooking) : l'heure proposee dans un encadre + le bouton pour en
-// choisir une autre. Absent = l'ancien paragraphe « vous contactera le … ».
+// Refonte du 2026-09-28 (maquette approuvée par David) : le constructeur vit dans
+// services/leadBooking/emails.js (welcomeEmail). Carte du conseiller avec le titre et le téléphone
+// de sa signature de profil, rendez-vous au format calendrier + Google Meet, 3 prochaines étapes,
+// signature officielle Cluster du représentant.
 function leadWelcomeEmail(lead, rep, callbackAt, settings, bookingUrl = null, meetUrl = null) {
-  const fr = lead.language !== 'en';
-  const first = lead.contact_first_name ? String(lead.contact_first_name).trim() : null;
-  const when = leadWhenLabel(callbackAt, fr ? 'fr' : 'en');
-  const repName = rep?.name || null;
-  const home = settings.merchantSiteUrl || LEAD_SETTINGS_DEFAULTS.merchantSiteUrl;
-
-  const title = fr ? 'Merci d\'avoir communiqué avec nous' : 'Thanks for getting in touch';
-  const hello = fr ? (first ? `Bonjour ${leadEsc(first)},` : 'Bonjour,')
-                   : (first ? `Hi ${leadEsc(first)},` : 'Hello,');
-
-  const intro = fr
-    ? `${hello}<br><br>Merci d'avoir communiqué avec Cluster aujourd'hui au sujet de <strong>${leadEsc(lead.business_name)}</strong>. Votre demande est bien reçue, et elle est déjà entre les mains d'une personne — pas d'une file d'attente.`
-    : `${hello}<br><br>Thanks for getting in touch with Cluster today about <strong>${leadEsc(lead.business_name)}</strong>. We have your request, and it is already with a person — not a queue.`;
-
-  const repBlock = repName
-    ? `<div style="margin:22px 0;padding:16px 18px;background:#f8fafc;border-radius:10px">
-         <p style="margin:0 0 4px;color:#94a3b8;font-size:11px;text-transform:uppercase;font-weight:700;letter-spacing:.4px">${fr ? 'Votre conseiller' : 'Your advisor'}</p>
-         <p style="margin:0;color:#0f1722;font-size:17px;font-weight:700">${leadEsc(repName)}</p>
-         ${rep?.email ? `<p style="margin:4px 0 0;font-size:14px"><a href="mailto:${leadEsc(rep.email)}" style="color:#3c50e0;text-decoration:none">${leadEsc(rep.email)}</a></p>` : ''}
-       </div>`
-    : '';
-
-  const promise = when
-    ? (fr
-        ? `<p style="margin:0;color:#475569;font-size:14.5px;line-height:1.65">${repName ? leadEsc(repName) : 'Un conseiller'} vous contactera <strong>${leadEsc(when)}</strong>. Si ce moment ne vous convient pas, répondez simplement à ce courriel et nous nous ajusterons.</p>`
-        : `<p style="margin:0;color:#475569;font-size:14.5px;line-height:1.65">${repName ? leadEsc(repName) : 'An advisor'} will reach out on <strong>${leadEsc(when)}</strong>. If that time doesn't work, just reply to this email and we'll adjust.</p>`)
-    : (fr
-        ? `<p style="margin:0;color:#475569;font-size:14.5px;line-height:1.65">${repName ? leadEsc(repName) : 'Un conseiller'} vous contactera sous peu. Vous pouvez aussi répondre directement à ce courriel.</p>`
-        : `<p style="margin:0;color:#475569;font-size:14.5px;line-height:1.65">${repName ? leadEsc(repName) : 'An advisor'} will be in touch shortly. You can also just reply to this email.</p>`);
-
-  const inner = `<h1 style="margin:0 0 14px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${title}</h1>
-    <div style="color:#475569;font-size:14.5px;line-height:1.65">${intro}</div>
-    ${repBlock}
-    ${bookingUrl ? leadBooking.welcomeBookingBlock({ lang: fr ? 'fr' : 'en', at: callbackAt, bookingUrl, meetUrl }) : promise}`;
-
-  return {
-    subject: fr ? `Merci — votre demande est entre bonnes mains` : `Thank you — your request is in good hands`,
-    html: mailChrome(inner, title, 'cluster-plain', fr ? 'fr' : 'en', home),
-  };
+  return leadBooking.emails.welcomeEmail(mailChrome, {
+    lang: lead.language === 'en' ? 'en' : 'fr',
+    firstName: lead.contact_first_name ? String(lead.contact_first_name).trim() : null,
+    businessName: lead.business_name,
+    rep: rep ? { name: rep.name, email: rep.email, role: rep.signatureRole || null, phone: rep.signaturePhone || null } : null,
+    at: callbackAt || null,
+    minutes: Number(settings?.slotMinutes) || 30,
+    bookingUrl, meetUrl,
+    home: settings?.merchantSiteUrl || LEAD_SETTINGS_DEFAULTS.merchantSiteUrl,
+    signatureHtml: rep?.signatureHtml || '',
+  });
 }
 
 // app_settings 'lead_review_recipients' — qui recoit « une piste attend ». Liste VIDE = aucun
@@ -37465,7 +37450,17 @@ async function acceptLead(leadId, actor, opts = {}) {
   if (settings.notifyMerchant && lead.contact_email) {
     const { subject, html } = leadWelcomeEmail(lead, rep, callbackAt, settings, bookingUrl, steps.calendar?.ok ? steps.calendar.meetUrl : null);
     const sender = leadBooking.senderFor(rep, settings);
-    const m = await sendMail(lead.contact_email, subject, html, sender);
+    // Le fichier d'agenda : même UID que les confirmations, qui le remplaceront si l'heure change.
+    const attachments = callbackAt ? [{
+      filename: lead.language === 'en' ? 'meeting.ics' : 'rendez-vous.ics', contentType: 'text/calendar; charset=utf-8',
+      content: Buffer.from(leadBooking.emails.ics({
+        uid: `lead-${lead.ref_code}@saleshub.clusterpos.com`, at: callbackAt, minutes: Number(settings.slotMinutes) || 30,
+        title: lead.language === 'en' ? `Meeting with ${rep?.name || 'Cluster'} — Cluster` : `Rendez-vous avec ${rep?.name || 'Cluster'} — Cluster`,
+        description: [steps.calendar?.meetUrl ? `Google Meet : ${steps.calendar.meetUrl}` : null, bookingUrl].filter(Boolean).join('\n'),
+        location: steps.calendar?.meetUrl || null, organizerName: rep?.name, organizerEmail: rep?.email, sequence: 0,
+      })),
+    }] : undefined;
+    const m = await sendMail(lead.contact_email, subject, html, { ...sender, attachments });
     steps.merchantEmail = m.sent
       ? { ok: true, to: lead.contact_email, from: sender.from || null }
       : { ok: false, to: lead.contact_email, error: m.reason };

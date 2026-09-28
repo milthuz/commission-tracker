@@ -48,6 +48,120 @@ function welcomeBookingBlock({ lang, at, bookingUrl, meetUrl }) {
     + button(when ? (fr ? 'Choisir un autre moment' : 'Pick another time') : (fr ? 'Choisir un moment' : 'Pick a time'), bookingUrl);
 }
 
+// ── Le courriel de BIENVENUE au marchand (refonte du 2026-09-28, maquette approuvée par David) ──
+// Carte du conseiller (initiales, titre et téléphone de sa SIGNATURE de profil), rendez-vous au
+// format « calendrier » avec Google Meet, les 3 prochaines étapes (textes validés par David), et la
+// signature officielle Cluster du représentant (buildSignatureHtml, la même que les propositions).
+// Tout en TABLEAUX et styles en ligne : Outlook ignore flexbox et la plupart des feuilles de style.
+//   rep : { name, email, role, phone }          — role/phone viennent de salespeople.signature_*
+//   at  : Date | null — l'heure proposée ; null = aucun rendez-vous planifié
+//   signatureHtml : '' quand le représentant n'a pas configuré sa signature
+function welcomeEmail(mailChrome, { lang, firstName, businessName, rep, at, minutes = 30, bookingUrl, meetUrl, home, signatureHtml }) {
+  const fr = lang !== 'en';
+  const repName = rep?.name || null;
+  const initials = (repName || 'C').split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0].toUpperCase()).join('');
+  const T = (a, b) => (fr ? a : b);
+
+  const title = firstName
+    ? T(`Bonjour ${esc(firstName)}, votre demande est entre bonnes mains`, `Hi ${esc(firstName)}, your request is in good hands`)
+    : T('Bonjour, votre demande est entre bonnes mains', 'Hello, your request is in good hands');
+  const intro = T(
+    `Merci d'avoir pensé à nous pour <strong style="color:#0f1722">${esc(businessName)}</strong>. Une vraie personne, pas une file d'attente, s'occupe maintenant de votre dossier.`,
+    `Thanks for thinking of us for <strong style="color:#0f1722">${esc(businessName)}</strong>. A real person, not a queue, is now looking after your request.`);
+
+  // Carte du conseiller.
+  const repCard = repName ? `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:6px 0 18px;border:1px solid #e2e8f0;border-radius:12px">
+      <tr>
+        <td width="76" style="padding:14px 0 14px 16px;vertical-align:middle">
+          <table role="presentation" cellpadding="0" cellspacing="0"><tr><td align="center" style="width:48px;height:48px;border-radius:24px;background:#fff1e8;color:#c2410c;font-weight:700;font-size:16px">${esc(initials)}</td></tr></table>
+        </td>
+        <td style="padding:14px 16px 14px 0;vertical-align:middle">
+          <div style="font-weight:700;font-size:15px;color:#0f1722">${esc(repName)}</div>
+          <div style="font-size:12.5px;color:#64748b">${esc(rep.role || T('Votre conseiller', 'Your advisor'))} · Cluster</div>
+          ${rep.email ? `<div style="font-size:13px;margin-top:2px"><a href="mailto:${esc(rep.email)}" style="color:#3c50e0;text-decoration:none">${esc(rep.email)}</a></div>` : ''}
+          ${rep.phone ? `<div style="font-size:13px;margin-top:1px"><a href="tel:${esc(String(rep.phone).replace(/[^\d+]/g, ''))}" style="color:#0f1722;text-decoration:none">${esc(rep.phone)}</a></div>` : ''}
+        </td>
+      </tr>
+    </table>` : '';
+
+  // Le rendez-vous, au format calendrier.
+  let appt = '';
+  if (at) {
+    const loc = fr ? 'fr-CA' : 'en-CA';
+    const part = (o) => new Date(at).toLocaleString(loc, { timeZone: TZ, ...o });
+    const end = new Date(new Date(at).getTime() + minutes * 60000);
+    const hm = (d) => new Date(d).toLocaleTimeString(loc, { timeZone: TZ, hour: 'numeric', minute: '2-digit' });
+    appt = `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 12px;border:1px solid #fed7aa;border-radius:12px;border-collapse:separate">
+      <tr>
+        <td width="84" align="center" style="background:#f97316;color:#ffffff;padding:12px 0;border-radius:11px 0 0 11px">
+          <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px">${esc(part({ month: 'short' }))}</div>
+          <div style="font-size:30px;font-weight:700;line-height:1.1">${esc(part({ day: 'numeric' }))}</div>
+          <div style="font-size:11px">${esc(part({ weekday: 'long' }))}</div>
+        </td>
+        <td style="background:#fff7ed;padding:12px 16px;border-radius:0 11px 11px 0">
+          <div style="font-size:17px;font-weight:700;color:#0f1722">${esc(hm(at))} – ${esc(hm(end))}</div>
+          <div style="font-size:12.5px;color:#9a3412;margin-top:2px">${T(`Premier rendez-vous · ${minutes} minutes · heure de Montréal`, `First meeting · ${minutes} minutes · Montreal time`)}</div>
+        </td>
+      </tr>
+    </table>`;
+  }
+  const btn = (label, url, primary) => `<td style="padding:0 8px 8px 0"><table role="presentation" cellpadding="0" cellspacing="0"><tr><td style="border-radius:9px;${primary ? 'background:#1a73e8' : 'background:#ffffff;border:1px solid #cbd5e1'}">
+      <a href="${esc(url)}" style="display:inline-block;padding:${primary ? '11px 18px' : '10px 16px'};font-size:13.5px;font-weight:700;text-decoration:none;color:${primary ? '#ffffff' : '#0f1722'};border-radius:9px">${label}</a>
+    </td></tr></table></td>`;
+  const buttons = [
+    at && meetUrl ? btn(T('Rejoindre par Google Meet', 'Join with Google Meet'), meetUrl, true) : '',
+    bookingUrl ? btn(at ? T('Choisir un autre moment', 'Pick another time') : T('Choisir un moment', 'Pick a time'), bookingUrl, !(at && meetUrl)) : '',
+  ].join('');
+  const actions = buttons ? `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:4px 0 0"><tr>${buttons}</tr></table>` : '';
+  const who = repName ? esc(repName.split(/\s+/)[0]) : T('votre conseiller', 'your advisor');
+  const note = at
+    ? `<p style="margin:6px 0 20px;font-size:12.5px;color:#94a3b8;line-height:1.6">${T(
+        `Le fichier joint l'ajoute à votre agenda. Vous préférez le téléphone ? Répondez simplement à ce courriel, ${who} vous appellera.`,
+        `The attached file adds it to your calendar. Prefer the phone? Just reply to this email and ${who} will call you.`)}</p>`
+    : `<p style="margin:6px 0 20px;font-size:12.5px;color:#94a3b8;line-height:1.6">${T(
+        `${repName ? esc(repName) : 'Votre conseiller'} vous contactera sous peu. Vous pouvez aussi répondre directement à ce courriel.`,
+        `${repName ? esc(repName) : 'Your advisor'} will be in touch shortly. You can also just reply to this email.`)}</p>`;
+
+  // Les 3 prochaines étapes (textes validés par David le 2026-09-28).
+  const step = (n, t, d) => `<tr><td width="36" style="vertical-align:top;padding:0 0 12px">
+      <table role="presentation" cellpadding="0" cellspacing="0"><tr><td align="center" style="width:24px;height:24px;border-radius:12px;background:#0f1722;color:#ffffff;font-size:12px;font-weight:700">${n}</td></tr></table>
+    </td><td style="vertical-align:top;padding:0 0 12px">
+      <div style="font-size:14px;font-weight:700;color:#0f1722">${t}</div>
+      <div style="font-size:13px;color:#64748b;line-height:1.5">${d}</div>
+    </td></tr>`;
+  const biz = esc(businessName);
+  const steps = `
+    <div style="border-top:1px solid #eef1f6;padding-top:16px">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+        ${step(1, T('On fait connaissance', "Let's get to know you"),
+          T(`${who.charAt(0).toUpperCase() + who.slice(1)} apprend comment roule ${biz} : vos services, votre équipe, ce qui vous ralentit.`,
+            `${who.charAt(0).toUpperCase() + who.slice(1)} learns how ${biz} runs: your services, your team, what slows you down.`))}
+        ${step(2, T('Une proposition sur mesure', 'A tailored proposal'),
+          T('Le bon système et les bons tarifs pour vous, sans surprise.', 'The right system and the right rates for you, with no surprises.'))}
+        ${step(3, T('On vous installe', 'We get you set up'),
+          T("Installation, migration et formation de votre équipe, avec un suivi après le lancement.", 'Installation, migration and training for your team, with follow-up after launch.'))}
+      </table>
+    </div>`;
+
+  const dayWord = at ? new Date(at).toLocaleString(fr ? 'fr-CA' : 'en-CA', { timeZone: TZ, weekday: 'long' }) : null;
+  const signOff = `<p style="margin:18px 0 0;font-size:14.5px;color:#475569;line-height:1.6">${
+    at ? T(`Au plaisir de vous parler ${esc(dayWord)},`, `Looking forward to speaking with you on ${esc(dayWord)},`) : T('Au plaisir,', 'Talk soon,')}</p>`
+    + (signatureHtml || `<p style="margin:6px 0 0;font-size:14.5px;line-height:1.6"><strong style="color:#0f1722">${esc(repName || 'Cluster')}</strong><br><span style="color:#475569">Cluster</span></p>`);
+
+  const inner = `
+    <p style="margin:0 0 6px;color:#c2410c;font-size:11px;font-weight:700;letter-spacing:.6px;text-transform:uppercase">${T('Bienvenue chez Cluster', 'Welcome to Cluster')}</p>
+    <h1 style="margin:0 0 10px;color:#0f1722;font-size:22px;font-weight:700;line-height:1.3">${title}</h1>
+    <p style="${P}">${intro}</p>
+    ${repCard}${appt}${actions}${note}${steps}${signOff}`;
+
+  return {
+    subject: T(`Bienvenue chez Cluster — votre demande pour ${businessName}`, `Welcome to Cluster — your request for ${businessName}`),
+    html: mailChrome(inner, title.replace(/<[^>]+>/g, ''), 'cluster-plain', fr ? 'fr' : 'en', home, rep?.email || null),
+  };
+}
+
 // Au marchand, après qu'il a choisi, changé ou annulé.
 //   kind: 'booked' | 'cancelled'
 function clientConfirmEmail(mailChrome, { lang, firstName, businessName, repName, repEmail, at, bookingUrl, meetUrl, kind, home }) {
@@ -133,4 +247,4 @@ function ics({ uid, at, minutes, title, description, location, organizerName, or
   return lines.join('\r\n') + '\r\n';
 }
 
-module.exports = { whenLabel, welcomeBookingBlock, clientConfirmEmail, repChangedEmail, ics };
+module.exports = { whenLabel, welcomeBookingBlock, welcomeEmail, clientConfirmEmail, repChangedEmail, ics };
