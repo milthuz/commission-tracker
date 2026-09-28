@@ -19689,6 +19689,24 @@ async function saasCsDepartment() {
 // deux libelles rendrait donc zero pour toujours, en silence.
 // On compte donc sur la CATEGORIE seule. Le champ sous-categorie reste la, vide : le jour ou la
 // synchro rapportera la valeur, il suffira de la renseigner pour resserrer le compte.
+// ── QUAND LA CATEGORIE MENT, LE SUJET PARLE ──────────────────────────────────────────────────
+//
+// Le service classe ces billets ou il veut. Releve du 2026-09-28 : 18 billets du pupitre CS
+// parlent explicitement de la hausse dans leur SUJET, mais 8 d'entre eux sont ranges hors des
+// deux familles — « Account Modification », « Other », « General Inquiries ». Le plus couteux :
+// « Retention - Account Cancelation request following Price Increase », classe *Account
+// Modification*, donc invisible a la famille qui sert justement a mesurer si la hausse fait fuir.
+//
+// Le motif est VOLONTAIREMENT etroit. Mesure faite sur les billets reels : 18 attrapes, 18
+// justes, aucun faux positif. Le motif large (`subject ILIKE '%increase%'`) en ramenait 23, dont
+// 5 sans aucun rapport — un compteur qui gonfle est aussi faux qu'un compteur qui rate.
+const SAAS_SUJET_HAUSSE = '(price|pricing|rate)[ -]?(increase|change|adjustment)|increase in price'
+  + '|new (price|rate)|nouveau prix|hausse|augmentation|ajustement (de |des )?(prix|tarif)';
+// … et il parle de partir. Sert a ROUTER un billet detecte par le sujet vers une seule des deux
+// familles : sans ce partage, le meme billet tomberait dans les deux et serait compte deux fois.
+const SAAS_SUJET_DEPART = 'cancel|cancelation|cancellation|resiliation|annulation|annuler'
+  + '|suspend|suspension|pause|account closure|close the account|fermeture|churn|retention';
+
 const SAAS_TICKET_FAMILIES_DEFAULT = [
   { key: 'pricing', issueType: 'Statements and Billing Inquiries', csCategory: '' },
   { key: 'churn',   issueType: 'Account Status Modification',      csCategory: '' },
@@ -19823,24 +19841,49 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
     const avisesNorm = new Set(tousAvisesNoms.map(n => n.toLowerCase().replace(/[^a-z0-9]+/g, '')));
     const norm = (x) => String(x || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 
-    const calculerFamille = async (fam) => {
+    // Tous les libelles revendiques par une famille. Un billet que sa CATEGORIE designe deja
+    // appartient a cette famille-la : il ne doit pas etre repris par le sujet ailleurs, sinon il
+    // serait compte deux fois. C'est ce tableau qui garantit le partage.
+    const libelles = familles.flatMap(f => [f.issueType, f.csCategory].filter(Boolean));
+
+    const calculerFamille = async (fam, rang) => {
       if (!depuis || (!fam.issueType && !fam.csCategory)) return { ...fam, total: 0, list: [] };
+      // L'ordre des familles est fixe (voir SAAS_TICKET_FAMILIES_DEFAULT) : 0 = explications,
+      // 1 = depart. On s'appuie sur le rang et non sur la clef, que l'equipe peut renommer.
+      const estDepart = rang === 1;
       const lignes = (await pool.query(`
         SELECT t.id, t.ticket_number, t.subject, t.created_time, t.closed_time, t.status_type,
-               t.cs_category, t.issue_type, t.channel, t.web_url, a.name AS account_name
+               t.cs_category, t.issue_type, t.channel, t.web_url, a.name AS account_name,
+               NOT EXISTS (SELECT 1 FROM unnest($7::text[]) lbl
+                            WHERE sh_norm_name(replace(lbl, '&', 'and'))
+                              IN (sh_norm_name(replace(t.issue_type, '&', 'and')),
+                                  sh_norm_name(replace(t.cs_category, '&', 'and')))) AS par_sujet
           FROM desk_tickets t
           LEFT JOIN desk_accounts a ON a.id = t.account_id
          WHERE COALESCE(t.is_spam, FALSE) = FALSE
            AND t.created_time >= $1
            AND ($2::text IS NULL OR t.department_id = $2)
-           AND ($3::text = '' OR sh_norm_name(replace($3, '&', 'and'))
+           AND (
+             -- (a) la CATEGORIE le designe : le chiffre officiel, inchange.
+             (($3::text = '' OR sh_norm_name(replace($3, '&', 'and'))
                  IN (sh_norm_name(replace(t.issue_type, '&', 'and')),
                      sh_norm_name(replace(t.cs_category, '&', 'and'))))
-           AND ($4::text = '' OR sh_norm_name(replace($4, '&', 'and'))
+              AND ($4::text = '' OR sh_norm_name(replace($4, '&', 'and'))
                  IN (sh_norm_name(replace(t.issue_type, '&', 'and')),
-                     sh_norm_name(replace(t.cs_category, '&', 'and'))))
+                     sh_norm_name(replace(t.cs_category, '&', 'and')))))
+             -- (b) ou le SUJET le designe, et sa categorie n'appartient a AUCUNE famille.
+             --     $6 route vers une seule famille : le billet qui parle de partir va au depart,
+             --     les autres aux explications. Jamais les deux.
+             OR (t.subject ~* $5
+                 AND $6::boolean = (t.subject ~* $8)
+                 AND NOT EXISTS (SELECT 1 FROM unnest($7::text[]) lbl
+                                  WHERE sh_norm_name(replace(lbl, '&', 'and'))
+                                    IN (sh_norm_name(replace(t.issue_type, '&', 'and')),
+                                        sh_norm_name(replace(t.cs_category, '&', 'and')))))
+           )
          ORDER BY t.created_time DESC`,
-        [depuis, dept, fam.issueType || '', fam.csCategory || ''])).rows;
+        [depuis, dept, fam.issueType || '', fam.csCategory || '',
+         SAAS_SUJET_HAUSSE, estDepart, libelles, SAAS_SUJET_DEPART])).rows;
 
       const parMois = new Map();
       for (const l of lignes) {
@@ -19855,6 +19898,12 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
         ...fam,
         since: ymd(depuis),
         total: lignes.length,
+        // Le partage entre ce que la CATEGORIE designe et ce que seul le SUJET a rattrape. Un
+        // chiffre mi-classement mi-mot-clef doit dire lequel est lequel, sinon personne ne peut
+        // juger s'il est solide — et c'est le second qui disparaitra le jour ou le service
+        // corrigera son classement.
+        byCategoryMatch: lignes.filter(l => !l.par_sujet).length,
+        bySubjectMatch: lignes.filter(l => l.par_sujet).length,
         // Combien tombent sur un marchand REELLEMENT avise. L'ecart n'est pas une erreur : un
         // marchand peut appeler sans avoir ete avise, et le rapprochement par nom est partiel.
         matchedToCampaign: lignes.filter(l => avisesNorm.has(norm(l.account_name))).length,
@@ -19869,12 +19918,15 @@ app.get('/api/admin/saas-increase/scenarios/:id/campaign/desk', authenticateToke
           category: l.cs_category || l.issue_type || null, channel: l.channel,
           url: l.web_url, customerName: l.account_name,
           inCampaign: avisesNorm.has(norm(l.account_name)),
+          // 'category' = le service l'a classe la ; 'subject' = il l'a classe ailleurs et c'est
+          // son sujet qui l'a rattrape. La nuance change la confiance qu'on accorde a la ligne.
+          matchedBy: l.par_sujet ? 'subject' : 'category',
         })),
       };
     };
 
     const categorized = [];
-    for (const fam of familles) categorized.push(await calculerFamille(fam));
+    for (const [rang, fam] of familles.entries()) categorized.push(await calculerFamille(fam, rang));
 
     // ── LA QUESTION SIMPLE, TOUJOURS REPONDUE ──────────────────────────────────────────────
     // « Est-ce qu'on a des billets la-dessus ? » n'a pas besoin d'une fenetre symetrique. Tous
