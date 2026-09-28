@@ -449,7 +449,13 @@ function registerLeadBookingRoutes(app, deps) {
     } catch (e) { res.json({ ok: false, error: e.message }); }
   });
 
-  return { senderFor, proposeAt, upsertEvent, issueLink, recordAccepted, welcomeBookingBlock: E.welcomeBookingBlock, emails: E, googleConfigured: G.configured };
+  // Suppression d'une piste (DELETE /api/leads/:id) : l'evenement du representant part avec elle.
+  const deleteEvent = async (email, eventId) => {
+    if (!G.configured() || !email || !eventId) return { ok: true, skipped: true };
+    return G.deleteEvent(email, eventId).catch((e) => ({ ok: false, error: e.message }));
+  };
+
+  return { senderFor, proposeAt, upsertEvent, issueLink, recordAccepted, deleteEvent, welcomeBookingBlock: E.welcomeBookingBlock, emails: E, googleConfigured: G.configured };
 }
 
 module.exports = { registerLeadBookingRoutes };

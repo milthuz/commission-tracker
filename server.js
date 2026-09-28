@@ -196,6 +196,7 @@ const PERMISSION_CATALOG = [
   { key: 'leads:view_all',             label: 'View every lead and the review queue',                           category: 'Leads' },
   { key: 'leads:review',               label: 'Accept / reject leads, assign a rep, push them into Zoho CRM',   category: 'Leads' },
   { key: 'leads:manage_rules',         label: 'Configure assignment rules, the rotation and the automations',   category: 'Leads' },
+  { key: 'leads:delete',               label: 'Delete a lead — also deletes its Zoho CRM Lead, callback and calendar event', category: 'Leads' },
 
   // Sofia (in-app assistant) — CRM tools. Split read/write on purpose: the write key is the
   // only thing standing between a chat message and a real record in Zoho, so it must be
@@ -37550,6 +37551,7 @@ async function leadAccess(req) {
     review:  has('leads:review'),
     intake:  has('leads:intake'),
     rules:   has('leads:manage_rules'),
+    remove:  has('leads:delete'),
   };
 }
 
@@ -37688,7 +37690,8 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
       scope ? params.slice(0, 2) : []
     )).rows;
     res.json({
-      leads: rows.map(publicLead),
+      // Doublon masque a qui ne distribue pas (voir POST /api/leads).
+      leads: rows.map((r) => withoutDuplicateUnlessReviewer(publicLead(r), acc)),
       counts: Object.fromEntries(counts.map((r) => [r.status, r.n])),
       can: { review: acc.review, intake: acc.intake, viewAll: acc.viewAll, rules: acc.rules },
     });
@@ -37699,6 +37702,11 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
 
 // Forme envoyee au navigateur. Les colonnes brutes portent des noms de base de donnees ; l'ecran
 // en veut une poignee, nommees comme le reste de l'application.
+// La verification de doublon ne regarde que celui qui DISTRIBUE (leads:review ou admin).
+function withoutDuplicateUnlessReviewer(lead, acc) {
+  return acc.review ? lead : { ...lead, duplicate: { status: null, summary: null, records: [] } };
+}
+
 function publicLead(r) {
   return {
     id: r.id, refCode: r.ref_code, status: r.status, source: r.source, sourceDetail: r.source_detail,
@@ -37751,13 +37759,14 @@ app.get('/api/leads/:id', authenticateToken, async (req, res) => {
         WHERE entity_type = 'lead' AND entity_id = $1 ORDER BY created_at DESC LIMIT 50`,
       [String(r.id)]
     )).rows;
-    res.json({ lead: publicLead(r), history, can: { review: acc.review } });
+    res.json({ lead: withoutDuplicateUnlessReviewer(publicLead(r), acc), history, can: { review: acc.review, delete: acc.remove } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Saisie interne — le formulaire que l'employe remplit pendant l'appel. La detection de doublon
-// est ATTENDUE ici (contrairement au webhook) : savoir tout de suite « on l'a deja, Amy la
-// suit » vaut la seconde d'attente quand on a la personne au bout du fil.
+// tourne en ARRIERE-PLAN, comme pour le webhook. Ni le doublon ni le representant suggere ne
+// sont renvoyes a l'agent : decision de David (2026-09-28) — ils se jugent a la distribution,
+// par celui qui attribue la piste, pas par celui qui la saisit.
 app.post('/api/leads', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'leads:intake'))) return;
   try {
@@ -37765,14 +37774,70 @@ app.post('/api/leads', authenticateToken, async (req, res) => {
     if (!input.businessName) return res.status(400).json({ error: 'businessName is required' });
     const out = await createLeadRow(input, {
       createdBy: req.user.realAdminEmail || req.user.email || 'unknown',
-      waitForDuplicate: true,
     });
-    res.json({
-      success: true, id: out.id, refCode: out.refCode,
-      suggestion: out.suggestion,
-      duplicate: out.duplicate ? { status: out.duplicate.status, summary: out.duplicate.summary, records: out.duplicate.matches || [] } : null,
-    });
+    res.json({ success: true, id: out.id, refCode: out.refCode });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Suppression d'une piste — ET de ce qu'elle a cree ailleurs : le rappel Zoho, la fiche Lead Zoho,
+// l'evenement du Google Agenda du representant. Demande de David (2026-09-28), permission
+// dediee `leads:delete`.
+//
+// 🔑 ZOHO D'ABORD, et la piste locale n'est effacee QUE si Zoho a suivi : l'inverse laisserait une
+// fiche dans Zoho que plus rien dans Sales Hub ne permet de retrouver. Une fiche deja absente de
+// Zoho (INVALID_DATA : l'identifiant n'existe plus) compte comme supprimee.
+// 🔑 REFUS si la piste a ete CONVERTIE en Deal : un Deal porte de l'argent et des commissions, sa
+// suppression se decide dans Zoho, pas d'un clic ici.
+app.delete('/api/leads/:id', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:delete'))) return;
+  const id = parseInt(req.params.id, 10);
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  try {
+    const lead = (await pool.query(`SELECT * FROM leads WHERE id = $1`, [id])).rows[0];
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    if (lead.crm_deal_id) return res.status(409).json({ error: 'converted', dealId: lead.crm_deal_id });
+
+    const zohoDelete = async (module, recordId) => {
+      const token = await ensureValidCrmToken();
+      const r = await axios.delete(`https://www.zohoapis.com/crm/v2/${module}/${recordId}`, {
+        headers: { Authorization: `Zoho-oauthtoken ${token}` }, validateStatus: () => true, timeout: 20000,
+      });
+      const d = r.data?.data?.[0];
+      if (r.status >= 200 && r.status < 300 && (!d || d.status === 'success')) return { ok: true };
+      if (d?.code === 'INVALID_DATA') return { ok: true, alreadyGone: true };
+      return { ok: false, error: String(d?.message || r.data?.message || `HTTP ${r.status}`).slice(0, 300) };
+    };
+
+    const steps = {};
+    // Le rappel d'abord : sans lui, supprimer le Lead laisserait un appel orphelin dans la liste du rep.
+    if (lead.crm_followup_id) {
+      steps.callback = await zohoDelete(lead.crm_followup_kind === 'Tasks' ? 'Tasks' : 'Calls', lead.crm_followup_id)
+        .catch((e) => ({ ok: false, error: e.message }));
+    }
+    if (lead.crm_lead_id) {
+      steps.crmLead = await zohoDelete('Leads', lead.crm_lead_id).catch((e) => ({ ok: false, error: e.message }));
+      if (!steps.crmLead.ok) {
+        logActivity('lead', id, 'delete_failed', `${lead.ref_code} — Zoho a refusé la suppression : ${steps.crmLead.error}`, actor);
+        return res.status(502).json({ error: 'crm_delete_failed', detail: steps.crmLead.error, steps });
+      }
+    }
+    // L'evenement Google : au mieux (rien de financier, et le representant le voit disparaitre).
+    if (lead.gcal_event_id) {
+      steps.calendar = await leadBooking.deleteEvent(lead.gcal_calendar || lead.assigned_rep_email, lead.gcal_event_id);
+    }
+
+    await pool.query(`DELETE FROM leads WHERE id = $1`, [id]);
+    logActivity('lead', id, 'deleted',
+      `${lead.ref_code} — ${lead.business_name} supprimée par ${actor}`
+      + (lead.crm_lead_id ? ` (Zoho Lead ${lead.crm_lead_id} ${steps.crmLead?.alreadyGone ? 'déjà absent' : 'supprimé'})` : ' (jamais envoyée dans Zoho)')
+      + (steps.callback && !steps.callback.ok ? ` · rappel Zoho non supprimé : ${steps.callback.error}` : '')
+      + (steps.calendar && !steps.calendar.ok ? ` · événement Google non supprimé : ${steps.calendar.error}` : ''),
+      actor, { metadata: { refCode: lead.ref_code, crmLeadId: lead.crm_lead_id, steps } });
+    res.json({ ok: true, steps });
+  } catch (e) {
+    console.error('[leads] suppression :', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Correction avant acceptation. Une piste ACCEPTEE ne se modifie plus ici : sa verite vit dans
