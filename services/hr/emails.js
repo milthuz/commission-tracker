@@ -63,8 +63,12 @@ function signRequestEmail(mailShell, d) {
 // d = { name, positionFr, positionEn, link }
 function countersignEmail(mailShell, d) {
   const subject = `✍️ ${d.name} — contresignature requise / countersignature needed`;
-  const intro = `<p style="margin:0 0 12px"><b>${esc(d.name)}</b> (${esc(d.positionFr)}) a signé son offre d’emploi et son entente de rémunération. Il reste à les contresigner pour ${esc((d.employer || EMP.CLUSTER).shortName)}.</p>
-    <p style="margin:0;color:#64748b"><b>${esc(d.name)}</b> (${esc(d.positionEn)}) signed their offer of employment and compensation agreement. They now need ${esc((d.employer || EMP.CLUSTER).shortName)}’s countersignature.</p>`;
+  const co = esc((d.employer || EMP.CLUSTER).shortName);
+  const intro = d.docTitleFr
+    ? `<p style="margin:0 0 12px"><b>${esc(d.name)}</b> a signé l’addenda « ${esc(d.docTitleFr)} ». Il reste à le contresigner pour ${co}.</p>
+    <p style="margin:0;color:#64748b"><b>${esc(d.name)}</b> signed the addendum “${esc(d.docTitleEn)}”. It now needs ${co}’s countersignature.</p>`
+    : `<p style="margin:0 0 12px"><b>${esc(d.name)}</b> (${esc(d.positionFr)}) a signé son offre d’emploi et son entente de rémunération. Il reste à les contresigner pour ${co}.</p>
+    <p style="margin:0;color:#64748b"><b>${esc(d.name)}</b> (${esc(d.positionEn)}) signed their offer of employment and compensation agreement. They now need ${co}’s countersignature.</p>`;
   return { subject, html: mailShell('Contresignature requise · Countersignature needed', intro, 'Ouvrir / Open', d.link) };
 }
 
@@ -97,4 +101,42 @@ function declinedEmail(mailShell, d) {
   return { subject, html: mailShell('Offre refusée · Offer declined', intro, 'Ouvrir / Open', d.link) };
 }
 
-module.exports = { signRequestEmail, countersignEmail, completedEmployeeEmail, completedInternalEmail, declinedEmail, esc };
+// ---------------------------------------------------------------------------
+// ADDENDA — mêmes enveloppes et même bilinguisme, mais on parle d'un DOCUMENT à signer, pas
+// d'une offre d'emploi (l'employé est déjà en poste).
+// ---------------------------------------------------------------------------
+// d = { firstName, docTitleFr, docTitleEn, link, expiresDays, employer, logoUrl }
+function addendumRequestEmail(mailShell, d) {
+  const emp = d.employer || EMP.CLUSTER;
+  const subject = `Document à signer : ${d.docTitleFr} / Document to sign: ${d.docTitleEn}`;
+  const intro = `<p style="margin:0 0 12px">Bonjour ${esc(d.firstName)},</p>
+       <p style="margin:0 0 12px">${esc(emp.shortName)} vous transmet un addenda à votre contrat de travail : <b>${esc(d.docTitleFr)}</b>.</p>
+       <p style="margin:0 0 12px">Le bouton ci-dessous ouvre le document : lisez-le, puis signez directement à l’écran.</p>
+       <p style="margin:0">Ce lien vous est personnel et expire dans ${esc(d.expiresDays)} jours. Ne le transférez pas.</p>
+    ${SEP}${EN_BLOCK(`<p style="margin:0 0 12px">Hi ${esc(d.firstName)},</p>
+       <p style="margin:0 0 12px">${esc(emp.shortName)} is sending you an addendum to your employment agreement: <b>${esc(d.docTitleEn)}</b>.</p>
+       <p style="margin:0 0 12px">The button below opens the document: read it, then sign right on screen.</p>
+       <p style="margin:0">This link is personal to you and expires in ${esc(d.expiresDays)} days. Please do not forward it.</p>`)}`;
+  return { subject, html: candidateShell(mailShell, emp, d.logoUrl, 'Document à signer · Document to sign', intro, 'Consulter et signer · Review and sign', d.link) };
+}
+
+// À l'employé, document signé en pièce jointe. d = { firstName, docTitleFr, docTitleEn, employer, logoUrl }
+function addendumCompletedEmployeeEmail(mailShell, d) {
+  const emp = d.employer || EMP.CLUSTER;
+  const subject = `Document signé : ${d.docTitleFr} / Signed document: ${d.docTitleEn}`;
+  const intro = `<p style="margin:0 0 12px">Bonjour ${esc(d.firstName)},</p>
+       <p style="margin:0">L’addenda « ${esc(d.docTitleFr)} » est signé par les deux parties. Vous trouverez le document signé en pièce jointe — conservez-le avec votre contrat.</p>
+    ${SEP}${EN_BLOCK(`<p style="margin:0 0 12px">Hi ${esc(d.firstName)},</p>
+       <p style="margin:0">The addendum “${esc(d.docTitleEn)}” is signed by both parties. The signed document is attached — please keep it with your employment agreement.</p>`)}`;
+  return { subject, html: candidateShell(mailShell, emp, d.logoUrl, 'Document signé · Signed document', intro, null, null) };
+}
+
+// Interne. d = { name, docTitleFr, docTitleEn, link }
+function addendumCompletedInternalEmail(mailShell, d) {
+  const subject = `✅ ${d.name} — addenda signé / addendum signed : ${d.docTitleFr}`;
+  const intro = `<p style="margin:0 0 12px">L’addenda « ${esc(d.docTitleFr)} » de <b>${esc(d.name)}</b> est signé par les deux parties. Il est joint à ce courriel et reste disponible dans Sales Hub → Embauches.</p>
+    <p style="margin:0;color:#64748b">The addendum “${esc(d.docTitleEn)}” for <b>${esc(d.name)}</b> is fully signed. It is attached and remains available in Sales Hub → Hiring.</p>`;
+  return { subject, html: mailShell('Addenda signé · Addendum signed', intro, 'Ouvrir / Open', d.link) };
+}
+
+module.exports = { signRequestEmail, countersignEmail, completedEmployeeEmail, completedInternalEmail, declinedEmail, addendumRequestEmail, addendumCompletedEmployeeEmail, addendumCompletedInternalEmail, esc };

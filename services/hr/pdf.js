@@ -559,6 +559,123 @@ async function renderOffer(snap, { employeeSig = null, companySig = null, lang: 
 }
 
 // ---------------------------------------------------------------------------
+// Addenda — page de signature GÉNÉRÉE, ajoutée après le(s) PDF téléversé(s) par les RH.
+//
+// On ne sait pas où signer dans un PDF arbitraire : plutôt que de deviner un emplacement, on
+// ajoute une page qui NOMME les documents signés (titre, nombre de pages, empreinte SHA-256) —
+// la signature porte ainsi sans ambiguïté sur ces octets-là. Même style que l'entente v7.7.
+// ---------------------------------------------------------------------------
+const ADD_TXT = {
+  en: {
+    kind: 'Addendum', confidential: 'Confidential', fields: ['EMPLOYEE', 'DOCUMENT', 'REFERENCE', 'DATE'],
+    intro: (emp, name, parent) => `This addendum forms an integral part of the employment agreement between ${emp} (the "Company") and ${name} (the "Employee")${parent ? ` (file ${parent})` : ''}. By signing below, both parties confirm that they have read and accept the following document(s):`,
+    pages: (n) => (n ? `${n} page${n > 1 ? 's' : ''}` : ''),
+    note: 'Except as expressly amended by this addendum, all other terms of the employment agreement remain unchanged and in full force.',
+    ackTitle: 'Signature of the Addendum', ackSub: 'Please read carefully before signing',
+    employee: 'EMPLOYEE', company: 'FOR', fullName: 'Full Name:', signature: 'Signature:', date: 'Date:',
+    footer: '  |  Addendum  |  Confidential',
+  },
+  fr: {
+    kind: 'Addenda', confidential: 'Confidentiel', fields: ['EMPLOYÉ(E)', 'DOCUMENT', 'RÉFÉRENCE', 'DATE'],
+    intro: (emp, name, parent) => `Le présent addenda fait partie intégrante du contrat de travail intervenu entre ${emp} (la « Société ») et ${name} (l'« Employé(e) »)${parent ? ` (dossier ${parent})` : ''}. En signant ci-dessous, les parties confirment avoir lu et accepté le ou les documents suivants :`,
+    pages: (n) => (n ? `${n} page${n > 1 ? 's' : ''}` : ''),
+    note: 'Sauf ce qui est expressément modifié par le présent addenda, toutes les autres conditions du contrat de travail demeurent inchangées et en vigueur.',
+    ackTitle: 'Signature de l’addenda', ackSub: 'Veuillez lire attentivement avant de signer',
+    employee: 'EMPLOYÉ(E)', company: 'POUR', fullName: 'Nom complet :', signature: 'Signature :', date: 'Date :',
+    footer: '  |  Addenda  |  Confidentiel',
+  },
+};
+
+async function renderAddendumSignature(snap, { employeeSig = null, companySig = null } = {}) {
+  const h = snap.hire;
+  const lang = h.agreementLang === 'en' ? 'en' : 'fr';
+  const A = ADD_TXT[lang];
+  const emp = snap.employer || EMP.CLUSTER;
+  const name = `${h.firstName} ${h.lastName}`;
+  const title = lang === 'fr' ? (h.docTitleFr || h.docTitleEn) : (h.docTitleEn || h.docTitleFr);
+  const doc = newDoc(`${A.kind} — ${title} — ${name}`, emp.legalName);
+  const out = collect(doc);
+  const f = flow(doc);
+
+  // Bandeau
+  const bandH = 64;
+  doc.rect(M, M, CW, bandH).fill(INK);
+  doc.rect(M + CW * 0.34, M, CW * 0.66, bandH).fill('#262626');
+  brandMark(doc, emp, M + 16, M + 10, CW * 0.3);
+  doc.font('Helvetica').fontSize(7.5).fillColor('#a3a3a3').text(emp.website || '', M + 16, M + 48, { lineBreak: false });
+  doc.font('Helvetica-Bold').fontSize(13).fillColor('#ffffff').text(A.kind, M, M + 11, { width: CW - 16, align: 'right' });
+  doc.font('Helvetica-Bold').fontSize(12).fillColor(ORANGE).text(title, M + CW * 0.36, M + 28, { width: CW * 0.64 - 16, align: 'right', height: 16, ellipsis: true });
+  doc.font('Helvetica').fontSize(8).fillColor('#e5e5e5').text(A.confidential, M, M + 46, { width: CW - 16, align: 'right' });
+  f.st.y = M + bandH + 12;
+  doc.rect(M - 2, f.st.y, CW + 38, 1.6).fill(ORANGE);
+  f.st.y += 14;
+
+  // Bande d'identification
+  const values = [name, title, snap.parentRef || '—', longDate(snap.sentOn || new Date().toLocaleDateString('en-CA', { timeZone: 'America/Toronto' }), lang)]; // date d'envoi, figée
+  const colW = CW / 4;
+  doc.rect(M, f.st.y, CW, 50).fill('#f4f4f4');
+  A.fields.forEach((label, i) => {
+    const x = M + i * colW + 8;
+    doc.font('Helvetica-Bold').fontSize(6.5).fillColor(ORANGE).text(label, x, f.st.y + 7, { width: colW - 16, lineBreak: false });
+    doc.font('Helvetica').fontSize(8.5).fillColor(TEXT).text(values[i] || '', x, f.st.y + 18, { width: colW - 16, height: 22, ellipsis: true, lineGap: 0 });
+    doc.save().moveTo(x, f.st.y + 42).lineTo(x + colW - 16, f.st.y + 42).lineWidth(0.6).strokeColor('#bdbdbd').stroke().restore();
+  });
+  f.st.y += 66;
+
+  f.para(A.intro(emp.legalName, name, snap.parentRef), { gap: 12 });
+
+  // Liste des documents signés, avec leur empreinte : c'est elle qui lie la signature aux octets.
+  for (const a of snap.attachments || []) {
+    const label = a.filename.replace(/\.pdf$/i, '');
+    const meta = [A.pages(a.pages), `SHA-256 ${String(a.sha256).slice(0, 16)}…`].filter(Boolean).join('  ·  ');
+    doc.font('Helvetica-Bold').fontSize(10);
+    const hh = doc.heightOfString(label, { width: CW - 30 }) + 16;
+    f.ensure(hh + 6);
+    doc.rect(M, f.st.y, CW, hh).fill('#fdf0e6');
+    doc.rect(M, f.st.y, 2.5, hh).fill(ORANGE);
+    doc.fillColor(TEXT).text(label, M + 14, f.st.y + 5, { width: CW - 30 });
+    doc.font('Helvetica').fontSize(8).fillColor(MUTED).text(meta, M + 14, f.st.y + hh - 12, { width: CW - 30, lineBreak: false });
+    f.st.y += hh + 6;
+  }
+  f.st.y += 6;
+  f.para(A.note, { size: 9, font: 'Helvetica-Oblique', color: '#555555', gap: 16 });
+
+  // Cartes de signature (même dessin que l'entente)
+  f.ensure(230);
+  doc.rect(M, f.st.y, CW, 40).fill(INK);
+  doc.font('Helvetica-Bold').fontSize(13).fillColor('#ffffff').text(A.ackTitle, M, f.st.y + 8, { width: CW, align: 'center' });
+  doc.font('Helvetica').fontSize(8).fillColor('#fdba8c').text(A.ackSub, M, f.st.y + 25, { width: CW, align: 'center' });
+  f.st.y += 54;
+  const cardW = (CW - 18) / 2;
+  const cardY = f.st.y;
+  const companyName = companySig ? companySig.name : (h.supervisorName || '');
+  const card = (x, role, fullName, sig, ts) => {
+    const hC = 148;
+    doc.save().rect(x, cardY, cardW, hC).lineWidth(0.6).strokeColor('#e0e0e0').stroke().restore();
+    doc.rect(x, cardY, 1.8, hC).fill(ORANGE);
+    const ix = x + 12;
+    const iw = cardW - 24;
+    doc.font('Helvetica-Bold').fontSize(7).fillColor(ORANGE).text(role, ix, cardY + 12, { width: iw, lineBreak: false, ellipsis: true });
+    doc.font('Helvetica-Bold').fontSize(8.5).fillColor('#444444').text(A.fullName, ix, cardY + 30);
+    doc.font('Helvetica').fontSize(9).fillColor(TEXT).text(fullName || '', ix, cardY + 41, { width: iw });
+    doc.save().moveTo(ix, cardY + 54).lineTo(ix + iw, cardY + 54).lineWidth(0.6).strokeColor('#bdbdbd').stroke().restore();
+    doc.font('Helvetica-Bold').fontSize(8.5).fillColor('#444444').text(A.signature, ix, cardY + 64);
+    const img = sigBuffer(sig);
+    if (img) { try { doc.image(img, ix + 50, cardY + 58, { fit: [iw - 54, 34] }); } catch { /* image illisible */ } }
+    doc.save().moveTo(ix, cardY + 96).lineTo(ix + iw, cardY + 96).lineWidth(0.6).strokeColor('#bdbdbd').stroke().restore();
+    doc.font('Helvetica-Bold').fontSize(8.5).fillColor('#444444').text(A.date, ix, cardY + 106);
+    if (ts) doc.font('Helvetica').fontSize(9).fillColor(TEXT).text(longDate(isoDay(ts), lang), ix + 40, cardY + 106);
+    doc.save().moveTo(ix, cardY + 132).lineTo(ix + iw, cardY + 132).lineWidth(0.6).strokeColor('#bdbdbd').stroke().restore();
+  };
+  card(M, A.employee, employeeSig ? employeeSig.name : name, employeeSig, employeeSig && employeeSig.at);
+  card(M + cardW + 18, `${A.company} ${emp.legalName.toUpperCase()}`, companyName, companySig, companySig && companySig.at);
+
+  footer(doc, A.footer, (i, n) => `${name}   ·   ${i} / ${n}`, null, emp);
+  doc.end();
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Certificat de signature — dernière page du dossier signé. Bilingue : il sert de preuve aux
 // deux parties, quelle que soit la langue de l'entente.
 // ---------------------------------------------------------------------------
@@ -626,4 +743,4 @@ async function pageCount(buf) {
   try { return (await LibDoc.load(buf, { ignoreEncryption: true })).getPageCount(); } catch { return null; }
 }
 
-module.exports = { renderAgreement, renderOffer, renderCertificate, mergePdfs, pageCount, money, longDate };
+module.exports = { renderAgreement, renderOffer, renderAddendumSignature, renderCertificate, mergePdfs, pageCount, money, longDate };

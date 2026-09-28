@@ -201,7 +201,48 @@ function normalizeHire(body, defaults) {
   return { ok: true, hire, terms, plan: p.plan };
 }
 
+// ---------------------------------------------------------------------------
+// ADDENDA — un document TÉLÉVERSÉ par les RH (modification de salaire, de poste, de territoire…)
+// qui passe par le même circuit de signature qu'une embauche (demande des RH, 2026-09-28).
+// Il vise un employé déjà en poste : soit un dossier d'embauche signé dans Sales Hub (parentId),
+// soit une personne embauchée avant Sales Hub (nom + courriel saisis). Pas de plan, pas de
+// conditions : `terms` et `plan` restent vides.
+// ---------------------------------------------------------------------------
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function normalizeAddendum(body) {
+  const b = body || {};
+  const errors = [];
+  const hire = {
+    firstName: str(b.firstName, 100),
+    lastName: str(b.lastName, 100),
+    email: str(b.email, 200).toLowerCase(),
+    // Poste de l'employé, facultatif (affiché sur la page de signature générée).
+    position: str(b.position, 120),
+    positionFr: str(b.positionFr, 120),
+    // Titre du document, dans les deux langues (le FR sert de repli à l'EN et inversement).
+    docTitleFr: str(b.docTitleFr, 160),
+    docTitleEn: str(b.docTitleEn, 160),
+    agreementLang: b.agreementLang === 'en' ? 'en' : 'fr',
+    // Qui contresigne pour l'employeur (liste des gestionnaires) — reçoit l'avis de signature.
+    supervisorName: str(b.supervisorName, 120),
+    reportsToName: str(b.supervisorName, 120),
+    employer: /^[a-z0-9-]{1,40}$/.test(String(b.employer || '')) ? String(b.employer) : 'cluster',
+    parentId: UUID_RE.test(String(b.parentId || '')) ? String(b.parentId) : null,
+    notes: str(b.notes, 4000),
+  };
+  if (!hire.firstName) errors.push('firstName');
+  if (!hire.lastName) errors.push('lastName');
+  if (!EMAIL_RE.test(hire.email)) errors.push('email');
+  if (!hire.docTitleFr && !hire.docTitleEn) errors.push('docTitle');
+  if (!hire.supervisorName) errors.push('supervisorName');
+  if (!hire.docTitleFr) hire.docTitleFr = hire.docTitleEn;
+  if (!hire.docTitleEn) hire.docTitleEn = hire.docTitleFr;
+  if (errors.length) return { ok: false, errors };
+  return { ok: true, hire, terms: {}, plan: {} };
+}
+
 module.exports = {
   PLAN_VERSION, BASE_PLAN, BASE_TERMS,
-  engineDefaults, normalizePlan, normalizeHire, planDiffers,
+  engineDefaults, normalizePlan, normalizeHire, normalizeAddendum, planDiffers,
 };
