@@ -18346,15 +18346,46 @@ app.post('/api/saas-increase/lookup/freeze', authenticateToken, async (req, res)
     jusqua = brut;
   }
 
+  const acteur = req.user.realAdminEmail || req.user.email || 'unknown';
+
+  // Un gel REFUSE ne laissait aucune trace : ni ligne modifiee, ni journal. Le message rouge
+  // mourait au rafraichissement de l'ecran de l'agent, et l'enquete du lendemain se faisait sans
+  // rien — on ne pouvait meme pas distinguer « elle a essaye et Zoho a refuse » de « elle n'a
+  // jamais clique ». Une tentative qui echoue est un evenement : elle s'ecrit.
+  //
+  // Le journal reste best-effort (`.catch`) : ecrire l'echec ne doit jamais transformer un 502
+  // lisible en 500 opaque.
+  let itemRef = null;
+  const journaliserEchec = async (motif, detail) => {
+    await pool.query(
+      `INSERT INTO activity_log (entity_type, entity_id, event_type, description, actor, metadata)
+       VALUES ('saas_increase', $1, 'increase_freeze_failed', $2, $3, $4::jsonb)`,
+      [String(itemRef?.id ?? 0),
+       `Gel REFUSE pour ${itemRef?.customer_name || number} — ${motif}`,
+       acteur,
+       JSON.stringify({ subscriptionNumber: number, orgId, until: jusqua,
+                        reason: raison || null, failure: motif,
+                        // L'etat de la ligne AU MOMENT du refus : c'est lui qui dit si un
+                        // changement vivait chez Zoho, donc si le marchand risque d'etre
+                        // facture malgre la promesse faite au telephone.
+                        itemStatus: itemRef?.status ?? null,
+                        detail: String(detail || '').slice(0, 400) })]
+    );
+  };
+  const journalEchec = (motif, detail) =>
+    journaliserEchec(motif, detail).catch(e => console.warn('[saas-freeze] echec non journalise:', e.message));
+
   try {
     const item = (await pool.query(
       `SELECT * FROM saas_increase_items
         WHERE org_id = $1 AND subscription_number = $2
         ORDER BY id DESC LIMIT 1`, [orgId, number])).rows[0];
     if (!item) return res.status(404).json({ error: 'subscription not found in any scenario' });
+    itemRef = item;
 
-    const acteur = req.user.realAdminEmail || req.user.email || 'unknown';
     let annuleChezZoho = null;
+    // Vrai quand Zoho repond « aucun changement planifie » sur une ligne que la base dit poussee.
+    let divergence = false;
 
     // Cas 2 : la hausse vit deja chez Zoho. On la retire AVANT d'ecrire le gel — si Zoho refuse,
     // on n'aura pas affiche un gel qui n'en est pas un.
@@ -18362,7 +18393,10 @@ app.post('/api/saas-increase/lookup/freeze', authenticateToken, async (req, res)
       try {
         const live = (await getSaasIncreaseSubscriptions())
           .find(x => x.orgId === orgId && x.subscriptionNumber === number);
-        if (!live) return res.status(409).json({ error: 'subscription_not_in_zoho' });
+        if (!live) {
+          await journalEchec('abonnement introuvable chez Zoho', null);
+          return res.status(409).json({ error: 'subscription_not_in_zoho' });
+        }
         const { accessToken, apiDomain } = await getAdminBooksAuth();
         // Meme appel que « Annuler le changement planifie » : DELETE sur scheduledchanges. Ce
         // n'est pas une methode du service Zoho, c'est un appel direct — le reproduire ici plutot
@@ -18376,11 +18410,17 @@ app.post('/api/saas-increase/lookup/freeze', authenticateToken, async (req, res)
         // 400 / 107222 = « rien n'etait planifie » : c'est le resultat voulu, pas un echec.
         const rien = r.status === 400 && /107222/.test(JSON.stringify(r.data || {}));
         if (r.status !== 200 && !rien) {
+          await journalEchec(`Zoho HTTP ${r.status}`, JSON.stringify(r.data));
           return res.status(502).json({ error: `Zoho HTTP ${r.status}`,
             raw: JSON.stringify(r.data).slice(0, 400) });
         }
         annuleChezZoho = r.status === 200;
+        // La ligne est dite « appliquee » mais Zoho n'avait RIEN de planifie. Le gel tient quand
+        // meme — il n'y a rien a annuler — mais les deux cotes divergent, et c'est le genre
+        // d'ecart qu'on ne retrouve jamais apres coup s'il n'est pas ecrit tout de suite.
+        if (rien) divergence = true;
       } catch (e) {
+        await journalEchec('annulation impossible chez Zoho', e.message);
         return res.status(502).json({ error: `annulation impossible chez Zoho : ${e.message}` });
       }
     }
@@ -18404,7 +18444,9 @@ app.post('/api/saas-increase/lookup/freeze', authenticateToken, async (req, res)
          : `Gel leve pour ${item.customer_name}`,
        acteur,
        JSON.stringify({ subscriptionNumber: number, orgId, until: jusqua, reason: raison || null,
-                        cancelledInZoho: annuleChezZoho === true })]
+                        cancelledInZoho: annuleChezZoho === true,
+                        // Ecart base/Zoho constate au passage — voir plus haut.
+                        ...(divergence ? { zohoHadNothingScheduled: true } : {}) })]
     ).catch(e => console.warn('[saas-freeze] journal non ecrit:', e.message));
 
     // La date que le marchand verra reellement sur sa facture.
@@ -18426,8 +18468,16 @@ app.post('/api/saas-increase/lookup/freeze', authenticateToken, async (req, res)
       // Dit en clair si un changement a REELLEMENT ete retire de Zoho : c'est la difference
       // entre « on ne le poussera pas » et « il ne sera pas facture ».
       cancelledInZoho: annuleChezZoho === true,
+      // La ligne se disait appliquee, Zoho n'avait rien : l'agent doit le savoir avant de
+      // promettre quoi que ce soit au marchand.
+      zohoHadNothingScheduled: divergence,
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    // Meme un plantage inattendu laisse une trace : c'est la seule facon de savoir plus tard
+    // qu'un gel a ete TENTE sur cette ligne.
+    await journalEchec('erreur serveur', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // CREER UNE OPPORTUNITE DE PAIEMENT — POST /api/saas-increase/lookup/deal
