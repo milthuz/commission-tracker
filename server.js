@@ -23092,6 +23092,9 @@ async function checkCrmDuplicate({ businessName, contactEmail, contactPhone }) {
           phone: rec.Phone || rec.Mobile || null,
           email: rec.Email || rec.Secondary_Email || null,
           city: rec.Billing_City || rec.Mailing_City || null,
+          // A QUI la fiche appartient deja dans Zoho : avant d'attribuer une piste, c'est la
+          // question qui compte — si Sophie a deja ce marchand, c'est a elle qu'il revient.
+          owner: rec.Owner?.name ? { id: rec.Owner.id || null, name: rec.Owner.name, email: rec.Owner.email || null } : null,
         });
       }
     }
@@ -37290,6 +37293,10 @@ async function acceptLead(leadId, actor, opts = {}) {
   if (!lead) return { error: 'not_found' };
   if (lead.status === 'accepted') return { error: 'already_accepted' };
 
+  // Doublon trouve dans Zoho : on n'accepte que si la personne l'a vu et confirme. Le bouton de
+  // l'ecran le demande, mais la regle vit ICI pour qu'aucun autre chemin ne la contourne.
+  if (lead.crm_match_status === 'match_found' && !opts.confirmDuplicate) return { error: 'duplicate_unconfirmed' };
+
   const settings = await leadSettings();
   const repName = String(opts.repName || '').trim() || lead.assigned_rep_name || lead.suggested_rep_name;
   if (!repName) return { error: 'no_rep' };
@@ -37779,6 +37786,7 @@ app.post('/api/leads/:id/accept', authenticateToken, async (req, res) => {
   try {
     const out = await acceptLead(parseInt(req.params.id, 10), actor, {
       repName: req.body?.repName,
+      confirmDuplicate: req.body?.confirmDuplicate === true,
       // Le NOM n'est repris que hors usurpation d'identite — meme regle que l'approbation d'une
       // opportunite partenaire : pendant une usurpation, `req.user.name` est celui de la
       // personne visitee alors que `actor` reste l'admin.
@@ -37787,6 +37795,7 @@ app.post('/api/leads/:id/accept', authenticateToken, async (req, res) => {
     if (out.error === 'not_found') return res.status(404).json({ error: 'Lead not found' });
     if (out.error === 'already_accepted') return res.status(409).json({ error: 'already_accepted' });
     if (out.error === 'no_rep') return res.status(400).json({ error: 'no_rep' });
+    if (out.error === 'duplicate_unconfirmed') return res.status(409).json({ error: 'duplicate_unconfirmed' });
     if (out.error === 'crm_failed') return res.status(502).json({ error: 'crm_failed', detail: out.detail });
     res.json(out);
   } catch (e) { res.status(500).json({ error: e.message }); }
