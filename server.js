@@ -3852,6 +3852,16 @@ require('./services/revenueModel/routes').registerRevenueModelRoutes(app, {
   authenticateToken, requirePerm, hasPerm, pool, logActivity,
 });
 
+// Rendez-vous des pistes (page publique /rdv, Google Agenda des reps) — services/leadBooking/.
+// `late` : ce que le module lit dans la section des pistes, définie plus bas dans ce fichier.
+const leadBooking = require('./services/leadBooking').registerLeadBookingRoutes(app, {
+  authenticateToken, requirePerm, pool, logActivity,
+  rateLimited: (...a) => rateLimited(...a), sendMail: (...a) => sendMail(...a),
+  mailChrome: (...a) => mailChrome(...a), mailShell: (...a) => mailShell(...a),
+  ensureValidCrmToken: (...a) => ensureValidCrmToken(...a),
+  late: () => ({ leadSettings, scheduleLeadCallback, tzParts, tzOffsetString }),
+});
+
 // ============================================================================
 // ZOHO OAUTH CONFIG
 // ============================================================================
@@ -4573,7 +4583,7 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // sampleEmail(), dans TEMPLATE_TYPES de EmailPreview.tsx, et dans les libellés i18n.
 // Les quatre `pass_*` sont les courriels du programme La Passe ; ils sont les seuls de la
 // liste à partir d'une adresse et d'une enveloppe qui ne sont pas celles de Sales Hub.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder', 'lead_review', 'lead_assigned', 'lead_welcome', 'partner_lead_assigned', 'hr_sign_request', 'hr_countersign', 'hr_completed', 'hr_declined'];
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder', 'lead_review', 'lead_assigned', 'lead_welcome', 'lead_booking_client', 'lead_booking_cancelled', 'lead_booking_rep', 'partner_lead_assigned', 'hr_sign_request', 'hr_countersign', 'hr_completed', 'hr_declined'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -4633,8 +4643,23 @@ function sampleEmail(type, lang) {
     const rep = { name: 'Amy Tremblay', email: 'amy@clustersystems.com', crmUserId: null };
     const callbackAt = leadCallbackAt(LEAD_SETTINGS_DEFAULTS, now);
     if (type === 'lead_review') return leadReviewEmail(lead, `${lead.suggested_rep_name} — règle « ${lead.suggested_rule_name} »`);
-    if (type === 'lead_assigned') return leadAssignedEmail(lead, rep, callbackAt, null);
-    if (type === 'lead_welcome') return leadWelcomeEmail(lead, rep, callbackAt, LEAD_SETTINGS_DEFAULTS);
+    const bookingUrl = `${base}/rdv?token=exemple`;
+    const meetUrl = 'https://meet.google.com/abc-defg-hij';
+    if (type === 'lead_assigned') return leadAssignedEmail(lead, rep, callbackAt, null, true);
+    if (type === 'lead_welcome') return leadWelcomeEmail(lead, rep, callbackAt, LEAD_SETTINGS_DEFAULTS, bookingUrl, meetUrl);
+    // Rendez-vous (services/leadBooking) : les memes constructeurs que les vrais envois.
+    const confirm = (kind) => leadBooking.emails.clientConfirmEmail(mailChrome, {
+      lang: lead.language, firstName: lead.contact_first_name, businessName: lead.business_name,
+      repName: rep.name, repEmail: rep.email, at: kind === 'cancelled' ? null : callbackAt, bookingUrl, meetUrl, kind,
+      home: LEAD_SETTINGS_DEFAULTS.merchantSiteUrl,
+    });
+    if (type === 'lead_booking_client') return confirm('booked');
+    if (type === 'lead_booking_cancelled') return confirm('cancelled');
+    if (type === 'lead_booking_rep') {
+      return leadBooking.emails.repChangedEmail(mailShell, {
+        lead, at: new Date(callbackAt.getTime() + 24 * 3600000), previousAt: callbackAt, kind: 'booked', crmLeadId: null, base, meetUrl,
+      });
+    }
   }
 
   // L'avis au representant Cluster passe par son VRAI constructeur, avec une opportunite
@@ -36547,7 +36572,15 @@ const LEAD_SETTINGS_DEFAULTS = {
   notifyRep:            true,
   notifyMerchant:       true,
   merchantFrom:         '',                  // vide → l'expediteur SMTP habituel
+  sendFromRep:          true,                // courriels au marchand DE l'adresse du representant
   merchantSiteUrl:      'https://www.clusterpos.com',
+  // Rendez-vous (services/leadBooking) : le marchand choisit / change / annule depuis son courriel.
+  bookingEnabled:       true,
+  slotMinutes:          30,
+  bookingDays:          5,                   // jours OUVRABLES proposes
+  minNoticeHours:       2,
+  allowCancel:          true,
+  includeMeet:          true,                // lien Google Meet sur l'evenement du representant
   reviewReminderHours:  4,
   leadSourceWebsite:    '',
   leadSourcePhone:      '',
@@ -36965,7 +36998,7 @@ function leadReviewEmail(lead, suggestionLabel) {
 }
 
 // 2. Au representant — « cette piste est a toi ». Bilingue, meme raison.
-function leadAssignedEmail(lead, rep, callbackAt, crmLeadId) {
+function leadAssignedEmail(lead, rep, callbackAt, crmLeadId, canMove = false) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const who = leadDisplayName(lead);
   const when = leadWhenLabel(callbackAt, 'fr');
@@ -36989,7 +37022,8 @@ function leadAssignedEmail(lead, rep, callbackAt, crmLeadId) {
     ? `<br><br><div style="border-left:3px solid #f97316;padding:10px 0 10px 14px;color:#0f1722;font-size:14px">`
       + `<strong>Le client a été prévenu que vous le contacteriez.</strong><br>`
       + `Rappel planifié dans Zoho : <strong>${leadEsc(when)}</strong>.<br>`
-      + `<span style="color:#64748b">The client has been told you would reach out — callback scheduled for ${leadEsc(whenEn)}.</span>`
+      + (canMove ? `Le client peut déplacer ce moment depuis son courriel ; vous serez prévenu, et Zoho et votre Google Agenda suivront.<br>` : '')
+      + `<span style="color:#64748b">The client has been told you would reach out — callback scheduled for ${leadEsc(whenEn)}.${canMove ? " They can move it from their email; you'll be told." : ''}</span>`
       + `</div>`
     : '';
 
@@ -37105,7 +37139,9 @@ async function notifierRepOpportunite(opportuniteId) {
 // piste : c'est le seul de la trilogie qui sorte de l'entreprise, et un client ne doit pas lire
 // sa propre langue en deuxieme. Marque CLUSTER, pas Sales Hub : le prospect fait affaire avec
 // Cluster et n'a jamais entendu parler de l'outil interne.
-function leadWelcomeEmail(lead, rep, callbackAt, settings) {
+// `bookingUrl` (services/leadBooking) : l'heure proposee dans un encadre + le bouton pour en
+// choisir une autre. Absent = l'ancien paragraphe « vous contactera le … ».
+function leadWelcomeEmail(lead, rep, callbackAt, settings, bookingUrl = null, meetUrl = null) {
   const fr = lead.language !== 'en';
   const first = lead.contact_first_name ? String(lead.contact_first_name).trim() : null;
   const when = leadWhenLabel(callbackAt, fr ? 'fr' : 'en');
@@ -37139,7 +37175,7 @@ function leadWelcomeEmail(lead, rep, callbackAt, settings) {
   const inner = `<h1 style="margin:0 0 14px;color:#0f1722;font-size:20px;font-weight:700;line-height:1.3">${title}</h1>
     <div style="color:#475569;font-size:14.5px;line-height:1.65">${intro}</div>
     ${repBlock}
-    ${promise}`;
+    ${bookingUrl ? leadBooking.welcomeBookingBlock({ lang: fr ? 'fr' : 'en', at: callbackAt, bookingUrl, meetUrl }) : promise}`;
 
   return {
     subject: fr ? `Merci — votre demande est entre bonnes mains` : `Thank you — your request is in good hands`,
@@ -37321,6 +37357,14 @@ async function acceptLead(leadId, actor, opts = {}) {
   let callbackAt = null;
   if (settings.callbackEnabled) {
     callbackAt = leadCallbackAt(settings);
+    // Rendez-vous : on PROPOSE le premier creneau libre du representant a partir de cette heure
+    // (Google Agenda + rendez-vous deja pris dans Sales Hub), pas une heure qui tombe sur une
+    // reunion. Le marchand pourra la changer depuis son courriel.
+    if (settings.bookingEnabled) {
+      const p = await leadBooking.proposeAt(rep, settings, callbackAt, leadId);
+      callbackAt = p.at;
+      steps.availability = { source: p.source, fallback: p.fallback, ...(p.googleError ? { googleError: p.googleError } : {}) };
+    }
     const cb = await scheduleLeadCallback(lead, rep, crm.leadId, callbackAt, settings);
     steps.callback = cb.ok
       ? { ok: true, kind: cb.kind, id: cb.id, at: callbackAt.toISOString(), linkField: cb.linkField }
@@ -37331,24 +37375,40 @@ async function acceptLead(leadId, actor, opts = {}) {
     steps.callback = { ok: false, skipped: 'disabled' };
   }
 
+  // 2b. L'evenement dans le Google Agenda du representant — le creneau est bloque pour tout le
+  // monde, et il suivra si le marchand le deplace. Aucun courriel Google (sendUpdates: none).
+  let bookingUrl = null;
+  if (settings.bookingEnabled) {
+    steps.calendar = callbackAt
+      ? await leadBooking.upsertEvent(lead, rep?.email, callbackAt, settings, crm.leadId)
+      : { ok: false, skipped: 'no_callback' };
+    if (lead.contact_email) {
+      try { bookingUrl = await leadBooking.issueLink(leadId); }
+      catch (e) { steps.bookingLink = { ok: false, error: e.message }; }
+    }
+  } else {
+    steps.calendar = { ok: false, skipped: 'disabled' };
+  }
+
   // 3. Le representant.
   if (settings.notifyRep && rep?.email) {
-    const { subject, html } = leadAssignedEmail(lead, rep, callbackAt, crm.leadId);
+    const { subject, html } = leadAssignedEmail(lead, rep, callbackAt, crm.leadId, !!bookingUrl);
     const m = await sendMail(rep.email, subject, html);
     steps.repEmail = m.sent ? { ok: true, to: rep.email } : { ok: false, to: rep.email, error: m.reason };
   } else {
     steps.repEmail = { ok: false, skipped: !settings.notifyRep ? 'disabled' : 'no_rep_email' };
   }
 
-  // 4. Le marchand. `replyTo` pointe sur le representant : une reponse doit atterrir chez la
-  // personne nommee dans le courriel, pas dans une boite generique que personne ne relit.
+  // 4. Le marchand. Il part DE l'adresse du representant (domaine authentifie chez SendGrid) —
+  // sinon au nom du representant sur l'adresse habituelle — et la reponse lui revient toujours :
+  // elle doit atterrir chez la personne nommee dans le courriel, pas dans une boite generique.
   if (settings.notifyMerchant && lead.contact_email) {
-    const { subject, html } = leadWelcomeEmail(lead, rep, callbackAt, settings);
-    const m = await sendMail(lead.contact_email, subject, html, {
-      from: settings.merchantFrom || undefined,
-      replyTo: rep?.email || undefined,
-    });
-    steps.merchantEmail = m.sent ? { ok: true, to: lead.contact_email } : { ok: false, to: lead.contact_email, error: m.reason };
+    const { subject, html } = leadWelcomeEmail(lead, rep, callbackAt, settings, bookingUrl, steps.calendar?.ok ? steps.calendar.meetUrl : null);
+    const sender = leadBooking.senderFor(rep, settings);
+    const m = await sendMail(lead.contact_email, subject, html, sender);
+    steps.merchantEmail = m.sent
+      ? { ok: true, to: lead.contact_email, from: sender.from || null }
+      : { ok: false, to: lead.contact_email, error: m.reason };
   } else {
     steps.merchantEmail = { ok: false, skipped: !settings.notifyMerchant ? 'disabled' : 'no_contact_email' };
   }
@@ -37370,6 +37430,10 @@ async function acceptLead(leadId, actor, opts = {}) {
      !!steps.repEmail?.ok, !!steps.merchantEmail?.ok, JSON.stringify(steps)]
   );
   await bumpLeadRotation(rep.name);
+  if (settings.bookingEnabled) {
+    try { await leadBooking.recordAccepted(leadId, { at: callbackAt, event: steps.calendar }); }
+    catch (e) { console.warn('[rdv] etat du rendez-vous non enregistre :', e.message); }
+  }
 
   logActivity('lead', leadId, 'accepted',
     `${lead.ref_code} — ${lead.business_name} → ${rep.name} (Zoho ${crm.leadId})`, actor,
@@ -37603,6 +37667,10 @@ function publicLead(r) {
       followupId: r.crm_followup_id, followupKind: r.crm_followup_kind,
     },
     callbackAt: r.callback_at, repNotifiedAt: r.rep_notified_at, merchantNotifiedAt: r.merchant_notified_at,
+    // Rendez-vous (services/leadBooking) : proposed = heure proposee, confirmed = choisie ou
+    // confirmee par le client, cancelled = annulee par lui.
+    booking: { status: r.booking_status || null, updatedAt: r.booking_updated_at || null, changes: r.booking_changes || 0,
+               inGoogleCalendar: !!r.gcal_event_id, meetUrl: r.gcal_meet_url || null },
     automation: r.automation || {},
   };
 }
@@ -37801,7 +37869,14 @@ app.put('/api/admin/lead-settings', authenticateToken, async (req, res) => {
     notifyRep:            b.notifyRep !== false,
     notifyMerchant:       b.notifyMerchant !== false,
     merchantFrom:         str(b.merchantFrom, d.merchantFrom, 160),
+    sendFromRep:          b.sendFromRep !== false,
     merchantSiteUrl:      str(b.merchantSiteUrl, d.merchantSiteUrl, 200) || d.merchantSiteUrl,
+    bookingEnabled:       b.bookingEnabled !== false,
+    slotMinutes:          [15, 20, 30, 45, 60].includes(Number(b.slotMinutes)) ? Number(b.slotMinutes) : d.slotMinutes,
+    bookingDays:          num(b.bookingDays, d.bookingDays, 1, 15),
+    minNoticeHours:       num(b.minNoticeHours, d.minNoticeHours, 0, 72),
+    allowCancel:          b.allowCancel !== false,
+    includeMeet:          b.includeMeet !== false,
     reviewReminderHours:  num(b.reviewReminderHours, d.reviewReminderHours, 0, 168),
     leadSourceWebsite:    str(b.leadSourceWebsite, d.leadSourceWebsite, 80),
     leadSourcePhone:      str(b.leadSourcePhone, d.leadSourcePhone, 80),
