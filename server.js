@@ -20942,10 +20942,19 @@ async function runSaasScheduledPushes() {
   // passent maintenant en tete (NULLS FIRST) : elles sont peu nombreuses, et ce sont justement
   // celles dont personne ne s'occupait. La poussee, elle, reste refusee plus bas faute de
   // promesse a respecter.
+  // ⚠️ `LIMIT $1` figurait ici, avec le plafond des poussees. Le plafond portait donc sur les
+  // lignes REGARDEES et non sur les appels Zoho. Consequence vecue le 2026-09-28 : 2 075 lignes
+  // en file, dont 2 060 attendaient leur terme — les 1 475 dernieres n'etaient JAMAIS examinees,
+  // et comme une ligne ne quitte la file qu'une fois poussee, la fenetre n'avancait pas. Une
+  // ligne qui murissait au-dela du rang 600 ratait son renouvellement et glissait d'un mois
+  // entier (MONTE CRISTO, terme au 1er novembre, rang 1194 : un mois de hausse perdu).
+  //
+  // On lit donc toute la file, et c'est le nombre de POUSSEES qui est plafonne — ce que le
+  // plafond a toujours voulu dire : borner les appels a Zoho, pas la vision.
   const attente = (await pool.query(
     `SELECT * FROM saas_increase_items
       WHERE skipped = FALSE AND notify_status = 'sent' AND status IN ('pending', 'deferred')
-      ORDER BY effective_date NULLS FIRST, id LIMIT $1`, [SAAS_AUTO_MAX_PER_RUN])).rows;
+      ORDER BY effective_date NULLS FIRST, id`)).rows;
   if (!attente.length) return { pushed: 0, failed: 0, waiting: 0 };
 
   const liveSubs = await getSaasIncreaseSubscriptions();
@@ -20956,9 +20965,13 @@ async function runSaasScheduledPushes() {
     .map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
   const { accessToken, apiDomain } = await getAdminBooksAuth();
 
-  let pushed = 0, failed = 0, waiting = 0, geles = 0;
+  let pushed = 0, failed = 0, waiting = 0, geles = 0, reportees = 0;
   const manquants = [];
   for (const item of attente) {
+    // Budget du jour epuise. On ne casse pas la boucle pour pouvoir compter ce qui reste, mais
+    // on ne touche plus a Zoho. Les lignes poussees quittent la file, donc le reste est atteint
+    // des demain — c'est ce qui rendait la fenetre fixe auparavant.
+    if (pushed >= SAAS_AUTO_MAX_PER_RUN) { reportees++; continue; }
     const key = `${item.org_id}||${item.subscription_number}`;
     const live = liveByKey.get(key);
     const currentPeriod = baseByKey.get(key);
@@ -21023,9 +21036,22 @@ async function runSaasScheduledPushes() {
     }
     await new Promise(r2 => setTimeout(r2, 250));
   }
+  // GARDE-FOU. Le cache des abonnements Zoho peut etre PARTIEL au moment du passage — c'est
+  // exactement ce qui avait fait marquer « supprimees » des factures bien vivantes le
+  // 2026-08-18. Tant qu'on n'examinait que 600 lignes, un cache a moitie vide n'en salissait
+  // que 600 ; on lit desormais toute la file, donc le meme incident annoterait des milliers de
+  // lignes et, pire, en FERMERAIT. Au-dela d'un cinquieme de la file, on tient la LECTURE pour
+  // fautive plutot que les abonnements : on n'ecrit rien et on repasse demain.
+  const seuilSuspect = Math.max(50, Math.ceil(attente.length * 0.2));
+  if (manquants.length > seuilSuspect) {
+    console.warn(`[saas-auto] ${manquants.length}/${attente.length} lignes introuvables chez Zoho —`
+      + ` lecture jugee partielle, aucune ligne annotee ni fermee`);
+    return { pushed, failed, waiting, incomplets: 0, fermes: 0, enPause: 0, geles, reportees,
+             lectureSuspecte: manquants.length };
+  }
   // Une seule lecture de Zoho pour tout le lot, et seulement s'il y a quelque chose a expliquer.
   const { incomplets, fermes, enPause } = await saasExpliquerManquants(manquants);
-  return { pushed, failed, waiting, incomplets, fermes, enPause, geles };
+  return { pushed, failed, waiting, incomplets, fermes, enPause, geles, reportees };
 }
 
 // ── LE BILAN QUOTIDIEN DE LA CAMPAGNE ────────────────────────────────────────────────────────
@@ -21204,7 +21230,9 @@ async function runSaasIncreaseAutopilot() {
     && !push.incomplets && !push.fermes;
   console.log(`[saas-auto] avis ${avis.sent}/${avis.failed} echecs · poussees ${push.pushed}/${push.failed} echecs`
     + ` · ${push.fermes || 0} resilies · ${push.enPause || 0} en pause · ${push.geles || 0} geles`
-    + ` · ${push.incomplets || 0} incomplets · ${push.waiting} en attente`);
+    + ` · ${push.incomplets || 0} incomplets · ${push.waiting} en attente`
+    + (push.reportees ? ` · ${push.reportees} remises a demain (plafond ${SAAS_AUTO_MAX_PER_RUN})` : '')
+    + (push.lectureSuspecte ? ` · ⚠️ lecture Zoho partielle (${push.lectureSuspecte}), rien annote` : ''));
   if (rien) return;
 
   const to = await getSaasIncreaseInternalRecipients();
