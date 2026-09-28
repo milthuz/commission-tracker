@@ -3863,6 +3863,12 @@ const leadBooking = require('./services/leadBooking').registerLeadBookingRoutes(
   late: () => ({ leadSettings, scheduleLeadCallback, tzParts, tzOffsetString }),
 });
 
+// Pistes du site Webflow : webhook NATIF (form_submission), signé, connecté depuis Admin → Pistes.
+require('./services/webflowLeads').registerWebflowLeadRoutes(app, {
+  authenticateToken, requirePerm, pool, logActivity,
+  late: () => ({ normalizeLeadInput, createLeadRow }),
+});
+
 // ============================================================================
 // ZOHO OAUTH CONFIG
 // ============================================================================
