@@ -20237,30 +20237,55 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
     // 78 abonnements sur 2 767 ont un merchant_saas_links. Le rapprochement par NOM normalise
     // (sh_norm_name, deja utilise pour joindre Desk a Books) en retrouve 246 de plus, et
     // reconnait 456 des 513 marchands actifs de Zentact.
+    // 💣 LA CLEF EST (ORGANISATION, NUMERO), JAMAIS LE NUMERO SEUL.
+    //
+    // Les numeros d'abonnement Zoho sont uniques PAR ORGANISATION. SUB-00450 designe « Thaizone
+    // St-Romuald » chez Cluster Canada, « El Sol Bakery » chez Cluster USA et « BAR LAITIER
+    // PARAD'ICE » chez Xperio — trois marchands sans aucun rapport. Cette carte etait indexee sur
+    // le numero nu : le bar laitier affichait « deja client du traitement depuis le 6 mai 2026 »,
+    // qui est la verite de la Thaizone. 313 numeros sont ainsi partages entre organisations et
+    // 65 fiches pouvaient montrer le statut d'un autre marchand (releve du 2026-09-28).
+    //
+    // Ce n'est pas cosmetique : la pastille verte SUPPRIME l'occasion de vente. Un marchand qu'on
+    // aurait du solliciter passait pour deja servi, et un agent au telephone lui affirmait une
+    // relation commerciale qui n'existe pas.
     const paiementParSub = new Map();
+    const cleSub = (orgId, numero) => `${orgId}||${numero}`;
     try {
+      const orgs = rows.map(r => r.org_id);
       const numeros = rows.map(r => r.subscription_number);
       const noms = rows.map(r => r.customer_name || '');
       const pay = (await pool.query(`
-        SELECT i.subscription_number, z.merchant_account_id, z.business_name, z.status, z.activated_at,
+        WITH cibles AS (
+          SELECT UNNEST($1::text[]) AS org_id,
+                 UNNEST($2::text[]) AS subscription_number,
+                 UNNEST($3::text[]) AS customer_name
+        )
+        SELECT c.org_id, c.subscription_number, z.merchant_account_id, z.business_name,
+               z.status, z.activated_at,
                CASE WHEN l.subscription_number IS NOT NULL THEN 'link' ELSE 'name' END AS matched_by
-          FROM saas_increase_items i
+          FROM cibles c
+          -- Le lien explicite ne porte pas d'organisation. Son NOM DE FACTURATION tranche : sur
+          -- les cinq liens dont le numero est partage, un seul nom concorde a chaque fois. Les
+          -- liens sans nom (15 sur 140) retombent sur le numero seul, comme avant.
           LEFT JOIN merchant_saas_links l
-            ON l.subscription_number = i.subscription_number AND l.merchant_account_id IS NOT NULL
+            ON l.subscription_number = c.subscription_number
+           AND l.merchant_account_id IS NOT NULL
+           AND (NULLIF(l.billing_customer_name, '') IS NULL
+                OR sh_norm_name(l.billing_customer_name) = sh_norm_name(c.customer_name))
           JOIN zentact_merchants z
             ON z.merchant_account_id = l.merchant_account_id
-            OR sh_norm_name(z.business_name) = sh_norm_name(i.customer_name)
-         WHERE i.subscription_number = ANY($1::text[]) OR i.customer_name = ANY($2::text[])`,
-        [numeros, noms])).rows;
+            OR sh_norm_name(z.business_name) = sh_norm_name(c.customer_name)`,
+        [orgs, numeros, noms])).rows;
       for (const r of pay) {
-        const actuel = paiementParSub.get(r.subscription_number);
+        const actuel = paiementParSub.get(cleSub(r.org_id, r.subscription_number));
         // Le lien explicite l'emporte sur le nom, et un compte ACTIF l'emporte sur un compte
         // ferme : un marchand qui a resilie le paiement redevient une occasion de vente.
         const mieux = !actuel
           || (r.matched_by === 'link' && actuel.matchedBy === 'name')
           || (String(r.status).toUpperCase() === 'ACTIVE' && actuel.status !== 'ACTIVE');
         if (!mieux) continue;
-        paiementParSub.set(r.subscription_number, {
+        paiementParSub.set(cleSub(r.org_id, r.subscription_number), {
           merchantAccountId: r.merchant_account_id,
           businessName: r.business_name,
           status: String(r.status || '').toUpperCase(),
@@ -20354,7 +20379,7 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
         // le rapprochement se fait par nom pour la plupart des lignes, et 57 marchands actifs
         // de Zentact restent introuvables. L'ecran doit dire « aucun compte trouve », pas
         // « ce client n'a pas le paiement ».
-        payments: paiementParSub.get(r.subscription_number) || null,
+        payments: paiementParSub.get(cleSub(r.org_id, r.subscription_number)) || null,
       };
     });
     res.json({ results, total, offset: decalage, limit: limite });
