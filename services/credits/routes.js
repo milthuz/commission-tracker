@@ -107,6 +107,9 @@ async function ensureSchema(pool) {
       created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
+  // Le dossier part d'un marchand ZENTACT (demande de David, 2026-09-29) ; le compte Zoho Books,
+  // nécessaire à la note de crédit, est relié ensuite (au plus tard à l'approbation).
+  await pool.query('ALTER TABLE merchant_credits ADD COLUMN IF NOT EXISTS zentact_merchant_id TEXT');
   await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS merchant_credits_token ON merchant_credits (token_hash) WHERE token_hash IS NOT NULL');
   await pool.query(`
     CREATE TABLE IF NOT EXISTS merchant_credit_docs (
@@ -123,7 +126,7 @@ async function ensureSchema(pool) {
 }
 
 // Ce que l'écran reçoit : jamais les PDF ni le jeton.
-const LIST_COLS = `id, ref, status, lang, rep_email, rep_name, books_customer_id, legal_name, contact_person, phone, email,
+const LIST_COLS = `id, ref, status, lang, rep_email, rep_name, books_customer_id, zentact_merchant_id, legal_name, contact_person, phone, email,
   amount, note, token_expires_at, sent_at, viewed_at, signed_at,
   -- DATE en texte : un objet Date passerait par minuit UTC et reculerait d'un jour à Montréal.
   to_char(commitment_end, 'YYYY-MM-DD') AS commitment_end, decline_reason, approved_by, approved_at,
@@ -135,7 +138,7 @@ function shape(r) {
   return {
     id: r.id, ref: r.ref, status: r.status, lang: r.lang,
     repEmail: r.rep_email, repName: r.rep_name,
-    customerId: r.books_customer_id, legalName: r.legal_name, contactPerson: r.contact_person,
+    customerId: r.books_customer_id, merchantId: r.zentact_merchant_id, legalName: r.legal_name, contactPerson: r.contact_person,
     phone: r.phone, email: r.email, amount: Number(r.amount), note: r.note,
     tokenExpiresAt: r.token_expires_at, sentAt: r.sent_at, viewedAt: r.viewed_at, signedAt: r.signed_at,
     signerName: r.signer_name, signerTitle: r.signer_title, commitmentEnd: r.commitment_end,
@@ -223,8 +226,35 @@ function registerCreditRoutes(app, deps) {
     res.json({ canSend: send, canViewAll: viewAll, canApprove: approve, commitmentMonths: COMMITMENT_MONTHS });
   });
 
-  app.get('/api/credits/customers', authenticateToken, async (req, res) => {
+  // Statuts Zentact exclus : un marchand fermé, refusé ou révoqué ne reçoit plus de crédit. Ceux
+  // en cours d'intégration restent proposés : le crédit est souvent offert AU moment du transfert.
+  const DEAD_ZENTACT = ['CLOSED', 'REJECTED', 'APPLICATION_REVOKED', 'INVITE_REVOKED', 'INVITE_EXPIRED'];
+  const shapeMerchant = (m) => ({ id: m.merchant_account_id, name: m.business_name || '', email: m.invitee_email || '', status: m.status || '', rep: m.sales_rep_name || '' });
+  const likeArg = (q) => `%${q.replace(/[\\%_]/g, (c) => '\\' + c)}%`;
+
+  app.get('/api/credits/merchants', authenticateToken, async (req, res) => {
     if (!(await requirePerm(req, res, PERM_SEND))) return;
+    const q = clean(req.query.q, 80);
+    if (q.length < 2) return res.json({ merchants: [] });
+    try {
+      const { rows } = await pool.query(
+        `SELECT merchant_account_id, business_name, invitee_email, status, sales_rep_name FROM zentact_merchants
+          WHERE NOT (status = ANY($2::text[])) AND (business_name ILIKE $1 OR merchant_account_id ILIKE $1)
+          ORDER BY business_name LIMIT 25`, [likeArg(q), DEAD_ZENTACT]);
+      res.json({ merchants: rows.map(shapeMerchant) });
+    } catch (e) { console.error('credits merchants:', e.message); res.status(500).json({ error: 'load_failed' }); }
+  });
+
+  async function zentactMerchant(id) {
+    if (!id || String(id).length > 255) return null;
+    const { rows } = await pool.query(
+      'SELECT merchant_account_id, business_name, invitee_email, status, sales_rep_name FROM zentact_merchants WHERE merchant_account_id = $1', [String(id)]);
+    return rows[0] || null;
+  }
+
+  // Comptes Zoho Books : pour RELIER le dossier au compte qui recevra la note de crédit.
+  app.get('/api/credits/customers', authenticateToken, async (req, res) => {
+    if (!(await can(req, PERM_SEND)) && !(await can(req, PERM_APPROVE))) return res.status(403).json({ error: `Permission required: ${PERM_SEND}` });
     const q = clean(req.query.q, 80);
     if (q.length < 2) return res.json({ customers: [] });
     try { res.json({ customers: await zb.searchCustomers(q) }); }
@@ -232,7 +262,7 @@ function registerCreditRoutes(app, deps) {
   });
 
   app.get('/api/credits/customers/:cid', authenticateToken, async (req, res) => {
-    if (!(await requirePerm(req, res, PERM_SEND))) return;
+    if (!(await can(req, PERM_SEND)) && !(await can(req, PERM_APPROVE))) return res.status(403).json({ error: `Permission required: ${PERM_SEND}` });
     if (!/^\d{1,30}$/.test(req.params.cid)) return res.status(400).json({ error: 'bad_id' });
     try { res.json({ customer: await zb.getCustomer(req.params.cid) }); }
     catch (e) { console.error('credits customer:', e.message); res.status(502).json({ error: 'books_unavailable', message: e.message }); }
@@ -256,7 +286,7 @@ function registerCreditRoutes(app, deps) {
     const out = {
       legal_name: clean(b.legalName), contact_person: clean(b.contactPerson), phone: clean(b.phone, 40),
       email: clean(b.email, 160).toLowerCase(), lang: b.lang === 'en' ? 'en' : 'fr', note: clean(b.note, 1000),
-      books_customer_id: /^\d{1,30}$/.test(String(b.customerId || '')) ? String(b.customerId) : null,
+      zentact_merchant_id: b.merchantId ? clean(b.merchantId, 255) : null,
     };
     const amount = parseAmount(b.amount);
     return { out, amount };
@@ -265,15 +295,15 @@ function registerCreditRoutes(app, deps) {
   app.post('/api/credits', authenticateToken, async (req, res) => {
     if (!(await requirePerm(req, res, PERM_SEND))) return;
     const { out, amount } = readFields(req.body);
-    if (!out.books_customer_id) return res.status(400).json({ error: 'customer_required' });
     try {
       await schema();
+      if (!(await zentactMerchant(out.zentact_merchant_id))) return res.status(400).json({ error: 'merchant_required' });
       const id = crypto.randomUUID();
       const ref = newRef();
       await pool.query(
-        `INSERT INTO merchant_credits (id, ref, status, lang, rep_email, rep_name, books_customer_id, legal_name, contact_person, phone, email, amount, note)
+        `INSERT INTO merchant_credits (id, ref, status, lang, rep_email, rep_name, zentact_merchant_id, legal_name, contact_person, phone, email, amount, note)
          VALUES ($1,$2,'draft',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-        [id, ref, out.lang, email(req), req.user.name || email(req), out.books_customer_id, out.legal_name, out.contact_person, out.phone, out.email, amount || 0, out.note || null]);
+        [id, ref, out.lang, email(req), req.user.name || email(req), out.zentact_merchant_id, out.legal_name, out.contact_person, out.phone, out.email, amount || 0, out.note || null]);
       await log({ id, ref }, 'created', `brouillon créé pour ${out.legal_name}`, email(req), { amount: amount || 0 });
       res.json({ credit: await reload(id) });
     } catch (e) { console.error('credits create:', e.message); res.status(500).json({ error: 'save_failed' }); }
@@ -285,10 +315,11 @@ function registerCreditRoutes(app, deps) {
     if (row.status !== 'draft') return res.status(409).json({ error: 'not_draft' });
     const { out, amount } = readFields(req.body);
     try {
+      if (out.zentact_merchant_id && !(await zentactMerchant(out.zentact_merchant_id))) return res.status(400).json({ error: 'merchant_required' });
       await pool.query(
-        `UPDATE merchant_credits SET lang=$2, books_customer_id=COALESCE($3, books_customer_id), legal_name=$4, contact_person=$5,
+        `UPDATE merchant_credits SET lang=$2, zentact_merchant_id=COALESCE($3, zentact_merchant_id), legal_name=$4, contact_person=$5,
                 phone=$6, email=$7, amount=$8, note=$9, updated_at=NOW() WHERE id=$1`,
-        [row.id, out.lang, out.books_customer_id, out.legal_name, out.contact_person, out.phone, out.email, amount || 0, out.note || null]);
+        [row.id, out.lang, out.zentact_merchant_id, out.legal_name, out.contact_person, out.phone, out.email, amount || 0, out.note || null]);
       res.json({ credit: await reload(row.id) });
     } catch (e) { console.error('credits update:', e.message); res.status(500).json({ error: 'save_failed' }); }
   });
@@ -358,7 +389,7 @@ function registerCreditRoutes(app, deps) {
     const row = await loadFor(req, res, { edit: true }); if (!row) return;
     if (!['draft', 'sent', 'viewed', 'expired'].includes(row.status)) return res.status(409).json({ error: 'not_sendable' });
     const missing = [];
-    if (!row.books_customer_id) missing.push('customer');
+    if (!row.zentact_merchant_id) missing.push('merchant');
     if (!row.legal_name) missing.push('legalName');
     if (!row.contact_person) missing.push('contactPerson');
     if (!EMAIL_RE.test(row.email)) missing.push('email');
@@ -426,10 +457,26 @@ function registerCreditRoutes(app, deps) {
     return r;
   }
 
+  // Relie le dossier au compte Zoho Books qui recevra la note de crédit. Vérifié chez Zoho (le
+  // compte doit exister) ; possible jusqu'à l'approbation, par l'auteur ou un approbateur.
+  app.post('/api/credits/:id/books-customer', authenticateToken, async (req, res) => {
+    const row = await loadFor(req, res); if (!row) return;
+    if (!(await canEdit(req, row)) && !(await can(req, PERM_APPROVE))) return res.status(403).json({ error: 'forbidden' });
+    if (['approved', 'rejected', 'cancelled'].includes(row.status)) return res.status(409).json({ error: 'locked' });
+    const cid = String((req.body || {}).customerId || '');
+    if (!/^\d{1,30}$/.test(cid)) return res.status(400).json({ error: 'bad_id' });
+    let cust;
+    try { cust = await zb.getCustomer(cid); } catch (e) { return res.status(502).json({ error: 'books_unavailable', message: e.message }); }
+    await pool.query('UPDATE merchant_credits SET books_customer_id=$2, updated_at=NOW() WHERE id=$1', [row.id, cid]);
+    await log(row, 'books_linked', `relié au compte Zoho Books « ${cust.legalName} » (#${cid})`, email(req));
+    res.json({ credit: await reload(row.id) });
+  });
+
   app.post('/api/credits/:id/approve', authenticateToken, async (req, res) => {
     if (!(await requirePerm(req, res, PERM_APPROVE))) return;
     const row = await loadFor(req, res); if (!row) return;
     if (row.status !== 'signed') return res.status(409).json({ error: 'not_signed' });
+    if (!row.books_customer_id) return res.status(400).json({ error: 'books_customer_required' });
     const { rows: [{ n }] } = await pool.query('SELECT COUNT(*)::int AS n FROM merchant_credit_docs WHERE credit_id = $1', [row.id]);
     if (!n) return res.status(400).json({ error: 'docs_required' });
     // Verrou : un double clic ou deux approbateurs simultanés ne créent pas DEUX notes de crédit.

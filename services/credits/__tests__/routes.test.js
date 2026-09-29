@@ -48,6 +48,11 @@ function crc32(buf) { let c, crc = 0xffffffff; for (let n = 0; n < buf.length; n
     CREATE TABLE user_tokens (email TEXT, is_admin BOOLEAN);
     INSERT INTO roles (name, permissions) VALUES ('Rep', '["credits:send"]'), ('Finance', '["credits:approve"]');
     INSERT INTO user_roles VALUES ('rep@x.com', 1), ('autre@x.com', 1), ('david@x.com', 2);
+    CREATE TABLE zentact_merchants (merchant_account_id TEXT PRIMARY KEY, business_name TEXT, invitee_email TEXT, status TEXT, sales_rep_name TEXT);
+    INSERT INTO zentact_merchants VALUES
+      ('ZM-1', 'Restaurants l''Étoile inc.', 'owner@resto.ca', 'ACTIVE', 'Julie'),
+      ('ZM-2', 'Bistro 50% off', 'b@b.ca', 'INVITE_ACCEPTED', 'Julie'),
+      ('ZM-3', 'Resto Fermé', 'x@x.ca', 'CLOSED', 'Julie');
   `);
   const perms = { 'rep@x.com': ['credits:send'], 'autre@x.com': ['credits:send'], 'david@x.com': ['credits:approve'], 'nobody@x.com': [] };
   const has = (req, p) => (perms[req.user.email] || []).includes(p);
@@ -94,10 +99,14 @@ function crc32(buf) { let c, crc = 0xffffffff; for (let n = 0; n < buf.length; n
   ok(meta.canSend && !meta.canApprove, 'rep : peut envoyer, pas approuver');
 
   // Recherche Zoho + création
-  const cust = (await api('GET', '/api/credits/customers?q=Etoile', 'rep@x.com')).body.customers;
-  ok(cust.length === 1 && cust[0].id === '4600001', 'recherche de clients Books');
-  ok((await api('POST', '/api/credits', 'rep@x.com', { legalName: 'X' })).status === 400, 'client Books obligatoire');
-  let c = (await api('POST', '/api/credits', 'rep@x.com', { customerId: '4600001', legalName: 'Restaurants l’Étoile inc.', contactPerson: 'Marie-Ève', phone: '514', email: 'owner@resto.ca', amount: '2 450,50', lang: 'fr' })).body.credit;
+  const zm = (await api('GET', '/api/credits/merchants?q=Rest', 'rep@x.com')).body.merchants;
+  ok(zm.length === 1 && zm[0].id === 'ZM-1', 'recherche Zentact : le marchand fermé est exclu');
+  ok((await api('GET', '/api/credits/merchants?q=50%25', 'rep@x.com')).body.merchants.map((m) => m.id).join() === 'ZM-2', 'un « % » tapé est cherché tel quel, pas comme joker');
+  ok((await api('GET', '/api/credits/merchants?q=%25%25', 'rep@x.com')).body.merchants.length === 0, '« %% » ne renvoie pas toute la liste');
+  ok((await api('POST', '/api/credits', 'rep@x.com', { legalName: 'X' })).status === 400, 'marchand Zentact obligatoire');
+  ok((await api('POST', '/api/credits', 'rep@x.com', { merchantId: 'ZM-INEXISTANT', legalName: 'X' })).body.error === 'merchant_required', 'marchand Zentact inconnu refusé');
+  let c = (await api('POST', '/api/credits', 'rep@x.com', { merchantId: 'ZM-1', legalName: 'Restaurants l’Étoile inc.', contactPerson: 'Marie-Ève', phone: '514', email: 'owner@resto.ca', amount: '2 450,50', lang: 'fr' })).body.credit;
+  ok(c.merchantId === 'ZM-1' && !c.customerId, 'dossier relié au marchand Zentact, pas encore à Books');
   ok(c.status === 'draft' && c.amount === 2450.5 && /^MC-\d{8}-[0-9A-F]{4}$/.test(c.ref), 'brouillon créé, montant « 2 450,50 » lu');
 
   // Cloisonnement
@@ -149,6 +158,12 @@ function crc32(buf) { let c, crc = 0xffffffff; for (let n = 0; n < buf.length; n
 
   // Approbation — Zoho refuse d'abord (permission manquante), puis accepte
   ok((await api('POST', `/api/credits/${c.id}/approve`, 'rep@x.com')).status === 403, 'le rep ne peut pas approuver');
+  ok((await api('POST', `/api/credits/${c.id}/approve`, 'david@x.com')).body.error === 'books_customer_required', 'pas d’approbation sans compte Zoho Books relié');
+  const books = (await api('GET', '/api/credits/customers?q=Etoile', 'david@x.com')).body.customers;
+  ok(books.length === 1 && books[0].id === '4600001', 'l’approbateur cherche le compte Books');
+  ok((await api('POST', `/api/credits/${c.id}/books-customer`, 'autre@x.com', { customerId: '4600001' })).status === 404, 'un autre rep ne peut pas relier le dossier');
+  const linked = await api('POST', `/api/credits/${c.id}/books-customer`, 'david@x.com', { customerId: '4600001' });
+  ok(linked.status === 200 && linked.body.credit.customerId === '4600001', 'compte Books relié');
   let ap = await api('POST', `/api/credits/${c.id}/approve`, 'david@x.com');
   ok(ap.status === 200 && ap.body.credit.status === 'approved' && !ap.body.books.ok && /creditnotes\.CREATE/.test(ap.body.credit.booksError), 'approuvé, Zoho refuse : erreur claire');
   ok((await api('POST', `/api/credits/${c.id}/approve`, 'david@x.com')).status === 409, 'pas de double approbation');
@@ -160,16 +175,17 @@ function crc32(buf) { let c, crc = 0xffffffff; for (let n = 0; n < buf.length; n
   ok((await fetch(`${base}/api/credits/${c.id}/docs/1`, { method: 'DELETE', headers: { 'x-test-user': 'rep@x.com' } })).status === 409, 'pièces verrouillées après approbation');
 
   // Dossier sans pièce : approbation refusée
-  let c2 = (await api('POST', '/api/credits', 'rep@x.com', { customerId: '4600001', legalName: 'B inc.', contactPerson: 'B', email: 'b@b.ca', amount: 100 })).body.credit;
+  let c2 = (await api('POST', '/api/credits', 'rep@x.com', { merchantId: 'ZM-2', legalName: 'B inc.', contactPerson: 'B', email: 'b@b.ca', amount: 100 })).body.credit;
   await api('POST', `/api/credits/${c2.id}/send`, 'rep@x.com');
   const t2 = /token=([A-Za-z0-9_-]+)/.exec(mails.filter((m) => m.to === 'b@b.ca').pop().html)[1];
   await api('POST', `/api/public/credit-sign/${t2}/sign`, null, { printName: 'B B', title: 'CEO', consent: true, signature: fakeSignaturePng() });
+  await api('POST', `/api/credits/${c2.id}/books-customer`, 'david@x.com', { customerId: '4600001' });
   ok((await api('POST', `/api/credits/${c2.id}/approve`, 'david@x.com')).body.error === 'docs_required', 'pas d’approbation sans pièce justificative');
   ok((await api('POST', `/api/credits/${c2.id}/reject`, 'david@x.com', {})).status === 400, 'refus : raison obligatoire');
   ok((await api('POST', `/api/credits/${c2.id}/reject`, 'david@x.com', { reason: 'Pièce manquante' })).body.credit.status === 'rejected', 'refusé avec raison');
 
   // Envoi incomplet
-  const c3 = (await api('POST', '/api/credits', 'rep@x.com', { customerId: '4600001', legalName: 'C', contactPerson: '', email: 'pas-un-courriel', amount: 0 })).body.credit;
+  const c3 = (await api('POST', '/api/credits', 'rep@x.com', { merchantId: 'ZM-1', legalName: 'C', contactPerson: '', email: 'pas-un-courriel', amount: 0 })).body.credit;
   const inc = await api('POST', `/api/credits/${c3.id}/send`, 'rep@x.com');
   ok(inc.status === 400 && inc.body.missing.includes('email') && inc.body.missing.includes('amount') && inc.body.missing.includes('contactPerson'), 'envoi incomplet refusé, champs nommés');
   ok((await api('DELETE', `/api/credits/${c3.id}`, 'rep@x.com')).status === 200, 'brouillon supprimable');
