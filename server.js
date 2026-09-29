@@ -3856,7 +3856,7 @@ require('./services/hr/routes').registerHrRoutes(app, {
 
 // Crédits de compensation marchand — formulaire signé en ligne, note de crédit Zoho Books.
 // Tout vit sous services/credits/.
-require('./services/credits/routes').registerCreditRoutes(app, {
+const creditsModule = require('./services/credits/routes').registerCreditRoutes(app, {
   authenticateToken, requirePerm, hasPerm, pool, logActivity,
   sendMail: (...a) => sendMail(...a), mailShell: (...a) => mailShell(...a), rateLimited: (...a) => rateLimited(...a),
   getAdminBooksAuth: (...a) => getAdminBooksAuth(...a),
@@ -14790,6 +14790,17 @@ function startAutoSync() {
     checkProbationNotifications();
     setInterval(checkProbationNotifications, 24 * 60 * 60 * 1000);
   }, 3 * 60 * 1000);
+
+  // Crédits processeur marchand : reprise possible (clause 3) quand un marchand crédité est fermé
+  // dans Zentact avant la fin de ses 36 mois. Quotidien ; premier passage 8 min après le
+  // démarrage, APRÈS la synchro Zentact qui met les statuts à jour.
+  setTimeout(() => {
+    const run = () => creditsModule.checkClawbacks()
+      .then((r) => { if (r.flagged || r.alerted) console.log(`[credits] reprise : ${r.flagged} signalé(s), ${r.alerted} avis`); })
+      .catch((e) => console.warn('[credits] vérification de reprise échouée :', e.message));
+    run();
+    setInterval(run, 24 * 60 * 60 * 1000);
+  }, 8 * 60 * 1000);
 
   // Etat des Deals partenaires (etape + date de depot) → eligibilite au versement. Horaire :
   // c'est de l'argent du a des partenaires, une reactivite d'une heure suffit et menage l'API

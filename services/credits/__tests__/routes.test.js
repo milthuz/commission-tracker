@@ -75,7 +75,7 @@ function crc32(buf) { let c, crc = 0xffffffff; for (let n = 0; n < buf.length; n
     const e = req.headers['x-test-user']; if (!e) return res.status(401).json({ error: 'auth' });
     req.user = { email: e, name: e.split('@')[0], isAdmin: false }; next();
   };
-  registerCreditRoutes(app, {
+  const credits = registerCreditRoutes(app, {
     authenticateToken, pool, books: fakeBooks, getAdminBooksAuth: null,
     hasPerm: async (req, p) => has(req, p),
     requirePerm: async (req, res, p) => { if (has(req, p)) return true; res.status(403).json({ error: 'perm' }); return false; },
@@ -190,6 +190,27 @@ function crc32(buf) { let c, crc = 0xffffffff; for (let n = 0; n < buf.length; n
   ok(inc.status === 400 && inc.body.missing.includes('email') && inc.body.missing.includes('amount') && inc.body.missing.includes('contactPerson'), 'envoi incomplet refusé, champs nommés');
   ok((await api('DELETE', `/api/credits/${c3.id}`, 'rep@x.com')).status === 200, 'brouillon supprimable');
   ok((await api('DELETE', `/api/credits/${c.id}`, 'rep@x.com')).status === 409, 'un dossier envoyé ne se supprime pas');
+
+  // Reprise avant 36 mois
+  const before = mails.length;
+  let chk = await credits.checkClawbacks();
+  ok(chk.flagged === 0, 'marchand actif : aucune reprise signalée');
+  await pool.query(`UPDATE zentact_merchants SET status = 'CLOSED' WHERE merchant_account_id = 'ZM-1'`);
+  chk = await credits.checkClawbacks();
+  ok(chk.flagged === 1 && chk.alerted === 1, 'marchand fermé avant 36 mois : reprise signalée, avis envoyé');
+  ok(mails.length === before + 1 && mails[mails.length - 1].to.includes('david@x.com') && /Reprise possible/.test(mails[mails.length - 1].subject), 'avis de reprise à l’approbateur');
+  chk = await credits.checkClawbacks();
+  ok(chk.flagged === 0 && chk.alerted === 0 && mails.length === before + 1, 'un seul avis, jamais répété');
+  let det = (await api('GET', `/api/credits/${c.id}`, 'david@x.com')).body.credit;
+  ok(det.clawback && det.clawback.status === 'flagged' && det.clawback.zentactStatus === 'CLOSED', 'le dossier porte l’alerte');
+  ok((await api('POST', `/api/credits/${c.id}/clawback`, 'rep@x.com', { decision: 'reclaimed' })).status === 403, 'le rep ne tranche pas la reprise');
+  ok((await api('POST', `/api/credits/${c.id}/clawback`, 'david@x.com', { decision: 'n_importe' })).status === 400, 'décision invalide refusée');
+  det = (await api('POST', `/api/credits/${c.id}/clawback`, 'david@x.com', { decision: 'reclaimed', note: 'Facturé sur la dernière facture' })).body.credit;
+  ok(det.clawback.status === 'reclaimed' && det.clawback.decidedBy === 'david@x.com', 'reprise tranchée et tracée');
+  ok((await api('POST', `/api/credits/${c.id}/clawback`, 'david@x.com', { decision: 'waived' })).status === 409, 'on ne tranche pas deux fois');
+  // un engagement déjà terminé ne se reprend plus
+  await pool.query(`UPDATE merchant_credits SET clawback_status = NULL, commitment_end = CURRENT_DATE - 1 WHERE id = $1`, [c.id]);
+  ok((await credits.checkClawbacks()).flagged === 0, 'engagement terminé : pas de reprise');
 
   server.close();
   console.log(`credits : ${n} vérifications OK`);

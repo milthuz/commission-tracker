@@ -29,6 +29,9 @@ const PERM_APPROVE = 'credits:approve';
 
 const TOKEN_DAYS = 14;
 const COMMITMENT_MONTHS = 36; // clause 3 du formulaire
+// Statuts Zentact qui signifient que le marchand a QUITTÉ Cluster. Un départ détecté avant la fin
+// de l'engagement ouvre une alerte de reprise sur tout crédit APPROUVÉ de ce marchand.
+const LEFT_ZENTACT = ['CLOSED'];
 const MAX_AMOUNT = 1_000_000;
 const MAX_DOC = 10 * 1024 * 1024;
 const DOC_TYPES = new Set(['application/pdf', 'image/png', 'image/jpeg', 'image/webp']);
@@ -110,6 +113,12 @@ async function ensureSchema(pool) {
   // Le dossier part d'un marchand ZENTACT (demande de David, 2026-09-29) ; le compte Zoho Books,
   // nécessaire à la note de crédit, est relié ensuite (au plus tard à l'approbation).
   await pool.query('ALTER TABLE merchant_credits ADD COLUMN IF NOT EXISTS zentact_merchant_id TEXT');
+  // Reprise (clause 3) : le marchand quitte Cluster avant la fin de l'engagement de 36 mois.
+  // clawback_status : NULL (rien à signaler) → 'flagged' (départ détecté) → 'reclaimed' | 'waived'.
+  for (const col of ['clawback_status TEXT', 'clawback_flagged_at TIMESTAMPTZ', 'clawback_alerted_at TIMESTAMPTZ',
+    'clawback_zentact_status TEXT', 'clawback_decided_by TEXT', 'clawback_decided_at TIMESTAMPTZ', 'clawback_note TEXT']) {
+    await pool.query(`ALTER TABLE merchant_credits ADD COLUMN IF NOT EXISTS ${col}`);
+  }
   await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS merchant_credits_token ON merchant_credits (token_hash) WHERE token_hash IS NOT NULL');
   await pool.query(`
     CREATE TABLE IF NOT EXISTS merchant_credit_docs (
@@ -131,6 +140,7 @@ const LIST_COLS = `id, ref, status, lang, rep_email, rep_name, books_customer_id
   -- DATE en texte : un objet Date passerait par minuit UTC et reculerait d'un jour à Montréal.
   to_char(commitment_end, 'YYYY-MM-DD') AS commitment_end, decline_reason, approved_by, approved_at,
   rejected_by, rejected_at, reject_reason, creditnote_id, creditnote_number, books_error, created_at, updated_at,
+  clawback_status, clawback_flagged_at, clawback_zentact_status, clawback_decided_by, clawback_decided_at, clawback_note,
   (signature->>'name') AS signer_name, (signature->>'title') AS signer_title,
   (SELECT COUNT(*)::int FROM merchant_credit_docs d WHERE d.credit_id = merchant_credits.id) AS doc_count`;
 
@@ -146,6 +156,10 @@ function shape(r) {
     rejectedBy: r.rejected_by, rejectedAt: r.rejected_at, rejectReason: r.reject_reason,
     creditnoteId: r.creditnote_id, creditnoteNumber: r.creditnote_number, booksError: r.books_error,
     docCount: r.doc_count, createdAt: r.created_at, updatedAt: r.updated_at,
+    clawback: r.clawback_status ? {
+      status: r.clawback_status, flaggedAt: r.clawback_flagged_at, zentactStatus: r.clawback_zentact_status,
+      decidedBy: r.clawback_decided_by, decidedAt: r.clawback_decided_at, note: r.clawback_note,
+    } : null,
   };
 }
 
@@ -512,6 +526,58 @@ function registerCreditRoutes(app, deps) {
     res.json({ credit: await reload(row.id) });
   });
 
+  // ── Reprise avant 36 mois (clause 3) ──
+  // Appelée chaque jour par le worker (server.js) et à la demande. Idempotente : un dossier n'est
+  // signalé qu'une fois, et l'avis n'est envoyé qu'une fois (clawback_alerted_at).
+  async function checkClawbacks() {
+    await schema();
+    const { rows: flagged } = await pool.query(
+      `UPDATE merchant_credits mc SET clawback_status = 'flagged', clawback_flagged_at = NOW(),
+              clawback_zentact_status = z.status, updated_at = NOW()
+         FROM zentact_merchants z
+        WHERE z.merchant_account_id = mc.zentact_merchant_id
+          AND mc.status = 'approved' AND mc.clawback_status IS NULL
+          AND mc.commitment_end > CURRENT_DATE
+          AND z.status = ANY($1::text[])
+        RETURNING mc.*`, [LEFT_ZENTACT]);
+    for (const row of flagged) {
+      await log(row, 'clawback_flagged', `reprise possible : le marchand est ${row.clawback_zentact_status} dans Zentact avant la fin de l'engagement`, 'system', { amount: Number(row.amount) });
+    }
+    const { rows: pending } = await pool.query(
+      `SELECT * FROM merchant_credits WHERE clawback_status = 'flagged' AND clawback_alerted_at IS NULL ORDER BY clawback_flagged_at`);
+    if (pending.length) {
+      const to = [...new Set([...(await approverEmails()), ...pending.map((r) => String(r.rep_email).toLowerCase())])].filter((e) => EMAIL_RE.test(e));
+      if (to.length) {
+        const lines = pending.map((r) => `<li><b>${esc(r.legal_name)}</b> — ${esc(r.ref)} — ${esc(pdf.formatAmount(r.amount, 'fr'))} $ (engagement jusqu'au ${esc(String(r.commitment_end instanceof Date ? r.commitment_end.toISOString().slice(0, 10) : r.commitment_end).slice(0, 10))})</li>`).join('');
+        const title = pending.length === 1 ? 'Reprise possible d\'un crédit processeur marchand' : `Reprise possible de ${pending.length} crédits processeur marchand`;
+        const intro = `Ces marchands sont fermés dans Zentact avant la fin de leur engagement de ${COMMITMENT_MONTHS} mois. Selon la clause 3, Cluster peut reprendre le crédit :<ul>${lines}</ul>Ouvrez chaque dossier pour noter la décision (crédit repris ou pas de reprise).`;
+        const r = await sendMail(to.join(','), title, mailShell(title, intro, 'Ouvrir les crédits', `${frontend()}/credits?filter=clawback`, 'fr')).catch(() => null);
+        if (!r || !r.sent) { console.warn('[credits] avis de reprise non envoyé :', r && r.reason); return { flagged: flagged.length, alerted: 0 }; }
+      }
+      await pool.query(`UPDATE merchant_credits SET clawback_alerted_at = NOW() WHERE id = ANY($1::uuid[])`, [pending.map((r) => r.id)]);
+    }
+    return { flagged: flagged.length, alerted: pending.length };
+  }
+
+  app.post('/api/credits/clawback-check', authenticateToken, async (req, res) => {
+    if (!(await requirePerm(req, res, PERM_APPROVE))) return;
+    try { res.json(await checkClawbacks()); } catch (e) { console.error('credits clawback:', e.message); res.status(500).json({ error: 'check_failed' }); }
+  });
+
+  app.post('/api/credits/:id/clawback', authenticateToken, async (req, res) => {
+    if (!(await requirePerm(req, res, PERM_APPROVE))) return;
+    const row = await loadFor(req, res); if (!row) return;
+    if (row.clawback_status !== 'flagged') return res.status(409).json({ error: 'no_clawback' });
+    const decision = (req.body || {}).decision;
+    if (!['reclaimed', 'waived'].includes(decision)) return res.status(400).json({ error: 'bad_decision' });
+    const note = clean((req.body || {}).note, 500);
+    await pool.query(
+      `UPDATE merchant_credits SET clawback_status=$2, clawback_decided_by=$3, clawback_decided_at=NOW(), clawback_note=$4, updated_at=NOW() WHERE id=$1`,
+      [row.id, decision, email(req), note || null]);
+    await log(row, `clawback_${decision}`, `${decision === 'reclaimed' ? 'crédit repris' : 'pas de reprise'}${note ? ` : ${note}` : ''}`, email(req), { amount: Number(row.amount) });
+    res.json({ credit: await reload(row.id) });
+  });
+
   // ── Page de signature PUBLIQUE (aucune session : le jeton est l'autorisation) ──
   async function byToken(req, res) {
     const raw = String(req.params.token || '');
@@ -607,6 +673,8 @@ function registerCreditRoutes(app, deps) {
     }
     res.json({ status: 'declined' });
   });
+
+  return { checkClawbacks };
 }
 
-module.exports = { registerCreditRoutes, PERM_SEND, PERM_VIEW_ALL, PERM_APPROVE, parseAmount, validSignature };
+module.exports = { registerCreditRoutes, PERM_SEND, PERM_VIEW_ALL, PERM_APPROVE, LEFT_ZENTACT, parseAmount, validSignature };
