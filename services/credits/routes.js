@@ -124,7 +124,9 @@ async function ensureSchema(pool) {
 
 // Ce que l'écran reçoit : jamais les PDF ni le jeton.
 const LIST_COLS = `id, ref, status, lang, rep_email, rep_name, books_customer_id, legal_name, contact_person, phone, email,
-  amount, note, token_expires_at, sent_at, viewed_at, signed_at, commitment_end, decline_reason, approved_by, approved_at,
+  amount, note, token_expires_at, sent_at, viewed_at, signed_at,
+  -- DATE en texte : un objet Date passerait par minuit UTC et reculerait d'un jour à Montréal.
+  to_char(commitment_end, 'YYYY-MM-DD') AS commitment_end, decline_reason, approved_by, approved_at,
   rejected_by, rejected_at, reject_reason, creditnote_id, creditnote_number, books_error, created_at, updated_at,
   (signature->>'name') AS signer_name, (signature->>'title') AS signer_title,
   (SELECT COUNT(*)::int FROM merchant_credit_docs d WHERE d.credit_id = merchant_credits.id) AS doc_count`;
