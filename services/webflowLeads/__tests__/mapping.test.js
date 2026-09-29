@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const { mapSubmission, guessTarget, verifySignature } = require('..');
+const { mapSubmission, screenSubmission, guessTarget, verifySignature } = require('..');
 
 describe('guessTarget', () => {
   test.each([
@@ -75,4 +75,63 @@ describe('verifySignature', () => {
   });
   test('en-têtes absents → refus', () => expect(verifySignature({ secret, rawBody: body }).reason).toBe('missing_signature'));
   test('sans secret (webhook non signé) → accepté par la clé d\'adresse seule', () => expect(verifySignature({ secret: null, rawBody: body })).toEqual({ ok: true, skipped: true }));
+});
+
+// Les noms EXACTS proposés par l'équipe Webflow (audit du 2026-09-29).
+describe('formulaires du site (audit 2026-09-29)', () => {
+  test('Contact Us : noms proposés', () => {
+    const data = {
+      'Interest - Point of Sale': 'true', 'Interest - Cluster Payments': 'false', 'Interest - Hardware': 'true',
+      'First Name': 'Julie', 'Last Name': 'Tremblay', 'Email': 'julie@cafe.ca', 'Company': 'Café Merlebleu',
+      'Phone': '514-555-0142', 'Message': 'Un ami', 'Consent': 'true', 'language': 'fr', 'website_url': '', 'Page': '/fr-ca/pricing',
+    };
+    expect(screenSubmission(data)).toBeNull();
+    const out = mapSubmission(data);
+    expect(out).toMatchObject({ contactFirstName: 'Julie', contactLastName: 'Tremblay', contactEmail: 'julie@cafe.ca',
+      businessName: 'Café Merlebleu', contactPhone: '514-555-0142', language: 'fr', interest: 'Point of Sale, Hardware' });
+    expect(out.website).toBeUndefined();
+    expect(out.notes).toContain('Un ami');
+    expect(out.notes).toContain('Page : /fr-ca/pricing');
+    expect(out.notes).toContain('Consent : true');
+  });
+
+  test('champ piège rempli → ignoré ; jamais versé dans « site web »', () => {
+    const data = { 'Email': 'bot@spam.io', 'Company': 'Spam', 'website_url': 'http://spam.io' };
+    expect(screenSubmission(data)).toEqual({ reason: 'honeypot', detail: 'website_url' });
+    expect(mapSubmission(data).website).toBeUndefined();
+  });
+
+  test('un vrai champ « Website » n\'est PAS un piège', () => {
+    expect(screenSubmission({ 'Website': 'https://cafe.ca', 'Email': 'a@b.ca' })).toBeNull();
+    expect(mapSubmission({ 'Website': 'https://cafe.ca' }).website).toBe('https://cafe.ca');
+  });
+
+  test.each([
+    ['Existing', 'Technical Support', 'existing_customer'],
+    ['Existing', 'Account & Billing', 'existing_customer'],
+    ['Existing', 'Customer Service', 'existing_customer'],
+    ['Existant', 'Soutien', 'existing_customer'],
+    ['Existing', undefined, 'existing_customer'],
+    ['Existing', 'Sales', null],
+    ['Existant', 'Ventes', null],
+    ['New', 'Technical Support', null],
+    ['Nouveau', undefined, null],
+  ])('Get in Touch : %s / %s → %s', (type, dept, reason) => {
+    const data = { 'Customer Type': type, 'First Name': 'Luc', 'Email': 'luc@x.ca', 'Company': 'X', 'Message': 'Allo' };
+    if (dept) data.Department = dept;
+    const r = screenSubmission(data);
+    expect(r ? r.reason : null).toBe(reason);
+  });
+
+  test('Get in Touch gardé : type et service vont au message', () => {
+    const out = mapSubmission({ 'Customer Type': 'Existing', 'Department': 'Sales', 'Company': 'X', 'Message': 'Une 2e succursale' });
+    expect(out.businessName).toBe('X');
+    expect(out.notes).toContain('Customer Type : Existing');
+    expect(out.notes).toContain('Department : Sales');
+  });
+
+  test('Kaizen Early Access : noms proposés', () => {
+    const out = mapSubmission({ 'First Name': 'Ana', 'Last Name': 'Diaz', 'Email': 'ana@x.ca', 'Phone': '438-555-0101', 'Company': 'Tacos Ana', 'language': 'en' });
+    expect(out).toMatchObject({ contactFirstName: 'Ana', contactLastName: 'Diaz', contactPhone: '438-555-0101', businessName: 'Tacos Ana', language: 'en' });
+  });
 });

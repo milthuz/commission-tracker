@@ -75,6 +75,32 @@ function guessTarget(fieldName) {
   return null;
 }
 
+// ── Règles de tri (2026-09-29, demandées par David après l'audit des formulaires du site) ──
+// 1. Champ piège anti-robot : un champ caché que seul un robot remplit. Noms EXACTS (insensibles à
+//    la casse) pour ne jamais confondre avec un vrai champ « Website » : `website_url` est le nom
+//    retenu par l'équipe Webflow.
+const HONEYPOT_FIELDS = new Set(['website_url', 'hp', 'hp_field', 'honeypot', '_gotcha']);
+const isHoneypot = (field) => HONEYPOT_FIELDS.has(String(field || '').trim().toLowerCase());
+// 2. Client EXISTANT qui écrit au soutien ou à la facturation (« Get in Touch ») : ce n'est pas une
+//    piste de vente. S'il demande les VENTES (ajout de produit, nouvelle succursale), il reste une piste.
+const CUSTOMER_TYPE_FIELD = /(customertype|clienttype|typedeclient|neworexisting|nouveauouexistant)/;
+const DEPARTMENT_FIELD = /(department|departement|connectmewith|dirigervers|diriger)/;
+const EXISTING_VALUE = /(existing|existant|current|actuel)/i;
+const SALES_VALUE = /(sales|vente)/i;
+
+// Rend { reason, detail } si la soumission ne doit PAS devenir une piste, sinon null.
+function screenSubmission(data) {
+  const entries = Object.entries(data || {}).map(([k, v]) => [k, Array.isArray(v) ? v.join(', ') : v == null ? '' : String(v).trim()]);
+  const trap = entries.find(([k, v]) => isHoneypot(k) && v);
+  if (trap) return { reason: 'honeypot', detail: trap[0] };
+  const type = entries.find(([k]) => CUSTOMER_TYPE_FIELD.test(norm(k)));
+  if (type && EXISTING_VALUE.test(type[1])) {
+    const dept = entries.find(([k]) => DEPARTMENT_FIELD.test(norm(k)));
+    if (!(dept && SALES_VALUE.test(dept[1]))) return { reason: 'existing_customer', detail: dept?.[1] || null };
+  }
+  return null;
+}
+
 // Transforme `data` (clés = noms de champs Webflow) en objet compris par normalizeLeadInput.
 // fieldMap : { "<nom exact du champ>": "<cible>" | "ignore" | "notes" } — prime sur l'heuristique.
 function mapSubmission(data, fieldMap = {}) {
@@ -82,7 +108,7 @@ function mapSubmission(data, fieldMap = {}) {
   const extras = [];
   for (const [field, raw] of Object.entries(data || {})) {
     const value = Array.isArray(raw) ? raw.join(', ') : raw == null ? '' : String(raw).trim();
-    if (!value) continue;
+    if (!value || isHoneypot(field)) continue;
     const explicit = fieldMap[field];
     const target = explicit || guessTarget(field);
     if (target === 'ignore') continue;
@@ -198,6 +224,17 @@ function registerWebflowLeadRoutes(app, deps) {
       if (submissionId) {
         const dup = (await pool.query(`SELECT ref_code FROM leads WHERE external_ref = $1`, [submissionId])).rows[0];
         if (dup) return res.json({ ok: true, duplicate: true, ref: dup.ref_code });
+      }
+
+      // Tri : robot (champ piège rempli) ou client existant qui écrit au soutien. 200 pour que
+      // Webflow ne réessaie pas ; une trace dans le journal pour qu'on puisse vérifier.
+      const screened = screenSubmission(p.data);
+      if (screened) {
+        const who = [p.data?.Email, p.data?.Company].filter(Boolean).join(' · ').slice(0, 160);
+        logActivity('lead', 0, `webflow_${screened.reason}`, screened.reason === 'honeypot'
+          ? `Soumission Webflow « ${formName} » ignorée : champ piège « ${screened.detail} » rempli (robot)`
+          : `Soumission Webflow « ${formName} » non transformée en piste : client existant${screened.detail ? ` (${screened.detail})` : ''}${who ? ` — ${who}` : ''}`, 'webflow');
+        return res.json({ ok: true, ignored: screened.reason });
       }
 
       const mapped = mapSubmission(p.data, cfg.fieldMap || {});
@@ -327,4 +364,4 @@ function registerWebflowLeadRoutes(app, deps) {
   });
 }
 
-module.exports = { registerWebflowLeadRoutes, mapSubmission, guessTarget, verifySignature, TARGETS };
+module.exports = { registerWebflowLeadRoutes, mapSubmission, screenSubmission, guessTarget, verifySignature, TARGETS };
