@@ -241,6 +241,11 @@ const PERMISSION_CATALOG = [
   { key: 'hr:manage',                  label: 'HR — create hiring files, generate contracts and send them for signature', category: 'HR' },
   // Signer AU NOM de Cluster engage l'entreprise : clé distincte de la préparation du dossier.
   { key: 'hr:countersign',             label: 'HR — countersign contracts on behalf of Cluster', category: 'HR' },
+  // Crédits de compensation marchand (pénalité de résiliation du processeur précédent) : le rep
+  // prépare et envoie, le client signe en ligne, l'approbateur crée la note de crédit Zoho Books.
+  { key: 'credits:send',               label: 'Merchant credits: create, upload proof and send compensation-credit agreements for signature (own files)', category: 'Merchant Credits' },
+  { key: 'credits:view_all',           label: 'Merchant credits: see every compensation-credit file, all reps', category: 'Merchant Credits' },
+  { key: 'credits:approve',            label: 'Merchant credits: approve a signed agreement — creates the credit note in Zoho Books', category: 'Merchant Credits' },
   { key: 'revmodel:settings',          label: 'Edit the Revenue Modeler SaaS tiers (the three default prices, applied to everyone)', category: 'Revenue Modeler' },
 ];
 
@@ -3749,6 +3754,7 @@ const DEMO_NAME_KEYS = new Set([
   'billing_customer_name', 'merchant', 'client', 'customer',
   'merchantname', 'accountname', 'dealname', 'companyname', 'clientname',
   'linked_customer_name', 'linkedcustomername',
+  'legalname', 'legal_name', // crédits de compensation marchand
 ]);
 // SH-20 — identites de CONTACT (une personne physique, pas un commerce) portees par les pistes
 // entrantes. Elles ne peuvent pas passer par DEMO_NAME_KEYS : remplacer un courriel par
@@ -3846,6 +3852,14 @@ require('./services/hr/routes').registerHrRoutes(app, {
   authenticateToken, requirePerm, hasPerm, pool, logActivity,
   sendMail: (...a) => sendMail(...a), mailShell: (...a) => mailShell(...a), rateLimited: (...a) => rateLimited(...a),
   engine: () => ({ monthlyQuota: MONTHLY_QUOTA, monthlyTiers: MONTHLY_BONUS_TIERS, annualTiers: ANNUAL_BONUS_TIERS }),
+});
+
+// Crédits de compensation marchand — formulaire signé en ligne, note de crédit Zoho Books.
+// Tout vit sous services/credits/.
+require('./services/credits/routes').registerCreditRoutes(app, {
+  authenticateToken, requirePerm, hasPerm, pool, logActivity,
+  sendMail: (...a) => sendMail(...a), mailShell: (...a) => mailShell(...a), rateLimited: (...a) => rateLimited(...a),
+  getAdminBooksAuth: (...a) => getAdminBooksAuth(...a),
 });
 
 // Modélisateur de revenus (P&L 3 ans d'un marchand) — tout vit sous services/revenueModel/.
@@ -10689,6 +10703,7 @@ THE APP'S SECTIONS (left sidebar):
 - Services & Pricing Guide: Cluster's pricing reference (SaaS, Integrations & Add-ons, Rental, Menu Build, Installation, Support, Online Ordering, Shipping, On-Site/XPERIO) with a monthly/yearly toggle and a built-in quote builder that totals recurring vs one-time costs. "Integrations & Add-ons" holds the recurring monthly add-ons: the non-Cluster payment-processing integration ($45/mo, +$15 per extra terminal), Cluster KDS ($39/mo), the Aligner kitchen-display integrations ($69 suite / $39 extra screen / $169 unlimited 3+ units) and the third-party integrations (7Shifts, Androbar, Datacandy, Deliverect, Freebees, GGGolf, LIBRO, Mews, Octogone, Piecemeal, PIVOT, Planifico, PUSH, QuickBooks, RapidStock (formerly Rapid Bar), RESTOCK, Sage, UEAT, Wisk) — $19/month each except Freebees, PIVOT and RESTOCK (free) and GGGolf ($59).
 - Proposals: build and send a branded sales proposal (cover + company deck + optional Zoho Books estimate) to a client, with open/click tracking.
 - Revenue Modeler (Modélisateur de revenus): an INTERNAL what-if tool that models Cluster's 5-year P&L for onboarding a merchant chain. The rep enters locations, terminals per location, annual credit and Interac volume, SaaS price, payment pricing, network costs (credit and Interac, in % of volume and per transaction), per-location processing fees (Account on file, PCI Fee, Bank transfer — each with a monthly revenue and cost), terminal economics, hardware purchase/selling prices, installation cost/selling price and commission rates; the P&L table updates live. Year 1 carries the one-time items (terminal purchase, hardware, installation, all commissions); years 2 to 5 are recurring only (same amount each year). No commission is paid on terminals; the per-location payment commission sits under "Other commissions". It warns when installation loses money after its commission and when the Interac margin is under $10k/year, compares the three SaaS tiers side by side, exports CSV, prints, and saves named scenarios that the whole team can see (only the author can overwrite or delete them). Users with revmodel:settings can change the three SaaS tiers and save the current values as everyone's defaults. It shows Cluster's own costs, so it is internal only — never present its figures to a merchant as a quote. It is a model: nothing in it is billed or paid, and its commission lines are the model's assumptions, not the rep's actual commission.
+- Merchant Credits (Crédits marchand): compensation credits that cover the early-termination penalty a merchant pays their previous payment processor to switch to Cluster. The rep picks the merchant's Zoho Books account, enters the credit amount, uploads the proof (the penalty invoice and proof of payment), and sends the agreement (FR or EN). The merchant signs it online through a personal link valid 14 days. An approver then approves the signed file, which creates the credit note in Zoho Books. If the merchant leaves before the 36-month commitment, Cluster can reclaim the credit (the end date is shown on each file). Never promise a credit amount yourself: only an approved file creates a credit.
 - Partners: the referral-partner program (Moneris and others). Partner staff submit merchant leads through their own portal; a Cluster partner manager reviews each one in the Opportunity Queue, and approving it creates a real Lead in Zoho CRM assigned to a chosen Cluster rep. Sub-tabs: Opportunity Queue (review/approve/reject), Manage Partners, Users, Payouts, Data import, and Statistics. Statistics has two halves — the deal PIPELINE (volume submitted, what is still open, won vs lost, win rate over decided records, and per-partner conversion) and portal USAGE (invitations, activations, logins, dormant accounts). A partner payout is triggered by the deposit date on the Zoho deal, not by a paid invoice.
 - Support (Soutien technique): high-level reports on Zoho Desk tickets — a local copy of ~126k tickets since 2022, refreshed hourly. Sub-tabs: Overview (monthly volume, resolution-time distribution, channels), Issues (Ticket Type, sub-categories, recurring words in subjects), Team (departments and agents), Merchants (who opens the most tickets), and Revenue & churn (tickets crossed with invoiced revenue, plus a churned-vs-active comparison). Two things to know when answering: the measured delay is creation-to-closure, because Zoho only exposes FIRST-RESPONSE time one ticket at a time; and the "Integration Emails" department is absent, because Zoho refuses to serve it to the reader account — it is automated lead email, not support.
   What the numbers actually say about churn, so you do not overclaim: ticket VOLUME barely separates merchants who left from those who stayed (8.2 vs 6.6 on average over 12 months). What does separate them is tickets that DRAGGED past 72 hours — 1.86 per merchant who left for a competitor and 2.17 for those who stopped using the system, against 0.84 for active merchants. And 61% of cancellations are a business closure or a change of owner, which support cannot influence at all. Point people at slow tickets, not at ticket counts.
