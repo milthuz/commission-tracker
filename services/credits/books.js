@@ -3,7 +3,7 @@
 //
 // Trois appels, tous avec le jeton ADMIN (getAdminBooksAuth, comme Propositions) et
 // l'organisation ZOHO_ORG_ID :
-//   searchCustomers(q)  — recherche de comptes clients par nom (GET /contacts, search_text) ;
+//   searchCustomers(q)  — recherche de comptes clients par NOM (GET /contacts, *_name_contains) ;
 //   getCustomer(id)     — fiche d'un compte : personne-ressource principale, courriel, téléphone ;
 //   createCreditNote(…) — la note de crédit, à l'approbation.
 //
@@ -31,21 +31,45 @@ function books(getAdminBooksAuth) {
     return r;
   }
 
+  // Recherche par NOM seulement. `search_text` de Zoho fouille aussi les téléphones, adresses et
+  // notes : « barbies » ramenait des dizaines de fiches sans rapport (des contacts nommés par leur
+  // numéro de téléphone, entre autres). On interroge donc le nom du contact ET le nom de
+  // l'entreprise (`*_contains`), on fusionne, puis on classe : nom qui COMMENCE par la recherche
+  // d'abord, fiches actives avant les inactives, « (DO NOT USE) » en dernier.
   async function searchCustomers(q) {
-    const r = await call('get', '/contacts', {
-      params: { contact_type: 'customer', search_text: q, per_page: 25, sort_column: 'contact_name' },
-    });
-    if (r.status !== 200 || !r.data || r.data.code !== 0) {
-      const e = new Error((r.data && r.data.message) || `books_${r.status}`); e.status = r.status; throw e;
-    }
-    return (r.data.contacts || []).map((c) => ({
-      id: String(c.contact_id),
-      name: c.contact_name || c.company_name || '',
-      company: c.company_name || '',
-      email: c.email || '',
-      phone: c.phone || c.mobile || '',
-      status: c.status || '',
-    }));
+    const needle = String(q || '').trim();
+    const one = async (field) => {
+      const r = await call('get', '/contacts', {
+        params: { contact_type: 'customer', [field]: needle, per_page: 50, sort_column: 'contact_name' },
+      });
+      if (r.status !== 200 || !r.data || r.data.code !== 0) {
+        const e = new Error((r.data && r.data.message) || `books_${r.status}`); e.status = r.status; throw e;
+      }
+      return r.data.contacts || [];
+    };
+    const [byContact, byCompany] = await Promise.all([one('contact_name_contains'), one('company_name_contains')]);
+    const seen = new Map();
+    for (const c of [...byContact, ...byCompany]) if (!seen.has(String(c.contact_id))) seen.set(String(c.contact_id), c);
+    const fold = (x) => String(x || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+    const n = fold(needle);
+    const rank = (c) => {
+      const names = [c.contact_name, c.company_name].map(fold);
+      let r = names.some((x) => x.startsWith(n)) ? 0 : names.some((x) => x.split(/[^a-z0-9]+/).some((w) => w.startsWith(n))) ? 1 : 2;
+      if (c.status && c.status !== 'active') r += 3;
+      if (/do not use|ne pas utiliser/.test(names.join(' '))) r += 6;
+      return r;
+    };
+    return [...seen.values()]
+      .sort((a, b) => rank(a) - rank(b) || fold(a.contact_name).localeCompare(fold(b.contact_name)))
+      .slice(0, 25)
+      .map((c) => ({
+        id: String(c.contact_id),
+        name: c.contact_name || c.company_name || '',
+        company: c.company_name && c.company_name !== c.contact_name ? c.company_name : '',
+        email: c.email || '',
+        phone: c.phone || c.mobile || '',
+        status: c.status || '',
+      }));
   }
 
   async function getCustomer(id) {

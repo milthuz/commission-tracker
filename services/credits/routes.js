@@ -36,6 +36,7 @@ const MAX_AMOUNT = 1_000_000;
 const MAX_DOC = 10 * 1024 * 1024;
 const DOC_TYPES = new Set(['application/pdf', 'image/png', 'image/jpeg', 'image/webp']);
 const MAX_SIG_BYTES = 400 * 1024;
+const MAX_CLIENT_DOCS = 8; // pièces que le client peut joindre lui-même depuis la page de signature
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Une colonne BYTEA revient en Buffer avec node-postgres, mais en Uint8Array avec d'autres pilotes :
@@ -45,6 +46,15 @@ const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 const clean = (v, max = 200) => String(v == null ? '' : v).replace(/[\r\n\t]+/g, ' ').trim().slice(0, max);
 const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Type RÉEL d'un fichier, lu dans ses premiers octets : le type annoncé par le navigateur se falsifie.
+function sniffType(buf) {
+  if (!buf || buf.length < 12) return null;
+  if (buf.slice(0, 5).toString('latin1') === '%PDF-') return 'application/pdf';
+  if (buf.slice(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return 'image/png';
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  if (buf.slice(0, 4).toString('latin1') === 'RIFF' && buf.slice(8, 12).toString('latin1') === 'WEBP') return 'image/webp';
+  return null;
+}
 
 function clientIp(req) {
   const xff = String(req.headers['x-forwarded-for'] || '');
@@ -405,7 +415,6 @@ function registerCreditRoutes(app, deps) {
     const missing = [];
     if (!row.zentact_merchant_id) missing.push('merchant');
     if (!row.legal_name) missing.push('legalName');
-    if (!row.contact_person) missing.push('contactPerson');
     if (!EMAIL_RE.test(row.email)) missing.push('email');
     if (!(Number(row.amount) > 0)) missing.push('amount');
     if (missing.length) return res.status(400).json({ error: 'incomplete', missing });
@@ -424,8 +433,8 @@ function registerCreditRoutes(app, deps) {
       const amount = `${pdf.formatAmount(row.amount, row.lang)} $ CAD`;
       const title = fr ? 'Votre crédit de compensation Cluster' : 'Your Cluster Compensation Credit';
       const intro = fr
-        ? `Bonjour ${esc(row.contact_person)},<br><br>${esc(row.rep_name || 'Votre représentant Cluster')} vous offre un crédit de compensation de <b>${esc(amount)}</b> pour ${esc(row.legal_name)}, afin de couvrir la pénalité de résiliation de votre processeur de paiement actuel.<br><br>Veuillez lire l'entente et la signer en ligne. Le lien est personnel et valable ${TOKEN_DAYS} jours.`
-        : `Hello ${esc(row.contact_person)},<br><br>${esc(row.rep_name || 'Your Cluster representative')} is offering a compensation credit of <b>${esc(amount)}</b> to ${esc(row.legal_name)}, to cover the termination penalty from your current payment processor.<br><br>Please review the agreement and sign it online. This link is personal and valid for ${TOKEN_DAYS} days.`;
+        ? `Bonjour${row.contact_person ? ` ${esc(row.contact_person)}` : ''},<br><br>${esc(row.rep_name || 'Votre représentant Cluster')} vous offre un crédit de compensation de <b>${esc(amount)}</b> pour ${esc(row.legal_name)}, afin de couvrir la pénalité de résiliation de votre processeur de paiement actuel.<br><br>Veuillez compléter l'entente et la signer en ligne ; vous pouvez aussi y joindre les pièces justificatives. Le lien est personnel et valable ${TOKEN_DAYS} jours.`
+        : `Hello${row.contact_person ? ` ${esc(row.contact_person)}` : ''},<br><br>${esc(row.rep_name || 'Your Cluster representative')} is offering a compensation credit of <b>${esc(amount)}</b> to ${esc(row.legal_name)}, to cover the termination penalty from your current payment processor.<br><br>Please complete the agreement and sign it online; you can also attach the supporting documents there. This link is personal and valid for ${TOKEN_DAYS} days.`;
       const html = mailShell(title, intro, fr ? 'Lire et signer' : 'Review and sign', link, row.lang, 'cluster');
       const r = await sendMail(row.email, title, html, senderOpts(row));
       if (!r || !r.sent) {
@@ -598,9 +607,28 @@ function registerCreditRoutes(app, deps) {
 
   const publicInfo = (row) => ({
     ref: row.ref, lang: row.lang, status: ['signed', 'approved', 'rejected'].includes(row.status) ? 'signed' : row.status,
-    legalName: row.legal_name, contactPerson: row.contact_person, amount: Number(row.amount),
-    repName: row.rep_name, signedAt: row.signed_at, commitmentMonths: COMMITMENT_MONTHS,
+    legalName: row.legal_name, contactPerson: row.contact_person, phone: row.phone, email: row.email,
+    amount: Number(row.amount), repName: row.rep_name, signedAt: row.signed_at, commitmentMonths: COMMITMENT_MONTHS,
   });
+
+  // Ce que le CLIENT remplit sur la page : les infos du marchand. Le montant reste celui que Cluster
+  // offre (le rep le fixe) ; le client ne le modifie pas.
+  function clientFields(b) {
+    const f = {
+      legal_name: clean(b.legalName), contact_person: clean(b.contactPerson), phone: clean(b.phone, 40),
+      email: clean(b.email, 160).toLowerCase(),
+    };
+    const missing = [];
+    if (f.legal_name.length < 2) missing.push('legalName');
+    if (f.contact_person.length < 2) missing.push('contactPerson');
+    if (f.phone.replace(/\D/g, '').length < 7) missing.push('phone');
+    if (!EMAIL_RE.test(f.email)) missing.push('email');
+    return { f, missing };
+  }
+
+  const publicDocs = async (row) => (await pool.query(
+    `SELECT id, filename, size, uploaded_at FROM merchant_credit_docs WHERE credit_id = $1 AND uploaded_by = 'client' ORDER BY uploaded_at`, [row.id])).rows
+    .map((d) => ({ id: d.id, filename: d.filename, size: d.size }));
 
   app.get('/api/public/credit-sign/:token', async (req, res) => {
     const row = await byToken(req, res); if (!row) return;
@@ -609,7 +637,51 @@ function registerCreditRoutes(app, deps) {
       await log(row, 'viewed', 'ouvert par le client', 'client');
       row.status = 'viewed';
     }
-    res.json(publicInfo(row));
+    res.json({ ...publicInfo(row), docs: await publicDocs(row) });
+  });
+
+  // Aperçu : le formulaire rempli avec ce que le client vient de saisir, avant qu'il signe.
+  app.post('/api/public/credit-sign/:token/preview', async (req, res) => {
+    const row = await byToken(req, res); if (!row) return;
+    if (!['sent', 'viewed'].includes(row.status)) return res.status(409).json({ error: 'not_signable' });
+    const { f } = clientFields(req.body || {});
+    try {
+      const buf = await pdf.renderUnsigned({ ...row, ...f });
+      res.set('Content-Type', 'application/pdf').set('Content-Disposition', `inline; filename="${row.ref}.pdf"`).send(buf);
+    } catch (e) { console.error('credits preview:', e.message); res.status(500).json({ error: 'pdf_failed' }); }
+  });
+
+  // Pièces justificatives jointes par le CLIENT (clause 4). Mêmes règles que pour le rep, plus :
+  // type vérifié dans les octets, nombre plafonné, retrait possible de SES pièces seulement.
+  app.post('/api/public/credit-sign/:token/docs', (req, res, next) => upload.single('file')(req, res, (err) => {
+    if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'file_too_large' : 'upload_failed' });
+    next();
+  }), async (req, res) => {
+    const row = await byToken(req, res); if (!row) return;
+    if (!['sent', 'viewed'].includes(row.status)) return res.status(409).json({ error: 'not_signable' });
+    const f = req.file;
+    if (!f || !f.buffer || !f.buffer.length) return res.status(400).json({ error: 'no_file' });
+    const mime = sniffType(f.buffer);
+    if (!mime) return res.status(400).json({ error: 'bad_type' });
+    const n = (await pool.query(`SELECT COUNT(*)::int AS n FROM merchant_credit_docs WHERE credit_id = $1 AND uploaded_by = 'client'`, [row.id])).rows[0].n;
+    if (n >= MAX_CLIENT_DOCS) return res.status(400).json({ error: 'too_many' });
+    const filename = clean(f.originalname, 180).replace(/[\\/]/g, '_') || 'document';
+    await pool.query(
+      `INSERT INTO merchant_credit_docs (credit_id, filename, mime, size, sha256, data, uploaded_by) VALUES ($1,$2,$3,$4,$5,$6,'client')`,
+      [row.id, filename, mime, f.buffer.length, sha256(f.buffer), f.buffer]);
+    await pool.query('UPDATE merchant_credits SET updated_at = NOW() WHERE id = $1', [row.id]);
+    await log(row, 'doc_uploaded', `pièce ajoutée par le client : ${filename}`, 'client');
+    res.json({ docs: await publicDocs(row) });
+  });
+
+  app.delete('/api/public/credit-sign/:token/docs/:docId', async (req, res) => {
+    const row = await byToken(req, res); if (!row) return;
+    if (!['sent', 'viewed'].includes(row.status)) return res.status(409).json({ error: 'not_signable' });
+    const r = await pool.query(`DELETE FROM merchant_credit_docs WHERE id = $1 AND credit_id = $2 AND uploaded_by = 'client' RETURNING filename`,
+      [Number(req.params.docId) || 0, row.id]);
+    if (!r.rows[0]) return res.status(404).json({ error: 'not_found' });
+    await log(row, 'doc_deleted', `pièce retirée par le client : ${r.rows[0].filename}`, 'client');
+    res.json({ docs: await publicDocs(row) });
   });
 
   app.get('/api/public/credit-sign/:token/pdf', async (req, res) => {
@@ -620,7 +692,7 @@ function registerCreditRoutes(app, deps) {
   });
 
   app.post('/api/public/credit-sign/:token/sign', async (req, res) => {
-    const row = await byToken(req, res); if (!row) return;
+    let row = await byToken(req, res); if (!row) return;
     if (!['sent', 'viewed'].includes(row.status)) return res.status(409).json({ error: 'not_signable' });
     const b = req.body || {};
     const name = clean(b.printName, 120);
@@ -629,18 +701,32 @@ function registerCreditRoutes(app, deps) {
     if (!title) return res.status(400).json({ error: 'title_required' });
     if (b.consent !== true) return res.status(400).json({ error: 'consent_required' });
     if (!validSignature(b.signature)) return res.status(400).json({ error: 'signature_invalid' });
+    const { f, missing } = clientFields(b);
+    if (missing.length) return res.status(400).json({ error: 'incomplete', missing });
     const { ip, chain } = clientIp(req);
     const sig = { name, title, image: b.signature, at: new Date().toISOString(), ip, ipChain: chain, ua: clean(req.headers['user-agent'], 300), consent: true };
     try {
-      const signed = await pdf.renderSigned(row, sig, row.unsigned_sha);
+      // Le document que le client a CONFIRMÉ = le formulaire rempli avec SES valeurs ; c'est lui qu'on
+      // fige et dont l'empreinte figure au certificat.
+      const merged = { ...row, ...f };
+      const confirmed = await pdf.renderUnsigned(merged);
+      const confirmedSha = sha256(confirmed);
+      const signed = await pdf.renderSigned(merged, sig, confirmedSha);
       // Verrou : deux envois simultanés du formulaire ne signent pas deux fois.
       const upd = await pool.query(
         `UPDATE merchant_credits SET status='signed', signed_at=NOW(), signature=$2::jsonb, signed_pdf=$3, signed_sha=$4,
+                unsigned_pdf=$5, unsigned_sha=$6, legal_name=$7, contact_person=$8, phone=$9, email=$10,
                 commitment_end = (NOW() + INTERVAL '${COMMITMENT_MONTHS} months')::date, updated_at=NOW()
           WHERE id=$1 AND status IN ('sent','viewed') RETURNING *`,
-        [row.id, JSON.stringify(sig), signed, sha256(signed)]);
+        [row.id, JSON.stringify(sig), signed, sha256(signed), confirmed, confirmedSha, f.legal_name, f.contact_person, f.phone, f.email]);
       if (!upd.rows[0]) return res.status(409).json({ error: 'not_signable' });
+      // Ce que le client a changé par rapport à ce que le rep avait prérempli : tracé.
+      const LBL = { legal_name: 'nom légal', contact_person: 'personne-ressource', phone: 'téléphone', email: 'courriel' };
+      const changed = Object.keys(LBL).filter((k) => String(row[k] || '') !== f[k]).map((k) => `${LBL[k]} : « ${row[k] || '—'} » → « ${f[k]} »`);
+      if (changed.length) await log(row, 'client_edited', `infos complétées par le client — ${changed.join(' ; ')}`, 'client');
       await log(row, 'signed', `signé par ${name} (${title})`, 'client', { amount: Number(row.amount) });
+      const origEmail = String(row.email || '').toLowerCase();
+      row = upd.rows[0];
 
       const fr = row.lang !== 'en';
       const attach = [{ filename: `${row.ref}.pdf`, content: signed, contentType: 'application/pdf' }];
@@ -649,7 +735,8 @@ function registerCreditRoutes(app, deps) {
       const ci = fr
         ? `Merci ${esc(name)}. Vous trouverez ci-joint votre entente de crédit de compensation signée (${esc(row.ref)}). Le crédit sera appliqué à votre compte Cluster après vérification des documents.`
         : `Thank you ${esc(name)}. Attached is your signed Compensation Credit agreement (${esc(row.ref)}). The credit will be applied to your Cluster account once the documents are verified.`;
-      await sendMail(row.email, ct, mailShell(ct, ci, null, null, row.lang, 'cluster'), { ...senderOpts(row), attachments: attach }).catch(() => {});
+      const copyTo = [...new Set([row.email, origEmail])].filter((e) => EMAIL_RE.test(e));
+      await sendMail(copyTo.join(','), ct, mailShell(ct, ci, null, null, row.lang, 'cluster'), { ...senderOpts(row), attachments: attach }).catch(() => {});
       // Avis interne : le rep + les approbateurs.
       const internal = [...new Set([String(row.rep_email).toLowerCase(), ...(await approverEmails())])].filter((e) => EMAIL_RE.test(e));
       if (internal.length) {

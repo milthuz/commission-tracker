@@ -142,18 +142,36 @@ function crc32(buf) { let c, crc = 0xffffffff; for (let n = 0; n < buf.length; n
   ok((await api('GET', '/api/public/credit-sign/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')).status === 404, 'jeton inconnu');
   const info = (await api('GET', `/api/public/credit-sign/${token}`)).body;
   ok(info.status === 'viewed' && info.amount === 2450.5 && info.legalName.includes('Étoile'), 'le client ouvre : consulté');
-  ok(!('email' in info) && !('repEmail' in info), 'la page publique ne divulgue pas les courriels');
+  ok(info.email === 'owner@resto.ca' && info.phone === '514' && !('repEmail' in info), 'préremplissage : le courriel du destinataire seulement, jamais celui du rep');
   const pubPdf = await api('GET', `/api/public/credit-sign/${token}/pdf`);
   ok(crypto.createHash('sha256').update(pubPdf.body).digest('hex') === stored.unsigned_sha, 'le client lit EXACTEMENT le document haché à l’envoi');
   ok((await api('POST', `/api/public/credit-sign/${token}/sign`, null, { printName: 'Marie', title: 'Propriétaire', consent: true, signature: 'data:image/png;base64,AAAA' })).status === 400, 'signature vide refusée');
   ok((await api('POST', `/api/public/credit-sign/${token}/sign`, null, { printName: 'Marie', title: 'Propriétaire', consent: false, signature: fakeSignaturePng() })).status === 400, 'consentement obligatoire');
-  const signed = await api('POST', `/api/public/credit-sign/${token}/sign`, null, { printName: 'Marie-Ève Tremblay', title: 'Propriétaire', consent: true, signature: fakeSignaturePng() });
+  // Le client remplit lui-même les infos du marchand
+  const inc0 = await api('POST', `/api/public/credit-sign/${token}/sign`, null, { printName: 'Marie', title: 'Propriétaire', consent: true, signature: fakeSignaturePng(), legalName: 'Restaurants l’Étoile inc.', contactPerson: '', phone: '12', email: 'owner@resto.ca' });
+  ok(inc0.status === 400 && inc0.body.missing.includes('contactPerson') && inc0.body.missing.includes('phone'), 'infos du marchand incomplètes : refusé, champs nommés');
+  const prev = await api('POST', `/api/public/credit-sign/${token}/preview`, null, { legalName: 'Restaurants l’Étoile inc.', contactPerson: 'Marie-Ève Tremblay', phone: '514 555-0199', email: 'marie@resto.ca' });
+  ok(prev.ct.includes('pdf') && prev.body.slice(0, 5).toString() === '%PDF-', 'aperçu PDF avec les valeurs saisies');
+  // pièces du client : type vérifié dans les octets
+  const up = async (name, buf, type) => { const fd = new FormData(); fd.append('file', new Blob([buf], { type }), name); const r = await fetch(`${base}/api/public/credit-sign/${token}/docs`, { method: 'POST', body: fd }); return { status: r.status, body: await r.json() }; };
+  ok((await up('faux.pdf', Buffer.from('<html>pas un pdf</html>'), 'application/pdf')).body.error === 'bad_type', 'client : faux PDF refusé (octets vérifiés)');
+  const upOk = await up('facture-penalite.pdf', Buffer.from('%PDF-1.4 fake pdf body for the test'), 'application/pdf');
+  ok(upOk.status === 200 && upOk.body.docs.length === 1, 'client : pièce jointe');
+  const up2 = await up('recu.pdf', Buffer.from('%PDF-1.4 second document here...'), 'application/pdf');
+  ok((await api('DELETE', `/api/public/credit-sign/${token}/docs/${up2.body.docs[1].id}`)).body.docs.length === 1, 'client : retire sa pièce');
+  ok((await api('GET', `/api/public/credit-sign/${token}`)).body.docs[0].filename === 'facture-penalite.pdf', 'la page revoit ses pièces');
+  const signed = await api('POST', `/api/public/credit-sign/${token}/sign`, null, { printName: 'Marie-Ève Tremblay', title: 'Propriétaire', consent: true, signature: fakeSignaturePng(), legalName: 'Restaurants l’Étoile inc.', contactPerson: 'Marie-Ève Tremblay', phone: '514 555-0199', email: 'marie@resto.ca' });
   ok(signed.status === 200 && signed.body.status === 'signed', 'signé');
+  const after = (await pool.query('SELECT contact_person, phone, email, unsigned_sha, unsigned_pdf FROM merchant_credits WHERE id=$1', [c.id])).rows[0];
+  ok(after.contact_person === 'Marie-Ève Tremblay' && after.phone === '514 555-0199' && after.email === 'marie@resto.ca', 'les valeurs du client sont enregistrées');
+  ok(after.unsigned_sha !== stored.unsigned_sha && crypto.createHash('sha256').update(Buffer.from(after.unsigned_pdf)).digest('hex') === after.unsigned_sha, 'document confirmé par le client figé et haché');
+  ok((await pool.query(`SELECT 1 FROM activity_log WHERE entity_id=$1 AND event_type='client_edited' AND description LIKE '%téléphone%'`, [c.id])).rows.length === 1, 'les changements du client sont tracés');
+  ok((await api('GET', `/api/credits/${c.id}`, 'rep@x.com')).body.docs.some((d) => d.filename === 'facture-penalite.pdf' && d.uploadedBy === 'client'), 'le rep voit la pièce du client');
   ok((await api('POST', `/api/public/credit-sign/${token}/sign`, null, { printName: 'X Y', title: 'Z', consent: true, signature: fakeSignaturePng() })).status === 409, 'on ne signe pas deux fois');
   const row = (await pool.query('SELECT commitment_end, signed_at, signed_pdf FROM merchant_credits WHERE id=$1', [c.id])).rows[0];
   const months = (new Date(row.commitment_end).getFullYear() - new Date(row.signed_at).getFullYear()) * 12 + (new Date(row.commitment_end).getMonth() - new Date(row.signed_at).getMonth());
   ok(months === 36, 'fin d’engagement = signature + 36 mois');
-  ok(mails.some((m) => m.to === 'owner@resto.ca' && m.opts.attachments), 'copie signée envoyée au client');
+  ok(mails.some((m) => m.to.includes('marie@resto.ca') && m.to.includes('owner@resto.ca') && m.opts.attachments), 'copie signée : adresse confirmée ET adresse d’origine');
   ok(mails.some((m) => m.to.includes('david@x.com') && m.to.includes('rep@x.com')), 'avis au rep et à l’approbateur');
 
   // Approbation — Zoho refuse d'abord (permission manquante), puis accepte
@@ -178,7 +196,7 @@ function crc32(buf) { let c, crc = 0xffffffff; for (let n = 0; n < buf.length; n
   let c2 = (await api('POST', '/api/credits', 'rep@x.com', { merchantId: 'ZM-2', legalName: 'B inc.', contactPerson: 'B', email: 'b@b.ca', amount: 100 })).body.credit;
   await api('POST', `/api/credits/${c2.id}/send`, 'rep@x.com');
   const t2 = /token=([A-Za-z0-9_-]+)/.exec(mails.filter((m) => m.to === 'b@b.ca').pop().html)[1];
-  await api('POST', `/api/public/credit-sign/${t2}/sign`, null, { printName: 'B B', title: 'CEO', consent: true, signature: fakeSignaturePng() });
+  await api('POST', `/api/public/credit-sign/${t2}/sign`, null, { printName: 'B B', title: 'CEO', consent: true, signature: fakeSignaturePng(), legalName: 'B inc.', contactPerson: 'B B', phone: '514 555-0100', email: 'b@b.ca' });
   await api('POST', `/api/credits/${c2.id}/books-customer`, 'david@x.com', { customerId: '4600001' });
   ok((await api('POST', `/api/credits/${c2.id}/approve`, 'david@x.com')).body.error === 'docs_required', 'pas d’approbation sans pièce justificative');
   ok((await api('POST', `/api/credits/${c2.id}/reject`, 'david@x.com', {})).status === 400, 'refus : raison obligatoire');
@@ -187,7 +205,7 @@ function crc32(buf) { let c, crc = 0xffffffff; for (let n = 0; n < buf.length; n
   // Envoi incomplet
   const c3 = (await api('POST', '/api/credits', 'rep@x.com', { merchantId: 'ZM-1', legalName: 'C', contactPerson: '', email: 'pas-un-courriel', amount: 0 })).body.credit;
   const inc = await api('POST', `/api/credits/${c3.id}/send`, 'rep@x.com');
-  ok(inc.status === 400 && inc.body.missing.includes('email') && inc.body.missing.includes('amount') && inc.body.missing.includes('contactPerson'), 'envoi incomplet refusé, champs nommés');
+  ok(inc.status === 400 && inc.body.missing.includes('email') && inc.body.missing.includes('amount') && !inc.body.missing.includes('contactPerson'), 'envoi incomplet refusé, champs nommés (la personne-ressource est remplie par le client)');
   ok((await api('DELETE', `/api/credits/${c3.id}`, 'rep@x.com')).status === 200, 'brouillon supprimable');
   ok((await api('DELETE', `/api/credits/${c.id}`, 'rep@x.com')).status === 409, 'un dossier envoyé ne se supprime pas');
 
