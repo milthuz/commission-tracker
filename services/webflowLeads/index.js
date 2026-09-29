@@ -86,6 +86,14 @@ function mapSubmission(data, fieldMap = {}) {
     const explicit = fieldMap[field];
     const target = explicit || guessTarget(field);
     if (target === 'ignore') continue;
+    // Case à cocher Webflow : cochée = « true », décochée = « false ». Pour l'intérêt, la valeur
+    // utile est le NOM de la case (« Intérêt - POS » → « POS ») ; une case décochée ne dit rien.
+    if (/^(false|off|no|non)$/i.test(value) && target === 'interest') continue;
+    if (/^(true|on|yes|oui|checked)$/i.test(value) && target === 'interest') {
+      const label = field.split(/\s[-–:]\s|[:–]/).pop().trim() || field;
+      out.interest = out.interest ? `${out.interest}, ${label}` : label;
+      continue;
+    }
     if (!target || target === 'extra' || !TARGETS.includes(target)) { extras.push(`${field} : ${value}`); continue; }
     if (target === 'notes') { out.notes = out.notes ? `${out.notes}\n${value}` : value; continue; }
     // Deux champs sur la même cible (ex. deux cases « intérêt ») : on les joint plutôt que d'en perdre un.

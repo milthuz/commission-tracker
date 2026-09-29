@@ -56,6 +56,11 @@ describe('mapSubmission', () => {
   });
 });
 
+test("cases à cocher d'intérêt : le nom de la case devient la valeur, décochées ignorées", () => {
+  const out = mapSubmission({ 'Intérêt - POS': 'true', 'Intérêt - Paiements': 'true', 'Intérêt - Matériel': 'false', 'Interest: Online Ordering': 'on' });
+  expect(out.interest).toBe('POS, Paiements, Online Ordering');
+});
+
 describe('verifySignature', () => {
   const secret = 'abc123';
   const body = Buffer.from('{"triggerType":"form_submission","payload":{"id":"x"}}');
