@@ -4671,7 +4671,7 @@ function sampleEmail(type, lang) {
     const bookingUrl = `${base}/rdv?token=exemple`;
     const meetUrl = 'https://meet.google.com/abc-defg-hij';
     if (type === 'lead_assigned') return leadAssignedEmail(lead, rep, callbackAt, null, true);
-    if (type === 'lead_welcome') return leadWelcomeEmail(lead, rep, callbackAt, LEAD_SETTINGS_DEFAULTS, bookingUrl, meetUrl);
+    if (type === 'lead_welcome') return leadWelcomeEmail(lead, rep, new Date(Date.now() + 55 * 60000), LEAD_SETTINGS_DEFAULTS, bookingUrl);
     // Rendez-vous (services/leadBooking) : les memes constructeurs que les vrais envois.
     const confirm = (kind) => leadBooking.emails.clientConfirmEmail(mailChrome, {
       lang: lead.language, firstName: lead.contact_first_name, businessName: lead.business_name,
@@ -36684,7 +36684,7 @@ const LEAD_STATUSES = ['new', 'in_review', 'accepted', 'rejected', 'duplicate'];
 const LEAD_SETTINGS_DEFAULTS = {
   callbackEnabled:      true,
   callbackType:         'call',              // 'call' → module Calls, 'task' → module Tasks
-  callbackDelayHours:   2,
+  callbackDelayHours:   1,                   // « on vous appelle d'ici une heure » (2026-09-29)
   businessHours:        { start: 9, end: 17 },
   notifyRep:            true,
   notifyMerchant:       true,
@@ -37144,10 +37144,10 @@ function leadAssignedEmail(lead, rep, callbackAt, crmLeadId, canMove = false) {
   // blanc, sinon le representant ne sait pas qu'une promesse a ete faite en son nom.
   const promise = when
     ? `<br><br><div style="border-left:3px solid #f97316;padding:10px 0 10px 14px;color:#0f1722;font-size:14px">`
-      + `<strong>Le client a été prévenu que vous le contacteriez.</strong><br>`
+      + `<strong>Le client a été prévenu que vous l'appelleriez ${leadEsc(leadBooking.emails.callbackPhrase(callbackAt, 'fr') || '')}.</strong><br>`
       + `Rappel planifié dans Zoho : <strong>${leadEsc(when)}</strong>.<br>`
-      + (canMove ? `Le client peut déplacer ce moment depuis son courriel ; vous serez prévenu, et Zoho et votre Google Agenda suivront.<br>` : '')
-      + `<span style="color:#64748b">The client has been told you would reach out — callback scheduled for ${leadEsc(whenEn)}.${canMove ? " They can move it from their email; you'll be told." : ''}</span>`
+      + (canMove ? `S'il choisit une autre plage depuis son courriel, vous serez prévenu : le rappel Zoho se déplacera, et l'événement (avec Google Meet) sera créé dans votre Google Agenda.<br>` : '')
+      + `<span style="color:#64748b">The client has been told you would call ${leadEsc(leadBooking.emails.callbackPhrase(callbackAt, 'en') || '')} — callback scheduled for ${leadEsc(whenEn)}.${canMove ? " If they pick another slot from their email, you'll be told and your calendar and Zoho will follow." : ''}</span>`
       + `</div>`
     : '';
 
@@ -37268,12 +37268,15 @@ async function notifierRepOpportunite(opportuniteId) {
 // de sa signature de profil, rendez-vous au format calendrier + Google Meet, 3 prochaines étapes,
 // signature officielle Cluster du représentant.
 function leadWelcomeEmail(lead, rep, callbackAt, settings, bookingUrl = null, meetUrl = null) {
+  // `callbackAt` = le RAPPEL annoncé (« d'ici une heure »), pas un rendez-vous fixé.
   return leadBooking.emails.welcomeEmail(mailChrome, {
     lang: lead.language === 'en' ? 'en' : 'fr',
     firstName: lead.contact_first_name ? String(lead.contact_first_name).trim() : null,
     businessName: lead.business_name,
     rep: rep ? { name: rep.name, email: rep.email, role: rep.signatureRole || null, phone: rep.signaturePhone || null } : null,
-    at: callbackAt || null,
+    at: null,
+    callbackAt: callbackAt || null,
+    clientPhone: lead.contact_phone || null,
     minutes: Number(settings?.slotMinutes) || 30,
     bookingUrl, meetUrl,
     home: settings?.merchantSiteUrl || LEAD_SETTINGS_DEFAULTS.merchantSiteUrl,
@@ -37455,18 +37458,13 @@ async function acceptLead(leadId, actor, opts = {}) {
   }
   steps.crm = { ok: true, leadId: crm.leadId };
 
-  // 2. Le rappel.
+  // 2. Le rappel — MÉCANIQUE DU 2026-09-29 (décision de David) : le représentant RAPPELLE le client
+  // dans <délai configuré> (1 h par défaut, ramené dans les heures ouvrables). Le client se fait
+  // dire « d'ici une heure » ; si ce n'est pas un bon moment, il choisit une plage sur /rdv, et
+  // c'est SEULEMENT là qu'un rendez-vous Google Agenda + Meet est créé (services/leadBooking).
   let callbackAt = null;
   if (settings.callbackEnabled) {
     callbackAt = leadCallbackAt(settings);
-    // Rendez-vous : on PROPOSE le premier creneau libre du representant a partir de cette heure
-    // (Google Agenda + rendez-vous deja pris dans Sales Hub), pas une heure qui tombe sur une
-    // reunion. Le marchand pourra la changer depuis son courriel.
-    if (settings.bookingEnabled) {
-      const p = await leadBooking.proposeAt(rep, settings, callbackAt, leadId);
-      callbackAt = p.at;
-      steps.availability = { source: p.source, fallback: p.fallback, ...(p.googleError ? { googleError: p.googleError } : {}) };
-    }
     const cb = await scheduleLeadCallback(lead, rep, crm.leadId, callbackAt, settings);
     steps.callback = cb.ok
       ? { ok: true, kind: cb.kind, id: cb.id, at: callbackAt.toISOString(), linkField: cb.linkField }
@@ -37477,19 +37475,13 @@ async function acceptLead(leadId, actor, opts = {}) {
     steps.callback = { ok: false, skipped: 'disabled' };
   }
 
-  // 2b. L'evenement dans le Google Agenda du representant — le creneau est bloque pour tout le
-  // monde, et il suivra si le marchand le deplace. Aucun courriel Google (sendUpdates: none).
+  // 2b. Le lien /rdv pour choisir une autre plage. Pas d'événement Google à ce stade : un rappel
+  // « d'ici une heure » n'est pas un rendez-vous ; l'événement (et son Meet) naît quand le client
+  // choisit une plage.
   let bookingUrl = null;
-  if (settings.bookingEnabled) {
-    steps.calendar = callbackAt
-      ? await leadBooking.upsertEvent(lead, rep?.email, callbackAt, settings, crm.leadId)
-      : { ok: false, skipped: 'no_callback' };
-    if (lead.contact_email) {
-      try { bookingUrl = await leadBooking.issueLink(leadId); }
-      catch (e) { steps.bookingLink = { ok: false, error: e.message }; }
-    }
-  } else {
-    steps.calendar = { ok: false, skipped: 'disabled' };
+  if (settings.bookingEnabled && lead.contact_email) {
+    try { bookingUrl = await leadBooking.issueLink(leadId); }
+    catch (e) { steps.bookingLink = { ok: false, error: e.message }; }
   }
 
   // 3. Le representant.
@@ -37505,19 +37497,9 @@ async function acceptLead(leadId, actor, opts = {}) {
   // sinon au nom du representant sur l'adresse habituelle — et la reponse lui revient toujours :
   // elle doit atterrir chez la personne nommee dans le courriel, pas dans une boite generique.
   if (settings.notifyMerchant && lead.contact_email) {
-    const { subject, html } = leadWelcomeEmail(lead, rep, callbackAt, settings, bookingUrl, steps.calendar?.ok ? steps.calendar.meetUrl : null);
+    const { subject, html } = leadWelcomeEmail(lead, rep, callbackAt, settings, bookingUrl);
     const sender = leadBooking.senderFor(rep, settings);
-    // Le fichier d'agenda : même UID que les confirmations, qui le remplaceront si l'heure change.
-    const attachments = callbackAt ? [{
-      filename: lead.language === 'en' ? 'meeting.ics' : 'rendez-vous.ics', contentType: 'text/calendar; charset=utf-8',
-      content: Buffer.from(leadBooking.emails.ics({
-        uid: `lead-${lead.ref_code}@saleshub.clusterpos.com`, at: callbackAt, minutes: Number(settings.slotMinutes) || 30,
-        title: lead.language === 'en' ? `Meeting with ${rep?.name || 'Cluster'} — Cluster` : `Rendez-vous avec ${rep?.name || 'Cluster'} — Cluster`,
-        description: [steps.calendar?.meetUrl ? `Google Meet : ${steps.calendar.meetUrl}` : null, bookingUrl].filter(Boolean).join('\n'),
-        location: steps.calendar?.meetUrl || null, organizerName: rep?.name, organizerEmail: rep?.email, sequence: 0,
-      })),
-    }] : undefined;
-    const m = await sendMail(lead.contact_email, subject, html, { ...sender, attachments });
+    const m = await sendMail(lead.contact_email, subject, html, sender);
     steps.merchantEmail = m.sent
       ? { ok: true, to: lead.contact_email, from: sender.from || null }
       : { ok: false, to: lead.contact_email, error: m.reason };

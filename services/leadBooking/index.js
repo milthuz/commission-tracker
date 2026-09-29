@@ -230,7 +230,8 @@ function registerLeadBookingRoutes(app, deps) {
     await pool.query(
       `UPDATE leads SET booking_status = $2, booking_updated_at = CURRENT_TIMESTAMP,
               gcal_event_id = $3, gcal_calendar = $4, gcal_meet_url = $5 WHERE id = $1`,
-      [leadId, at ? 'proposed' : null, event?.ok ? event.id : null, event?.ok ? event.calendar : null, event?.ok ? event.meetUrl || null : null]);
+      // 'callback' (2026-09-29) : rappel « d'ici une heure », pas encore un rendez-vous fixé.
+      [leadId, at ? (event?.ok ? 'proposed' : 'callback') : null, event?.ok ? event.id : null, event?.ok ? event.calendar : null, event?.ok ? event.meetUrl || null : null]);
   }
 
   // ── Page publique ─────────────────────────────────────────────────────────
@@ -260,7 +261,7 @@ function registerLeadBookingRoutes(app, deps) {
       const { lead } = got;
       const settings = await h().leadSettings();
       const cur = current(lead);
-      const past = !!cur && cur.getTime() < Date.now();
+      const past = !!cur && cur.getTime() < Date.now() && lead.booking_status !== 'callback';
       const r = past || settings.bookingEnabled === false
         ? { days: [], source: null }
         : await slotsFor({ repEmail: lead.assigned_rep_email, leadId: lead.id, current: cur, settings });
@@ -295,7 +296,7 @@ function registerLeadBookingRoutes(app, deps) {
       const at = new Date(req.body?.at);
       if (!Number.isFinite(at.getTime())) return res.status(400).json({ error: 'invalid_time' });
       const prev = current(lead);
-      if (prev && prev.getTime() < Date.now()) return res.status(409).json({ error: 'past' });
+      if (prev && prev.getTime() < Date.now() && lead.booking_status !== 'callback') return res.status(409).json({ error: 'past' });
 
       // Verrou par représentant : vérifier et réserver ne font qu'un.
       lockKey = String(lead.assigned_rep_email || `lead:${lead.id}`).toLowerCase();
@@ -358,13 +359,20 @@ function registerLeadBookingRoutes(app, deps) {
           })
         : { sent: false, reason: 'no_contact_email' };
       if (rep.email && (!same || lead.booking_status !== 'confirmed')) {
-        const m = E.repChangedEmail(mailShell, { lead: fresh, at, previousAt: same ? null : cur, kind: 'booked', crmLeadId: lead.crm_lead_id, base: base(), meetUrl });
+        const wasCallback = lead.booking_status === 'callback';
+        const m = E.repChangedEmail(mailShell, {
+          lead: fresh, at, previousAt: same || wasCallback ? null : cur, replacedCallbackAt: wasCallback ? cur : null,
+          kind: 'booked', crmLeadId: lead.crm_lead_id, base: base(), meetUrl,
+        });
         steps.repEmail = await sendMail(rep.email, m.subject, m.html);
       }
 
       const label = E.whenLabel(at, 'fr');
-      logActivity('lead', lead.id, same ? 'booking_confirmed' : (cur ? 'booking_moved' : 'booking_booked'),
-        `${lead.ref_code} — ${same ? `le client a confirmé l'appel du ${label}` : cur ? `le client a déplacé l'appel au ${label} (avant : ${E.whenLabel(cur, 'fr')})` : `le client a choisi l'appel du ${label}`}`
+      const fromCallback = lead.booking_status === 'callback' && cur;
+      logActivity('lead', lead.id, same ? 'booking_confirmed' : fromCallback ? 'booking_booked' : (cur ? 'booking_moved' : 'booking_booked'),
+        `${lead.ref_code} — ${same ? `le client a confirmé l'appel du ${label}`
+          : fromCallback ? `le client a choisi un rendez-vous le ${label} (au lieu du rappel prévu ${E.whenLabel(cur, 'fr')})`
+          : cur ? `le client a déplacé l'appel au ${label} (avant : ${E.whenLabel(cur, 'fr')})` : `le client a choisi l'appel du ${label}`}`
         + (steps.crm && !steps.crm.ok && !steps.crm.skipped ? ` · Zoho : ${steps.crm.error}` : '')
         + (steps.calendar && !steps.calendar.ok && !steps.calendar.skipped ? ` · Google : ${steps.calendar.error}` : ''),
         lead.contact_email || 'client', { metadata: { at: at.toISOString(), previous: cur ? cur.toISOString() : null, steps } });
@@ -390,7 +398,7 @@ function registerLeadBookingRoutes(app, deps) {
       if (settings.allowCancel === false) return res.status(403).json({ error: 'cancel_not_allowed' });
       const cur = current(lead);
       if (!cur) return res.json({ ok: true, alreadyCancelled: true });
-      if (cur.getTime() < Date.now()) return res.status(409).json({ error: 'past' });
+      if (cur.getTime() < Date.now() && lead.booking_status !== 'callback') return res.status(409).json({ error: 'past' });
 
       const rep = repOf(lead);
       const steps = {};

@@ -18,6 +18,21 @@ function whenLabel(at, lang) {
 }
 
 const P = 'margin:0 0 14px;color:#475569;font-size:14.5px;line-height:1.65';
+
+// Quand le représentant rappellera, en mots : « d'ici une heure » / « d'ici deux heures » quand
+// c'est vrai ; sinon le jour et l'heure (piste acceptée après les heures ouvrables : le rappel
+// tombe à la prochaine ouverture, et promettre « d'ici une heure » serait faux).
+function callbackPhrase(at, lang, now = Date.now()) {
+  if (!at) return null;
+  const fr = lang !== 'en';
+  const mins = (new Date(at).getTime() - now) / 60000;
+  if (mins <= 65) return fr ? "d'ici une heure" : 'within the hour';
+  if (mins <= 125) return fr ? "d'ici deux heures" : 'within two hours';
+  const loc = fr ? 'fr-CA' : 'en-CA';
+  const day = new Date(at).toLocaleDateString(loc, { timeZone: TZ, weekday: 'long', day: 'numeric', month: 'long' });
+  const hm = new Date(at).toLocaleTimeString(loc, { timeZone: TZ, hour: 'numeric', minute: '2-digit' });
+  return fr ? `le ${day} vers ${hm}` : `on ${day} around ${hm}`;
+}
 function button(label, url) {
   return `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:22px 0 4px"><tr><td style="border-radius:9px;background:#f97316">
     <a href="${esc(url)}" style="display:inline-block;padding:13px 28px;color:#ffffff;font-size:14px;font-weight:700;text-decoration:none;border-radius:9px">${label}</a>
@@ -56,7 +71,11 @@ function welcomeBookingBlock({ lang, at, bookingUrl, meetUrl }) {
 //   rep : { name, email, role, phone }          — role/phone viennent de salespeople.signature_*
 //   at  : Date | null — l'heure proposée ; null = aucun rendez-vous planifié
 //   signatureHtml : '' quand le représentant n'a pas configuré sa signature
-function welcomeEmail(mailChrome, { lang, firstName, businessName, rep, at, minutes = 30, bookingUrl, meetUrl, home, signatureHtml }) {
+// MÉCANIQUE DU 2026-09-29 (décision de David) : à l'acceptation, le représentant RAPPELLE le client
+// d'ici une heure — `callbackAt` + `clientPhone`. Le courriel l'annonce et offre de choisir une
+// autre plage si ce n'est pas un bon moment ; c'est seulement alors qu'un rendez-vous (Google
+// Agenda + Meet) est créé. `at` (rendez-vous déjà fixé) reste géré pour les autres usages.
+function welcomeEmail(mailChrome, { lang, firstName, businessName, rep, at, callbackAt = null, clientPhone = null, minutes = 30, bookingUrl, meetUrl, home, signatureHtml, now = Date.now() }) {
   const fr = lang !== 'en';
   const repName = rep?.name || null;
   const initials = (repName || 'C').split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0].toUpperCase()).join('');
@@ -107,16 +126,38 @@ function welcomeEmail(mailChrome, { lang, firstName, businessName, rep, at, minu
       </tr>
     </table>`;
   }
+  // Le rappel annoncé (pas de rendez-vous fixé) : seulement si le client a laissé un téléphone.
+  const callbackWhen = !at && callbackAt && clientPhone ? callbackPhrase(callbackAt, lang, now) : null;
+  if (callbackWhen) {
+    const whoFull = repName ? esc(repName) : T('Votre conseiller', 'Your advisor');
+    appt = `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 12px;border:1px solid #fed7aa;border-radius:12px;border-collapse:separate">
+      <tr>
+        <td width="84" align="center" style="background:#f97316;color:#ffffff;padding:14px 0;border-radius:11px 0 0 11px;font-size:26px;line-height:1">&#9742;</td>
+        <td style="background:#fff7ed;padding:12px 16px;border-radius:0 11px 11px 0">
+          <div style="font-size:17px;font-weight:700;color:#0f1722">${T(`Appel prévu ${esc(callbackWhen)}`, `We'll call you ${esc(callbackWhen)}`)}</div>
+          <div style="font-size:13px;color:#9a3412;margin-top:3px">${T(`${whoFull} vous appellera au ${esc(clientPhone)}.`, `${whoFull} will call you at ${esc(clientPhone)}.`)}</div>
+        </td>
+      </tr>
+    </table>`;
+  }
   const btn = (label, url, primary) => `<td style="padding:0 8px 8px 0"><table role="presentation" cellpadding="0" cellspacing="0"><tr><td style="border-radius:9px;${primary ? 'background:#1a73e8' : 'background:#ffffff;border:1px solid #cbd5e1'}">
       <a href="${esc(url)}" style="display:inline-block;padding:${primary ? '11px 18px' : '10px 16px'};font-size:13.5px;font-weight:700;text-decoration:none;color:${primary ? '#ffffff' : '#0f1722'};border-radius:9px">${label}</a>
     </td></tr></table></td>`;
   const buttons = [
     at && meetUrl ? btn(T('Rejoindre par Google Meet', 'Join with Google Meet'), meetUrl, true) : '',
-    bookingUrl ? btn(at ? T('Choisir un autre moment', 'Pick another time') : T('Choisir un moment', 'Pick a time'), bookingUrl, !(at && meetUrl)) : '',
+    bookingUrl ? btn(
+      callbackWhen ? T('Choisir une autre plage', 'Pick another time')
+        : at ? T('Choisir un autre moment', 'Pick another time') : T('Choisir un moment', 'Pick a time'),
+      bookingUrl, !(at && meetUrl)) : '',
   ].join('');
   const actions = buttons ? `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:4px 0 0"><tr>${buttons}</tr></table>` : '';
   const who = repName ? esc(repName.split(/\s+/)[0]) : T('votre conseiller', 'your advisor');
-  const note = at
+  const note = callbackWhen
+    ? `<p style="margin:6px 0 20px;font-size:12.5px;color:#94a3b8;line-height:1.6">${T(
+        `Ce n'est pas un bon moment ? Choisissez une plage qui vous convient : ${who} vous rencontrera alors par Google Meet ou par téléphone. Vous pouvez aussi répondre directement à ce courriel.`,
+        `Not a good time? Pick a slot that suits you: ${who} will then meet you by Google Meet or by phone. You can also just reply to this email.`)}</p>`
+    : at
     ? `<p style="margin:6px 0 20px;font-size:12.5px;color:#94a3b8;line-height:1.6">${T(
         `Le fichier joint l'ajoute à votre agenda. Vous préférez le téléphone ? Répondez simplement à ce courriel, ${who} vous appellera.`,
         `The attached file adds it to your calendar. Prefer the phone? Just reply to this email and ${who} will call you.`)}</p>`
@@ -147,7 +188,8 @@ function welcomeEmail(mailChrome, { lang, firstName, businessName, rep, at, minu
 
   const dayWord = at ? new Date(at).toLocaleString(fr ? 'fr-CA' : 'en-CA', { timeZone: TZ, weekday: 'long' }) : null;
   const signOff = `<p style="margin:18px 0 0;font-size:14.5px;color:#475569;line-height:1.6">${
-    at ? T(`Au plaisir de vous parler ${esc(dayWord)},`, `Looking forward to speaking with you on ${esc(dayWord)},`) : T('Au plaisir,', 'Talk soon,')}</p>`
+    at ? T(`Au plaisir de vous parler ${esc(dayWord)},`, `Looking forward to speaking with you on ${esc(dayWord)},`)
+      : callbackWhen ? T('Au plaisir de vous parler très bientôt,', 'Talk to you very soon,') : T('Au plaisir,', 'Talk soon,')}</p>`
     + (signatureHtml || `<p style="margin:6px 0 0;font-size:14.5px;line-height:1.6"><strong style="color:#0f1722">${esc(repName || 'Cluster')}</strong><br><span style="color:#475569">Cluster</span></p>`);
 
   const inner = `
@@ -196,7 +238,8 @@ function clientConfirmEmail(mailChrome, { lang, firstName, businessName, repName
 }
 
 // Au représentant : le client a choisi / déplacé / annulé. Bilingue, comme leadAssignedEmail.
-function repChangedEmail(mailShell, { lead, at, previousAt, kind, crmLeadId, base, meetUrl }) {
+// `replacedCallbackAt` : le client a choisi une plage au lieu du rappel « d'ici une heure ».
+function repChangedEmail(mailShell, { lead, at, previousAt, kind, crmLeadId, base, meetUrl, replacedCallbackAt = null }) {
   const who = [lead.contact_first_name, lead.contact_last_name].filter(Boolean).join(' ');
   const rows = [
     `<strong>${esc(lead.business_name)}</strong> — ${esc(lead.ref_code)}`,
@@ -213,9 +256,10 @@ function repChangedEmail(mailShell, { lead, at, previousAt, kind, crmLeadId, bas
     : `<div style="border-left:3px solid #f97316;padding:10px 0 10px 14px;color:#0f1722;font-size:14px">`
       + `<strong>${previousAt ? 'Le client a déplacé son rendez-vous' : 'Le client a choisi son rendez-vous'} : ${esc(whenLabel(at, 'fr'))}</strong><br>`
       + (previousAt ? `<span style="color:#64748b">Avant : ${esc(whenLabel(previousAt, 'fr'))}</span><br>` : '')
+      + (replacedCallbackAt ? `<span style="color:#64748b">Au lieu de l'appel prévu ${esc(whenLabel(replacedCallbackAt, 'fr'))} : ne l'appelez pas avant l'heure choisie.</span><br>` : '')
       + `Votre Google Agenda et le rappel Zoho sont à jour.<br>`
       + (meetUrl ? `Google Meet : <a href="${esc(meetUrl)}" style="color:#1a73e8;text-decoration:none">${esc(meetUrl)}</a><br>` : '')
-      + `<span style="color:#64748b">The client ${previousAt ? 'moved' : 'picked'} the meeting to ${esc(whenLabel(at, 'en'))}. Your calendar and Zoho are updated.</span></div>`;
+      + `<span style="color:#64748b">${previousAt ? 'The client moved the meeting to' : 'The client booked a meeting for'} ${esc(whenLabel(at, 'en'))}${replacedCallbackAt ? " instead of the scheduled call: don't call before then" : ''}. Your calendar and Zoho are updated.</span></div>`;
   return {
     subject: kind === 'cancelled'
       ? `Rendez-vous annulé — ${lead.business_name}`
@@ -247,4 +291,4 @@ function ics({ uid, at, minutes, title, description, location, organizerName, or
   return lines.join('\r\n') + '\r\n';
 }
 
-module.exports = { whenLabel, welcomeBookingBlock, welcomeEmail, clientConfirmEmail, repChangedEmail, ics };
+module.exports = { whenLabel, callbackPhrase, welcomeBookingBlock, welcomeEmail, clientConfirmEmail, repChangedEmail, ics };
