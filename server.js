@@ -84,6 +84,7 @@ const PERMISSION_CATALOG = [
   { key: 'tracker:assign_merchants',   label: 'Assign unassigned Zentact merchants to reps', category: 'Commission Tracker' },
   { key: 'tracker:manual_activation',  label: 'Add manual payment activations (when Zentact is unavailable)', category: 'Commission Tracker' },
   { key: 'tracker:exclude_deal',       label: 'Exclude a deal from the Commission Tracker (and give it back)', category: 'Commission Tracker' },
+  { key: 'tracker:manual_deal',        label: 'Add manual POS deals (points) that are not in Zoho CRM', category: 'Commission Tracker' },
 
   // Commission Report
   { key: 'report:view_own',            label: 'View own commission report',                  category: 'Commission Report' },
@@ -2694,6 +2695,15 @@ async function initializeDatabase() {
     // sold_date or groups by owner — and those fire on every dashboard load.
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_sold_deals_sold_date ON crm_sold_deals(sold_date)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_crm_sold_deals_owner_date ON crm_sold_deals(owner_name, sold_date)`);
+
+    // Manual deals: a sale that never got (or will never get) its own Zoho deal — e.g. a V2
+    // install for an existing client. They live IN crm_sold_deals (synthetic "MANUAL-" id) so
+    // every points counter, the exclusion and the quota gate treat them exactly like a synced
+    // deal. The sync never touches them (it upserts Zoho ids only); the reset and the prune
+    // skip them explicitly — they have no Zoho record to come back from.
+    await pool.query(`ALTER TABLE crm_sold_deals ADD COLUMN IF NOT EXISTS is_manual BOOLEAN DEFAULT FALSE`);
+    await pool.query(`ALTER TABLE crm_sold_deals ADD COLUMN IF NOT EXISTS manual_note TEXT`);
+    await pool.query(`ALTER TABLE crm_sold_deals ADD COLUMN IF NOT EXISTS manual_created_by VARCHAR(255)`);
 
     // Deals an admin has taken OUT of the Commission Tracker (duplicate, test, deal that
     // should never have counted). Deliberately a SEPARATE table rather than a flag on
@@ -13779,7 +13789,9 @@ app.post('/api/admin/prune-deleted-deal', requireOpsSecret, async (req, res) => 
     // Safety: if Zoho returned nothing (search hiccup), don't delete anything.
     if (zohoIds.size === 0) return res.status(409).json({ error: 'Zoho returned 0 deals for that query — aborting to avoid wrong deletes', zohoCount: 0 });
     const stored = (await pool.query(
-      `SELECT deal_id, deal_name FROM crm_sold_deals WHERE deal_name ILIKE '%'||$1||'%' OR account_name ILIKE '%'||$1||'%'`,
+      // Manual deals are never in Zoho by definition — "absent from Zoho" says nothing about them.
+      `SELECT deal_id, deal_name FROM crm_sold_deals
+        WHERE is_manual IS NOT TRUE AND (deal_name ILIKE '%'||$1||'%' OR account_name ILIKE '%'||$1||'%')`,
       [q]
     )).rows;
     const toDelete = stored.filter(r => !zohoIds.has(String(r.deal_id)));
@@ -13844,7 +13856,8 @@ app.post('/api/crm/sold-deals-db/reset', authenticateToken, async (req, res) => 
   // Run async without blocking the response
   (async () => {
     try {
-      await pool.query('TRUNCATE TABLE crm_sold_deals');
+      // Not a TRUNCATE: manual deals have no Zoho record, the re-sync would never bring them back.
+      await pool.query('DELETE FROM crm_sold_deals WHERE is_manual IS NOT TRUE');
       const crmToken = await ensureValidCrmToken();
       const crm = new ZohoCRMService(crmToken);
       const syncResult = await syncCrmSoldDeals(crm);
@@ -13996,7 +14009,7 @@ app.get('/api/admin/deals-search', authenticateToken, async (req, res) => {
               COALESCE(d.lead_source_group_override, d.lead_source_group) AS lead_source_group,
               d.points, d.sold_date::date AS sold_date,
               (x.deal_id IS NOT NULL) AS excluded, x.reason AS exclusion_reason,
-              x.excluded_by, x.excluded_at
+              x.excluded_by, x.excluded_at, (d.is_manual IS TRUE) AS is_manual
        FROM crm_sold_deals d
        LEFT JOIN excluded_deals x ON x.deal_id = d.deal_id
        WHERE d.deal_name ILIKE '%'||$1||'%' OR d.account_name ILIKE '%'||$1||'%' OR d.owner_name ILIKE '%'||$1||'%'
@@ -14066,6 +14079,91 @@ app.post('/api/crm/deals/:dealId/exclude', authenticateToken, async (req, res) =
     // Points feed the quota gate, so a stale cache would show the old total.
     _dataHealthCache = { at: 0, data: null };
     res.json({ success: true, dealId, excluded });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Manual deals — POS points for a sale that has no Zoho deal (e.g. a V2 install on an
+// existing client, where recreating the whole deal in Zoho makes no sense). Stored in
+// crm_sold_deals itself so all five points counters and the quota gate pick it up unchanged.
+// Its points are the deal TYPE's value, computed exactly like the tracker does (configured
+// value, else the type's most frequent synced value) and stored on the row, because the annual
+// totals sum the stored column while the monthly/quota paths re-derive it from the type.
+app.get('/api/crm/deals/manual', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'tracker:manual_deal'))) return;
+  try {
+    const rows = (await pool.query(
+      `SELECT deal_id, deal_name, account_name, owner_name, lead_source_group, points,
+              to_char(sold_date, 'YYYY-MM-DD') AS sold_date, manual_note, manual_created_by, first_seen_at
+         FROM crm_sold_deals WHERE is_manual = true ORDER BY sold_date DESC, first_seen_at DESC`
+    )).rows;
+    res.json({ deals: rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/crm/deals/manual', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'tracker:manual_deal'))) return;
+  const { repName, dealName, accountName, leadSourceGroup, soldDate, note } = req.body || {};
+  const name = (dealName || '').toString().trim().slice(0, 500);
+  const group = (leadSourceGroup || '').toString().trim().slice(0, 255);
+  if (!repName || !name || !group || !/^\d{4}-\d{2}-\d{2}$/.test(String(soldDate || ''))) {
+    return res.status(400).json({ error: 'repName, dealName, leadSourceGroup and soldDate (YYYY-MM-DD) required' });
+  }
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  try {
+    const sp = await pool.query(`SELECT 1 FROM salespeople WHERE name = $1 AND is_active = true`, [repName]);
+    if (sp.rowCount === 0) return res.status(400).json({ error: 'Unknown or inactive rep' });
+
+    const configured = (await pool.query(
+      `SELECT points FROM deal_source_points WHERE LOWER(source_group) = LOWER($1)`, [group])).rows[0];
+    let pts = configured ? parseInt(configured.points) : null;
+    if (pts == null) {
+      const common = (await pool.query(
+        `SELECT points FROM crm_sold_deals
+          WHERE COALESCE(lead_source_group_override, lead_source_group) = $1
+          GROUP BY points ORDER BY COUNT(*) DESC, points DESC LIMIT 1`, [group])).rows[0];
+      if (!common) return res.status(400).json({ error: 'Unknown deal type' });
+      pts = parseInt(common.points) || 0;
+    }
+
+    const dealId = `MANUAL-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    await pool.query(
+      `INSERT INTO crm_sold_deals
+         (deal_id, deal_name, account_name, owner_name, lead_source_group, points, sold_date,
+          amount, is_manual, manual_note, manual_created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::date, 0, true, $8, $9)`,
+      [dealId, name, (accountName || '').toString().trim().slice(0, 500), repName, group, pts, soldDate,
+       (note || '').toString().trim().slice(0, 1000) || null, actor]
+    );
+    logActivity('crm_deal', dealId, 'manual_deal_added',
+      `Manual deal "${name}" (${group}, ${pts} pt) added for ${repName} on ${soldDate} by ${actor}`,
+      actor, { metadata: { points: pts, owner: repName, soldDate, note: note || null } });
+    // Points feed the quota gate: drop the caches and let recalc re-apply the gate now rather
+    // than at the next 6-hour pass — a month about to be paid is exactly when this gets used.
+    _monthlyPointsCache.clear();
+    _dataHealthCache = { at: 0, data: null };
+    runRecalcV2('manual-deal').catch(e => console.error('manual-deal recalc error:', e.message));
+    res.json({ success: true, dealId, points: pts });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/crm/deals/manual/:dealId', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'tracker:manual_deal'))) return;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  try {
+    const row = (await pool.query(
+      `DELETE FROM crm_sold_deals WHERE deal_id = $1 AND is_manual = true
+       RETURNING deal_name, owner_name, points, to_char(sold_date, 'YYYY-MM-DD') AS sold_date`,
+      [req.params.dealId]
+    )).rows[0];
+    if (!row) return res.status(404).json({ error: 'Not found (or not a manual deal)' });
+    await pool.query(`DELETE FROM excluded_deals WHERE deal_id = $1`, [req.params.dealId]);
+    logActivity('crm_deal', req.params.dealId, 'manual_deal_removed',
+      `Manual deal "${row.deal_name}" (${row.points} pt, ${row.owner_name}, ${row.sold_date}) removed by ${actor}`,
+      actor, { metadata: { points: row.points, owner: row.owner_name } });
+    _monthlyPointsCache.clear();
+    _dataHealthCache = { at: 0, data: null };
+    runRecalcV2('manual-deal').catch(e => console.error('manual-deal recalc error:', e.message));
+    res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
