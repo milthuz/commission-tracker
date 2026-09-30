@@ -246,6 +246,8 @@ const PERMISSION_CATALOG = [
   { key: 'credits:send',               label: 'Merchant processor credits: create (Zentact merchants), upload proof and send compensation-credit agreements for signature (own files)', category: 'Merchant Processor Credits' },
   { key: 'credits:view_all',           label: 'Merchant processor credits: see every compensation-credit file, all reps', category: 'Merchant Processor Credits' },
   { key: 'credits:approve',            label: 'Merchant processor credits: link the Zoho Books account and approve a signed agreement — creates the credit note in Zoho Books', category: 'Merchant Processor Credits' },
+  { key: 'credits:delete',             label: 'Merchant processor credits: delete any file, including sent, signed or approved ones (a reason is required; the Zoho Books credit note is NOT deleted)', category: 'Merchant Processor Credits' },
+  { key: 'credits:report',             label: 'Merchant processor credits — accounting: monthly report of approved credits and clawbacks, CSV export, signed PDFs (read-only)', category: 'Merchant Processor Credits' },
   { key: 'revmodel:settings',          label: 'Edit the Revenue Modeler SaaS tiers (the three default prices, applied to everyone)', category: 'Revenue Modeler' },
 ];
 

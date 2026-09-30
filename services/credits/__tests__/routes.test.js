@@ -54,7 +54,7 @@ function crc32(buf) { let c, crc = 0xffffffff; for (let n = 0; n < buf.length; n
       ('ZM-2', 'Bistro 50% off', 'b@b.ca', 'INVITE_ACCEPTED', 'Julie'),
       ('ZM-3', 'Resto Fermé', 'x@x.ca', 'CLOSED', 'Julie');
   `);
-  const perms = { 'rep@x.com': ['credits:send'], 'autre@x.com': ['credits:send'], 'david@x.com': ['credits:approve'], 'nobody@x.com': [] };
+  const perms = { 'rep@x.com': ['credits:send'], 'autre@x.com': ['credits:send'], 'david@x.com': ['credits:approve', 'credits:delete'], 'compta@x.com': ['credits:report'], 'nobody@x.com': [] };
   const has = (req, p) => (perms[req.user.email] || []).includes(p);
 
   const mails = [];
@@ -207,7 +207,7 @@ function crc32(buf) { let c, crc = 0xffffffff; for (let n = 0; n < buf.length; n
   const inc = await api('POST', `/api/credits/${c3.id}/send`, 'rep@x.com');
   ok(inc.status === 400 && inc.body.missing.includes('email') && inc.body.missing.includes('amount') && !inc.body.missing.includes('contactPerson'), 'envoi incomplet refusé, champs nommés (la personne-ressource est remplie par le client)');
   ok((await api('DELETE', `/api/credits/${c3.id}`, 'rep@x.com')).status === 200, 'brouillon supprimable');
-  ok((await api('DELETE', `/api/credits/${c.id}`, 'rep@x.com')).status === 409, 'un dossier envoyé ne se supprime pas');
+  ok((await api('DELETE', `/api/credits/${c.id}`, 'rep@x.com')).status === 403, 'un dossier envoyé ne se supprime pas sans credits:delete');
 
   // Reprise avant 36 mois
   const before = mails.length;
@@ -229,6 +229,41 @@ function crc32(buf) { let c, crc = 0xffffffff; for (let n = 0; n < buf.length; n
   // un engagement déjà terminé ne se reprend plus
   await pool.query(`UPDATE merchant_credits SET clawback_status = NULL, commitment_end = CURRENT_DATE - 1 WHERE id = $1`, [c.id]);
   ok((await credits.checkClawbacks()).flagged === 0, 'engagement terminé : pas de reprise');
+
+  // Rapport mensuel (comptabilité)
+  // (le test de reprise ci-dessus a remis clawback_status à NULL : on remet la décision tranchée)
+  await pool.query(`UPDATE merchant_credits SET clawback_status = 'reclaimed', clawback_decided_at = NOW(), clawback_decided_by = 'david@x.com' WHERE id = $1`, [c.id]);
+  const month = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Toronto' }).slice(0, 7);
+  ok((await api('GET', `/api/credits/report?month=${month}`, 'rep@x.com')).status === 403, 'rapport : refusé au rep');
+  ok((await api('GET', '/api/credits/report?month=2026-13', 'compta@x.com')).status === 400, 'rapport : mois invalide refusé');
+  const cmeta = (await api('GET', '/api/credits/meta', 'compta@x.com')).body;
+  ok(cmeta.canReport && !cmeta.canSend && !cmeta.canApprove && !cmeta.canDelete, 'comptabilité : rapport seulement');
+  ok((await api('GET', '/api/credits', 'compta@x.com')).status === 403, 'comptabilité : pas la liste des dossiers');
+  const rpt = (await api('GET', `/api/credits/report?month=${month}`, 'compta@x.com')).body;
+  const line = rpt.rows.find((r) => r.id === c.id);
+  ok(line && line.amount === 2450.5 && line.creditnoteNumber === 'CN-00042' && line.booksCustomerName === 'Resto Test inc.', 'rapport : crédit approuvé du mois, note de crédit et compte Books');
+  ok(rpt.totals.count === rpt.rows.length && rpt.months.includes(month), 'rapport : totaux et mois disponibles');
+  ok(rpt.clawbacks.some((x) => x.ref === c.ref && x.decision === 'reclaimed'), 'rapport : reprises tranchées du mois');
+  ok((await api('GET', `/api/credits/report?month=2020-01`, 'compta@x.com')).body.rows.length === 0, 'rapport : mois sans crédit vide');
+  ok((await api('GET', `/api/credits/${c.id}/pdf`, 'compta@x.com')).status === 200, 'comptabilité : ouvre le PDF signé d’un crédit approuvé');
+  ok((await api('GET', `/api/credits/${c2.id}`, 'compta@x.com')).status === 404, 'comptabilité : ne voit pas un dossier non approuvé');
+  // CSV : Excel fr-CA, formule neutralisée
+  await pool.query(`UPDATE merchant_credits SET legal_name = '=HYPERLINK("http://x")' WHERE id = $1`, [c.id]);
+  const csv = await api('GET', `/api/credits/report.csv?month=${month}`, 'compta@x.com');
+  const txt = csv.body.toString('utf8');
+  ok(csv.ct.includes('text/csv') && txt.charCodeAt(0) === 0xfeff, 'CSV : UTF-8 avec BOM');
+  ok(txt.includes('Approuvé le;Référence;Marchand') && txt.includes('2450,50'), 'CSV français : « ; » et virgule décimale');
+  ok(txt.includes(`"'=HYPERLINK(""http://x"")"`), 'CSV : une cellule-formule est neutralisée');
+  ok((await api('GET', `/api/credits/report.csv?month=${month}&lang=en`, 'compta@x.com')).body.toString('utf8').includes('Approved on,Reference'), 'CSV anglais');
+
+  // Suppression d'un dossier approuvé
+  ok((await api('DELETE', `/api/credits/${c.id}`, 'rep@x.com')).status === 403, 'suppression : le rep ne supprime pas un dossier approuvé');
+  ok((await api('DELETE', `/api/credits/${c.id}`, 'david@x.com', {})).body.error === 'reason_required', 'suppression : raison obligatoire');
+  const gone = await api('DELETE', `/api/credits/${c.id}`, 'david@x.com', { reason: 'Test de bout en bout' });
+  ok(gone.status === 200 && gone.body.creditnoteNumber === 'CN-00042', 'suppression : la note de crédit à annuler dans Zoho est nommée');
+  ok((await pool.query('SELECT 1 FROM merchant_credits WHERE id=$1', [c.id])).rows.length === 0
+    && (await pool.query('SELECT 1 FROM merchant_credit_docs WHERE credit_id=$1', [c.id])).rows.length === 0, 'suppression : dossier et pièces effacés');
+  ok((await pool.query(`SELECT 1 FROM activity_log WHERE entity_id=$1 AND event_type='deleted' AND description LIKE '%CN-00042%' AND description LIKE '%Test de bout en bout%'`, [c.id])).rows.length === 1, 'suppression : trace gardée au journal');
 
   server.close();
   console.log(`credits : ${n} vérifications OK`);

@@ -26,6 +26,8 @@ const { books: booksApi } = require('./books');
 const PERM_SEND = 'credits:send';
 const PERM_VIEW_ALL = 'credits:view_all';
 const PERM_APPROVE = 'credits:approve';
+const PERM_DELETE = 'credits:delete';  // supprimer un dossier envoyé, signé ou approuvé (un brouillon : son auteur)
+const PERM_REPORT = 'credits:report';  // comptabilité : rapport mensuel des crédits approuvés, lecture seule
 
 const TOKEN_DAYS = 14;
 const COMMITMENT_MONTHS = 36; // clause 3 du formulaire
@@ -123,6 +125,7 @@ async function ensureSchema(pool) {
   // Le dossier part d'un marchand ZENTACT (demande de David, 2026-09-29) ; le compte Zoho Books,
   // nécessaire à la note de crédit, est relié ensuite (au plus tard à l'approbation).
   await pool.query('ALTER TABLE merchant_credits ADD COLUMN IF NOT EXISTS zentact_merchant_id TEXT');
+  await pool.query('ALTER TABLE merchant_credits ADD COLUMN IF NOT EXISTS books_customer_name TEXT');
   // Reprise (clause 3) : le marchand quitte Cluster avant la fin de l'engagement de 36 mois.
   // clawback_status : NULL (rien à signaler) → 'flagged' (départ détecté) → 'reclaimed' | 'waived'.
   for (const col of ['clawback_status TEXT', 'clawback_flagged_at TIMESTAMPTZ', 'clawback_alerted_at TIMESTAMPTZ',
@@ -191,7 +194,8 @@ function registerCreditRoutes(app, deps) {
   // Voir un dossier : le sien, ou view_all / approve.
   async function canSee(req, row) {
     if (row.rep_email.toLowerCase() === email(req)) return true;
-    return (await can(req, PERM_VIEW_ALL)) || (await can(req, PERM_APPROVE));
+    if ((await can(req, PERM_VIEW_ALL)) || (await can(req, PERM_APPROVE))) return true;
+    return row.status === 'approved' && (await can(req, PERM_REPORT));
   }
   // Modifier / envoyer / téléverser : l'auteur (avec credits:send), ou un approbateur.
   async function canEdit(req, row) {
@@ -250,9 +254,10 @@ function registerCreditRoutes(app, deps) {
 
   // ── Écran interne ────────────────────────────────────────────────────────────────────
   app.get('/api/credits/meta', authenticateToken, async (req, res) => {
-    const [send, viewAll, approve] = await Promise.all([can(req, PERM_SEND), can(req, PERM_VIEW_ALL), can(req, PERM_APPROVE)]);
-    if (!send && !viewAll && !approve) return res.status(403).json({ error: `Permission required: ${PERM_SEND}` });
-    res.json({ canSend: send, canViewAll: viewAll, canApprove: approve, commitmentMonths: COMMITMENT_MONTHS });
+    const [send, viewAll, approve, del, report] = await Promise.all([can(req, PERM_SEND), can(req, PERM_VIEW_ALL), can(req, PERM_APPROVE), can(req, PERM_DELETE), can(req, PERM_REPORT)]);
+    if (!send && !viewAll && !approve && !report) return res.status(403).json({ error: `Permission required: ${PERM_SEND}` });
+    // Le rapport est ouvert à la comptabilité (credits:report) ET aux approbateurs.
+    res.json({ canSend: send, canViewAll: viewAll, canApprove: approve, canDelete: del, canReport: report || approve, commitmentMonths: COMMITMENT_MONTHS });
   });
 
   // Statuts Zentact exclus : un marchand fermé, refusé ou révoqué ne reçoit plus de crédit. Ceux
@@ -351,6 +356,109 @@ function registerCreditRoutes(app, deps) {
         [row.id, out.lang, out.zentact_merchant_id, out.legal_name, out.contact_person, out.phone, out.email, amount || 0, out.note || null]);
       res.json({ credit: await reload(row.id) });
     } catch (e) { console.error('credits update:', e.message); res.status(500).json({ error: 'save_failed' }); }
+  });
+
+  // ── Rapport mensuel pour la comptabilité ──
+  // ⚠️ Déclaré AVANT `/api/credits/:id` : Express prendrait « report » pour un identifiant.
+  // Les crédits APPROUVÉS pendant le mois (heure de Montréal), avec le compte Books, la note de
+  // crédit et l'état de la reprise ; plus les reprises tranchées pendant ce mois. Lecture seule.
+  const MONTH_RE = /^(\d{4})-(0[1-9]|1[0-2])$/;
+  async function reportData(month) {
+    const range = `$1::timestamp AT TIME ZONE 'America/Toronto'`;
+    const until = `($1::timestamp + INTERVAL '1 month') AT TIME ZONE 'America/Toronto'`;
+    const start = `${month}-01 00:00:00`;
+    const [approved, clawbacks, months] = await Promise.all([
+      pool.query(
+        `SELECT id, ref, legal_name, books_customer_id, books_customer_name, amount, creditnote_number, books_error, rep_name, rep_email,
+                approved_by, to_char(approved_at AT TIME ZONE 'America/Toronto', 'YYYY-MM-DD') AS approved_day,
+                to_char(commitment_end, 'YYYY-MM-DD') AS commitment_end, clawback_status
+           FROM merchant_credits
+          WHERE status = 'approved' AND approved_at >= ${range} AND approved_at < ${until}
+          ORDER BY approved_at`, [start]),
+      pool.query(
+        `SELECT id, ref, legal_name, amount, creditnote_number, clawback_status, clawback_decided_by, clawback_note,
+                to_char(clawback_decided_at AT TIME ZONE 'America/Toronto', 'YYYY-MM-DD') AS decided_day
+           FROM merchant_credits
+          WHERE clawback_status IN ('reclaimed', 'waived') AND clawback_decided_at >= ${range} AND clawback_decided_at < ${until}
+          ORDER BY clawback_decided_at`, [start]),
+      pool.query(
+        `SELECT DISTINCT to_char(approved_at AT TIME ZONE 'America/Toronto', 'YYYY-MM') AS m
+           FROM merchant_credits WHERE status = 'approved' AND approved_at IS NOT NULL ORDER BY 1 DESC LIMIT 36`),
+    ]);
+    const rows = approved.rows.map((r) => ({
+      id: r.id, ref: r.ref, legalName: r.legal_name, booksCustomerId: r.books_customer_id, booksCustomerName: r.books_customer_name,
+      amount: Number(r.amount), creditnoteNumber: r.creditnote_number, booksError: r.books_error ? true : false,
+      rep: r.rep_name || r.rep_email, approvedBy: r.approved_by, approvedDay: r.approved_day, commitmentEnd: r.commitment_end, clawback: r.clawback_status,
+    }));
+    const cents = (xs) => Math.round(xs.reduce((a, x) => a + Math.round(Number(x) * 100), 0)) / 100;
+    const reclaimed = clawbacks.rows.filter((r) => r.clawback_status === 'reclaimed');
+    return {
+      month,
+      months: months.rows.map((r) => r.m),
+      rows,
+      clawbacks: clawbacks.rows.map((r) => ({ id: r.id, ref: r.ref, legalName: r.legal_name, amount: Number(r.amount), creditnoteNumber: r.creditnote_number,
+        decision: r.clawback_status, decidedBy: r.clawback_decided_by, decidedDay: r.decided_day, note: r.clawback_note })),
+      totals: {
+        count: rows.length,
+        amount: cents(rows.map((r) => r.amount)),
+        withCreditNote: rows.filter((r) => r.creditnoteNumber).length,
+        pendingCreditNote: rows.filter((r) => !r.creditnoteNumber).length,
+        reclaimedCount: reclaimed.length,
+        reclaimedAmount: cents(reclaimed.map((r) => r.amount)),
+      },
+    };
+  }
+
+  async function reportAccess(req, res) {
+    if ((await can(req, PERM_REPORT)) || (await can(req, PERM_APPROVE))) return true;
+    res.status(403).json({ error: `Permission required: ${PERM_REPORT}` });
+    return false;
+  }
+
+  app.get('/api/credits/report', authenticateToken, async (req, res) => {
+    if (!(await reportAccess(req, res))) return;
+    const month = String(req.query.month || '');
+    if (!MONTH_RE.test(month)) return res.status(400).json({ error: 'bad_month' });
+    try { await schema(); res.json(await reportData(month)); } catch (e) { console.error('credits report:', e.message); res.status(500).json({ error: 'report_failed' }); }
+  });
+
+  // CSV pour Excel : BOM UTF-8 ; en français, « ; » et virgule décimale (réglages régionaux fr-CA).
+  app.get('/api/credits/report.csv', authenticateToken, async (req, res) => {
+    if (!(await reportAccess(req, res))) return;
+    const month = String(req.query.month || '');
+    if (!MONTH_RE.test(month)) return res.status(400).json({ error: 'bad_month' });
+    const en = req.query.lang === 'en';
+    try {
+      await schema();
+      const d = await reportData(month);
+      const sep = en ? ',' : ';';
+      // Une cellule qui commence par = + - @ serait lue comme une FORMULE par Excel : on la neutralise.
+      const cell = (v) => {
+        let t = v == null ? '' : String(v);
+        if (/^[=+\-@\t\r]/.test(t)) t = `'${t}`;
+        return t.includes(sep) || /["\n\r]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+      };
+      const num = (v) => (en ? Number(v).toFixed(2) : Number(v).toFixed(2).replace('.', ','));
+      const H = en
+        ? ['Approved on', 'Reference', 'Merchant', 'Zoho Books account', 'Books account #', 'Amount (CAD)', 'Credit note', 'Rep', 'Approved by', 'Commitment end', 'Clawback']
+        : ['Approuvé le', 'Référence', 'Marchand', 'Compte Zoho Books', 'No compte Books', 'Montant (CAD)', 'Note de crédit', 'Représentant', 'Approuvé par', "Fin de l'engagement", 'Reprise'];
+      const CB = en ? { flagged: 'possible', reclaimed: 'reclaimed', waived: 'waived' } : { flagged: 'possible', reclaimed: 'reprise', waived: 'abandonnée' };
+      const lines = [H.map(cell).join(sep)];
+      for (const r of d.rows) {
+        lines.push([r.approvedDay, r.ref, r.legalName, r.booksCustomerName || '', r.booksCustomerId || '', num(r.amount),
+          r.creditnoteNumber || (en ? 'TO CREATE' : 'À CRÉER'), r.rep, r.approvedBy, r.commitmentEnd || '', r.clawback ? CB[r.clawback] || r.clawback : ''].map(cell).join(sep));
+      }
+      lines.push([en ? 'Total' : 'Total', '', `${d.totals.count}`, '', '', num(d.totals.amount)].map(cell).join(sep));
+      if (d.clawbacks.length) {
+        lines.push('');
+        lines.push([en ? 'Clawbacks decided this month' : 'Reprises tranchées ce mois-ci'].map(cell).join(sep));
+        lines.push((en ? ['Decided on', 'Reference', 'Merchant', 'Amount (CAD)', 'Credit note', 'Decision', 'Decided by', 'Note'] : ['Tranché le', 'Référence', 'Marchand', 'Montant (CAD)', 'Note de crédit', 'Décision', 'Par', 'Note']).map(cell).join(sep));
+        for (const r of d.clawbacks) lines.push([r.decidedDay, r.ref, r.legalName, num(r.amount), r.creditnoteNumber || '', CB[r.decision] || r.decision, r.decidedBy, r.note || ''].map(cell).join(sep));
+      }
+      const name = `${en ? 'merchant-processor-credits' : 'credits-processeur-marchand'}-${month}.csv`;
+      res.set('Content-Type', 'text/csv; charset=utf-8').set('Content-Disposition', `attachment; filename="${name}"`)
+        .send('\ufeff' + lines.join('\r\n') + '\r\n');
+    } catch (e) { console.error('credits report csv:', e.message); res.status(500).json({ error: 'report_failed' }); }
   });
 
   app.get('/api/credits/:id', authenticateToken, async (req, res) => {
@@ -460,13 +568,35 @@ function registerCreditRoutes(app, deps) {
   });
 
   // Brouillon seulement : un dossier envoyé laisse une trace (on l'annule, on ne l'efface pas).
+  // Brouillon : son auteur (ou un approbateur) le supprime librement. Tout autre statut exige
+  // credits:delete ET une raison, parce qu'on efface une entente envoyée ou signée. Le journal
+  // d'activité garde la trace (référence, marchand, montant, note de crédit) : il survit au dossier.
+  // ⚠️ La note de crédit Zoho n'est PAS supprimée (Sales Hub n'a pas ce droit chez Zoho) : la
+  // réponse la nomme pour que l'écran demande de l'annuler dans Zoho Books.
   app.delete('/api/credits/:id', authenticateToken, async (req, res) => {
-    const row = await loadFor(req, res, { edit: true }); if (!row) return;
-    if (row.status !== 'draft') return res.status(409).json({ error: 'not_draft' });
-    await pool.query('DELETE FROM merchant_credits WHERE id = $1', [row.id]);
-    await log(row, 'deleted', 'brouillon supprimé', email(req));
-    res.json({ ok: true });
+    const draft = await (async () => {
+      if (!UUID_RE.test(req.params.id || '')) return null;
+      await schema();
+      return (await pool.query('SELECT status FROM merchant_credits WHERE id = $1', [req.params.id])).rows[0] || null;
+    })();
+    if (draft && draft.status === 'draft') {
+      const row = await loadFor(req, res, { edit: true }); if (!row) return;
+      await pool.query('DELETE FROM merchant_credits WHERE id = $1', [row.id]);
+      await log(row, 'deleted', 'brouillon supprimé', email(req));
+      return res.json({ ok: true, creditnoteNumber: null });
+    }
+    if (!(await requirePerm(req, res, PERM_DELETE))) return;
+    const row = await loadFor(req, res); if (!row) return;
+    const reason = clean((req.body || {}).reason, 500);
+    if (reason.length < 3) return res.status(400).json({ error: 'reason_required' });
+    const del = await pool.query('DELETE FROM merchant_credits WHERE id = $1 AND status = $2 RETURNING id', [row.id, row.status]);
+    if (!del.rows[0]) return res.status(409).json({ error: 'changed' });
+    await log(row, 'deleted',
+      `dossier supprimé (${row.status}) — ${row.legal_name}, ${pdf.formatAmount(row.amount, 'fr')} $${row.creditnote_number ? `, note de crédit ${row.creditnote_number} (à annuler dans Zoho Books)` : ''} — raison : ${reason}`,
+      email(req), { amount: Number(row.amount) });
+    res.json({ ok: true, creditnoteNumber: row.creditnote_number || null });
   });
+
 
   // ── Approbation → note de crédit Zoho Books ──
   async function pushToBooks(row, actor) {
@@ -495,7 +625,7 @@ function registerCreditRoutes(app, deps) {
     if (!/^\d{1,30}$/.test(cid)) return res.status(400).json({ error: 'bad_id' });
     let cust;
     try { cust = await zb.getCustomer(cid); } catch (e) { return res.status(502).json({ error: 'books_unavailable', message: e.message }); }
-    await pool.query('UPDATE merchant_credits SET books_customer_id=$2, updated_at=NOW() WHERE id=$1', [row.id, cid]);
+    await pool.query('UPDATE merchant_credits SET books_customer_id=$2, books_customer_name=$3, updated_at=NOW() WHERE id=$1', [row.id, cid, cust.legalName || null]);
     await log(row, 'books_linked', `relié au compte Zoho Books « ${cust.legalName} » (#${cid})`, email(req));
     res.json({ credit: await reload(row.id) });
   });
@@ -770,4 +900,4 @@ function registerCreditRoutes(app, deps) {
   return { checkClawbacks };
 }
 
-module.exports = { registerCreditRoutes, PERM_SEND, PERM_VIEW_ALL, PERM_APPROVE, LEFT_ZENTACT, parseAmount, validSignature };
+module.exports = { registerCreditRoutes, PERM_SEND, PERM_VIEW_ALL, PERM_APPROVE, PERM_DELETE, PERM_REPORT, LEFT_ZENTACT, parseAmount, validSignature };
