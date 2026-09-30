@@ -129,7 +129,31 @@ function books(getAdminBooksAuth) {
     };
   }
 
-  return { searchCustomers, getCustomer, createCreditNote };
+  // Annuler (void) une note de crédit — demande de David, quand on supprime un dossier créé par
+  // erreur. On ANNULE plutôt que supprimer : la note reste visible dans Books, marquée annulée, et
+  // la suite des numéros n'a pas de trou (pratique comptable ; la suppression exigerait en plus
+  // la portée creditnotes.DELETE, jamais demandée).
+  // Déjà annulée, ou supprimée à la main dans Books : rien à faire, c'est un succès.
+  // ⚠️ Zoho refuse d'annuler une note déjà APPLIQUÉE à une facture ou remboursée : le message de
+  // Zoho est renvoyé tel quel, et l'écran propose de supprimer le dossier quand même.
+  async function voidCreditNote(id) {
+    const cid = encodeURIComponent(String(id || ''));
+    const g = await call('get', `/creditnotes/${cid}`);
+    if (g.status === 404 || (g.data && g.data.code === 1002)) return { ok: true, already: 'gone' };
+    const status = g.data && g.data.creditnote && g.data.creditnote.status;
+    if (status === 'void') return { ok: true, already: 'void' };
+    const r = await call('post', `/creditnotes/${cid}/status/void`);
+    if (r.status === 200 && r.data && r.data.code === 0) return { ok: true };
+    return {
+      ok: false,
+      status: r.status,
+      code: r.data && r.data.code,
+      message: (r.data && r.data.message) || `HTTP ${r.status}`,
+      scopeMissing: r.status === 401 || (r.data && (r.data.code === 57 || /scope|authoriz/i.test(String(r.data.message || '')))),
+    };
+  }
+
+  return { searchCustomers, getCustomer, createCreditNote, voidCreditNote };
 }
 
 module.exports = { books };

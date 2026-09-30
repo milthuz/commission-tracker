@@ -60,6 +60,7 @@ function crc32(buf) { let c, crc = 0xffffffff; for (let n = 0; n < buf.length; n
   const mails = [];
   let booksMode = 'scope_missing';
   const creditNotes = [];
+  const voids = []; let voidMode = 'applied';
   const fakeBooks = {
     searchCustomers: async (q) => [{ id: '4600001', name: `Resto ${q}`, company: `Resto ${q} inc.`, email: 'owner@resto.ca', phone: '514 555-0100' }],
     getCustomer: async (id) => ({ id, legalName: 'Resto Test inc.', contactPerson: 'Marie Test', email: 'owner@resto.ca', phone: '514 555-0100' }),
@@ -67,6 +68,7 @@ function crc32(buf) { let c, crc = 0xffffffff; for (let n = 0; n < buf.length; n
       if (booksMode === 'scope_missing') return { ok: false, status: 401, code: 57, message: 'You are not authorized to perform this operation', scopeMissing: true };
       creditNotes.push(a); return { ok: true, id: '9001', number: 'CN-00042' };
     },
+    voidCreditNote: async (id) => { voids.push(id); return voidMode === 'applied' ? { ok: false, status: 400, code: 1036, message: 'Credit note has been applied to invoices' } : { ok: true }; },
   };
 
   const app = express();
@@ -259,11 +261,21 @@ function crc32(buf) { let c, crc = 0xffffffff; for (let n = 0; n < buf.length; n
   // Suppression d'un dossier approuvé
   ok((await api('DELETE', `/api/credits/${c.id}`, 'rep@x.com')).status === 403, 'suppression : le rep ne supprime pas un dossier approuvé');
   ok((await api('DELETE', `/api/credits/${c.id}`, 'david@x.com', {})).body.error === 'reason_required', 'suppression : raison obligatoire');
+  const refused = await api('DELETE', `/api/credits/${c.id}`, 'david@x.com', { reason: 'Test de bout en bout' });
+  ok(refused.status === 502 && refused.body.error === 'books_void_failed' && /applied/.test(refused.body.message) && voids[0] === '9001', 'suppression : Zoho refuse d’annuler la note → message de Zoho');
+  ok((await pool.query('SELECT 1 FROM merchant_credits WHERE id=$1', [c.id])).rows.length === 1, 'suppression : rien n’est effacé si la note n’a pas pu être annulée');
+  voidMode = 'ok';
   const gone = await api('DELETE', `/api/credits/${c.id}`, 'david@x.com', { reason: 'Test de bout en bout' });
-  ok(gone.status === 200 && gone.body.creditnoteNumber === 'CN-00042', 'suppression : la note de crédit à annuler dans Zoho est nommée');
+  ok(gone.status === 200 && gone.body.creditnoteNumber === 'CN-00042' && gone.body.creditnoteVoided === true && voids.length === 2, 'suppression : note de crédit annulée dans Zoho, puis dossier effacé');
   ok((await pool.query('SELECT 1 FROM merchant_credits WHERE id=$1', [c.id])).rows.length === 0
     && (await pool.query('SELECT 1 FROM merchant_credit_docs WHERE credit_id=$1', [c.id])).rows.length === 0, 'suppression : dossier et pièces effacés');
-  ok((await pool.query(`SELECT 1 FROM activity_log WHERE entity_id=$1 AND event_type='deleted' AND description LIKE '%CN-00042%' AND description LIKE '%Test de bout en bout%'`, [c.id])).rows.length === 1, 'suppression : trace gardée au journal');
+  ok((await pool.query(`SELECT 1 FROM activity_log WHERE entity_id=$1 AND event_type='deleted' AND description LIKE '%CN-00042 annulée%' AND description LIKE '%Test de bout en bout%'`, [c.id])).rows.length === 1, 'suppression : trace gardée au journal');
+  // force : Zoho refuse, on supprime quand même (la note reste à annuler à la main)
+  voidMode = 'applied';
+  const c9 = (await api('POST', '/api/credits', 'rep@x.com', { merchantId: 'ZM-1', legalName: 'F inc.', email: 'f@f.ca', amount: 5 })).body.credit;
+  await pool.query(`UPDATE merchant_credits SET status='approved', creditnote_id='9009', creditnote_number='CN-9' WHERE id=$1`, [c9.id]);
+  const forced = await api('DELETE', `/api/credits/${c9.id}`, 'david@x.com', { reason: 'Erreur du rep', force: true });
+  ok(forced.status === 200 && forced.body.creditnoteVoided === false && !voids.includes('9009'), 'suppression forcée : sans toucher Zoho, note signalée à annuler');
 
   server.close();
   console.log(`credits : ${n} vérifications OK`);

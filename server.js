@@ -3919,7 +3919,7 @@ app.get('/api/auth/zoho', (req, res) => {
     // faudrait refaire consentir plus tard. READ accompagne CREATE : creer une note de credit
     // sans pouvoir la relire empecherait de verifier ce qu'on vient d'ecrire.
     // Les subventions DEJA accordees ne changent pas ; seul un nouveau consentement la porte.
-    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE,ZohoBooks.estimates.READ,ZohoBooks.contacts.READ,ZohoBooks.creditnotes.CREATE,ZohoBooks.creditnotes.READ,ZohoSubscriptions.plans.READ,ZohoSubscriptions.products.READ,ZohoSubscriptions.subscriptions.READ,ZohoSubscriptions.subscriptions.UPDATE,ZohoSubscriptions.subscriptions.DELETE,AaaServer.profile.READ` +
+    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE,ZohoBooks.estimates.READ,ZohoBooks.contacts.READ,ZohoBooks.creditnotes.CREATE,ZohoBooks.creditnotes.READ,ZohoBooks.creditnotes.UPDATE,ZohoSubscriptions.plans.READ,ZohoSubscriptions.products.READ,ZohoSubscriptions.subscriptions.READ,ZohoSubscriptions.subscriptions.UPDATE,ZohoSubscriptions.subscriptions.DELETE,AaaServer.profile.READ` +
     `&client_id=${ZOHO_CONFIG.client_id}` +
     `&response_type=code` +
     `&redirect_uri=${ZOHO_CONFIG.redirect_uri}` +

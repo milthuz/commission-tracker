@@ -571,8 +571,9 @@ function registerCreditRoutes(app, deps) {
   // Brouillon : son auteur (ou un approbateur) le supprime librement. Tout autre statut exige
   // credits:delete ET une raison, parce qu'on efface une entente envoyée ou signée. Le journal
   // d'activité garde la trace (référence, marchand, montant, note de crédit) : il survit au dossier.
-  // ⚠️ La note de crédit Zoho n'est PAS supprimée (Sales Hub n'a pas ce droit chez Zoho) : la
-  // réponse la nomme pour que l'écran demande de l'annuler dans Zoho Books.
+  // La note de crédit Zoho du dossier est ANNULÉE (void) dans Books AVANT d'effacer le dossier.
+  // Si Zoho refuse (note déjà appliquée à une facture, portée manquante…), rien n'est effacé et le
+  // message de Zoho revient ; `force: true` supprime quand même, la note restant à annuler à la main.
   app.delete('/api/credits/:id', authenticateToken, async (req, res) => {
     const draft = await (async () => {
       if (!UUID_RE.test(req.params.id || '')) return null;
@@ -589,12 +590,25 @@ function registerCreditRoutes(app, deps) {
     const row = await loadFor(req, res); if (!row) return;
     const reason = clean((req.body || {}).reason, 500);
     if (reason.length < 3) return res.status(400).json({ error: 'reason_required' });
+    const force = (req.body || {}).force === true;
+    let voided = false;
+    if (row.creditnote_id && !force) {
+      let v;
+      try { v = await zb.voidCreditNote(row.creditnote_id); } catch (e) { v = { ok: false, message: e.message }; }
+      if (!v.ok) {
+        await log(row, 'creditnote_void_failed', `annulation de la note de crédit ${row.creditnote_number} refusée par Zoho : ${v.message}`, email(req));
+        return res.status(502).json({ error: 'books_void_failed', message: v.message, scopeMissing: !!v.scopeMissing, creditnoteNumber: row.creditnote_number });
+      }
+      voided = true;
+      await log(row, 'creditnote_voided', `note de crédit ${row.creditnote_number} ${v.already === 'gone' ? 'déjà supprimée' : v.already === 'void' ? 'déjà annulée' : 'annulée'} dans Zoho Books`, email(req), { amount: Number(row.amount) });
+    }
     const del = await pool.query('DELETE FROM merchant_credits WHERE id = $1 AND status = $2 RETURNING id', [row.id, row.status]);
     if (!del.rows[0]) return res.status(409).json({ error: 'changed' });
+    const cnNote = row.creditnote_number ? `, note de crédit ${row.creditnote_number} ${voided ? 'annulée dans Zoho Books' : '(à annuler dans Zoho Books)'}` : '';
     await log(row, 'deleted',
-      `dossier supprimé (${row.status}) — ${row.legal_name}, ${pdf.formatAmount(row.amount, 'fr')} $${row.creditnote_number ? `, note de crédit ${row.creditnote_number} (à annuler dans Zoho Books)` : ''} — raison : ${reason}`,
+      `dossier supprimé (${row.status}) — ${row.legal_name}, ${pdf.formatAmount(row.amount, 'fr')} $${cnNote} — raison : ${reason}`,
       email(req), { amount: Number(row.amount) });
-    res.json({ ok: true, creditnoteNumber: row.creditnote_number || null });
+    res.json({ ok: true, creditnoteNumber: row.creditnote_number || null, creditnoteVoided: voided });
   });
 
 
