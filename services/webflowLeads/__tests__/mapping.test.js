@@ -106,22 +106,12 @@ describe('formulaires du site (audit 2026-09-29)', () => {
     expect(mapSubmission({ 'Website': 'https://cafe.ca' }).website).toBe('https://cafe.ca');
   });
 
-  test.each([
-    ['Existing', 'Technical Support', 'existing_customer'],
-    ['Existing', 'Account & Billing', 'existing_customer'],
-    ['Existing', 'Customer Service', 'existing_customer'],
-    ['Existant', 'Soutien', 'existing_customer'],
-    ['Existing', undefined, 'existing_customer'],
-    ['Existing', 'Sales', null],
-    ['Existant', 'Ventes', null],
-    ['New', 'Technical Support', null],
-    ['Nouveau', undefined, null],
-  ])('Get in Touch : %s / %s → %s', (type, dept, reason) => {
-    const data = { 'Customer Type': type, 'First Name': 'Luc', 'Email': 'luc@x.ca', 'Company': 'X', 'Message': 'Allo' };
-    if (dept) data.Department = dept;
-    const r = screenSubmission(data);
-    expect(r ? r.reason : null).toBe(reason);
-  });
+  test.each([['Existing', 'Technical Support'], ['Existant', 'Soutien'], ['Existing', undefined], ['New', 'Sales']])(
+    'Get in Touch : %s / %s → toujours une piste (décision du 2026-09-30)', (type, dept) => {
+      const data = { 'Customer Type': type, 'First Name': 'Luc', 'Email': 'luc@x.ca', 'Company': 'X', 'Message': 'Allo' };
+      if (dept) data.Department = dept;
+      expect(screenSubmission(data)).toBeNull();
+    });
 
   test('Get in Touch gardé : type et service vont au message', () => {
     const out = mapSubmission({ 'Customer Type': 'Existing', 'Department': 'Sales', 'Company': 'X', 'Message': 'Une 2e succursale' });

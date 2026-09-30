@@ -81,23 +81,15 @@ function guessTarget(fieldName) {
 //    retenu par l'équipe Webflow.
 const HONEYPOT_FIELDS = new Set(['website_url', 'hp', 'hp_field', 'honeypot', '_gotcha']);
 const isHoneypot = (field) => HONEYPOT_FIELDS.has(String(field || '').trim().toLowerCase());
-// 2. Client EXISTANT qui écrit au soutien ou à la facturation (« Get in Touch ») : ce n'est pas une
-//    piste de vente. S'il demande les VENTES (ajout de produit, nouvelle succursale), il reste une piste.
-const CUSTOMER_TYPE_FIELD = /(customertype|clienttype|typedeclient|neworexisting|nouveauouexistant)/;
-const DEPARTMENT_FIELD = /(department|departement|connectmewith|dirigervers|diriger)/;
-const EXISTING_VALUE = /(existing|existant|current|actuel)/i;
-const SALES_VALUE = /(sales|vente)/i;
+// 2. (retirée le 2026-09-30) Un client EXISTANT sur « Get in Touch » était écarté sauf s'il demandait
+//    les ventes. Décision de David : « Prenez contact » crée une piste comme les autres formulaires.
+//    « Customer Type » arrive dans le message de la piste : l'examinateur voit que c'est un client existant.
 
 // Rend { reason, detail } si la soumission ne doit PAS devenir une piste, sinon null.
 function screenSubmission(data) {
   const entries = Object.entries(data || {}).map(([k, v]) => [k, Array.isArray(v) ? v.join(', ') : v == null ? '' : String(v).trim()]);
   const trap = entries.find(([k, v]) => isHoneypot(k) && v);
   if (trap) return { reason: 'honeypot', detail: trap[0] };
-  const type = entries.find(([k]) => CUSTOMER_TYPE_FIELD.test(norm(k)));
-  if (type && EXISTING_VALUE.test(type[1])) {
-    const dept = entries.find(([k]) => DEPARTMENT_FIELD.test(norm(k)));
-    if (!(dept && SALES_VALUE.test(dept[1]))) return { reason: 'existing_customer', detail: dept?.[1] || null };
-  }
   return null;
 }
 
