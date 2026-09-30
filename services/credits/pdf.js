@@ -78,8 +78,8 @@ function merchantFields(c) {
   };
 }
 
-// PDF lu par le client avant de signer.
-async function renderUnsigned(c) {
+// PDF lu par le client avant de signer — ancien gabarit (secours).
+async function templateUnsigned(c) {
   const doc = await loadTemplate(c.lang);
   await fill(doc, merchantFields(c));
   doc.setTitle(c.lang === 'en' ? 'Merchant Compensation Credit' : 'Crédit de compensation marchand');
@@ -160,9 +160,9 @@ async function addCertificate(doc, c, sig, unsignedSha) {
   }
 }
 
-// PDF signé : formulaire rempli + signature + certificat.
+// PDF signé : formulaire rempli + signature + certificat — ancien gabarit (secours).
 // sig = { name, title, at, ip, ua, image (data:image/png;base64,…) }
-async function renderSigned(c, sig, unsignedSha) {
+async function templateSigned(c, sig, unsignedSha) {
   const doc = await loadTemplate(c.lang);
   await fill(doc, {
     ...merchantFields(c),
@@ -179,4 +179,40 @@ async function renderSigned(c, sig, unsignedSha) {
   return Buffer.from(await doc.save());
 }
 
-module.exports = { renderUnsigned, renderSigned, formatAmount, safe, SIG_BOX };
+// ── Document v2 (2026-09-30) : même présentation que la page de signature ──
+// Rendu HTML → PDF par le service Chromium des propositions. S'il est absent ou en panne, on
+// retombe sur l'ancien gabarit : une signature client ne doit JAMAIS échouer pour une question de
+// mise en page. Le document rendu est de toute façon celui qu'on fige et qu'on hache.
+const axios = require('axios');
+const { renderCreditHtml } = require('./html');
+const { renderHtmlUrl } = require('../revenueModel/chainProposal');
+
+let htmlRenderer = async (html) => {
+  const url = renderHtmlUrl();
+  if (!url) throw new Error('render_not_configured');
+  const r = await axios.post(url, { html, token: process.env.PROPOSAL_RENDER_TOKEN || '' }, {
+    responseType: 'arraybuffer', timeout: 45000, validateStatus: () => true,
+  });
+  if (r.status !== 200 || !r.data || r.data.byteLength < 1000) throw new Error(`render_failed_${r.status}`);
+  return Buffer.from(r.data);
+};
+// Tests : remplacer le service de rendu (null = retour au vrai).
+function setHtmlRenderer(fn) { htmlRenderer = fn; }
+
+async function viaHtml(html, fallback) {
+  try { return await htmlRenderer(html); } catch (e) {
+    if (!/not_configured/.test(e.message)) console.warn('[credits] rendu HTML indisponible, ancien gabarit utilisé :', e.message);
+    return fallback();
+  }
+}
+
+// opts : { docs: [noms des pièces jointes], commitmentMonths }
+async function renderUnsigned(c, opts = {}) {
+  return viaHtml(renderCreditHtml(c, { docs: opts.docs || [], commitmentMonths: opts.commitmentMonths }), () => templateUnsigned(c));
+}
+
+async function renderSigned(c, sig, unsignedSha, opts = {}) {
+  return viaHtml(renderCreditHtml(c, { sig, sha: unsignedSha, docs: opts.docs || [], commitmentMonths: opts.commitmentMonths }), () => templateSigned(c, sig, unsignedSha));
+}
+
+module.exports = { renderUnsigned, renderSigned, templateUnsigned, templateSigned, setHtmlRenderer, formatAmount, safe, SIG_BOX };

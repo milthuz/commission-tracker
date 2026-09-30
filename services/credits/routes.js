@@ -214,6 +214,11 @@ function registerCreditRoutes(app, deps) {
     return rows[0] ? shape(rows[0]) : null;
   }
 
+  // Noms des pièces jointes, imprimés dans la clause 4 du document.
+  const docNames = async (id) => (await pool.query(
+    'SELECT filename FROM merchant_credit_docs WHERE credit_id = $1 ORDER BY uploaded_at, id', [id])).rows.map((r) => r.filename);
+  const pdfOpts = async (id) => ({ docs: await docNames(id), commitmentMonths: COMMITMENT_MONTHS });
+
   const log = (row, event, desc, actor, extra) =>
     logActivity('merchant_credit', row.id, event, `${row.ref} — ${desc}`, actor, extra).catch(() => {});
 
@@ -367,7 +372,7 @@ function registerCreditRoutes(app, deps) {
   app.get('/api/credits/:id/pdf', authenticateToken, async (req, res) => {
     const row = await loadFor(req, res); if (!row) return;
     try {
-      const buf = asBuffer(row.signed_pdf || row.unsigned_pdf) || (await pdf.renderUnsigned(row));
+      const buf = asBuffer(row.signed_pdf || row.unsigned_pdf) || (await pdf.renderUnsigned(row, await pdfOpts(row.id)));
       res.set('Content-Type', 'application/pdf').set('Content-Disposition', `inline; filename="${row.ref}.pdf"`).send(buf);
     } catch (e) { console.error('credits pdf:', e.message); res.status(500).json({ error: 'pdf_failed' }); }
   });
@@ -420,7 +425,7 @@ function registerCreditRoutes(app, deps) {
     if (missing.length) return res.status(400).json({ error: 'incomplete', missing });
     try {
       // Premier envoi : on fige le document. Un renvoi réutilise le MÊME document (même empreinte).
-      const unsigned = asBuffer(row.unsigned_pdf) || (await pdf.renderUnsigned(row));
+      const unsigned = asBuffer(row.unsigned_pdf) || (await pdf.renderUnsigned(row, await pdfOpts(row.id)));
       const raw = crypto.randomBytes(32).toString('base64url');
       const expires = new Date(Date.now() + TOKEN_DAYS * 86400000);
       await pool.query(
@@ -646,7 +651,7 @@ function registerCreditRoutes(app, deps) {
     if (!['sent', 'viewed'].includes(row.status)) return res.status(409).json({ error: 'not_signable' });
     const { f } = clientFields(req.body || {});
     try {
-      const buf = await pdf.renderUnsigned({ ...row, ...f });
+      const buf = await pdf.renderUnsigned({ ...row, ...f }, await pdfOpts(row.id));
       res.set('Content-Type', 'application/pdf').set('Content-Disposition', `inline; filename="${row.ref}.pdf"`).send(buf);
     } catch (e) { console.error('credits preview:', e.message); res.status(500).json({ error: 'pdf_failed' }); }
   });
@@ -709,9 +714,10 @@ function registerCreditRoutes(app, deps) {
       // Le document que le client a CONFIRMÉ = le formulaire rempli avec SES valeurs ; c'est lui qu'on
       // fige et dont l'empreinte figure au certificat.
       const merged = { ...row, ...f };
-      const confirmed = await pdf.renderUnsigned(merged);
+      const opts = await pdfOpts(row.id);
+      const confirmed = await pdf.renderUnsigned(merged, opts);
       const confirmedSha = sha256(confirmed);
-      const signed = await pdf.renderSigned(merged, sig, confirmedSha);
+      const signed = await pdf.renderSigned(merged, sig, confirmedSha, opts);
       // Verrou : deux envois simultanés du formulaire ne signent pas deux fois.
       const upd = await pool.query(
         `UPDATE merchant_credits SET status='signed', signed_at=NOW(), signature=$2::jsonb, signed_pdf=$3, signed_sha=$4,
