@@ -37649,6 +37649,18 @@ app.get('/api/leads/stats', authenticateToken, async (req, res) => {
   }
 });
 
+// Pastille rouge du menu « Pistes » : combien de pistes attendent un examen. Mêmes statuts que
+// la file (`queue` ci-dessus). Réservé aux examinateurs : un rep ne voit que SES pistes, et un
+// compteur de la file entière lui montrerait ce que `leadAccess` lui cache.
+app.get('/api/leads/pending-count', authenticateToken, async (req, res) => {
+  const acc = await leadAccess(req);
+  if (!acc.review) return res.json({ count: 0 });
+  try {
+    const r = await pool.query(`SELECT COUNT(*)::int AS n FROM leads WHERE status IN ('new', 'in_review')`);
+    res.json({ count: r.rows[0].n });
+  } catch (e) { res.status(500).json({ error: 'count_failed' }); }
+});
+
 // La liste des representants attribuables : le tour de role d'abord (avec son etat), puis tout
 // representant actif absent de la rotation — un examinateur doit pouvoir attribuer a quelqu'un
 // qui n'est pas dans le bassin automatique.
