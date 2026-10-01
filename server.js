@@ -198,6 +198,11 @@ const PERMISSION_CATALOG = [
   { key: 'leads:review',               label: 'Accept / reject leads, assign a rep, push them into Zoho CRM',   category: 'Leads' },
   { key: 'leads:manage_rules',         label: 'Configure assignment rules, the rotation and the automations',   category: 'Leads' },
   { key: 'leads:delete',               label: 'Delete a lead — also deletes its Zoho CRM Lead, callback and calendar event', category: 'Leads' },
+  // Texto au représentant quand une piste lui est attribuée (David, 2026-10-01). La clé ouvre
+  // la section du Profil où il saisit son cellulaire et coupe/rallume les textos.
+  { key: 'leads:sms_alerts',           label: 'Receive a text message (SMS) when a lead is assigned to me — set in Profile', category: 'Leads' },
+  // Un client existant qui écrit au formulaire de vente : sa demande devient un billet Desk.
+  { key: 'leads:to_ticket',            label: 'Turn a lead into a Zoho Desk support ticket (existing customer)', category: 'Leads' },
 
   // Sofia (in-app assistant) — CRM tools. Split read/write on purpose: the write key is the
   // only thing standing between a chat message and a real record in Zoho, so it must be
@@ -509,6 +514,7 @@ async function hasPerm(req, perm) {
 // from the Heroku dynos. Every round-trip pays ~30-100ms of public-internet latency, so we
 // bound connections and fail fast instead of hanging into the Heroku 30s H12 timeout.
 const isWorker = process.env.ROLE === 'worker';
+const { sendSms, smsConfigured, toE164 } = require('./services/sms');
 // SSL: the Railway PUBLIC proxy (proxy.rlwy.net, used from Heroku) requires SSL; the Railway
 // PRIVATE network (*.railway.internal, used once the app runs ON Railway) speaks plaintext and
 // REJECTS an SSL handshake. Detect the internal host so the Heroku→Railway cutover doesn't fail
@@ -1082,6 +1088,11 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS signature_role TEXT`);
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS signature_role2 TEXT`);
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS signature_phone TEXT`);
+    // Textos des nouvelles pistes (Profil → Alertes SMS, permission leads:sms_alerts). Le
+    // cellulaire est DISTINCT du téléphone de signature : celui-là s'imprime dans les courriels
+    // aux marchands, et peut être une ligne de bureau qui ne reçoit pas de texto.
+    await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS sms_mobile TEXT`);
+    await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS sms_lead_alerts BOOLEAN DEFAULT true`);
     // Configurable bonus tiers (monthly + annual). Seeded once from the code defaults; editable in
     // Admin → Salespeople → Bonuses. calculate*Bonus read the in-memory arrays kept in sync below.
     await pool.query(`
@@ -2326,6 +2337,12 @@ async function initializeDatabase() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_leads_rep     ON leads(assigned_rep_name, created_at DESC)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_leads_source  ON leads(source, created_at DESC)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_leads_created ON leads(created_at DESC)`);
+    // Client existant (contacts Zoho Books des trois organisations + contacts Desk, par
+    // courriel) et billet Desk créé à partir de la piste (statut 'support_ticket').
+    await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS existing_customer JSONB`);
+    await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS desk_ticket_id TEXT`);
+    await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS desk_ticket_number TEXT`);
+    await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS desk_ticket_url TEXT`);
 
     // Regles d'attribution, evaluees DANS L'ORDRE de `position`. Un critere laisse vide ne
     // filtre rien — une regle sans aucun critere attrape donc tout ce qui lui parvient, ce
@@ -11560,7 +11577,11 @@ app.get('/api/auth/zoho-crm', authenticateToken, (req, res) => {
 // ⚠️ On reutilise l'URL de retour du CRM et on distingue par le `state` SIGNE. En ajouter une
 // troisieme obligerait a l'enregistrer a la main dans la console API de Zoho — une friction
 // evitable, et le `state` porte deja une identite signee depuis le 2026-08-17.
-const DESK_SCOPES = 'Desk.tickets.READ,Desk.contacts.READ,Desk.basic.READ,Desk.settings.READ,Desk.search.READ';
+// Desk.tickets.CREATE + Desk.contacts.CREATE ajoutés le 2026-10-01 : une piste venue d'un client
+// existant devient un billet de soutien (POST /api/leads/:id/to-ticket). Les jetons accordés
+// AVANT n'ont pas ces portées — un admin doit reconnecter Desk une fois ; d'ici là la création
+// répond « desk_scope » et l'écran le dit, sans rien casser du reste (les rapports lisent).
+const DESK_SCOPES = 'Desk.tickets.READ,Desk.contacts.READ,Desk.basic.READ,Desk.settings.READ,Desk.search.READ,Desk.tickets.CREATE,Desk.contacts.CREATE';
 app.get('/api/auth/zoho-desk', authenticateToken, (req, res) => {
   // Reserve aux admins : contrairement au CRM (un jeton PAR personne), Desk n'a qu'un seul
   // compte lecteur, epingle. Laisser n'importe qui lancer ce flux laisserait repointer
@@ -15643,6 +15664,18 @@ async function deskGet(chemin, params = {}) {
   return r.data;
 }
 
+// Le seul point d'ÉCRITURE vers Desk (même en-têtes que deskGet). Rend { status, data } sans
+// lever : l'appelant doit distinguer « portée manquante » (reconnecter) d'un vrai refus.
+async function deskPost(chemin, body) {
+  const token = await ensureValidDeskToken();
+  const orgId = await deskOrgId();
+  const r = await axios.post(`https://desk.zoho.com/api/v1${chemin}`, body, {
+    headers: { Authorization: `Zoho-oauthtoken ${token}`, orgId, 'Content-Type': 'application/json' },
+    validateStatus: () => true, timeout: 30000,
+  });
+  return { status: r.status, data: r.data };
+}
+
 // GET /api/auth/desk-status — l'etat de la connexion, et une VRAIE lecture pour le prouver.
 // Un « connecte » base sur la seule presence d'un jeton en base mentirait : c'est exactement
 // comme ca qu'un profil Zoho sans acces API est passe inapercu cote CRM.
@@ -16725,6 +16758,60 @@ app.put('/api/user/signature', authenticateToken, async (req, res) => {
     console.error('Signature error:', error);
     res.status(500).json({ error: 'Failed to save signature', details: error.message });
   }
+});
+
+// Profil → Alertes SMS (permission leads:sms_alerts). Même rattachement à la fiche salespeople
+// que la signature : par le nom d'affichage du compte.
+async function smsProfileRep(req) {
+  const tok = (await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [req.user.email])).rows[0];
+  const repName = tok?.display_name || req.user.name || req.user.email;
+  return (await pool.query(
+    `SELECT name, sms_mobile, sms_lead_alerts FROM salespeople
+      WHERE name = $1 OR LOWER(email) = LOWER($2) ORDER BY (name = $1) DESC LIMIT 1`,
+    [repName, req.user.email])).rows[0] || null;
+}
+const _smsTestAt = new Map();
+
+app.get('/api/user/sms-alerts', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:sms_alerts'))) return;
+  try {
+    const sp = await smsProfileRep(req);
+    res.json({
+      configured: smsConfigured(), linked: !!sp,
+      mobile: sp?.sms_mobile || '', enabled: sp ? sp.sms_lead_alerts !== false : true,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/user/sms-alerts', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:sms_alerts'))) return;
+  const raw = String(req.body?.mobile || '').trim();
+  const enabled = req.body?.enabled !== false;
+  const mobile = raw ? toE164(raw) : null;
+  if (raw && !mobile) return res.status(400).json({ error: 'bad_number' });
+  try {
+    const sp = await smsProfileRep(req);
+    if (!sp) return res.status(404).json({ error: 'no_salesperson' });
+    await pool.query(`UPDATE salespeople SET sms_mobile = $1, sms_lead_alerts = $2, updated_at = CURRENT_TIMESTAMP WHERE name = $3`,
+      [mobile, enabled, sp.name]);
+    res.json({ success: true, mobile: mobile || '', enabled });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Texto d'essai, une fois par minute au plus : le seul moyen pour un rep de savoir que SON
+// numéro fonctionne avant d'attendre sa prochaine piste.
+app.post('/api/user/sms-alerts/test', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:sms_alerts'))) return;
+  const last = _smsTestAt.get(req.user.email) || 0;
+  if (Date.now() - last < 60000) return res.status(429).json({ error: 'wait' });
+  _smsTestAt.set(req.user.email, Date.now());
+  try {
+    const sp = await smsProfileRep(req);
+    if (!sp?.sms_mobile) return res.status(400).json({ error: 'no_mobile' });
+    const r = await sendSms(sp.sms_mobile, 'Sales Hub : texto d\u2019essai — tes alertes de nouvelles pistes fonctionnent. / Test text — your new-lead alerts work.');
+    if (!r.sent) return res.status(502).json({ error: r.reason, detail: r.detail || null });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // SaaS Increase — push confirmation PIN. Required before pushing price increases into live
@@ -36859,7 +36946,8 @@ app.patch('/api/releases/fix-urls', authenticateToken, async (req, res) => {
 // n'ouvre le CRM.
 
 const LEAD_SOURCES  = ['website', 'phone', 'walk_in', 'referral', 'event', 'other'];
-const LEAD_STATUSES = ['new', 'in_review', 'accepted', 'rejected', 'duplicate'];
+// 'support_ticket' : client existant dont la demande est devenue un billet Zoho Desk (2026-10-01).
+const LEAD_STATUSES = ['new', 'in_review', 'accepted', 'rejected', 'duplicate', 'support_ticket'];
 
 // `leadSource*` par defaut a VIDE, et c'est delibere : `Lead_Source` est une liste de choix
 // chez Zoho, et une valeur absente de la liste fait rejeter TOUT l'enregistrement, pas
@@ -37263,6 +37351,9 @@ async function createLeadRow(input, { createdBy = null, raw = null, waitForDupli
     })
     .catch((e) => { console.warn('[leads] detection de doublon impossible:', e.message); return null; });
 
+  // Client existant ? Détaché comme le doublon : un formulaire public ne doit pas attendre Zoho.
+  refreshLeadExistingCustomer(id, input.email).catch(() => {});
+
   notifyLeadReviewers(id).catch(() => {});
 
   return { id, refCode, suggestion, duplicate: waitForDuplicate ? await dup : null };
@@ -37432,6 +37523,10 @@ async function notifierRepOpportunite(opportuniteId) {
 
     const { subject, html } = partnerLeadAssignedEmail(op, op.crm_lead_id);
     const envoi = await sendMail(dest.email, subject, html);
+    notifyRepBySms(dest.name || op.crm_owner_name, dest.email, {
+      fr: `Sales Hub : nouvelle opportunité partenaire (${op.partner_name}) — ${op.business_name}. Détails dans ton courriel.`,
+      en: `Sales Hub: new partner opportunity (${op.partner_name}) — ${op.business_name}. Details in your email.`,
+    }, { entity: 'partner_opportunity', id: opportuniteId }).catch(() => {});
     logActivity('partner_opportunity', String(opportuniteId), envoi.sent ? 'rep_notified' : 'rep_notify_failed',
       envoi.sent
         ? `${dest.name || dest.email} prévenu par courriel de la piste ${op.business_name}`
@@ -37677,6 +37772,19 @@ async function acceptLead(leadId, actor, opts = {}) {
   } else {
     steps.repEmail = { ok: false, skipped: !settings.notifyRep ? 'disabled' : 'no_rep_email' };
   }
+  // 3b. Le texto au representant — en plus du courriel, jamais a sa place. Il ne bloque rien.
+  if (settings.notifyRep) {
+    const where = [lead.city, lead.province].filter(Boolean).join(', ');
+    const who = [leadDisplayName(lead), lead.contact_phone].filter(Boolean).join(' · ');
+    const whenFr = callbackAt ? leadWhenLabel(callbackAt, 'fr') : null;
+    const whenEn = callbackAt ? leadWhenLabel(callbackAt, 'en') : null;
+    steps.repSms = await notifyRepBySms(rep?.name || repName, rep?.email, {
+      fr: `Sales Hub : nouvelle piste pour toi — ${lead.business_name}${where ? ` (${where})` : ''}.`
+        + `${who ? ` ${who}.` : ''}${whenFr ? ` Rappel prévu ${whenFr}.` : ''} Détails dans ton courriel.`,
+      en: `Sales Hub: new lead for you — ${lead.business_name}${where ? ` (${where})` : ''}.`
+        + `${who ? ` ${who}.` : ''}${whenEn ? ` Call back ${whenEn}.` : ''} Details in your email.`,
+    }, { entity: 'lead', id: leadId });
+  }
 
   // 4. Le marchand. Il part DE l'adresse du representant (domaine authentifie chez SendGrid) —
   // sinon au nom du representant sur l'adresse habituelle — et la reponse lui revient toujours :
@@ -37771,6 +37879,7 @@ async function leadAccess(req) {
     intake:  has('leads:intake'),
     rules:   has('leads:manage_rules'),
     remove:  has('leads:delete'),
+    toTicket: has('leads:to_ticket'),
   };
 }
 
@@ -37935,7 +38044,7 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
 // en veut une poignee, nommees comme le reste de l'application.
 // La verification de doublon ne regarde que celui qui DISTRIBUE (leads:review ou admin).
 function withoutDuplicateUnlessReviewer(lead, acc) {
-  return acc.review ? lead : { ...lead, duplicate: { status: null, summary: null, records: [] } };
+  return acc.review ? lead : { ...lead, duplicate: { status: null, summary: null, records: [] }, existingCustomer: null };
 }
 
 function publicLead(r) {
@@ -37970,6 +38079,12 @@ function publicLead(r) {
     booking: { status: r.booking_status || null, updatedAt: r.booking_updated_at || null, changes: r.booking_changes || 0,
                inGoogleCalendar: !!r.gcal_event_id, meetUrl: r.gcal_meet_url || null },
     automation: r.automation || {},
+    // Client existant (null = pas encore vérifié). Les clés `customerName`/`contactEmail` sont
+    // couvertes par le mode démo (DEMO_NAME_KEYS / DEMO_CONTACT_KEYS).
+    existingCustomer: r.existing_customer || null,
+    deskTicket: r.desk_ticket_id
+      ? { id: r.desk_ticket_id, number: r.desk_ticket_number, url: r.desk_ticket_url }
+      : null,
   };
 }
 
@@ -37990,7 +38105,8 @@ app.get('/api/leads/:id', authenticateToken, async (req, res) => {
         WHERE entity_type = 'lead' AND entity_id = $1 ORDER BY created_at DESC LIMIT 50`,
       [String(r.id)]
     )).rows;
-    res.json({ lead: withoutDuplicateUnlessReviewer(publicLead(r), acc), history, can: { review: acc.review, delete: acc.remove } });
+    res.json({ lead: withoutDuplicateUnlessReviewer(publicLead(r), acc), history,
+               can: { review: acc.review, delete: acc.remove, toTicket: acc.toTicket } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -38183,10 +38299,167 @@ app.post('/api/leads/:id/recheck', authenticateToken, async (req, res) => {
       `UPDATE leads SET crm_match_status = $2, crm_match_summary = $3, crm_match_records = $4::jsonb WHERE id = $1`,
       [id, result.status, result.summary, JSON.stringify(result.matches || [])]
     );
+    await refreshLeadExistingCustomer(id, lead.contact_email).catch(() => {});
     res.json({ status: result.status, summary: result.summary, records: result.matches || [] });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+
+// ── Texto au représentant ─────────────────────────────────────────────────────
+// Cellulaire et choix sur la fiche salespeople (Profil → Alertes SMS). Rien ne part si le rep
+// n'a pas saisi de numéro, ou a coupé les textos ; la langue suit sa préférence de profil.
+// Ne lève jamais : un texto raté ne doit rien faire échouer.
+async function notifyRepBySms(repName, repEmail, texts, ctx = {}) {
+  try {
+    if (!smsConfigured()) return { ok: false, skipped: 'not_configured' };
+    const sp = (await pool.query(
+      `SELECT name, email, sms_mobile, sms_lead_alerts FROM salespeople
+        WHERE ($1::text IS NOT NULL AND LOWER(name) = LOWER($1))
+           OR ($2::text IS NOT NULL AND LOWER(email) = LOWER($2))
+           -- salespeople.email est vide chez la plupart des reps : le compte connecté porte le lien.
+           OR ($2::text IS NOT NULL AND LOWER(name) = LOWER((SELECT display_name FROM user_tokens WHERE LOWER(email) = LOWER($2) LIMIT 1)))
+        ORDER BY (LOWER(name) = LOWER(COALESCE($1, ''))) DESC LIMIT 1`,
+      [repName || null, repEmail || null])).rows[0];
+    if (!sp?.sms_mobile) return { ok: false, skipped: 'no_mobile' };
+    if (sp.sms_lead_alerts === false) return { ok: false, skipped: 'opted_out' };
+    const lang = (await pool.query(
+      `SELECT language FROM user_preferences WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+      [repEmail || sp.email || ''])).rows[0]?.language;
+    const body = String(lang || '').startsWith('en') ? texts.en : texts.fr;
+    const r = await sendSms(sp.sms_mobile, body);
+    if (ctx.entity) {
+      logActivity(ctx.entity, String(ctx.id), r.sent ? 'rep_sms_sent' : 'rep_sms_failed',
+        r.sent ? `Texto envoyé à ${sp.name}` : `Texto à ${sp.name} non envoyé : ${r.reason}${r.detail ? ` (${r.detail})` : ''}`,
+        'system');
+    }
+    return r.sent ? { ok: true, to: sp.name } : { ok: false, to: sp.name, error: r.reason };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// ── Client existant ? ──────────────────────────────────────────────────────────
+// Une demande arrivée par le formulaire de vente vient parfois d'un client qui a besoin de
+// soutien (David, 2026-10-01). On cherche son COURRIEL dans les contacts clients de Zoho Books
+// (les trois organisations de facturation) et dans les contacts Zoho Desk. Le courriel seul :
+// un numéro de téléphone s'écrit de dix façons et Zoho ne le cherche qu'en texte, donc il
+// donnerait surtout des absences trompeuses. Un SIGNAL pour l'examinateur, jamais une décision.
+// Une lecture ratée s'inscrit comme telle (`error`) : « pas trouvé » et « pas pu chercher » ne
+// doivent pas se ressembler.
+async function findExistingCustomer(email) {
+  const wanted = String(email || '').trim().toLowerCase();
+  const out = { checkedAt: new Date().toISOString(), byEmail: wanted || null, matches: [], errors: [] };
+  if (!wanted) return out;
+  try {
+    const { accessToken, apiDomain } = await getAdminBooksAuth();
+    for (const [orgId, orgName] of Object.entries(ZOHO_BILLING_ORG_NAMES)) {
+      const r = await axios.get(`${apiDomain}/books/v3/contacts`, {
+        params: { organization_id: orgId, email: wanted, contact_type: 'customer', per_page: 10 },
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true, timeout: 15000,
+      });
+      if (r.status !== 200) { out.errors.push(`books ${orgName}: HTTP ${r.status}`); continue; }
+      for (const c of (r.data?.contacts || [])) {
+        // Le filtre `email` de Zoho est permissif ; égalité exacte revérifiée ici.
+        if (String(c.email || '').trim().toLowerCase() !== wanted) continue;
+        out.matches.push({
+          source: 'books', org: orgName, id: String(c.contact_id),
+          customerName: c.company_name || c.contact_name || null,
+          active: String(c.status || '').toLowerCase() !== 'inactive',
+        });
+      }
+    }
+  } catch (e) { out.errors.push(`books: ${e.message}`); }
+  try {
+    const d = await deskGet('/contacts/search', { email: wanted, limit: 5 });
+    for (const c of (d?.data || [])) {
+      if (String(c.email || '').trim().toLowerCase() !== wanted) continue;
+      out.matches.push({
+        source: 'desk', id: String(c.id),
+        customerName: c.accountName || c.account?.accountName || [c.firstName, c.lastName].filter(Boolean).join(' ') || null,
+        url: c.webUrl || null,
+      });
+    }
+  } catch (e) {
+    // Desk répond 204 (corps vide) quand rien ne correspond : ce n'est pas une erreur.
+    if (!/HTTP 204/.test(e.message)) out.errors.push(`desk: ${e.message.slice(0, 160)}`);
+  }
+  return out;
+}
+
+async function refreshLeadExistingCustomer(leadId, email) {
+  const res = await findExistingCustomer(email);
+  await pool.query(`UPDATE leads SET existing_customer = $2::jsonb WHERE id = $1`, [leadId, JSON.stringify(res)]);
+  return res;
+}
+
+// ── Piste → billet Zoho Desk ───────────────────────────────────────────────────
+app.get('/api/leads/meta/desk-departments', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:to_ticket'))) return;
+  try {
+    const d = await deskGet('/departments', { isEnabled: true, limit: 50 });
+    const departments = (d?.data || []).filter((x) => x.isEnabled !== false)
+      .map((x) => ({ id: String(x.id), name: x.name || x.nameInCustomerPortal || String(x.id) }));
+    res.json({ departments });
+  } catch (e) { res.status(502).json({ error: 'desk_unavailable', detail: e.message.slice(0, 300) }); }
+});
+
+app.post('/api/leads/:id/to-ticket', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:to_ticket'))) return;
+  const id = parseInt(req.params.id, 10);
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  const departmentId = String(req.body?.departmentId || '').trim();
+  if (!/^\d+$/.test(departmentId)) return res.status(400).json({ error: 'department_required' });
+  try {
+    const lead = (await pool.query(`SELECT * FROM leads WHERE id = $1`, [id])).rows[0];
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+    // Une piste acceptée vit déjà dans Zoho CRM ; un billet déjà créé ne se recrée pas.
+    if (lead.status === 'accepted') return res.status(409).json({ error: 'already_accepted' });
+    if (lead.desk_ticket_id) return res.status(409).json({ error: 'already_ticket', ticket: { number: lead.desk_ticket_number, url: lead.desk_ticket_url } });
+
+    const subject = String(req.body?.subject || '').trim().slice(0, 250)
+      || `${lead.business_name} — ${String(lead.notes || '').split('\n')[0].slice(0, 120) || 'Demande de soutien'}`;
+    const extra = String(req.body?.description || '').trim();
+    const contact = {
+      firstName: lead.contact_first_name || undefined,
+      // Desk exige un nom de famille : à défaut, le nom de l'entreprise.
+      lastName: lead.contact_last_name || lead.contact_first_name || lead.business_name,
+      email: lead.contact_email || undefined,
+      phone: lead.contact_phone || undefined,
+    };
+    const description = [
+      extra || null,
+      lead.notes ? `Message du client :\n${lead.notes}` : null,
+      '—',
+      `Converti depuis la piste Sales Hub ${lead.ref_code} par ${actor}.`,
+      `Entreprise : ${lead.business_name}`,
+      [lead.city, lead.province].filter(Boolean).length ? `Lieu : ${[lead.city, lead.province].filter(Boolean).join(', ')}` : null,
+      lead.contact_phone ? `Téléphone : ${lead.contact_phone}` : null,
+      `Source : ${lead.source}${lead.source_detail ? ` (${lead.source_detail})` : ''}`,
+    ].filter(Boolean).join('\n');
+
+    const r = await deskPost('/tickets', {
+      subject, departmentId, contact, description,
+      email: lead.contact_email || undefined, phone: lead.contact_phone || undefined,
+      channel: lead.source === 'phone' ? 'Phone' : 'Web',
+    });
+    if (r.status < 200 || r.status >= 300) {
+      const brut = JSON.stringify(r.data || {}).slice(0, 400);
+      // Jeton accordé avant l'ajout de Desk.tickets.CREATE : il faut reconnecter Desk.
+      const scope = r.status === 401 || r.status === 403 || /scope|INVALID_OAUTH|UNAUTHORIZED/i.test(brut);
+      logActivity('lead', String(id), 'desk_ticket_failed', `${lead.ref_code} — billet Desk refusé (HTTP ${r.status}) : ${brut}`, actor);
+      return res.status(502).json({ error: scope ? 'desk_scope' : 'desk_refused', detail: brut });
+    }
+    const t = r.data || {};
+    await pool.query(
+      `UPDATE leads SET status = 'support_ticket', desk_ticket_id = $2, desk_ticket_number = $3, desk_ticket_url = $4,
+              reviewed_by = $5, reviewed_at = CURRENT_TIMESTAMP
+        WHERE id = $1`,
+      [id, String(t.id || ''), t.ticketNumber ? String(t.ticketNumber) : null, t.webUrl || null, actor]);
+    logActivity('lead', String(id), 'desk_ticket_created',
+      `${lead.ref_code} — ${lead.business_name} converti en billet de soutien Desk #${t.ticketNumber || t.id}`, actor);
+    res.json({ success: true, ticket: { id: String(t.id || ''), number: t.ticketNumber || null, url: t.webUrl || null } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // ── Administration : regles, rotation, automatisations, destinataires ───────
 
