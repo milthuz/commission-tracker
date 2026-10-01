@@ -38043,8 +38043,21 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
 // Forme envoyee au navigateur. Les colonnes brutes portent des noms de base de donnees ; l'ecran
 // en veut une poignee, nommees comme le reste de l'application.
 // La verification de doublon ne regarde que celui qui DISTRIBUE (leads:review ou admin).
+// Le formulaire du site demande « Nouveau / Existant » (champ Webflow « Customer Type »). C'est
+// le client qui le dit : un signal plus sûr que toute recherche par courriel (David, 2026-10-01,
+// piste L-00010 « Customer Type : Existing » dont le courriel n'était connu nulle part).
+function leadFormSaysExisting(raw) {
+  const data = raw?.payload?.data || raw?.data || raw || {};
+  if (!data || typeof data !== 'object') return false;
+  for (const [k, v] of Object.entries(data)) {
+    if (/customer.?type|type.?de.?client|client.?type|existing.?customer/i.test(k)
+        && /exist|actuel|current/i.test(String(v || ''))) return true;
+  }
+  return false;
+}
+
 function withoutDuplicateUnlessReviewer(lead, acc) {
-  return acc.review ? lead : { ...lead, duplicate: { status: null, summary: null, records: [] }, existingCustomer: null };
+  return acc.review ? lead : { ...lead, duplicate: { status: null, summary: null, records: [] }, existingCustomer: null, formSaysExisting: false };
 }
 
 function publicLead(r) {
@@ -38082,6 +38095,7 @@ function publicLead(r) {
     // Client existant (null = pas encore vérifié). Les clés `customerName`/`contactEmail` sont
     // couvertes par le mode démo (DEMO_NAME_KEYS / DEMO_CONTACT_KEYS).
     existingCustomer: r.existing_customer || null,
+    formSaysExisting: leadFormSaysExisting(r.raw),
     deskTicket: r.desk_ticket_id
       ? { id: r.desk_ticket_id, number: r.desk_ticket_number, url: r.desk_ticket_url }
       : null,
