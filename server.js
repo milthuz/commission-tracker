@@ -3447,6 +3447,42 @@ const ALLOWED_ORIGINS = [
 // page servie depuis le domaine Railway.
 const FRAME_ANCESTORS = ["'self'", ...ALLOWED_ORIGINS.filter(o => /^https?:\/\//.test(o))].join(' ');
 
+// ── Durée des requêtes API (David, 2026-10-01 : « un mini lag et un rond qui spin » en passant
+// d'une section à l'autre). Avant, aucune durée n'était journalisée : impossible de dire quelle
+// page attend ses données. Deux traces, dans les journaux Railway :
+//   [SLOW]       chaque requête de plus de SLOW_REQUEST_MS (chemin SANS la chaîne de requête :
+//                elle peut porter un secret= ou un jeton) ;
+//   [API-TIMING] toutes les heures, les routes les plus lentes en moyenne (≥ 3 appels), puis remise
+//                à zéro. Clé = le MOTIF de route Express (/api/hr/hires/:id), pas l'URL réelle,
+//                pour que les appels d'une même route s'additionnent.
+const SLOW_REQUEST_MS = parseInt(process.env.SLOW_REQUEST_MS, 10) || 1000;
+const _apiTiming = new Map(); // motif -> { n, total, max, slow }
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api/')) return next();
+  const t0 = process.hrtime.bigint();
+  res.on('finish', () => {
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    const pattern = req.route ? `${req.method} ${req.baseUrl || ''}${req.route.path}` : `${req.method} (sans route)`;
+    const st = _apiTiming.get(pattern) || { n: 0, total: 0, max: 0, slow: 0 };
+    st.n++; st.total += ms; if (ms > st.max) st.max = ms; if (ms >= SLOW_REQUEST_MS) st.slow++;
+    _apiTiming.set(pattern, st);
+    if (ms >= SLOW_REQUEST_MS) {
+      console.warn(`[SLOW] ${Math.round(ms)} ms ${req.method} ${req.path} -> ${res.statusCode} (${(req.user && req.user.email) || '-'})`);
+    }
+  });
+  next();
+});
+setInterval(() => {
+  const rows = [..._apiTiming.entries()].filter(([, v]) => v.n >= 3)
+    .map(([k, v]) => ({ k, n: v.n, avg: v.total / v.n, max: v.max, slow: v.slow }))
+    .sort((a, b) => b.avg - a.avg).slice(0, 12);
+  _apiTiming.clear();
+  if (!rows.length) return;
+  console.log('[API-TIMING] dernière heure, routes les plus lentes (moyenne) :\n' + rows
+    .map((r) => `  ${String(Math.round(r.avg)).padStart(6)} ms moy · ${String(Math.round(r.max)).padStart(6)} ms max · ${r.n} appels${r.slow ? ` · ${r.slow} lents` : ''} · ${r.k}`)
+    .join('\n'));
+}, 60 * 60 * 1000).unref();
+
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');      // stops MIME-sniffing an uploaded logo/doc into HTML
   res.setHeader('Content-Security-Policy', `frame-ancestors ${FRAME_ANCESTORS}`);
