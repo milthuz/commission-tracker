@@ -17724,6 +17724,38 @@ const SAAS_MSG_GEL_AVIS = 'Prix gele par le service client : avis non envoye, li
 // compare le prochain renouvellement a la date promise, donc le pilote attend puis applique de
 // lui-meme. Vecu le 2026-09-22 (Bar de Callieres et les deux Mexigo Express).
 const SAAS_MSG_REPORT = 'Hausse reportee a la demande du service client';
+
+// ── Refus de Zoho qu'on sait LIRE (David, 2026-10-01 : trois « échecs » rouges dont un seul
+// demandait vraiment une action). Deux codes ont une suite connue :
+//   107229 « End-of-Term changes are not allowed as Subscription Pause is scheduled » — une
+//          pause est PROGRAMMÉE (fermeture saisonnière). Rien à corriger : la ligne reste en
+//          attente sous le libellé de pause (section calme du bilan) et le pilote réessaie chaque
+//          jour ; elle part d'elle-même au retour de la pause.
+//   102012 « The selected addon is not associated with the plan » — un addon de l'abonnement
+//          n'est pas rattaché à son plan dans Zoho Billing. Action requise (reste rouge), mais le
+//          pilote réessaie chaque jour : la hausse part dès que la configuration est corrigée,
+//          sans relance manuelle. Repousser est sans danger (même prix, même end_of_term).
+const SAAS_ZOHO_PAUSE_SCHEDULED = 107229;
+const SAAS_ZOHO_ADDON_NOT_ON_PLAN = 102012;
+// Les refus que le pilote reprend de lui-même. Lus dans push_error, qui garde la réponse brute.
+const SAAS_REFUS_REPRIS_SQL = `push_error ~ '"code":(${SAAS_ZOHO_ADDON_NOT_ON_PLAN}|${SAAS_ZOHO_PAUSE_SCHEDULED})[^0-9]'`;
+function saasZohoRefusalCode(err) {
+  const brut = typeof err === 'string' ? err : JSON.stringify(err || {});
+  const m = /"code"\s*:\s*(\d+)/.exec(brut);
+  return m ? Number(m[1]) : null;
+}
+// L'état à écrire après un refus : { status, msg, pause }.
+function saasRefusalOutcome(err) {
+  const brut = typeof err === 'string' ? err : JSON.stringify(err || {});
+  if (saasZohoRefusalCode(err) === SAAS_ZOHO_PAUSE_SCHEDULED) {
+    return {
+      status: 'pending', pause: true,
+      msg: `${SAAS_MSG_PAUSE} (pause programmee, ${new Date().toISOString().slice(0, 10)}) — Zoho refuse`
+        + ` tout changement au terme tant que la pause est planifiee ; reessai automatique chaque jour`,
+    };
+  }
+  return { status: 'push_failed', pause: false, msg: brut.slice(0, 500) };
+}
 async function saasExpliquerManquants(liste) {
   if (!liste.length) return { incomplets: 0, fermes: 0, enPause: 0 };
   const jour = new Date().toISOString().slice(0, 10);
@@ -21038,9 +21070,9 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
         );
         results.push({ itemId: item.id, ok: true });
       } else {
-        const msg = typeof r.error === 'string' ? r.error : JSON.stringify(r.error || {}).slice(0, 500);
-        await pool.query(`UPDATE saas_increase_items SET status = 'push_failed', push_error = $1 WHERE id = $2`, [msg, item.id]);
-        results.push({ itemId: item.id, ok: false, error: msg });
+        const o = saasRefusalOutcome(r.error);
+        await pool.query(`UPDATE saas_increase_items SET status = $1, push_error = $2 WHERE id = $3`, [o.status, o.msg, item.id]);
+        results.push({ itemId: item.id, ok: false, deferred: o.pause, error: o.msg });
       }
       await new Promise(r2 => setTimeout(r2, 250));
     }
@@ -21239,7 +21271,8 @@ async function runSaasScheduledPushes() {
   // plafond a toujours voulu dire : borner les appels a Zoho, pas la vision.
   const attente = (await pool.query(
     `SELECT * FROM saas_increase_items
-      WHERE skipped = FALSE AND notify_status = 'sent' AND status IN ('pending', 'deferred')
+      WHERE skipped = FALSE AND notify_status = 'sent'
+        AND (status IN ('pending', 'deferred') OR (status = 'push_failed' AND ${SAAS_REFUS_REPRIS_SQL}))
       ORDER BY effective_date NULLS FIRST, id`)).rows;
   if (!attente.length) return { pushed: 0, failed: 0, waiting: 0 };
 
@@ -21251,7 +21284,10 @@ async function runSaasScheduledPushes() {
     .map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
   const { accessToken, apiDomain } = await getAdminBooksAuth();
 
-  let pushed = 0, failed = 0, waiting = 0, geles = 0, reportees = 0;
+  // `dejaConnus` : un refus connu qui se répète (addon pas encore rattaché). Il reste rouge dans
+  // le bilan de David, mais ne compte pas comme un NOUVEL échec : sinon le compte rendu partirait
+  // chaque matin aux treize destinataires internes pour la même ligne.
+  let pushed = 0, failed = 0, waiting = 0, geles = 0, reportees = 0, pauses = 0, dejaConnus = 0;
   const manquants = [];
   for (const item of attente) {
     // Budget du jour epuise. On ne casse pas la boucle pour pouvoir compter ce qui reste, mais
@@ -21311,9 +21347,10 @@ async function runSaasScheduledPushes() {
           [item.id]);
         pushed++;
       } else {
-        const msg = typeof r.error === 'string' ? r.error : JSON.stringify(r.error || {}).slice(0, 500);
-        await pool.query(`UPDATE saas_increase_items SET status = 'push_failed', push_error = $1 WHERE id = $2`, [msg, item.id]);
-        failed++;
+        const o = saasRefusalOutcome(r.error);
+        const repete = item.status === 'push_failed' && saasZohoRefusalCode(item.push_error) === saasZohoRefusalCode(r.error);
+        await pool.query(`UPDATE saas_increase_items SET status = $1, push_error = $2 WHERE id = $3`, [o.status, o.msg, item.id]);
+        if (o.pause) pauses++; else if (repete) dejaConnus++; else failed++;
       }
     } catch (e) {
       await pool.query(`UPDATE saas_increase_items SET status = 'push_failed', push_error = $1 WHERE id = $2`,
@@ -21332,12 +21369,12 @@ async function runSaasScheduledPushes() {
   if (manquants.length > seuilSuspect) {
     console.warn(`[saas-auto] ${manquants.length}/${attente.length} lignes introuvables chez Zoho —`
       + ` lecture jugee partielle, aucune ligne annotee ni fermee`);
-    return { pushed, failed, waiting, incomplets: 0, fermes: 0, enPause: 0, geles, reportees,
-             lectureSuspecte: manquants.length };
+    return { pushed, failed, waiting, incomplets: 0, fermes: 0, enPause: pauses, geles, reportees,
+             dejaConnus, lectureSuspecte: manquants.length };
   }
   // Une seule lecture de Zoho pour tout le lot, et seulement s'il y a quelque chose a expliquer.
   const { incomplets, fermes, enPause } = await saasExpliquerManquants(manquants);
-  return { pushed, failed, waiting, incomplets, fermes, enPause, geles, reportees };
+  return { pushed, failed, waiting, incomplets, fermes, enPause: enPause + pauses, geles, reportees, dejaConnus };
 }
 
 // ── LE BILAN QUOTIDIEN DE LA CAMPAGNE ────────────────────────────────────────────────────────
@@ -21469,7 +21506,7 @@ async function runSaasCampaignDigest() {
           ${l('Avis annuels &agrave; venir', chiffres.programmes)}
           ${l('&Eacute;checs de pouss&eacute;e', chiffres.echecs, true)}
           ${Number(chiffres.fermees) ? l('R&eacute;sili&eacute;s depuis leur avis (hausse sans objet)',
-            `${chiffres.fermees} &mdash; ${argent(chiffres.mrr_ferme)}`) : ''}
+            `${chiffres.fermees} — ${argent(chiffres.mrr_ferme)}`) : ''}
         </table>
       </td></tr>
 
@@ -21517,6 +21554,7 @@ async function runSaasIncreaseAutopilot() {
   console.log(`[saas-auto] avis ${avis.sent}/${avis.failed} echecs · poussees ${push.pushed}/${push.failed} echecs`
     + ` · ${push.fermes || 0} resilies · ${push.enPause || 0} en pause · ${push.geles || 0} geles`
     + ` · ${push.incomplets || 0} incomplets · ${push.waiting} en attente`
+    + (push.dejaConnus ? ` · ${push.dejaConnus} refus connus repetes` : '')
     + (push.reportees ? ` · ${push.reportees} remises a demain (plafond ${SAAS_AUTO_MAX_PER_RUN})` : '')
     + (push.lectureSuspecte ? ` · ⚠️ lecture Zoho partielle (${push.lectureSuspecte}), rien annote` : ''));
   if (rien) return;
