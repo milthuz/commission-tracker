@@ -35,6 +35,7 @@ const E = require('./emails');
 const PERM_VIEW = 'hr:view';
 const PERM_MANAGE = 'hr:manage';
 const PERM_SIGN = 'hr:countersign';
+const PERM_DELETE_SIGNED = 'hr:delete_signed';
 const RECIPIENTS_KEY = 'hr_recipients';
 const TOKEN_DAYS = 14;
 const MAX_ATTACH = 10 * 1024 * 1024;
@@ -85,6 +86,10 @@ const CERT_TITLE = {
 const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 const refOf = (n) => `RH-${String(n).padStart(4, '0')}`;
 const DELETABLE = ['draft', 'cancelled', 'declined'];
+// Dossiers signés (par le candidat, ou par les deux) : supprimables seulement avec PERM_DELETE_SIGNED,
+// le nom du candidat retapé et un motif. « sent »/« viewed » n'y sont pas : on annule d'abord,
+// pour que le lien de signature meure avant la fiche.
+const SIGNED_DELETABLE = ['employee_signed', 'completed'];
 
 async function ensureSchema(pool) {
   await pool.query(`
@@ -338,7 +343,7 @@ function registerHrRoutes(app, deps) {
       terms: P.BASE_TERMS,
       managers: await readManagers(),
       employers: (await EMP.readEmployers(pool)).map(EMP.publicShape),
-      can: { manage: await can(req, PERM_MANAGE), countersign: await can(req, PERM_SIGN) },
+      can: { manage: await can(req, PERM_MANAGE), countersign: await can(req, PERM_SIGN), deleteSigned: await can(req, PERM_DELETE_SIGNED) },
     });
   });
 
@@ -483,11 +488,29 @@ function registerHrRoutes(app, deps) {
       // Supprimables : brouillon, annulé, refusé (demande de David, 2026-09-23). JAMAIS un dossier
       // signé — c'est le contrat de travail — ni un dossier en cours de signature : on l'annule
       // d'abord, pour que le lien du candidat meure avant que la fiche disparaisse.
-      if (!DELETABLE.includes(row.status)) return res.status(409).json({ error: 'not_deletable', message: 'Only draft, cancelled or declined files can be deleted.' });
+      // Exception (demande de David, 2026-10-01 — un dossier de TEST signé restait coincé) : un
+      // dossier signé se supprime avec une permission à part, le nom retapé et un motif, qui
+      // restent au journal d'activité général puisque la fiche, elle, disparaît.
+      const signed = SIGNED_DELETABLE.includes(row.status);
+      let reason = null;
+      if (!DELETABLE.includes(row.status)) {
+        if (!signed) return res.status(409).json({ error: 'not_deletable', message: 'Only draft, cancelled or declined files can be deleted.' });
+        if (!(await can(req, PERM_DELETE_SIGNED))) return res.status(403).json({ error: 'forbidden', message: 'Deleting a signed file requires the hr:delete_signed permission.' });
+        const norm = (v) => String(v || '').trim().replace(/\s+/g, ' ').toLowerCase();
+        if (norm(req.body?.confirmName) !== norm(row.full_name)) return res.status(400).json({ error: 'confirm_name', message: 'The name typed does not match the candidate.' });
+        reason = String(req.body?.reason || '').trim().slice(0, 500);
+        if (reason.length < 3) return res.status(400).json({ error: 'reason_required', message: 'A reason is required.' });
+        // parent_id n'a pas de clé étrangère : effacer le parent laisserait un addenda orphelin.
+        const kids = (await pool.query('SELECT COUNT(*)::int n FROM hr_hires WHERE parent_id = $1', [row.id])).rows[0].n;
+        if (kids > 0) return res.status(409).json({ error: 'has_addenda', message: 'Delete the addenda linked to this file first.' });
+      }
       await pool.query('DELETE FROM hr_hires WHERE id = $1', [row.id]);
       // La fiche part avec ses pièces jointes et sa chronologie (ON DELETE CASCADE) : la trace
       // de la suppression reste dans le journal d'activité général.
-      await audit(row.id, 'deleted', `Hiring file ${refOf(row.ref_no)} deleted (${row.status}): ${row.full_name}`, req.user.email);
+      await audit(row.id, signed ? 'deleted_signed' : 'deleted',
+        `Hiring file ${refOf(row.ref_no)} deleted (${row.status}): ${row.full_name}`
+        + (signed ? ` — SIGNED file${row.salesperson_name ? `, rep "${row.salesperson_name}" left untouched` : ''} — reason: ${reason}` : ''),
+        req.user.email);
       res.json({ ok: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });

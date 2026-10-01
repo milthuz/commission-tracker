@@ -242,6 +242,9 @@ const PERMISSION_CATALOG = [
   { key: 'hr:manage',                  label: 'HR — create hiring files, generate contracts and send them for signature', category: 'HR' },
   // Signer AU NOM de Cluster engage l'entreprise : clé distincte de la préparation du dossier.
   { key: 'hr:countersign',             label: 'HR — countersign contracts on behalf of Cluster', category: 'HR' },
+  // Effacer un contrat SIGNÉ détruit la preuve : clé à part, absente du rôle RH semé (admins seuls
+  // par défaut). Sert aux dossiers de test ou créés par erreur.
+  { key: 'hr:delete_signed',           label: 'HR — permanently delete a SIGNED hiring file (test or created by mistake)', category: 'HR' },
   // Crédits de compensation marchand (pénalité de résiliation du processeur précédent) : le rep
   // prépare et envoie, le client signe en ligne, l'approbateur crée la note de crédit Zoho Books.
   { key: 'credits:send',               label: 'Merchant processor credits: create (Zentact merchants), upload proof and send compensation-credit agreements for signature (own files)', category: 'Merchant Processor Credits' },
