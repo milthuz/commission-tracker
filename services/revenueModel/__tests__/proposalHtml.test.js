@@ -12,6 +12,7 @@ const { DEFAULTS } = require('../defaults');
 
 const INTERNAL = {
   creditCostPct: 0.0917, creditCostPerTxn: 0.0913, interacCostPct: 0.0719, interacCostPerTxn: 0.0931,
+  interchangeCostPct: 1.3791,
   aofCost: 71.37, pciCost: 72.47, bankCost: 73.57,
   termWarrantyCost: 7.93, termUnitCost: 9137, hwCost: 8317.29, instCost: 1397.71,
   commSaasMonths: 7.3, commPayPerLoc: 913.7, commHwPct: 37.1, commInstPct: 19.3,
@@ -61,6 +62,27 @@ const a = JSON.stringify(buildPricing(scenario));
 const b = JSON.stringify(buildPricing({ ...scenario, ...Object.fromEntries(Object.keys(INTERNAL).map((k) => [k, 0])) }));
 assert.strictEqual(a, b, 'buildPricing dépend d’un champ interne'); n++;
 assert(!PRICE_KEYS.some((k) => k in INTERNAL), 'un champ interne est dans PRICE_KEYS'); n++;
+
+// 4 bis) Taux fixe : le taux fixe est affiché, la majoration Interchange+ et l'interchange absorbé
+//        par Cluster ne le sont pas.
+const flatSc = { ...scenario, pricingModel: 'flat', flatRatePct: 2.6917, markupRate: 0.0839 };
+for (const lang of ['fr', 'en']) {
+  const html = norm(renderPricingHtml(flatSc, { lang, startPage: 7 }));
+  const body = html.slice(html.indexOf('<body>'));
+  for (const must of lang === 'fr' ? ['Taux fixe', '2,6917 %', '4 679 $'] : ['Flat rate', '2.6917 %', '$4,679']) {
+    assert(body.includes(must), `[${lang}] taux fixe : attendu absent : ${must}`); n++;
+  }
+  for (const f of [...forms(0.0839), ...forms(INTERNAL.interchangeCostPct)]) {
+    assert(!body.includes(norm(f)), `[${lang}] taux fixe : FUITE (« ${f} »)`); n++;
+  }
+  assert(!body.includes('Interchange+'), `[${lang}] taux fixe : « Interchange+ » encore affiché`); n++;
+  const prose = body.replace(/<[^>]*>/g, ' ').toLowerCase();
+  for (const w of lang === 'fr' ? ['coût', 'marge', 'commission'] : ['cost', 'margin', 'commission']) {
+    assert(!prose.includes(w), `[${lang}] taux fixe : mot interne « ${w} »`); n++;
+  }
+}
+// Un scénario sans pricingModel (d'avant le 2026-10-01) reste Interchange+.
+{ const { pricingModel, ...old } = scenario; assert(renderPricingHtml(old, { lang: 'fr' }).includes('Interchange+'), 'ancien scénario plus en Interchange+'); n++; }
 
 // 5) Un nom de marchand hostile est échappé.
 const evil = renderPricingHtml({ ...scenario, merchantName: '<script>x</script>' }, { lang: 'fr' });

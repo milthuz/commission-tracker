@@ -23,13 +23,23 @@ const DEFAULTS = Object.freeze({
 
   saasPerLoc: 119,
 
+  // Tarification crédit : 'icplus' (Interchange+ : l'interchange est refacturé, on facture une
+  // majoration) ou 'flat' (taux fixe : un seul % tout compris, Cluster absorbe l'interchange).
+  // Interac ne change pas d'un modèle à l'autre : frais par transaction (David, 2026-10-01).
+  pricingModel: 'icplus',
   markupRate: 0.08,
+  // Taux fixe : % du volume crédit facturé au marchand. Le frais par transaction crédit reste
+  // `txnFeeCredit`, le même champ qu'en Interchange+. Valeur de départ, à ajuster.
+  flatRatePct: 2.69,
   txnFeeCredit: 0.04,
   txnFeeInterac: 0.04,
 
   creditCostPct: 0.05, // 0,05 % du volume (David, 2026-09-22)
   creditCostPerTxn: 0.035, // 0,035 $ par transaction crédit (David, 2026-09-22)
   interacCostPerTxn: 0.035, // 0,035 $ par transaction Interac (David, 2026-09-22)
+  // Interchange moyen que Cluster paie sur le crédit quand il l'ABSORBE (taux fixe seulement ;
+  // en Interchange+ il est refacturé au marchand). 1,60 % (David, 2026-10-01).
+  interchangeCostPct: 1.6,
   // Coût réseau Interac en % du volume Interac, comme creditCostPct (David, 2026-09-23). 0 tant
   // que le vrai taux n'est pas saisi : un taux inventé fausserait le profit.
   interacCostPct: 0,
@@ -91,6 +101,8 @@ const BOUNDS = Object.freeze({
   txnInterac: [0, 1e10],
   saasPerLoc: [0, 100000],
   markupRate: [0, 100],
+  flatRatePct: [0, 100],
+  interchangeCostPct: [0, 100],
   txnFeeCredit: [0, 100],
   txnFeeInterac: [0, 100],
   creditCostPct: [0, 100],
@@ -114,6 +126,7 @@ const BOUNDS = Object.freeze({
 });
 
 const MAX_NAME = 120;
+const PRICING_MODELS = ['icplus', 'flat'];
 
 // Logo du marchand (vue conseil, en-tête) : image matricielle en data URL, facultative. Le
 // navigateur la réduit avant l'envoi ; ce plafond ne sert qu'à refuser un fichier brut géant.
@@ -160,6 +173,10 @@ function validateInputs(raw) {
     if (logo.length > MAX_LOGO || !LOGO_RE.test(logo)) return { ok: false, field: 'merchantLogo' };
     out.merchantLogo = logo;
   }
+  // Absent (scénario d'avant le 2026-10-01) = Interchange+, le seul modèle qui existait.
+  const model = raw.pricingModel == null || raw.pricingModel === '' ? 'icplus' : String(raw.pricingModel);
+  if (!PRICING_MODELS.includes(model)) return { ok: false, field: 'pricingModel' };
+  out.pricingModel = model;
   for (const [key, [min, max]] of Object.entries(BOUNDS)) {
     const v = raw[key] == null ? DEFAULTS[key] : Number(raw[key]);
     if (!Number.isFinite(v) || v < min || v > max) return { ok: false, field: key };
@@ -168,4 +185,4 @@ function validateInputs(raw) {
   return { ok: true, inputs: out };
 }
 
-module.exports = { DEFAULTS, SAAS_TIERS, BOUNDS, MAX_NAME, validateInputs, validateTiers, upgradeInputs };
+module.exports = { DEFAULTS, SAAS_TIERS, BOUNDS, MAX_NAME, PRICING_MODELS, validateInputs, validateTiers, upgradeInputs };

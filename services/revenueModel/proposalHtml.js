@@ -19,7 +19,7 @@ const path = require('path');
 // Les seuls champs du scénario qui atteignent le document client.
 const PRICE_KEYS = [
   'merchantName', 'numLocs', 'termsPerLoc',
-  'saasPerLoc', 'markupRate', 'txnFeeCredit', 'txnFeeInterac',
+  'saasPerLoc', 'pricingModel', 'markupRate', 'flatRatePct', 'txnFeeCredit', 'txnFeeInterac',
   'termRentalRev', 'aofRev', 'pciRev', 'bankRev', 'hwPrice', 'instPrice',
 ];
 
@@ -30,6 +30,8 @@ const TERM_YEARS = 5;
 function buildPricing(scenario) {
   const i = {};
   for (const k of PRICE_KEYS) i[k] = k === 'merchantName' ? String(scenario[k] || '') : Number(scenario[k] || 0);
+  // Seul champ texte avec le nom : tout ce qui n'est pas 'flat' (absent compris) est Interchange+.
+  i.pricingModel = scenario.pricingModel === 'flat' ? 'flat' : 'icplus';
 
   const monthly = [
     { key: 'saas', amount: i.saasPerLoc },
@@ -76,6 +78,8 @@ const COPY = {
     rates: 'Paiements — Interchange+', markup: 'Majoration sur les transactions crédit',
     feeCredit: 'Frais par transaction — crédit', feeInterac: 'Frais par transaction — Interac',
     ratesNote: 'L’interchange des réseaux vous est refacturé au coût réel, sans majoration cachée.',
+    ratesFlat: 'Paiements — Taux fixe', flatRate: 'Taux fixe sur les transactions crédit',
+    ratesFlatNote: 'Un seul taux tout compris, sans interchange en sus.',
     monthlyTerm: 'Sur {y} ans, pour un emplacement ({m} mois)',
     termTitle: 'Total par emplacement sur {y} ans', termDetail: '{once} unique + {month} par mois × {m} mois',
     termNote: 'Hors frais de paiement, qui varient selon votre volume.',
@@ -97,6 +101,8 @@ const COPY = {
     rates: 'Payments — Interchange+', markup: 'Markup on credit transactions',
     feeCredit: 'Per-transaction fee — credit', feeInterac: 'Per-transaction fee — Interac',
     ratesNote: 'Card-network interchange is passed through at actual cost, with no hidden markup.',
+    ratesFlat: 'Payments — Flat rate', flatRate: 'Flat rate on credit transactions',
+    ratesFlatNote: 'One all-in rate, no interchange charged on top.',
     monthlyTerm: 'Over {y} years, for one location ({m} months)',
     termTitle: '{y}-year total per location', termDetail: '{once} one-time + {month} per month × {m} months',
     termNote: 'Excludes payment processing fees, which vary with your volume.',
@@ -129,6 +135,7 @@ function renderPricingHtml(scenario, { lang = 'fr', startPage = 1 } = {}) {
   const loc = lang === 'en' ? 'en-CA' : 'fr-CA';
   const d = buildPricing(scenario);
   const { i } = d;
+  const flat = i.pricingModel === 'flat';
   const money = (v, dec) => {
     const frac = dec != null ? dec : (Number.isInteger(Math.round(v * 100) / 100) ? 0 : 2);
     return Number(v).toLocaleString(loc, { style: 'currency', currency: 'CAD', currencyDisplay: 'narrowSymbol', minimumFractionDigits: frac, maximumFractionDigits: frac });
@@ -211,11 +218,11 @@ h1 { font-size: 25pt; font-weight: 700; line-height: 1.08; letter-spacing: -.01e
       <div class="sub"><span class="k">${esc(L.perLoc)}</span><span class="v">${money(d.oneTimePerLoc)}</span></div>
     </div>
     <div class="card">
-      <h2>${esc(L.rates)}</h2>
-      ${line(esc(L.markup), '', `${n(i.markupRate, 6)} %`)}
+      <h2>${esc(flat ? L.ratesFlat : L.rates)}</h2>
+      ${flat ? line(esc(L.flatRate), '', `${n(i.flatRatePct, 6)} %`) : line(esc(L.markup), '', `${n(i.markupRate, 6)} %`)}
       ${line(esc(L.feeCredit), '', fee(i.txnFeeCredit))}
       ${line(esc(L.feeInterac), '', fee(i.txnFeeInterac))}
-      <div class="note">${esc(L.ratesNote)}</div>
+      <div class="note">${esc(flat ? L.ratesFlatNote : L.ratesNote)}</div>
     </div>
   </div>
   <div class="term">

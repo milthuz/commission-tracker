@@ -123,7 +123,9 @@ function registerRevenueModelRoutes(app, deps) {
     if (!v.ok) return res.status(400).json({ error: 'bad_input', field: v.field });
     // Ni le prix SaaS (il suit le palier du milieu) ni le logo (propre à UN marchand) ne
     // deviennent une valeur par défaut.
-    const { saasPerLoc, merchantLogo, ...next } = v.inputs;
+    // pricingModel non plus : un nouveau scénario part TOUJOURS en Interchange+ ; le modèle se
+    // choisit par scénario, pas en valeur par défaut d'équipe.
+    const { saasPerLoc, merchantLogo, pricingModel, ...next } = v.inputs;
     try {
       const before = await readDefaults(pool);
       await pool.query(
