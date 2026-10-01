@@ -38,8 +38,8 @@ const DEFAULTS = Object.freeze({
   creditCostPerTxn: 0.035, // 0,035 $ par transaction crédit (David, 2026-09-22)
   interacCostPerTxn: 0.035, // 0,035 $ par transaction Interac (David, 2026-09-22)
   // Interchange moyen que Cluster paie sur le crédit quand il l'ABSORBE (taux fixe seulement ;
-  // en Interchange+ il est refacturé au marchand). 1,60 % (David, 2026-10-01).
-  interchangeCostPct: 1.6,
+  // en Interchange+ il est refacturé au marchand). 1,50 % (David, 2026-10-01 ; était 1,60 %).
+  interchangeCostPct: 1.5,
   // Coût réseau Interac en % du volume Interac, comme creditCostPct (David, 2026-09-23). 0 tant
   // que le vrai taux n'est pas saisi : un taux inventé fausserait le profit.
   interacCostPct: 0,
