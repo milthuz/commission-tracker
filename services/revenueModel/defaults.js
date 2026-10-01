@@ -29,8 +29,8 @@ const DEFAULTS = Object.freeze({
   pricingModel: 'icplus',
   markupRate: 0.08,
   // Taux fixe : % du volume crédit facturé au marchand. Le frais par transaction crédit reste
-  // `txnFeeCredit`, le même champ qu'en Interchange+. Valeur de départ, à ajuster.
-  flatRatePct: 2.69,
+  // `txnFeeCredit`, le même champ qu'en Interchange+. 2,29 % (David, 2026-10-01).
+  flatRatePct: 2.29,
   txnFeeCredit: 0.04,
   txnFeeInterac: 0.04,
 
