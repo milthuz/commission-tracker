@@ -18504,20 +18504,25 @@ app.get('/api/saas-increase/lookup/fees', authenticateToken, async (req, res) =>
     // sa facture, et qui n'est pas le prix du forfait.
     const optionsPeriode = lignes.reduce((a, l) => a + l.pricePeriod, 0);
 
-    // ── LE PRIX « AVEC LE PAIEMENT CLUSTER » ───────────────────────────────────────────────
-    // Decide par David le 2026-09-12 : le nouveau prix MOINS les frais d'integration que le
-    // marchand paie aujourd'hui. C'est le prix a lui annoncer s'il passe au paiement Cluster.
+    // ── CE QU'IL PAIERAIT AVEC LE PAIEMENT CLUSTER ─────────────────────────────────────────
     //
-    // ⚠️ Ce n'est PAS une neutralisation de la hausse : sur un forfait annuel a 2 471 $ avec
-    // 1 200 $ de frais, il tombe a 1 271 $, donc SOUS son prix actuel. C'est un vrai rabais,
-    // assume — on prefere le volume de paiement a la marge SaaS. Mais ca veut aussi dire que
-    // le resultat depend du marchand et peut passer sous zero quand ses frais depassent son
-    // forfait, ce qui arrive sur un Starter mensuel avec deux frais personnalises. On ne rend
-    // alors AUCUN prix : un agent qui lirait « 0 $ » l'annoncerait.
-    // Le prix par PERIODE ne vit pas sur la ligne du scenario : il vient de l'analyse
-    // (`saas_subscription_insights.plan_price_period`), et le nouveau prix s'en deduit par la
-    // MEME fonction que celle qui alimente l'ecran. Recalculer autrement ferait diverger les
-    // deux chiffres affiches cote a cote sur la meme fiche.
+    // 💣 CE QUI DISPARAIT, C'EST LE FRAIS D'INTEGRATION. RIEN D'AUTRE.
+    //
+    // Le code soustrayait les frais du PRIX DU FORFAIT : « nouveau prix moins les frais ».
+    // Restaurant Shiraz en sortait a 169 $ alors que la bonne reponse est 209 $. La soustraction
+    // comptait le frais DEUX FOIS — une fois parce qu'il cesse d'etre facture, une fois en rabais
+    // sur le forfait. L'agent annoncait donc un rabais de 40 $ que personne n'avait consenti.
+    //
+    // La regle est celle que David a redite le 2026-10-05 : « tout ce qu'il sauve, c'est les
+    // frais d'integration ». Le forfait suit sa hausse normale ; la ligne PAY-PRO-INT tombe.
+    //
+    // ⚠️ Et tout se raisonne sur la FACTURE, jamais sur une ligne de la facture :
+    // `plan_price_period` est le forfait SEUL, les options vivent ailleurs. Shiraz paie 239 $
+    // (199 + 40), pas 199 $. Un chiffre annonce au marchand doit se raccrocher a ce qu'il a sous
+    // les yeux, sinon il sort sa facture et contredit l'agent.
+    //
+    // Les options qui SURVIVENT au changement (UEAT, Datacandy...) restent facturees des deux
+    // cotes : elles comptent dans les totaux, jamais dans l'economie.
     const item = (await pool.query(
       `SELECT i.increase_type, i.increase_value, s.plan_price_period
          FROM saas_increase_items i
@@ -18529,44 +18534,29 @@ app.get('/api/saas-increase/lookup/fees', authenticateToken, async (req, res) =>
     let avecPaiement = null;
     const prixActuel = item?.plan_price_period != null ? Number(item.plan_price_period) : null;
     if (prixActuel != null && prixActuel > 0 && fraisPeriode > 0) {
+      // Le nouveau prix vient de la MEME fonction que celle qui alimente l'ecran — la recalculer
+      // autrement ferait diverger deux chiffres affiches cote a cote sur la meme fiche.
       const nouveau = saasNewPeriodPrice(prixActuel, item.increase_type, item.increase_value);
-      const brut = nouveau - fraisPeriode;
-      // ⚠️ L'ECONOMIE SE MESURE SUR LA FACTURE, PAS SUR LA LIGNE DU FORFAIT.
-      //
-      // `plan_price_period` est le prix du FORFAIT SEUL : les options sont ailleurs (voir
-      // saas_subscription_insights.addons_price_period). Restaurant Shiraz affichait « forfait
-      // 199 $, avec notre paiement 169 $, economie 40 $ » — trois chiffres irreconciliables. Il
-      // paie 239 $ (199 de forfait + 40 de frais), et il paierait 169 $ : l'economie est de
-      // 70 $, pas 40 $. L'ancien chiffre ne comptait que les frais qui disparaissent et
-      // ignorait le rabais que la meme carte applique au forfait.
-      //
-      // Les options NON liees au paiement (UEAT, Datacandy…) restent facturees des deux cotes :
-      // elles s'annulent dans la soustraction, d'ou `prixActuel + fraisPeriode - brut`.
+      const autresOptions = optionsPeriode - fraisPeriode;   // celles qui restent facturees
       const totalAujourdhui = prixActuel + optionsPeriode;
-      const totalAvec = brut + (optionsPeriode - fraisPeriode);
-      const economiePeriode = totalAujourdhui - totalAvec;
+      const totalNouveau = nouveau + optionsPeriode;          // s'il ne change rien
+      const totalAvec = nouveau + autresOptions;              // le frais d'integration tombe
+      const parMois = (x) => r2Money(x / Math.max(1, cadence));
       avecPaiement = {
-        periodPrice: Math.round(brut),
-        monthlyPrice: Math.round(brut / Math.max(1, cadence)),
-        // Ce que sa facture dit aujourd'hui, et ce qu'elle dirait apres. L'agent est au
-        // telephone avec la facture sous les yeux du marchand : lui annoncer un « prix actuel »
-        // qui ne figure nulle part sur ce papier, c'est perdre la discussion.
-        todayTotalPeriod: r2Money(totalAujourdhui),
-        todayTotalMonthly: r2Money(totalAujourdhui / Math.max(1, cadence)),
-        withTotalPeriod: r2Money(totalAvec),
-        withTotalMonthly: r2Money(totalAvec / Math.max(1, cadence)),
-        savingMonthly: r2Money(economiePeriode / Math.max(1, cadence)),
-        savingYearly: r2Money((economiePeriode / Math.max(1, cadence)) * 12),
-        // Contre ce qu'il paierait s'il ne fait rien : c'est la vraie alternative, et elle est
-        // plus grosse. On rend les deux, l'ecran annonce la prudente.
-        savingVsNewMonthly: r2Money((nouveau + optionsPeriode - totalAvec) / Math.max(1, cadence)),
-        // Une hausse peut depasser deux fois les frais : passer au paiement Cluster coute alors
-        // plus cher qu'aujourd'hui. Le dire plutot qu'afficher une economie negative.
-        noSaving: economiePeriode <= 0,
-        // Sous zero, la soustraction n'a plus de sens commercial : les frais coutent plus cher
-        // que le forfait. L'ecran doit le DIRE, pas afficher un prix — un agent qui lit « 0 $ »
-        // l'annonce.
-        belowZero: brut <= 0,
+        // Le chiffre que l'agent annonce : le TOTAL de sa facture avec le paiement Cluster.
+        periodPrice: r2Money(totalAvec),
+        monthlyPrice: parMois(totalAvec),
+        todayTotalPeriod: r2Money(totalAujourdhui),  todayTotalMonthly: parMois(totalAujourdhui),
+        newTotalPeriod: r2Money(totalNouveau),       newTotalMonthly: parMois(totalNouveau),
+        withTotalPeriod: r2Money(totalAvec),         withTotalMonthly: parMois(totalAvec),
+        // L'economie, et c'est exactement les frais d'integration : c'est la seule ligne qui
+        // disparait de sa facture.
+        savingMonthly: r2Money(fraisMois),
+        savingYearly: r2Money(fraisMois * 12),
+        // Par rapport a ce qu'il paie AUJOURD'HUI, la hausse mange une partie de l'economie.
+        // Peut etre negatif, et l'ecran doit alors le montrer plutot que de le cacher : un
+        // marchand qui compare a sa facture actuelle verra le meme chiffre.
+        savingVsTodayMonthly: parMois(totalAujourdhui - totalAvec),
         newPrice: r2Money(nouveau),
         currentPrice: r2Money(prixActuel),
         feesPeriod: r2Money(fraisPeriode),
@@ -18577,14 +18567,10 @@ app.get('/api/saas-increase/lookup/fees', authenticateToken, async (req, res) =>
       cadenceMonths: cadence,
       addons: lignes,
       paymentFees: paiement,
-      // L'economie annoncable. Quand un prix « avec notre paiement » a pu etre calcule, elle se
-      // mesure facture a facture (voir le bloc ci-dessus) ; sinon il ne reste que les frais qui
-      // disparaissent, et c'est alors le seul chiffre honnete disponible.
-      monthlySaving: avecPaiement && !avecPaiement.belowZero
-        ? avecPaiement.savingMonthly : r2Money(fraisMois),
-      yearlySaving: avecPaiement && !avecPaiement.belowZero
-        ? avecPaiement.savingYearly : r2Money(fraisMois * 12),
-      // Les frais seuls restent exposes : c'est la ligne « Frais aujourd'hui » de la carte.
+      // L'economie annoncable : les frais d'integration, et rien d'autre. Le forfait, lui, suit
+      // sa hausse. C'est ce chiffre qui part dans la note de l'opportunite Zoho.
+      monthlySaving: r2Money(fraisMois),
+      yearlySaving: r2Money(fraisMois * 12),
       feesMonthly: r2Money(fraisMois),
       withPayments: avecPaiement,
     });
@@ -19046,9 +19032,15 @@ app.post('/api/saas-increase/lookup/deal', authenticateToken, async (req, res) =
         : null,
       // Le prix annonce au telephone doit suivre l'opportunite : sans lui, le vendeur qui
       // rappelle proposerait autre chose que ce que le marchand a entendu.
-      avecPaiement && avecPaiement.periodPrice != null && !avecPaiement.belowZero
-        ? `Prix annonce s'il passe au paiement Cluster : ${argent(avecPaiement.periodPrice)}`
-          + ` par periode de facturation, au lieu de ${argent(avecPaiement.newPrice)}.`
+      //
+      // ⚠️ Les deux chiffres compares sont des TOTAUX de facture. Opposer le total a la ligne du
+      // forfait ferait croire a un rabais qui n'existe pas — c'est l'erreur qui a mis 169 $ sur
+      // la fiche de Restaurant Shiraz au lieu de 209 $.
+      avecPaiement && avecPaiement.withTotalPeriod != null
+        ? `Prix annonce s'il passe au paiement Cluster : ${argent(avecPaiement.withTotalPeriod)}`
+          + ` par periode de facturation, tout compris, au lieu de`
+          + ` ${argent(avecPaiement.newTotalPeriod)}. Il paie ${argent(avecPaiement.todayTotalPeriod)}`
+          + ` aujourd'hui.`
         : null,
       '',
       `Ouvert depuis la Reference hausse SaaS par ${scope.actorLabel}, pendant un appel du`
