@@ -32985,6 +32985,30 @@ async function snapshotAppGeneratedStub(repName, year, month, actor) {
   } finally { client.release(); }
 }
 
+// Les couples (representant, mois de deblocage) touches par un paiement a l'unite — donc les
+// bulletins a reconstruire. Une seule entree par couple : deux factures du meme mois ne doivent
+// pas declencher deux fois le meme instantane.
+//
+// ⚠️ `ymd()` et JAMAIS `getUTC*` : le pilote pg construit un Date a MINUIT LOCAL pour une
+// colonne `date`. Dans un fuseau POSITIF — Tokyo, UTC+9 — minuit local le 1er octobre vaut
+// 15 h UTC le 30 septembre : `getUTCMonth()` rend alors septembre, et la facture irait grossir
+// le bulletin du mois precedent. (Toronto, UTC-4, s'en sortirait : minuit local y vaut 4 h UTC
+// le MEME jour. C'est exactement ce qui rend le defaut invisible sur une machine d'ici et sur
+// Railway, qui tourne en UTC.) `ymd()` est le point de passage unique du projet pour ca.
+function periodesTouchees(rows) {
+  const vues = new Map();
+  for (const r of rows || []) {
+    if (!r.salesperson_name) continue;
+    const iso = ymd(r.commission_payable_date);
+    if (!iso) continue;
+    const [an, mois] = iso.split('-').map(Number);
+    if (!an || !mois) continue;
+    const cle = `${r.salesperson_name}|${an}|${mois}`;
+    if (!vues.has(cle)) vues.set(cle, { rep: r.salesperson_name, year: an, month: mois });
+  }
+  return [...vues.values()];
+}
+
 app.post('/api/commissions/mark-paid', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'report:mark_paid'))) return;
   const { repName, year, month, invoiceNumbers } = req.body;
@@ -32992,6 +33016,8 @@ app.post('/api/commissions/mark-paid', authenticateToken, async (req, res) => {
   try {
     let result;
     if (Array.isArray(invoiceNumbers) && invoiceNumbers.length > 0) {
+      // On renvoie AUSSI le vendeur et le mois de deblocage : ils servent juste apres a
+      // reconstruire le ou les bulletins touches.
       result = await pool.query(
         `UPDATE invoices
          SET approval_status = 'paid',
@@ -33000,9 +33026,20 @@ app.post('/api/commissions/mark-paid', authenticateToken, async (req, res) => {
              payout_paid_at  = CURRENT_TIMESTAMP,
              updated_at      = CURRENT_TIMESTAMP
          WHERE invoice_number = ANY($1) AND approval_status = 'approved'
-         RETURNING invoice_number`,
+         RETURNING invoice_number, salesperson_name, commission_payable_date`,
         [invoiceNumbers, payerEmail]
       );
+      // ⚠️ Sans ceci, une facture payee a l'unite resterait hors de TOUT bulletin jusqu'a la
+      // cloture du mois : de l'argent verse qu'aucun document ne justifie. Le chemin « tout le
+      // mois » appelle deja ce meme instantane ; il supprime puis reinsere le bulletin
+      // `app-generated` de la periode, donc le rejouer converge au lieu de dupliquer, et il
+      // s'efface devant un vrai fichier de paie importe.
+      for (const { rep, year: y, month: m } of periodesTouchees(result.rows)) {
+        // Au mieux : le paiement a deja reussi, un bulletin non reconstruit ne doit pas
+        // transformer un succes en erreur. L'echec est journalise, pas avale.
+        try { await snapshotAppGeneratedStub(rep, y, m, payerEmail); }
+        catch (e) { console.error(`[commissions] bulletin non reconstruit pour ${rep} ${y}-${m} :`, e.message); }
+      }
     } else if (repName && year && month) {
       const startDate = new Date(`${year}-${String(month).padStart(2, '0')}-01`);
       const endDate   = new Date(startDate);
