@@ -15584,6 +15584,53 @@ async function crmTokenFromRow(row) {
 // de vie independants, et melanger leurs rafraichissements ferait qu'une panne Desk pourrait
 // invalider le jeton dont depend tout le reste.
 
+// Pourquoi Desk a refuse. 401 et 403 ne disent PAS la meme chose, et les confondre a coute une
+// enquete le 2026-10-05 : l'ecran reclamait une reconnexion de Desk alors que les portees
+// etaient intactes, que le jeton se rafraichissait et que la lecture marchait.
+//
+//   desk_scope     401 / INVALID_OAUTH — le JETON est en cause : reconnecter Desk sert.
+//   desk_forbidden 403 FORBIDDEN — le jeton est bon, mais le compte epingle n'est pas agent du
+//                  departement vise. Reconnecter n'y changerait RIEN.
+//   desk_refused   tout le reste : champ invalide, departement inconnu, panne.
+function deskRefusalKind(status, brut) {
+  const texte = String(brut || '');
+  // Le JETON d'abord : un corps qui nomme explicitement OAuth l'emporte sur le code HTTP,
+  // parce que Desk renvoie parfois 403 pour une portee manquante.
+  if (status === 401 || /INVALID_OAUTH|OAUTH_SCOPE|UNAUTHORIZED|invalid_token/i.test(texte)) return 'desk_scope';
+  if (status === 403 || /FORBIDDEN/i.test(texte)) return 'desk_forbidden';
+  return 'desk_refused';
+}
+
+// Les departements dont le compte Desk epingle est REELLEMENT agent.
+//
+// Dans Zoho Desk, la portee OAuth n'est que la moitie du droit : le compte doit AUSSI etre
+// agent du departement vise, sinon `POST /tickets` repond 403 FORBIDDEN. Le 2026-10-05, le
+// selecteur proposait les 13 departements de l'organisation alors que le compte n'est agent
+// que de 7 — choisir l'un des 6 autres echouait, et le message parlait a tort de reconnecter
+// Desk. On ne propose donc plus que ce qui peut marcher.
+//
+// Renvoie `null` quand l'agent est introuvable : l'appelant montre alors TOUT, plutot que de
+// vider le selecteur sur une lecture ratee — une liste vide empecherait tout billet.
+let _deskAgentDeps = { at: 0, ids: null };
+async function deskAgentDepartmentIds() {
+  if (Date.now() - _deskAgentDeps.at < 10 * 60 * 1000) return _deskAgentDeps.ids;
+  try {
+    const compte = await deskSystemAccount();
+    if (!compte) return null;
+    const r = await deskGet('/agents', { searchStr: compte, limit: 10 });
+    const agents = r?.data || [];
+    const moi = agents.find((a) => String(a.emailId || '').toLowerCase() === String(compte).toLowerCase());
+    const ids = Array.isArray(moi?.associatedDepartmentIds) && moi.associatedDepartmentIds.length
+      ? moi.associatedDepartmentIds.map(String)
+      : null;
+    _deskAgentDeps = { at: Date.now(), ids };
+    return ids;
+  } catch (e) {
+    console.warn('[desk] departements de l\'agent illisibles :', e.message);
+    _deskAgentDeps = { at: Date.now(), ids: null };
+    return null;
+  }
+}
 async function deskSystemAccount() {
   const r = await pool.query(`SELECT value FROM sync_state WHERE key = $1`, [DESK_SYSTEM_KEY]);
   return r.rows[0]?.value || null;
@@ -38750,10 +38797,21 @@ app.get('/api/leads/meta/deal-stages', authenticateToken, async (req, res) => {
 app.get('/api/leads/meta/desk-departments', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'leads:to_ticket'))) return;
   try {
-    const d = await deskGet('/departments', { isEnabled: true, limit: 50 });
-    const departments = (d?.data || []).filter((x) => x.isEnabled !== false)
+    const [d, permis] = await Promise.all([
+      deskGet('/departments', { isEnabled: true, limit: 50 }),
+      deskAgentDepartmentIds(),
+    ]);
+    const tous = (d?.data || []).filter((x) => x.isEnabled !== false)
       .map((x) => ({ id: String(x.id), name: x.name || x.nameInCustomerPortal || String(x.id) }));
-    res.json({ departments });
+    // `permis === null` = agent introuvable : on montre tout plutot que rien.
+    const departments = permis ? tous.filter((x) => permis.includes(x.id)) : tous;
+    // Si le filtre ne laisse RIEN, c'est le filtre qui a tort — mieux vaut une liste
+    // complete qu'un selecteur vide dont personne ne comprendrait le silence.
+    res.json({
+      departments: departments.length ? departments : tous,
+      filtered: !!(permis && departments.length),
+      hidden: permis && departments.length ? tous.length - departments.length : 0,
+    });
   } catch (e) { res.status(502).json({ error: 'desk_unavailable', detail: e.message.slice(0, 300) }); }
 });
 
@@ -38798,10 +38856,13 @@ app.post('/api/leads/:id/to-ticket', authenticateToken, async (req, res) => {
     });
     if (r.status < 200 || r.status >= 300) {
       const brut = JSON.stringify(r.data || {}).slice(0, 400);
-      // Jeton accordé avant l'ajout de Desk.tickets.CREATE : il faut reconnecter Desk.
-      const scope = r.status === 401 || r.status === 403 || /scope|INVALID_OAUTH|UNAUTHORIZED/i.test(brut);
-      logActivity('lead', String(id), 'desk_ticket_failed', `${lead.ref_code} — billet Desk refusé (HTTP ${r.status}) : ${brut}`, actor);
-      return res.status(502).json({ error: scope ? 'desk_scope' : 'desk_refused', detail: brut });
+      const motif = deskRefusalKind(r.status, brut);
+      // Le DEPARTEMENT dans le journal : sans lui, l'enquete du 2026-10-05 n'avait aucun moyen
+      // de savoir lequel avait ete choisi, alors que c'etait toute l'explication. L'identifiant
+      // suffit — l'ecran, lui, a deja la liste et affiche le nom.
+      logActivity('lead', String(id), 'desk_ticket_failed',
+        `${lead.ref_code} — billet Desk refusé (HTTP ${r.status}, département ${departmentId}) : ${brut}`, actor);
+      return res.status(502).json({ error: motif, departmentId: String(departmentId), detail: brut });
     }
     const t = r.data || {};
     await pool.query(
