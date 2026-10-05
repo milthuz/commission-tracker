@@ -203,6 +203,10 @@ const PERMISSION_CATALOG = [
   { key: 'leads:sms_alerts',           label: 'Receive a text message (SMS) when a lead is assigned to me — set in Profile', category: 'Leads' },
   // Un client existant qui écrit au formulaire de vente : sa demande devient un billet Desk.
   { key: 'leads:to_ticket',            label: 'Turn a lead into a Zoho Desk support ticket (existing customer)', category: 'Leads' },
+  // Le marchand existe deja dans Zoho : au lieu d'un second Lead, une OPPORTUNITE sur son
+  // compte. Cle distincte de `leads:review` a dessein — un Deal entre dans le pipeline des
+  // ventes et dans le suivi des commissions, ce que l'acceptation ordinaire ne fait pas.
+  { key: 'leads:attach_existing',      label: 'Attach a lead to a merchant that already exists in Zoho (creates a deal, not a second lead)', category: 'Leads' },
 
   // Sofia (in-app assistant) — CRM tools. Split read/write on purpose: the write key is the
   // only thing standing between a chat message and a real record in Zoho, so it must be
@@ -2343,6 +2347,11 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS desk_ticket_id TEXT`);
     await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS desk_ticket_number TEXT`);
     await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS desk_ticket_url TEXT`);
+    // Rattachement a un marchand existant (2026-10-05) : le compte Zoho auquel l'opportunite
+    // a ete accrochee. Le nom est copie a cote de l'identifiant — l'ecran doit pouvoir dire
+    // « rattachee a Le Cambo » sans rappeler Zoho a chaque affichage.
+    await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS crm_account_id VARCHAR(50)`);
+    await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS crm_account_name VARCHAR(255)`);
 
     // Regles d'attribution, evaluees DANS L'ORDRE de `position`. Un critere laisse vide ne
     // filtre rien — une regle sans aucun critere attrape donc tout ce qui lui parvient, ce
@@ -37007,6 +37016,12 @@ const LEAD_SETTINGS_DEFAULTS = {
   leadSourcePhone:      '',
   contactMethodWebsite: 'Website — Sales Hub',
   contactMethodPhone:   'Phone — Sales Hub',
+  // Rattachement a un marchand existant : l'opportunite creee sur son compte.
+  // `dealStage` vide = la premiere etape que Zoho annonce. Une valeur saisie ici est envoyee
+  // TELLE QUELLE, meme si elle est absente des metadonnees : celles de Zoho mentent (voir le
+  // long commentaire de `Lead_Status: 'New'` dans createCrmLead). Seul le refus de Zoho fait foi.
+  dealStage:            '',
+  dealCloseDays:        30,                  // Closing_Date = aujourd'hui + N jours (champ exige)
 };
 
 let _leadSettingsCache = { at: 0, value: null };
@@ -37429,7 +37444,7 @@ function leadReviewEmail(lead, suggestionLabel) {
 }
 
 // 2. Au representant — « cette piste est a toi ». Bilingue, meme raison.
-function leadAssignedEmail(lead, rep, callbackAt, crmLeadId, canMove = false) {
+function leadAssignedEmail(lead, rep, callbackAt, crmLeadId, canMove = false, crmModule = 'Leads') {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const who = leadDisplayName(lead);
   const when = leadWhenLabel(callbackAt, 'fr');
@@ -37464,7 +37479,7 @@ function leadAssignedEmail(lead, rep, callbackAt, crmLeadId, canMove = false) {
       `Une nouvelle piste vous est assignée / A new lead is yours`,
       `${rows}${promise}`,
       'Voir la piste / View the lead',
-      crmLeadId ? `https://crm.zoho.com/crm/tab/Leads/${crmLeadId}` : `${base}/leads?ref=${encodeURIComponent(lead.ref_code)}`
+      crmLeadId ? `https://crm.zoho.com/crm/tab/${crmModule}/${crmLeadId}` : `${base}/leads?ref=${encodeURIComponent(lead.ref_code)}`
     ),
   };
 }
@@ -37632,7 +37647,9 @@ async function notifyLeadReviewers(leadId) {
 // selon le module vise, et je n'ai pas pu essayer contre l'organisation reelle — d'ou le
 // second essai avec l'autre forme quand le premier est refuse, et la forme retenue consignee
 // dans `automation` pour qu'on sache laquelle marche apres le premier vrai rappel.
-async function scheduleLeadCallback(lead, rep, crmLeadId, when, settings) {
+// `cible` : { module: 'Leads'|'Deals', id, contactId? }. Une piste rattachee a un marchand
+// existant n'a pas de Lead — son rappel doit pendre au DEAL, sinon il flotte sans dossier.
+async function scheduleLeadCallback(lead, rep, cible, when, settings) {
   const kind = String(settings.callbackType || 'call').toLowerCase() === 'task' ? 'Tasks' : 'Calls';
   const pad = (n) => String(n).padStart(2, '0');
   const p = tzParts(when);
@@ -37658,11 +37675,18 @@ async function scheduleLeadCallback(lead, rep, crmLeadId, when, settings) {
       }
     : { Due_Date: dateStr, Status: 'Not Started' };
 
+  const cibleModule = cible?.module === 'Deals' ? 'Deals' : 'Leads';
+  const cibleId = cible?.id || null;
   const attempt = async (linkField) => {
     const token = await ensureValidCrmToken();
+    // Sur un Deal, `Who_Id` designe le CONTACT et `What_Id` le dossier : les deux coexistent,
+    // au lieu de se remplacer comme sur un Lead.
+    const lien = cibleModule === 'Deals' && cible?.contactId && linkField === 'What_Id'
+      ? { What_Id: { id: cibleId }, Who_Id: { id: cible.contactId } }
+      : { [linkField]: { id: cibleId } };
     const r = await axios.post(
       `https://www.zohoapis.com/crm/v2/${kind}`,
-      { data: [{ ...common, ...specific, [linkField]: { id: crmLeadId }, $se_module: 'Leads' }] },
+      { data: [{ ...common, ...specific, ...lien, $se_module: cibleModule }] },
       { headers: { Authorization: `Zoho-oauthtoken ${token}`, 'Content-Type': 'application/json' },
         validateStatus: () => true, timeout: 20000 }
     );
@@ -37674,10 +37698,13 @@ async function scheduleLeadCallback(lead, rep, crmLeadId, when, settings) {
   };
 
   try {
-    let out = await attempt('Who_Id');
+    // Sur un Deal on commence par `What_Id` — c'est la forme juste ; sur un Lead on garde
+    // l'ordre historique (`Who_Id` d'abord), dont la forme retenue est consignee a chaque fois.
+    const [premier, second] = cibleModule === 'Deals' ? ['What_Id', 'Who_Id'] : ['Who_Id', 'What_Id'];
+    let out = await attempt(premier);
     if (!out.ok) {
       const first = out.error;
-      out = await attempt('What_Id');
+      out = await attempt(second);
       if (!out.ok) return { ok: false, kind, error: `${first} / ${out.error}` };
     }
     return { ok: true, kind, id: out.id, linkField: out.linkField };
@@ -37686,9 +37713,171 @@ async function scheduleLeadCallback(lead, rep, crmLeadId, when, settings) {
   }
 }
 
+// ── RATTACHER UNE PISTE A UN MARCHAND QUI EXISTE DEJA ──────────────────────────────────────
+//
+// Demande de David le 2026-10-05, en regardant L-00011 « Le Cambo » : le marchand etait deja
+// client (compte Zoho, contacts, factures Books), et accepter aurait cree un SECOND Lead — donc,
+// a la conversion, un second compte.
+//
+// 🔑 Un Lead Zoho ne peut PAS etre rattache a un compte : c'est un objet d'avant-conversion, il
+// n'a aucun champ de liaison vers Accounts. Rattacher veut donc forcement dire creer autre chose
+// qu'un Lead — une OPPORTUNITE (Deal) sur le compte existant. C'est aussi ce que le modele de
+// Zoho attend d'un client existant qui redemande quelque chose.
+//
+// On n'accepte QUE les fiches que la detection a elle-meme trouvees pour CETTE piste. Un
+// identifiant arbitraire venu du navigateur creerait sinon une opportunite sur n'importe quel
+// compte de l'organisation, au nom de n'importe quel representant.
+async function resolveAttachTarget(lead, want) {
+  const module = String(want?.module || '').trim();
+  const id = String(want?.id || '').trim();
+  if (!module || !id) return { error: 'attach_invalid' };
+  const connus = Array.isArray(lead.crm_match_records) ? lead.crm_match_records : [];
+  const trouve = connus.find((m) => String(m.module) === module && String(m.id) === id);
+  if (!trouve) return { error: 'attach_unknown' };
+  // Un Lead homonyme n'est pas un marchand : il n'a ni compte ni contact. Le rattachement n'a
+  // pas de sens, et c'est a la personne de trancher — fusionner dans Zoho, ou accepter quand meme.
+  if (module === 'Leads') return { error: 'attach_not_a_customer' };
+
+  if (module === 'Accounts') {
+    return { accountId: id, accountName: trouve.name || null, contactId: null, contactName: null };
+  }
+  // Contacts : le compte se lit SUR le contact, et Zoho exige un compte sur une opportunite.
+  try {
+    const token = await ensureValidCrmToken();
+    const r = await axios.get(`https://www.zohoapis.com/crm/v2/Contacts/${encodeURIComponent(id)}`,
+      { headers: { Authorization: `Zoho-oauthtoken ${token}` }, validateStatus: () => true, timeout: 20000 });
+    const c = r.status === 200 ? (r.data?.data?.[0] || null) : null;
+    if (!c) return { error: 'attach_unreadable' };
+    const accountId = c.Account_Name?.id || null;
+    // Un contact orphelin ne porte aucun compte : on ne va pas en inventer un. L'examinateur
+    // choisit un autre resultat, ou accepte quand meme.
+    if (!accountId) return { error: 'attach_no_account' };
+    return { accountId, accountName: c.Account_Name?.name || null, contactId: id, contactName: c.Full_Name || trouve.name || null };
+  } catch (e) {
+    return { error: 'attach_unreadable', detail: e.message };
+  }
+}
+
+// L'opportunite sur le compte existant. Reprend UNE A UNE les protections durement acquises par
+// createCrmLead, parce que le module Deals porte les memes pieges :
+//   - jeton de l'approbateur, repli sur le compte systeme quand son profil Zoho n'a pas l'API ;
+//   - retrait du champ que Zoho nomme comme fautif, puis seconde tentative ;
+//   - proprietaire REPOSE apres la creation avec `trigger: []`, puis RELU — les flux de
+//     l'organisation reecrivent le proprietaire a la creation (vecu sur les Leads le 2026-09-03) ;
+//   - la note en appel separe, parce que Description peut etre absente de la mise en page.
+async function createCrmDealOnAccount(o) {
+  const fields = {
+    Deal_Name: String(o.deal_name || '').slice(0, 200),
+    Account_Name: { id: String(o.account_id) },
+    Stage: o.stage,
+    Closing_Date: o.closing_date,
+    Description: String(o.description || '').slice(0, 32000),
+  };
+  if (o.contact_id) fields.Contact_Name = { id: String(o.contact_id) };
+  if (o.lead_source) fields.Lead_Source = o.lead_source;
+  if (o.crm_owner_id) fields.Owner = { id: String(o.crm_owner_id) };
+
+  try {
+    let { token: crmToken, actingAs } = await crmTokenForActor(o.approver_email);
+    // SACRIFIABLES : jamais Account_Name, Stage ni Closing_Date — sans eux l'opportunite serait
+    // soit orpheline, soit refusee de toute facon (Zoho les exige).
+    const SACRIFIABLES = new Set(['Lead_Source', 'Description', 'Contact_Name']);
+    const envoyer = () => axios.post(
+      'https://www.zohoapis.com/crm/v2/Deals',
+      { data: [fields] },
+      { headers: { Authorization: `Zoho-oauthtoken ${crmToken}`, 'Content-Type': 'application/json' },
+        validateStatus: () => true, timeout: 30000 }
+    );
+    let r = await envoyer();
+
+    const refuse = r.status === 401 || r.status === 403
+      || r.data?.code === 'NO_PERMISSION' || r.data?.code === 'OAUTH_SCOPE_MISMATCH'
+      || r.data?.code === 'INVALID_TOKEN' || r.data?.code === 'AUTHENTICATION_FAILURE';
+    const systeme = await crmSystemAccount();
+    const etaitPersonnel = actingAs && systeme
+      && String(actingAs).toLowerCase() !== String(systeme).toLowerCase();
+    if (refuse && etaitPersonnel) {
+      console.warn(`[leads] Zoho refuse le jeton de ${actingAs} pour un Deal (${r.status} ${r.data?.code || ''})`
+        + ` — repli sur le compte systeme ${systeme}.`);
+      crmToken = await ensureValidCrmToken();
+      actingAs = systeme;
+      r = await envoyer();
+    }
+
+    let premier = r.data?.data?.[0];
+    const fautif = premier?.details?.api_name;
+    if (premier?.status === 'error' && fautif && SACRIFIABLES.has(fautif) && fields[fautif] !== undefined) {
+      console.warn(`[leads] Zoho refuse « ${fautif} » sur le Deal — champ retire, seconde tentative`);
+      delete fields[fautif];
+      r = await envoyer();
+      premier = r.data?.data?.[0];
+    }
+
+    if (r.status >= 200 && r.status < 300 && premier?.status === 'success') {
+      const dealId = premier.details?.id || null;
+
+      if (dealId && o.crm_owner_id) {
+        try {
+          await axios.put(`https://www.zohoapis.com/crm/v2/Deals/${dealId}`,
+            { data: [{ Owner: { id: String(o.crm_owner_id) } }], trigger: [] },
+            { headers: { Authorization: `Zoho-oauthtoken ${crmToken}`, 'Content-Type': 'application/json' },
+              validateStatus: () => true });
+          const lu = await axios.get(`https://www.zohoapis.com/crm/v2/Deals/${dealId}`, {
+            headers: { Authorization: `Zoho-oauthtoken ${crmToken}` }, validateStatus: () => true });
+          const proprio = lu.data?.data?.[0]?.Owner;
+          if (String(proprio?.id) !== String(o.crm_owner_id)) {
+            console.warn(`[leads] proprietaire NON applique sur le Deal ${dealId} :`
+              + ` demande ${o.crm_owner_id}, Zoho garde ${proprio?.id} (${proprio?.name}).`);
+          }
+        } catch (e) {
+          console.warn('[leads] reaffirmation du proprietaire impossible sur le Deal :', e.message);
+        }
+      }
+
+      if (dealId && o.note_body) {
+        try {
+          await axios.post('https://www.zohoapis.com/crm/v2/Notes',
+            { data: [{
+              Note_Title: String(o.note_title || 'Piste Sales Hub').slice(0, 250),
+              Note_Content: String(o.note_body).slice(0, 32000),
+              Parent_Id: { id: dealId },
+              se_module: 'Deals',
+            }] },
+            { headers: { Authorization: `Zoho-oauthtoken ${crmToken}`, 'Content-Type': 'application/json' },
+              validateStatus: () => true });
+        } catch (e) {
+          console.warn('[leads] note non attachee au Deal', dealId, e.message);
+        }
+      }
+      return { success: true, dealId };
+    }
+
+    const det = premier?.details || {};
+    const champ = det.api_name ? ` (champ ${det.api_name}${det.expected_data_type ? `, attendu ${det.expected_data_type}` : ''})` : '';
+    return { success: false, error: `${premier?.code || r.data?.code || `HTTP ${r.status}`}: ${premier?.message || r.data?.message || 'refus de Zoho'}${champ}`.slice(0, 400) };
+  } catch (e) {
+    return { success: false, error: e.message.slice(0, 400) };
+  }
+}
+
+// L'etape de depart de l'opportunite. Une valeur CONFIGUREE est envoyee telle quelle, meme si
+// elle manque aux metadonnees : celles de Zoho mentent (le long commentaire de `Lead_Status:
+// 'New'` raconte comment les avoir crues a coute deux incidents). On ne devine qu'en l'absence
+// de consigne, et seul le refus de Zoho fait autorite.
+async function leadDealStage(settings) {
+  const voulu = String(settings.dealStage || '').trim();
+  if (voulu) return voulu;
+  const stages = await crmDealStages();
+  return stages[0] || null;
+}
+
 // ── L'acceptation : le seul endroit qui ecrit dans Zoho ─────────────────────
 // Quatre gestes, dans cet ordre, et un seul est bloquant :
-//   1. creer la piste dans Zoho CRM      ← BLOQUANT : si Zoho refuse, on n'accepte pas
+//   1. ecrire dans Zoho CRM             ← BLOQUANT : si Zoho refuse, on n'accepte pas
+//      — une fiche Lead d'ordinaire ;
+//      — une OPPORTUNITE sur un compte existant quand la piste y est RATTACHEE (2026-10-05,
+//        voir resolveAttachTarget) : le marchand est deja client, et un second Lead
+//        deviendrait un second compte a la conversion.
 //   2. planifier le rappel du representant
 //   3. prevenir le representant par courriel
 //   4. remercier le marchand et lui nommer son representant
@@ -37704,7 +37893,11 @@ async function acceptLead(leadId, actor, opts = {}) {
 
   // Doublon trouve dans Zoho : on n'accepte que si la personne l'a vu et confirme. Le bouton de
   // l'ecran le demande, mais la regle vit ICI pour qu'aucun autre chemin ne la contourne.
-  if (lead.crm_match_status === 'match_found' && !opts.confirmDuplicate) return { error: 'duplicate_unconfirmed' };
+  // Rattacher a l'une des fiches trouvees EST la reconnaissance du doublon — et meme la bonne
+  // reponse —, donc ce chemin n'a rien de plus a confirmer.
+  if (lead.crm_match_status === 'match_found' && !opts.confirmDuplicate && !opts.attachTo) {
+    return { error: 'duplicate_unconfirmed' };
+  }
 
   const settings = await leadSettings();
   const repName = String(opts.repName || '').trim() || lead.assigned_rep_name || lead.suggested_rep_name;
@@ -37753,21 +37946,72 @@ async function acceptLead(leadId, actor, opts = {}) {
     note_body:          noteBody,
   };
 
-  // 1. Zoho — bloquant.
-  let crm = await createCrmLead(payload);
-  if (!crm.success && (leadSource || contactMethod)) {
-    // `Lead_Source` et `Lead_Contact_Method` sont des listes de choix : une valeur absente de
-    // la liste fait rejeter TOUT l'enregistrement. Plutot que de perdre la piste, on refait un
-    // essai sans elles et on le dit — l'admin corrige ensuite la valeur dans les reglages.
-    crm = await createCrmLead({ ...payload, lead_source: null, lead_contact_method: null });
-    if (crm.success) steps.crmRetriedWithoutPicklists = true;
+  // 1. Zoho — bloquant, par l'un de DEUX chemins.
+  //
+  // Marchand deja dans Zoho : on accroche une OPPORTUNITE a son compte. Un second Lead
+  // deviendrait un second compte a la conversion — c'est precisement ce que David a demande
+  // d'eviter le 2026-10-05. Voir resolveAttachTarget.
+  let crm, attache = null;
+  if (opts.attachTo) {
+    attache = await resolveAttachTarget(lead, opts.attachTo);
+    if (attache.error) return { error: attache.error, detail: attache.detail || null };
+    const stage = await leadDealStage(settings);
+    // Sans etape, Zoho refuserait tout : on s'arrete AVANT d'ecrire, avec un message qui dit
+    // quoi faire, plutot qu'un « INVALID_DATA » a dechiffrer.
+    if (!stage) return { error: 'deal_no_stage' };
+    const jours = Number(settings.dealCloseDays) || 30;
+    const pc = tzParts(new Date(Date.now() + jours * 86400000));
+    const pad = (n) => String(n).padStart(2, '0');
+    // UN SEUL endroit decrit l'opportunite. Le reessai ne change qu'un champ : le recopier en
+    // entier, c'est garantir que les deux versions divergeront a la premiere retouche.
+    const dealPayload = (source) => ({
+      // Le numero de dossier DANS le nom : deux demandes du meme marchand seraient autrement
+      // indistinguables dans le pipeline, et c'est le seul fil qui ramene a Sales Hub.
+      deal_name:      `${attache.accountName || lead.business_name} — ${lead.ref_code}`,
+      account_id:     attache.accountId,
+      contact_id:     attache.contactId,
+      stage,
+      closing_date:   `${pc.year}-${pad(pc.month)}-${pad(pc.day)}`,
+      lead_source:    source,
+      crm_owner_id:   rep?.crmUserId || null,
+      approver_email: actor,
+      description:    noteBody,
+      note_title:     `Piste ${lead.ref_code} — ${lead.source === 'website' ? 'formulaire du site' : 'saisie Sales Hub'}`,
+      note_body:      noteBody,
+    });
+    crm = await createCrmDealOnAccount(dealPayload(leadSource || null));
+    if (!crm.success && leadSource) {
+      // `Lead_Source` est une liste de choix ici aussi : meme filet que pour un Lead.
+      crm = await createCrmDealOnAccount(dealPayload(null));
+      if (crm.success) steps.crmRetriedWithoutPicklists = true;
+    }
+    if (!crm.success) {
+      await pool.query(`UPDATE leads SET crm_lead_error = $2 WHERE id = $1`, [leadId, crm.error]);
+      logActivity('lead', leadId, 'crm_failed', `${lead.ref_code} — Zoho a refusé l'opportunité : ${crm.error}`, actor);
+      return { error: 'crm_failed', detail: crm.error };
+    }
+    steps.crm = { ok: true, attached: true, dealId: crm.dealId, stage,
+                  accountId: attache.accountId, accountName: attache.accountName,
+                  contactId: attache.contactId || null };
+  } else {
+    crm = await createCrmLead(payload);
+    if (!crm.success && (leadSource || contactMethod)) {
+      // `Lead_Source` et `Lead_Contact_Method` sont des listes de choix : une valeur absente de
+      // la liste fait rejeter TOUT l'enregistrement. Plutot que de perdre la piste, on refait un
+      // essai sans elles et on le dit — l'admin corrige ensuite la valeur dans les reglages.
+      crm = await createCrmLead({ ...payload, lead_source: null, lead_contact_method: null });
+      if (crm.success) steps.crmRetriedWithoutPicklists = true;
+    }
+    if (!crm.success) {
+      await pool.query(`UPDATE leads SET crm_lead_error = $2 WHERE id = $1`, [leadId, crm.error]);
+      logActivity('lead', leadId, 'crm_failed', `${lead.ref_code} — Zoho a refusé : ${crm.error}`, actor);
+      return { error: 'crm_failed', detail: crm.error };
+    }
+    steps.crm = { ok: true, leadId: crm.leadId };
   }
-  if (!crm.success) {
-    await pool.query(`UPDATE leads SET crm_lead_error = $2 WHERE id = $1`, [leadId, crm.error]);
-    logActivity('lead', leadId, 'crm_failed', `${lead.ref_code} — Zoho a refusé : ${crm.error}`, actor);
-    return { error: 'crm_failed', detail: crm.error };
-  }
-  steps.crm = { ok: true, leadId: crm.leadId };
+  // A partir d'ici, UN SEUL couple decrit le dossier Zoho, quel que soit le chemin pris.
+  const crmModule = attache ? 'Deals' : 'Leads';
+  const crmRecordId = attache ? crm.dealId : crm.leadId;
 
   // 2. Le rappel — MÉCANIQUE DU 2026-09-29 (décision de David) : le représentant RAPPELLE le client
   // dans <délai configuré> (1 h par défaut, ramené dans les heures ouvrables). Le client se fait
@@ -37776,7 +38020,9 @@ async function acceptLead(leadId, actor, opts = {}) {
   let callbackAt = null;
   if (settings.callbackEnabled) {
     callbackAt = leadCallbackAt(settings);
-    const cb = await scheduleLeadCallback(lead, rep, crm.leadId, callbackAt, settings);
+    const cb = await scheduleLeadCallback(lead, rep,
+      { module: crmModule, id: crmRecordId, contactId: attache?.contactId || null },
+      callbackAt, settings);
     steps.callback = cb.ok
       ? { ok: true, kind: cb.kind, id: cb.id, at: callbackAt.toISOString(), linkField: cb.linkField }
       : { ok: false, kind: cb.kind, error: cb.error };
@@ -37797,7 +38043,7 @@ async function acceptLead(leadId, actor, opts = {}) {
 
   // 3. Le representant.
   if (settings.notifyRep && rep?.email) {
-    const { subject, html } = leadAssignedEmail(lead, rep, callbackAt, crm.leadId, !!bookingUrl);
+    const { subject, html } = leadAssignedEmail(lead, rep, callbackAt, crmRecordId, !!bookingUrl, crmModule);
     const m = await sendMail(rep.email, subject, html);
     steps.repEmail = m.sent ? { ok: true, to: rep.email } : { ok: false, to: rep.email, error: m.reason };
   } else {
@@ -37837,15 +38083,18 @@ async function acceptLead(leadId, actor, opts = {}) {
             assigned_rep_name = $3, assigned_rep_email = $4, assigned_crm_user_id = $5,
             assigned_at = CURRENT_TIMESTAMP, assigned_by = $2,
             crm_lead_id = $6, crm_lead_error = NULL,
+            crm_deal_id = COALESCE($13::varchar, crm_deal_id),
+            crm_account_id = $14, crm_account_name = $15,
             crm_followup_id = $7, crm_followup_kind = $8, callback_at = $9,
             rep_notified_at      = CASE WHEN $10 THEN CURRENT_TIMESTAMP ELSE rep_notified_at END,
             merchant_notified_at = CASE WHEN $11 THEN CURRENT_TIMESTAMP ELSE merchant_notified_at END,
             automation = $12::jsonb
       WHERE id = $1`,
-    [leadId, actor, rep.name, rep.email, rep.crmUserId, crm.leadId,
+    [leadId, actor, rep.name, rep.email, rep.crmUserId, attache ? null : crm.leadId,
      steps.callback?.id || null, steps.callback?.ok ? steps.callback.kind : null,
      callbackAt ? callbackAt.toISOString() : null,
-     !!steps.repEmail?.ok, !!steps.merchantEmail?.ok, JSON.stringify(steps)]
+     !!steps.repEmail?.ok, !!steps.merchantEmail?.ok, JSON.stringify(steps),
+     attache ? crm.dealId : null, attache?.accountId || null, attache?.accountName || null]
   );
   await bumpLeadRotation(rep.name);
   if (settings.bookingEnabled) {
@@ -37854,10 +38103,17 @@ async function acceptLead(leadId, actor, opts = {}) {
   }
 
   logActivity('lead', leadId, 'accepted',
-    `${lead.ref_code} — ${lead.business_name} → ${rep.name} (Zoho ${crm.leadId})`, actor,
-    { metadata: { crmLeadId: crm.leadId, rep: rep.name, steps } });
+    `${lead.ref_code} — ${lead.business_name} → ${rep.name}`
+    + (attache
+        ? ` (opportunité Zoho ${crm.dealId} sur « ${attache.accountName || attache.accountId} »)`
+        : ` (Zoho ${crm.leadId})`), actor,
+    { metadata: { crmLeadId: attache ? null : crm.leadId, crmDealId: attache ? crm.dealId : null,
+                  attachedTo: attache ? { accountId: attache.accountId, accountName: attache.accountName } : null,
+                  rep: rep.name, steps } });
 
-  return { ok: true, crmLeadId: crm.leadId, rep, callbackAt, steps };
+  return { ok: true, crmLeadId: attache ? null : crm.leadId, crmDealId: attache ? crm.dealId : null,
+           attachedTo: attache ? { accountId: attache.accountId, accountName: attache.accountName } : null,
+           rep, callbackAt, steps };
 }
 
 // ── Endpoints ───────────────────────────────────────────────────────────────
@@ -37911,6 +38167,7 @@ async function leadAccess(req) {
     rules:   has('leads:manage_rules'),
     remove:  has('leads:delete'),
     toTicket: has('leads:to_ticket'),
+    attachExisting: has('leads:attach_existing'),
   };
 }
 
@@ -38116,6 +38373,9 @@ function publicLead(r) {
       leadId: r.crm_lead_id, error: r.crm_lead_error, dealId: r.crm_deal_id,
       dealStage: r.crm_deal_stage, depositDate: r.crm_deposit_date,
       followupId: r.crm_followup_id, followupKind: r.crm_followup_kind,
+      // Non nul = la piste a ete RATTACHEE a un marchand existant : pas de fiche Lead, une
+      // opportunite sur son compte.
+      accountId: r.crm_account_id || null, accountName: r.crm_account_name || null,
     },
     callbackAt: r.callback_at, repNotifiedAt: r.rep_notified_at, merchantNotifiedAt: r.merchant_notified_at,
     // Rendez-vous (services/leadBooking) : proposed = heure proposee, confirmed = choisie ou
@@ -38293,9 +38553,14 @@ app.post('/api/leads/:id/accept', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'leads:review'))) return;
   const actor = req.user.realAdminEmail || req.user.email || 'unknown';
   try {
+    // Rattacher cree une OPPORTUNITE dans Zoho — donc une entree dans le pipeline et dans le
+    // suivi des commissions. C'est plus que reviser une piste : cle a part.
+    const attachTo = req.body?.attachTo && typeof req.body.attachTo === 'object' ? req.body.attachTo : null;
+    if (attachTo && !(await requirePerm(req, res, 'leads:attach_existing'))) return;
     const out = await acceptLead(parseInt(req.params.id, 10), actor, {
       repName: req.body?.repName,
       confirmDuplicate: req.body?.confirmDuplicate === true,
+      attachTo,
       // Le NOM n'est repris que hors usurpation d'identite — meme regle que l'approbation d'une
       // opportunite partenaire : pendant une usurpation, `req.user.name` est celui de la
       // personne visitee alors que `actor` reste l'admin.
@@ -38306,6 +38571,11 @@ app.post('/api/leads/:id/accept', authenticateToken, async (req, res) => {
     if (out.error === 'no_rep') return res.status(400).json({ error: 'no_rep' });
     if (out.error === 'duplicate_unconfirmed') return res.status(409).json({ error: 'duplicate_unconfirmed' });
     if (out.error === 'crm_failed') return res.status(502).json({ error: 'crm_failed', detail: out.detail });
+    // Les refus propres au rattachement. Chacun dit QUOI faire — un 500 nu obligerait a lire
+    // les journaux pour comprendre qu'il manque simplement un compte sur le contact.
+    if (String(out.error || '').startsWith('attach_') || out.error === 'deal_no_stage') {
+      return res.status(400).json({ error: out.error, detail: out.detail || null });
+    }
     res.json(out);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -38438,6 +38708,15 @@ async function refreshLeadExistingCustomer(leadId, email) {
 }
 
 // ── Piste → billet Zoho Desk ───────────────────────────────────────────────────
+// Les etapes du pipeline Zoho, pour qu'Admin -> Pistes propose la bonne au lieu de la faire
+// taper. La liste reste INDICATIVE : les metadonnees de Zoho omettent des valeurs pourtant
+// valides, donc le champ accepte aussi une saisie libre (voir leadDealStage).
+app.get('/api/leads/meta/deal-stages', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:manage_rules'))) return;
+  try { res.json({ stages: await crmDealStages() }); }
+  catch (e) { res.status(502).json({ error: 'crm_unavailable', detail: e.message.slice(0, 300) }); }
+});
+
 app.get('/api/leads/meta/desk-departments', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'leads:to_ticket'))) return;
   try {
@@ -38557,6 +38836,8 @@ app.put('/api/admin/lead-settings', authenticateToken, async (req, res) => {
     leadSourcePhone:      str(b.leadSourcePhone, d.leadSourcePhone, 80),
     contactMethodWebsite: str(b.contactMethodWebsite, d.contactMethodWebsite, 80),
     contactMethodPhone:   str(b.contactMethodPhone, d.contactMethodPhone, 80),
+    dealStage:            str(b.dealStage, d.dealStage, 80),
+    dealCloseDays:        num(b.dealCloseDays, d.dealCloseDays, 1, 365),
   };
   if (settings.merchantFrom && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(settings.merchantFrom)) {
     return res.status(400).json({ error: 'merchantFrom must be an email address' });
@@ -38760,9 +39041,14 @@ app.put('/api/admin/lead-rotation', authenticateToken, async (req, res) => {
 const LEAD_CRM_SYNC_LIMIT = 200;
 async function syncLeadCrmState() {
   const rows = (await pool.query(
+    // ⚠️ `crm_lead_id IS NOT NULL` seul laissait DEHORS les pistes rattachees a un marchand
+    // existant : elles n'ont pas de Lead, seulement une opportunite. Leur etape et leur date
+    // de depot seraient restees figees a la creation — donc invisibles de l'entonnoir et du
+    // suivi des commissions, en silence.
     `SELECT id, ref_code, business_name, crm_lead_id, crm_deal_id
        FROM leads
-      WHERE status = 'accepted' AND crm_lead_id IS NOT NULL AND crm_deposit_date IS NULL
+      WHERE status = 'accepted' AND crm_deposit_date IS NULL
+        AND (crm_lead_id IS NOT NULL OR crm_deal_id IS NOT NULL)
       ORDER BY reviewed_at DESC
       LIMIT ${LEAD_CRM_SYNC_LIMIT + 1}`
   )).rows;
@@ -38773,7 +39059,11 @@ async function syncLeadCrmState() {
   }
   let changed = 0;
   for (const r of rows) {
-    const state = await getCrmLeadStage(r.crm_lead_id, r.business_name, r.crm_deal_id);
+    // Sans Lead, on lit l'opportunite directement — passer par getCrmLeadStage ferait un
+    // GET /Leads/null avant de retomber au meme endroit.
+    const state = r.crm_lead_id
+      ? await getCrmLeadStage(r.crm_lead_id, r.business_name, r.crm_deal_id)
+      : await resolvePartnerDeal(await ensureValidCrmToken(), r.business_name, r.crm_deal_id);
     if (!state) continue;
     const up = await pool.query(
       `UPDATE leads
