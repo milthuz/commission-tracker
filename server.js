@@ -38189,6 +38189,18 @@ async function leadAccess(req) {
   };
 }
 
+// Ce que les ecrans recoivent. UN SEUL endroit, et il RECOPIE tout `leadAccess` —
+// les trois reponses enumeraient leurs cles a la main, et c'est exactement ce qui a fait
+// disparaitre le bouton « Rattacher » le 2026-10-05 : la capacite existait cote serveur,
+// personne ne l'envoyait, et rien ne s'en plaignait. Une capacite ajoutee a leadAccess
+// atteint desormais l'ecran toute seule.
+//
+// `delete` est le seul renommage : la capacite s'appelle `remove` cote serveur (`delete`
+// est un mot reserve), mais l'ecran la lit sous son nom naturel.
+function leadCan(acc) {
+  return { ...acc, delete: acc.remove };
+}
+
 // ⚠️ Ces deux routes doivent rester AVANT `/api/leads/:id` : Express prend la premiere qui
 // correspond, et `:id` avalerait « stats » comme un identifiant.
 app.get('/api/leads/stats', authenticateToken, async (req, res) => {
@@ -38291,7 +38303,7 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
   if (acc.intake && !acc.viewAll && !acc.viewOwn && !acc.review) {
     return res.json({
       leads: [], counts: {},
-      can: { review: acc.review, intake: acc.intake, viewAll: acc.viewAll, rules: acc.rules },
+      can: leadCan(acc),
     });
   }
   if (!acc.viewAll && !acc.viewOwn && !acc.review) return res.status(403).json({ error: 'Permission required: leads:view_own' });
@@ -38339,7 +38351,7 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
       // Doublon masque a qui ne distribue pas (voir POST /api/leads).
       leads: rows.map((r) => withoutDuplicateUnlessReviewer(publicLead(r), acc)),
       counts: Object.fromEntries(counts.map((r) => [r.status, r.n])),
-      can: { review: acc.review, intake: acc.intake, viewAll: acc.viewAll, rules: acc.rules },
+      can: leadCan(acc),
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -38429,7 +38441,7 @@ app.get('/api/leads/:id', authenticateToken, async (req, res) => {
       [String(r.id)]
     )).rows;
     res.json({ lead: withoutDuplicateUnlessReviewer(publicLead(r), acc), history,
-               can: { review: acc.review, delete: acc.remove, toTicket: acc.toTicket } });
+               can: leadCan(acc) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
