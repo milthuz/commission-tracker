@@ -18499,6 +18499,10 @@ app.get('/api/saas-increase/lookup/fees', authenticateToken, async (req, res) =>
     const paiement = lignes.filter(l => l.isPayment);
     const fraisPeriode = paiement.reduce((a, l) => a + l.pricePeriod, 0);
     const fraisMois = paiement.reduce((a, l) => a + l.monthly, 0);
+    // TOUTES les options, y compris celles qui survivent au changement de processeur. Sert a
+    // dire ce que le marchand paie VRAIMENT aujourd'hui — le chiffre qu'il a sous les yeux sur
+    // sa facture, et qui n'est pas le prix du forfait.
+    const optionsPeriode = lignes.reduce((a, l) => a + l.pricePeriod, 0);
 
     // ── LE PRIX « AVEC LE PAIEMENT CLUSTER » ───────────────────────────────────────────────
     // Decide par David le 2026-09-12 : le nouveau prix MOINS les frais d'integration que le
@@ -18527,9 +18531,38 @@ app.get('/api/saas-increase/lookup/fees', authenticateToken, async (req, res) =>
     if (prixActuel != null && prixActuel > 0 && fraisPeriode > 0) {
       const nouveau = saasNewPeriodPrice(prixActuel, item.increase_type, item.increase_value);
       const brut = nouveau - fraisPeriode;
+      // ⚠️ L'ECONOMIE SE MESURE SUR LA FACTURE, PAS SUR LA LIGNE DU FORFAIT.
+      //
+      // `plan_price_period` est le prix du FORFAIT SEUL : les options sont ailleurs (voir
+      // saas_subscription_insights.addons_price_period). Restaurant Shiraz affichait « forfait
+      // 199 $, avec notre paiement 169 $, economie 40 $ » — trois chiffres irreconciliables. Il
+      // paie 239 $ (199 de forfait + 40 de frais), et il paierait 169 $ : l'economie est de
+      // 70 $, pas 40 $. L'ancien chiffre ne comptait que les frais qui disparaissent et
+      // ignorait le rabais que la meme carte applique au forfait.
+      //
+      // Les options NON liees au paiement (UEAT, Datacandy…) restent facturees des deux cotes :
+      // elles s'annulent dans la soustraction, d'ou `prixActuel + fraisPeriode - brut`.
+      const totalAujourdhui = prixActuel + optionsPeriode;
+      const totalAvec = brut + (optionsPeriode - fraisPeriode);
+      const economiePeriode = totalAujourdhui - totalAvec;
       avecPaiement = {
         periodPrice: Math.round(brut),
         monthlyPrice: Math.round(brut / Math.max(1, cadence)),
+        // Ce que sa facture dit aujourd'hui, et ce qu'elle dirait apres. L'agent est au
+        // telephone avec la facture sous les yeux du marchand : lui annoncer un « prix actuel »
+        // qui ne figure nulle part sur ce papier, c'est perdre la discussion.
+        todayTotalPeriod: r2Money(totalAujourdhui),
+        todayTotalMonthly: r2Money(totalAujourdhui / Math.max(1, cadence)),
+        withTotalPeriod: r2Money(totalAvec),
+        withTotalMonthly: r2Money(totalAvec / Math.max(1, cadence)),
+        savingMonthly: r2Money(economiePeriode / Math.max(1, cadence)),
+        savingYearly: r2Money((economiePeriode / Math.max(1, cadence)) * 12),
+        // Contre ce qu'il paierait s'il ne fait rien : c'est la vraie alternative, et elle est
+        // plus grosse. On rend les deux, l'ecran annonce la prudente.
+        savingVsNewMonthly: r2Money((nouveau + optionsPeriode - totalAvec) / Math.max(1, cadence)),
+        // Une hausse peut depasser deux fois les frais : passer au paiement Cluster coute alors
+        // plus cher qu'aujourd'hui. Le dire plutot qu'afficher une economie negative.
+        noSaving: economiePeriode <= 0,
         // Sous zero, la soustraction n'a plus de sens commercial : les frais coutent plus cher
         // que le forfait. L'ecran doit le DIRE, pas afficher un prix — un agent qui lit « 0 $ »
         // l'annonce.
@@ -18544,9 +18577,15 @@ app.get('/api/saas-increase/lookup/fees', authenticateToken, async (req, res) =>
       cadenceMonths: cadence,
       addons: lignes,
       paymentFees: paiement,
-      // L'economie annoncable : ce qui tombe si le marchand passe a notre paiement.
-      monthlySaving: r2Money(fraisMois),
-      yearlySaving: r2Money(fraisMois * 12),
+      // L'economie annoncable. Quand un prix « avec notre paiement » a pu etre calcule, elle se
+      // mesure facture a facture (voir le bloc ci-dessus) ; sinon il ne reste que les frais qui
+      // disparaissent, et c'est alors le seul chiffre honnete disponible.
+      monthlySaving: avecPaiement && !avecPaiement.belowZero
+        ? avecPaiement.savingMonthly : r2Money(fraisMois),
+      yearlySaving: avecPaiement && !avecPaiement.belowZero
+        ? avecPaiement.savingYearly : r2Money(fraisMois * 12),
+      // Les frais seuls restent exposes : c'est la ligne « Frais aujourd'hui » de la carte.
+      feesMonthly: r2Money(fraisMois),
       withPayments: avecPaiement,
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
