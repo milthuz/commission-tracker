@@ -20555,10 +20555,21 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
 
     // Per-period prices and the effective date come from the same two sources the notice quoted,
     // so what an agent reads back to a merchant matches the email that merchant received.
-    const periodByKey = new Map((await pool.query(
-      `SELECT org_id, subscription_number, plan_price_period FROM saas_subscription_insights
-        WHERE plan_price_period IS NOT NULL`
-    )).rows.map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
+    const insights = (await pool.query(
+      `SELECT org_id, subscription_number, plan_price_period, addons_price_period
+         FROM saas_subscription_insights WHERE plan_price_period IS NOT NULL`)).rows;
+    const periodByKey = new Map(insights.map(
+      r => [`${r.org_id}||${r.subscription_number}`, Number(r.plan_price_period)]));
+    // Les options, dans la MEME base de periode que le forfait. Elles viennent de l'analyse
+    // nocturne, deja en base : les rendre ici ne coute aucun appel a Zoho et vaut pour TOUTES
+    // les lignes, alors que le detail par option exige encore un clic (voir /lookup/fees).
+    //
+    // ⚠️ Sans elles, la carte n'affichait que le forfait — « 199 $ » pour un marchand dont la
+    // facture dit 308 $. 1 625 des 2 757 lignes portent des options : le prix du forfait seul
+    // n'est presque jamais ce que le marchand a sous les yeux.
+    const optionsByKey = new Map(insights
+      .filter(r => r.addons_price_period != null)
+      .map(r => [`${r.org_id}||${r.subscription_number}`, Number(r.addons_price_period)]));
     let liveByKey = new Map();
     try {
       const liveSubs = await getSaasIncreaseSubscriptions();
@@ -20668,6 +20679,7 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
     const results = rows.map(r => {
       const cur = periodByKey.get(`${r.org_id}||${r.subscription_number}`) ?? null;
       const next = cur == null ? null : saasNewPeriodPrice(cur, r.increase_type, r.increase_value);
+      const opt = optionsByKey.get(`${r.org_id}||${r.subscription_number}`) ?? null;
       return {
         id: r.id,
         customerName: r.customer_name,
@@ -20689,6 +20701,12 @@ app.get('/api/saas-increase/lookup', authenticateToken, async (req, res) => {
               ymd(r.frozen_until))
           : null,
         currentPrice: cur, newPrice: next,
+        // Le forfait, les options, et le total que le marchand voit vraiment. `null` quand
+        // l'analyse n'a pas encore vu cet abonnement — l'ecran n'affiche alors aucun total
+        // plutot qu'un total faux.
+        addonsPrice: opt,
+        currentTotal: cur == null || opt == null ? null : r2Money(cur + opt),
+        newTotal: next == null || opt == null ? null : r2Money(next + opt),
         // Pour un marchand DEJA avise, la seule bonne reponse est la date que son courriel
         // annonce. La recalculer donnerait une date plus tardive de jour en jour — un agent
         // contredirait au telephone le courriel que le client a sous les yeux.
