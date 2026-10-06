@@ -766,6 +766,7 @@ function registerOpenerRoutes(app, deps) {
   });
 
   return {
+    ensureReady: schema,
     runAll, syncKaizen, syncBilling, linkTwins, runMatching,
     // Worker : une fois par nuit, avec un plus gros lot d'adresses Books (personne n'attend).
     // ⚠️ Le worker redémarre à CHAQUE déploiement (plusieurs par jour) : sans cette garde, chaque

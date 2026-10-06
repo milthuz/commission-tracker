@@ -211,6 +211,10 @@ const PERMISSION_CATALOG = [
   // Module Opener (porte-à-porte). Lot 0 : l'appariement des magasins Cluster (Kaizen) à leur
   // fiche Google — il décide quels restaurants s'afficheront « client » sur la carte des openers.
   { key: 'opener:match',               label: 'Match Cluster customer locations (Kaizen V2 + Zoho Billing V1) to their Google listing, set their software version, run the sync', category: 'Opener' },
+  // Lots 1 à 4. Le manager prépare et publie les routes (et dépense des recherches Google en
+  // balayant des zones) ; l'opener fait SA route sur son téléphone : check-ins, pistes, journée.
+  { key: 'opener:routes',              label: 'Design opener routes: scan a zone for restaurants (Google), build, order and publish a route to an opener', category: 'Opener' },
+  { key: 'opener:field',               label: 'Opener in the field: see my route of the day, restaurant cards, check-ins, create leads, day summary', category: 'Opener' },
 
   // Sofia (in-app assistant) — CRM tools. Split read/write on purpose: the write key is the
   // only thing standing between a chat message and a real record in Zoho, so it must be
@@ -3836,7 +3840,7 @@ const DEMO_NAME_KEYS = new Set([
   'merchantname', 'accountname', 'dealname', 'companyname', 'clientname',
   'linked_customer_name', 'linkedcustomername',
   'legalname', 'legal_name', // crédits de compensation marchand
-  'storename', 'googlename', // Opener : magasins Kaizen et fiches Google
+  'storename', 'googlename', 'clustername', // Opener : emplacements Cluster et fiches Google
 ]);
 // SH-20 — identites de CONTACT (une personne physique, pas un commerce) portees par les pistes
 // entrantes. Elles ne peuvent pas passer par DEMO_NAME_KEYS : remplacer un courriel par
@@ -3969,6 +3973,14 @@ const openerModule = require('./services/opener/routes').registerOpenerRoutes(ap
     getAdminBooksAuth, fetchBillingSubs, ACTIVE_STATUSES,
     acquireSaasScanLock, saasScanShouldStop, saasScanLockHolder, releaseSaasScanLock,
   }),
+});
+
+// Module Opener, lots 1 à 4 : balayage Google d'une zone, routes du manager, terrain de l'opener
+// (check-ins, pistes, journée). services/opener/field.js. `late` : la création de piste et le
+// courriel, définis plus bas.
+require('./services/opener/field').registerOpenerFieldRoutes(app, {
+  authenticateToken, requirePerm, hasPerm, pool, logActivity, baseSchema: openerModule.ensureReady,
+  late: () => ({ normalizeLeadInput, createLeadRow, sendMail: (...a) => sendMail(...a), mailShell: (...a) => mailShell(...a) }),
 });
 
 // Pistes du site Webflow : webhook NATIF (form_submission), signé, connecté depuis Admin → Pistes.
@@ -4698,7 +4710,7 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // sampleEmail(), dans TEMPLATE_TYPES de EmailPreview.tsx, et dans les libellés i18n.
 // Les quatre `pass_*` sont les courriels du programme La Passe ; ils sont les seuls de la
 // liste à partir d'une adresse et d'une enveloppe qui ne sont pas celles de Sales Hub.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder', 'lead_review', 'lead_assigned', 'lead_welcome', 'lead_booking_client', 'lead_booking_cancelled', 'lead_booking_rep', 'partner_lead_assigned', 'hr_sign_request', 'hr_countersign', 'hr_completed', 'hr_declined'];
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder', 'lead_review', 'lead_assigned', 'lead_welcome', 'lead_booking_client', 'lead_booking_cancelled', 'lead_booking_rep', 'partner_lead_assigned', 'hr_sign_request', 'hr_countersign', 'hr_completed', 'hr_declined', 'opener_route_published'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -4707,6 +4719,13 @@ function sampleEmail(type, lang) {
   // un aperçu qui recopierait le gabarit à côté finirait par montrer autre chose que ce
   // qui part réellement, ce qui est exactement le contraire du but d'un outil d'aperçu.
   // RH : les vrais constructeurs de services/hr/emails.js, avec un candidat fictif.
+  if (type === 'opener_route_published') {
+    return require('./services/opener/emails').routePublishedEmail(mailShell, {
+      openerName: 'Jonathan', routeName: 'Plateau / Mile End', dateFr: 'mardi 6 octobre', dateEn: 'Tuesday, October 6',
+      publishedBy: 'Marie Manager', link: `${base}/opener`,
+      stops: [{ name: 'Café Merlebleu', address: '4520 Rue Saint-Denis' }, { name: 'Bistro du Coin', address: '100 Av. Laurier O' }],
+    });
+  }
   if (type.startsWith('hr_')) {
     const HRE = require('./services/hr/emails');
     const fr = isFrLocale(lang);

@@ -198,7 +198,53 @@ function createGooglePlaces({ http = axios, env = process.env } = {}) {
     } catch (e) { throw explain(e); }
   }
 
-  return { searchText, details, configured: () => !!key() };
+  // Balayage d'une zone (lot 1) : un cercle, les restaurants au plus près du centre d'abord.
+  // Plafond Google : 20 résultats — le quadrillage (geo.splitCircle) découpe les cercles pleins.
+  // Les champs dineIn / takeout / delivery placent l'appel dans la tranche de prix la plus haute
+  // de Nearby Search ; ils servent le filtre « type de service » du concepteur de routes.
+  async function searchNearby(center, radius, types) {
+    if (!key()) throw new Error('GOOGLE_PLACES_API_KEY absente');
+    try {
+      const r = await http.post('https://places.googleapis.com/v1/places:searchNearby', {
+        includedTypes: types, maxResultCount: 20, rankPreference: 'DISTANCE', languageCode: 'fr', regionCode: 'CA',
+        locationRestriction: { circle: { center: { latitude: center[0], longitude: center[1] }, radius: Math.min(50000, Math.max(1, radius)) } },
+      }, { headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': key(), 'X-Goog-FieldMask': NEARBY_FIELDS.join(',') }, timeout: 15000 });
+      return Array.isArray(r?.data?.places) ? r.data.places : [];
+    } catch (e) { throw explain(e); }
+  }
+
+  // Fiche complète pour l'écran de l'opener (lot 3) : lue à la demande, JAMAIS stockée en base
+  // (conditions Google) — seulement gardée une heure en mémoire par l'appelant.
+  async function detailsFull(placeId, lang = 'fr') {
+    if (!key()) throw new Error('GOOGLE_PLACES_API_KEY absente');
+    try {
+      const r = await http.get(`https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`,
+        { params: { languageCode: lang === 'en' ? 'en' : 'fr', regionCode: 'CA' },
+          headers: { 'X-Goog-Api-Key': key(), 'X-Goog-FieldMask': DETAIL_FIELDS.join(',') }, timeout: 15000 });
+      return r?.data || null;
+    } catch (e) { throw explain(e); }
+  }
+
+  return { searchText, details, searchNearby, detailsFull, configured: () => !!key() };
+}
+
+const NEARBY_FIELDS = [
+  'places.id', 'places.displayName', 'places.location', 'places.formattedAddress', 'places.shortFormattedAddress',
+  'places.primaryType', 'places.types', 'places.businessStatus', 'places.rating', 'places.userRatingCount',
+  'places.dineIn', 'places.takeout', 'places.delivery',
+];
+const DETAIL_FIELDS = [
+  'id', 'displayName', 'formattedAddress', 'location', 'rating', 'userRatingCount', 'priceLevel',
+  'primaryTypeDisplayName', 'types', 'regularOpeningHours', 'currentOpeningHours', 'nationalPhoneNumber',
+  'websiteUri', 'googleMapsUri', 'businessStatus', 'dineIn', 'takeout', 'delivery', 'addressComponents',
+];
+
+// Type de service déduit des indicateurs Google : sur place → tables, emporter seulement → quick.
+function serviceTypeOf(p) {
+  if (p?.dineIn === true && (p?.takeout === true || p?.delivery === true)) return 'both';
+  if (p?.dineIn === true) return 'tables';
+  if (p?.takeout === true || p?.delivery === true) return 'quick';
+  return null;
 }
 
 // Forme compacte d'un candidat : ce qu'on garde pendant que le magasin attend une décision
@@ -219,5 +265,5 @@ function candidateView(place, scored) {
 
 module.exports = {
   AUTO, REVIEW, MATCH_VERSION, normName, nameKey, trigramSim, nameSim, nameVariants, isAddressOnly, normPostal, civic, addressQuery,
-  scoreCandidate, decide, storeQuery, createGooglePlaces, candidateView,
+  scoreCandidate, decide, storeQuery, createGooglePlaces, candidateView, serviceTypeOf, NEARBY_FIELDS, DETAIL_FIELDS,
 };
