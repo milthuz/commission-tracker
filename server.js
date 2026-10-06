@@ -210,7 +210,7 @@ const PERMISSION_CATALOG = [
 
   // Module Opener (porte-à-porte). Lot 0 : l'appariement des magasins Cluster (Kaizen) à leur
   // fiche Google — il décide quels restaurants s'afficheront « client » sur la carte des openers.
-  { key: 'opener:match',               label: 'Match Cluster stores (Kaizen) to their Google listing, run the Kaizen sync', category: 'Opener' },
+  { key: 'opener:match',               label: 'Match Cluster customer locations (Kaizen V2 + Zoho Billing V1) to their Google listing, set their software version, run the sync', category: 'Opener' },
 
   // Sofia (in-app assistant) — CRM tools. Split read/write on purpose: the write key is the
   // only thing standing between a chat message and a real record in Zoho, so it must be
@@ -3959,10 +3959,16 @@ const leadBooking = require('./services/leadBooking').registerLeadBookingRoutes(
   late: () => ({ leadSettings, scheduleLeadCallback, tzParts, tzOffsetString }),
 });
 
-// Module Opener, lot 0 : magasins Cluster (API Kaizen) appariés à leur fiche Google.
-// services/opener/ ; plan dans design/opener/PLAN-TECHNIQUE.md. Passage de nuit : startAutoSync.
+// Module Opener, lot 0 : emplacements Cluster (Kaizen V2 + clients Zoho Billing V1) appariés à
+// leur fiche Google. services/opener/ ; plan dans design/opener/PLAN-TECHNIQUE.md. Passage de
+// nuit : startAutoSync. `late` : la lecture Billing et le verrou partagé du jeton Zoho, définis
+// plus bas dans ce fichier.
 const openerModule = require('./services/opener/routes').registerOpenerRoutes(app, {
   authenticateToken, requirePerm, pool, logActivity,
+  late: () => ({
+    getAdminBooksAuth, fetchBillingSubs, ACTIVE_STATUSES,
+    acquireSaasScanLock, saasScanShouldStop, saasScanLockHolder, releaseSaasScanLock,
+  }),
 });
 
 // Pistes du site Webflow : webhook NATIF (form_submission), signé, connecté depuis Admin → Pistes.
