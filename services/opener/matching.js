@@ -18,6 +18,11 @@ const axios = require('axios');
 
 const AUTO = 0.8;
 const REVIEW = 0.5;
+// Version de la notation. La monter remet en jeu les « à confirmer » et « non trouvés » notés par
+// une version antérieure (jamais les décisions humaines, jamais les « auto »).
+//   1 — 2026-10-06, première version
+//   2 — 2026-10-06, marque sans suffixe de succursale, adresses écartées, 2e essai par adresse
+const MATCH_VERSION = 2;
 
 // Équivalent JS de sh_norm_name() (SQL) : accents, mots juridiques et articles retirés,
 // puis tout ce qui n'est pas [a-z0-9]. Garder les deux alignés.
@@ -54,13 +59,36 @@ function trigramSim(a, b) {
   for (const g of A) if (B.has(g)) inter++;
   return inter / (A.size + B.size - inter);
 }
-function nameSim(a, b) {
-  const x = nameKey(a), y = nameKey(b);
+function nameSim1(x, y) {
   if (!x || !y) return 0;
   let s = trigramSim(x, y);
   // L'un contient l'autre (« saoko » dans « saokomileend ») : fort indice, pas une preuve.
   if (Math.min(x.length, y.length) >= 4 && (x.includes(y) || y.includes(x))) s = Math.max(s, 0.85);
   return s;
+}
+// Variantes d'un nom Kaizen : le nom entier, et la MARQUE seule quand le nom porte un suffixe de
+// succursale (« Pile ou Glace - Petite Italie », « Saoko | Mile End », « Kazu (Plateau) »).
+// Constaté sur les vrais magasins le 2026-10-06 : le suffixe faisait tomber le nom à 32 % face à
+// « Pile Ou Glace Gelateria », pourtant à la même adresse.
+function nameVariants(t) {
+  const s = String(t || '');
+  const out = [s];
+  const brand = s.split(/\s+[-–—|]\s+|\s*\(/)[0];
+  if (brand && brand.trim() !== s.trim()) out.push(brand);
+  return out;
+}
+function nameSim(a, b) {
+  const y = nameKey(b);
+  return Math.max(0, ...nameVariants(a).map((v) => nameSim1(nameKey(v), y)));
+}
+
+// Un résultat Google qui est une ADRESSE (immeuble, rue) et non un commerce : Text Search en
+// renvoie quand le nom cherché ne correspond à aucun commerce (« Montréal-Ouest » → « 51
+// Westminster North »). Un commerce porte toujours `establishment` ou `point_of_interest`.
+function isAddressOnly(place) {
+  const types = place.types || [];
+  if (!types.length) return !place.primaryType;
+  return !types.includes('establishment') && !types.includes('point_of_interest');
 }
 
 const normPostal = (p) => String(p || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -119,6 +147,14 @@ function storeQuery(store) {
   const pc = store.postal_code ?? store.postalCode;
   return [store.name, street, store.city, store.region, pc].filter(Boolean).join(', ');
 }
+// 2e essai, sans le nom : « quel commerce se trouve à cette adresse ? ». Pour les magasins dont le
+// nom Kaizen est un nom de lieu ou de succursale plutôt que de commerce.
+function addressQuery(store) {
+  const street = [store.street, store.unit ? `#${store.unit}` : null].filter(Boolean).join(' ');
+  if (!street) return null;
+  const pc = store.postal_code ?? store.postalCode;
+  return `restaurant, ${[street, store.city, pc].filter(Boolean).join(', ')}`;
+}
 
 // ----------------------------------------------------------------------------
 // Google Places (New). Clé DÉDIÉE : GOOGLE_PLACES_API_KEY, avec « Places API (New) » activée.
@@ -128,7 +164,7 @@ function storeQuery(store) {
 // ----------------------------------------------------------------------------
 const FIELDS = [
   'places.id', 'places.displayName', 'places.formattedAddress', 'places.location',
-  'places.addressComponents', 'places.businessStatus', 'places.primaryType',
+  'places.addressComponents', 'places.businessStatus', 'places.primaryType', 'places.types',
 ];
 
 function createGooglePlaces({ http = axios, env = process.env } = {}) {
@@ -182,6 +218,6 @@ function candidateView(place, scored) {
 }
 
 module.exports = {
-  AUTO, REVIEW, normName, nameKey, trigramSim, nameSim, normPostal, civic,
+  AUTO, REVIEW, MATCH_VERSION, normName, nameKey, trigramSim, nameSim, nameVariants, isAddressOnly, normPostal, civic, addressQuery,
   scoreCandidate, decide, storeQuery, createGooglePlaces, candidateView,
 };

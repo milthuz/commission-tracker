@@ -20,6 +20,7 @@ const kStore = (i, name, street, postal, extra = {}) => ({
 const gPlace = (id, name, postal, num, extra = {}) => ({
   id, displayName: { text: name }, formattedAddress: `${num} Rue, Montréal ${postal}`,
   location: { latitude: 45.5, longitude: -73.6 },
+  primaryType: 'restaurant', types: ['restaurant', 'food', 'point_of_interest', 'establishment'],
   addressComponents: [{ types: ['street_number'], shortText: num }, { types: ['postal_code'], shortText: postal }],
   ...extra,
 });
@@ -50,10 +51,14 @@ const gPlace = (id, name, postal, num, extra = {}) => ({
     'Pizza Nova': [gPlace('PLACE_NOVA_00001', 'Pizza Nova', 'H2T 1A1', '100'), gPlace('PLACE_NOVA_00002', 'Pizza Nova', 'H2T 1A1', '100')],
     Bistro: [gPlace('PLACE_BISTRO_001', 'Bistro Fermé', 'H2W 1A1', '9')],
     Introuvable: [],
+    // Cas réel du 2026-10-06 : nom Kaizen = nom de lieu. Google rend l'ADRESSE par le nom, et le
+    // commerce seulement quand on cherche par l'adresse.
+    'Montreal-Ouest': [gPlace('ADDR_51_WESTMINSTER', '51 Westminster North', 'H4X 1Y8', '51', { primaryType: undefined, types: ['premise', 'geocode'] })],
+    'restaurant, 51 Westminster': [gPlace('PLACE_DELICES_0001', 'Les Délices de Lauzon', 'H4X 1Y8', '51')],
   };
   const google = {
     configured: () => true,
-    searchText: async (q) => { googleCalls.push(q); const k = Object.keys(db_g).find((x) => q.includes(x)); return k ? db_g[k] : []; },
+    searchText: async (q) => { googleCalls.push(q); const k = Object.keys(db_g).filter((x) => q.includes(x)).sort((a, b) => b.length - a.length)[0]; return k ? db_g[k] : []; },
     details: async (id) => Object.values(db_g).flat().find((p) => p.id === id) || null,
   };
 
@@ -223,6 +228,32 @@ const gPlace = (id, name, postal, num, extra = {}) => ({
       // Un verrou abandonné depuis plus de 30 minutes ne bloque plus.
       await pool.query(`UPDATE sync_state SET updated_at = CURRENT_TIMESTAMP - INTERVAL '31 minutes' WHERE key = 'kaizen_sync_lock'`);
       assert.ok(await mod.runAll({ source: 'stale' }));
+    });
+
+    await t('nom de lieu (cas réel) : adresse Google écartée, commerce trouvé au 2e essai par adresse', async () => {
+      parc.push(kStore(6, 'Montreal-Ouest', '51 Westminster North', 'H4X 1Y8'));
+      const before = googleCalls.length;
+      await mod.runAll({ source: 'lieu' });
+      const calls = googleCalls.slice(before).filter((q) => q.includes('Westminster'));
+      assert.strictEqual(calls.length, 2, 'une recherche par le nom, une par l\'adresse');
+      const row = (await pool.query(`SELECT match_status, match_candidates, match_version FROM kaizen_stores WHERE uuid = $1`, [U(6)])).rows[0];
+      assert.strictEqual(row.match_status, 'review');
+      const ids = row.match_candidates.map((c) => c.id);
+      assert.deepStrictEqual(ids, ['PLACE_DELICES_0001'], 'l\'immeuble n\'est jamais proposé');
+      assert.strictEqual(row.match_version, 2);
+    });
+
+    await t('notation améliorée : les « à confirmer » / « non trouvés » d\'une version antérieure sont renotés une fois', async () => {
+      await pool.query(`UPDATE kaizen_stores SET match_status = 'none', match_version = 1, match_attempted_at = CURRENT_TIMESTAMP WHERE uuid = $1`, [U(6)]);
+      // Une décision humaine d'une version antérieure, elle, ne bouge pas.
+      await pool.query(`UPDATE kaizen_stores SET match_version = 1 WHERE uuid = $1`, [U(2)]);
+      const before = googleCalls.length;
+      await mod.runAll({ source: 'v2' });
+      const again = googleCalls.slice(before);
+      assert.ok(again.some((q) => q.includes('Westminster')), 'renoté malgré la fenêtre de 30 jours');
+      assert.ok(!again.some((q) => q.includes('Pizza Nova')), 'le manuel n\'est pas recherché');
+      await mod.runAll({ source: 'v2-bis' });
+      assert.strictEqual(googleCalls.filter((q) => q.includes('Westminster')).length, again.filter((q) => q.includes('Westminster')).length + 2, 'une seule fois : pas de boucle');
     });
 
     await t('passage planifié : sauté si le dernier date de moins de 20 h (redémarrages du worker)', async () => {

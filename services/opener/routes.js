@@ -57,6 +57,8 @@ const SCHEMA = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_kaizen_stores_status ON kaizen_stores (match_status)`,
   `CREATE INDEX IF NOT EXISTS idx_kaizen_stores_place  ON kaizen_stores (place_id)`,
+  // Version de la notation qui a produit le statut (voir MATCH_VERSION dans matching.js).
+  `ALTER TABLE kaizen_stores ADD COLUMN IF NOT EXISTS match_version SMALLINT NOT NULL DEFAULT 1`,
   `CREATE TABLE IF NOT EXISTS opener_places (
     place_id            VARCHAR(300) PRIMARY KEY,
     lat                 DOUBLE PRECISION,
@@ -198,8 +200,12 @@ function registerOpenerRoutes(app, deps) {
       [placeId, lat ?? null, lng ?? null]);
   }
 
+  // Les résultats qui sont des ADRESSES et non des commerces sont écartés : on n'apparie jamais
+  // un magasin à un immeuble. Doublons (même place_id renvoyé par les deux recherches) fusionnés.
   function scorePlaces(store, places) {
+    const seen = new Set();
     return places
+      .filter((p) => p && p.id && !M.isAddressOnly(p) && !seen.has(p.id) && seen.add(p.id))
       .map((p) => ({ p, s: M.scoreCandidate(store, p) }))
       .sort((a, b) => b.s.score - a.s.score)
       .map(({ p, s }) => ({ id: p.id, score: s.score, view: M.candidateView(p, s) }));
@@ -208,25 +214,33 @@ function registerOpenerRoutes(app, deps) {
   async function matchOne(store) {
     if (!store.street && !store.postal_code) {
       await pool.query(
-        `UPDATE kaizen_stores SET match_status = 'no_address', match_attempted_at = CURRENT_TIMESTAMP,
+        `UPDATE kaizen_stores SET match_status = 'no_address', match_attempted_at = CURRENT_TIMESTAMP, match_version = ${M.MATCH_VERSION},
                 place_id = NULL, match_candidates = NULL WHERE uuid = $1 AND match_status NOT IN ('manual','ignored')`, [store.uuid]);
       return 'no_address';
     }
-    const places = await google.searchText(M.storeQuery(store));
-    const scored = scorePlaces(store, places);
+    let places = await google.searchText(M.storeQuery(store));
+    let scored = scorePlaces(store, places);
+    // Rien de plausible par le nom : 2e essai par l'adresse seule (le nom Kaizen est parfois un
+    // nom de lieu, « Montréal-Ouest »). Une recherche de plus, seulement dans ce cas.
+    const aq = M.addressQuery(store);
+    if (aq && (!scored.length || scored[0].score < M.REVIEW)) {
+      places = places.concat(await google.searchText(aq));
+      scored = scorePlaces(store, places);
+    }
     const d = M.decide(scored);
     const top = scored.slice(0, 3).map((c) => c.view);
     if (d.status === 'auto') {
       const best = scored[0].view;
       await pool.query(
         `UPDATE kaizen_stores SET match_status = 'auto', place_id = $2, match_score = $3, match_candidates = NULL,
-                match_attempted_at = CURRENT_TIMESTAMP, matched_by = 'auto', matched_at = CURRENT_TIMESTAMP, match_note = NULL
+                match_attempted_at = CURRENT_TIMESTAMP, matched_by = 'auto', matched_at = CURRENT_TIMESTAMP, match_note = NULL,
+                match_version = ${M.MATCH_VERSION}
           WHERE uuid = $1 AND match_status NOT IN ('manual','ignored')`, [store.uuid, d.placeId, d.score]);
       await upsertPlace(best.id, best.lat, best.lng);
     } else {
       await pool.query(
         `UPDATE kaizen_stores SET match_status = $2, place_id = NULL, match_score = $3, match_candidates = $4::jsonb,
-                match_attempted_at = CURRENT_TIMESTAMP
+                match_attempted_at = CURRENT_TIMESTAMP, match_version = ${M.MATCH_VERSION}
           WHERE uuid = $1 AND match_status NOT IN ('manual','ignored')`,
         [store.uuid, d.status, d.score || null, top.length ? JSON.stringify(top) : null]);
     }
@@ -239,6 +253,8 @@ function registerOpenerRoutes(app, deps) {
       `SELECT uuid, name, street, unit, city, region, postal_code FROM kaizen_stores
         WHERE missing_since IS NULL
           AND (match_status = 'pending'
+               -- notés par une version antérieure de la notation : renotés une fois
+               OR (match_status IN ('review','none') AND match_version < ${M.MATCH_VERSION})
                OR (match_status = 'none' AND (match_attempted_at IS NULL OR match_attempted_at < CURRENT_TIMESTAMP - INTERVAL '${RETRY_NONE_DAYS} days')))
         ORDER BY active DESC, (match_status = 'pending') DESC, first_seen_at
         LIMIT $1`, [Math.max(1, Math.min(2000, budget | 0))]);

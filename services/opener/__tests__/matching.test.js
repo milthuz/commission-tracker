@@ -8,6 +8,7 @@ const t = (name, fn) => { fn(); n++; console.log('  ✓', name); };
 const place = (id, name, postal, num, extra = {}) => ({
   id, displayName: { text: name }, formattedAddress: `${num} Rue X, Montréal, QC ${postal}`,
   location: { latitude: 45.52, longitude: -73.58 },
+  primaryType: 'restaurant', types: ['restaurant', 'food', 'point_of_interest', 'establishment'],
   addressComponents: [
     { types: ['street_number'], shortText: num },
     { types: ['postal_code'], shortText: postal },
@@ -61,6 +62,30 @@ t('requête Text Search : nom, rue + unité, ville, code postal', () => {
 t('numéro civique : premier nombre de la rue seulement', () => {
   assert.strictEqual(M.civic('123-A rue X'), '123');
   assert.strictEqual(M.civic('rue X'), null);
+});
+
+t('cas réel : « Pile ou Glace - Petite Italie » = « Pile Ou Glace Gelateria » à la même adresse → auto', () => {
+  const s = M.scoreCandidate(
+    { name: 'Pile ou Glace - Petite Italie', street: '7084 Boulevard Saint-Laurent', postal_code: 'H2S 3E2' },
+    place('p', 'Pile Ou Glace Gelateria', 'H2S 3E2', '7084'));
+  assert.ok(s.score >= M.AUTO, JSON.stringify(s));
+});
+
+t('marque seule : suffixes de succursale reconnus, nom simple inchangé', () => {
+  assert.deepStrictEqual(M.nameVariants('Saoko | Mile End'), ['Saoko | Mile End', 'Saoko']);
+  assert.deepStrictEqual(M.nameVariants('Kazu (Plateau)'), ['Kazu (Plateau)', 'Kazu']);
+  assert.deepStrictEqual(M.nameVariants('Pied-de-Cochon'), ['Pied-de-Cochon'], 'un trait d\'union sans espaces ne coupe pas');
+  // La marque seule ne rend pas ressemblant ce qui ne l'est pas.
+  assert.ok(M.nameSim('Pile ou Glace - Petite Italie', 'Pizza Italia') < 0.5);
+});
+
+t('adresse ≠ commerce : un immeuble est reconnu, un restaurant non', () => {
+  assert.strictEqual(M.isAddressOnly({ types: ['premise', 'geocode'] }), true);
+  assert.strictEqual(M.isAddressOnly({ types: ['street_address'] }), true);
+  assert.strictEqual(M.isAddressOnly({ primaryType: 'restaurant', types: ['restaurant', 'point_of_interest', 'establishment'] }), false);
+  assert.strictEqual(M.addressQuery({ street: '51 Westminster North', city: 'Montréal-Ouest', postal_code: 'H4X 1Y8' }),
+    'restaurant, 51 Westminster North, Montréal-Ouest, H4X 1Y8');
+  assert.strictEqual(M.addressQuery({ street: null }), null);
 });
 
 t('clé Google : GOOGLE_PLACES_API_KEY seulement, jamais de repli sur GOOGLE_MAPS_API_KEY', () => {
