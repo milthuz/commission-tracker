@@ -39,6 +39,30 @@ function fmtPct(v, lang, digits = 4) {
   return lang === 'en' ? `${s}%` : `${s.replace('.', ',')} %`;
 }
 
+// Un frais facturé AU TRANSACTION n'est pas un pourcentage.
+//
+// Les paliers Interac Flash valent 0,035 $ par transaction, pas 3,5 %. Passés dans
+// fmtPct, ils s'impriment « 0,0000 % » sur le document remis au marchand : un zéro qui a
+// l'air d'une panne de l'outil plutôt que d'un vrai frais, juste à côté d'un statut
+// « À vérifier ». C'est la moitié visible du problème des paliers mélangés.
+function fmtPerTxn(v, lang) {
+  const s = Number(v).toFixed(4);
+  return lang === 'en' ? `$${s}/txn` : `${s.replace('.', ',')} $/tr.`;
+}
+
+// La cellule « Taux appliqué » ou « Taux publié » d'une ligne d'audit.
+//
+// ⚠️ Le montant par transaction ne s'affiche QUE faute de pourcentage utile. Les deux
+// réunis (« 0,0030 % + 0,0500 $/tr. ») débordent de la colonne du PDF, et une cellule qui
+// passe à la ligne décale toutes les lignes suivantes — la mise en page du tableau pose
+// chaque cellule au même y, calculé avant. Le cas à deux colonnes est rare (évaluations
+// Chase) et son pourcentage reste la figure principale.
+function fmtRateCell(rate, perItem, lang) {
+  const hasRate = Number.isFinite(rate) && rate !== 0;
+  if (!hasRate && Number.isFinite(perItem) && perItem > 0) return fmtPerTxn(perItem, lang);
+  return rate == null ? '—' : fmtPct(rate, lang);
+}
+
 function fmtList(items, lang) {
   const arr = (items || []).map(String);
   if (arr.length <= 1) return arr.join('');
@@ -57,6 +81,12 @@ const TEMPLATES = {
   formatDetected: {
     fr: 'Format détecté : {{processor}}{{layoutSuffix}}.',
     en: 'Format detected: {{processor}}{{layoutSuffix}}.',
+  },
+  // Fiserv a refondu sa mise en page à compter d'août 2026. Les deux lectures cohabitent :
+  // les anciens relevés circulent encore, et le rep doit savoir laquelle a servi.
+  cloverNewLayout: {
+    fr: 'Nouvelle mise en page Fiserv/Clover (2026) reconnue.',
+    en: 'New Fiserv/Clover statement layout (2026) recognised.',
   },
   emptyExtraction: {
     fr: "Aucun texte n'a pu être extrait du PDF. Un relevé numérisé (image) doit passer par la saisie JSON.",
@@ -297,6 +327,6 @@ function missingTranslations() {
 module.exports = {
   TEMPLATES, LANGS,
   note, render, renderAll, toRecords,
-  fmtMoney, fmtPct, fmtList,
+  fmtMoney, fmtPct, fmtList, fmtPerTxn, fmtRateCell,
   missingTranslations,
 };

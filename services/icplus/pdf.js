@@ -495,9 +495,9 @@ function auditTable(doc, rows, lang) {
     let cx = x;
     doc.text(String(r.desc || '').slice(0, 70), cx, y, { width: w * cols[0], ellipsis: true });
     cx += w * cols[0];
-    doc.text(pct(r.rate, lang), cx, y, { width: w * cols[1], align: 'right' });
+    doc.text(N.fmtRateCell(r.rate, r.perItem, lang), cx, y, { width: w * cols[1], align: 'right' });
     cx += w * cols[1];
-    doc.text(pct(r.publishedRate, lang), cx, y, { width: w * cols[2], align: 'right' });
+    doc.text(N.fmtRateCell(r.publishedRate, r.publishedPerItem, lang), cx, y, { width: w * cols[2], align: 'right' });
     cx += w * cols[2];
     doc.text(money(r.total, lang), cx, y, { width: w * cols[3], align: 'right' });
     cx += w * cols[3];

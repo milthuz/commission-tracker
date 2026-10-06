@@ -296,6 +296,51 @@ const lines = fs.readFileSync(path.join(__dirname, 'fixtures', 'global-fr.lines.
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // LA TRACE D'UNE ANALYSE ET D'UN DOCUMENT CLIENT.
+  //
+  // ⚠️ Ajoutee le 2026-09-24 apres avoir decouvert que l'outil presentait Cluster comme ne
+  // facturant RIEN : toute comparaison produite depuis la mise en production annoncait une
+  // economie fausse, et il etait IMPOSSIBLE de savoir qui prevenir. Ni /parse, ni /import,
+  // ni /pdf n'ecrivaient quoi que ce soit ; le journal ne contenait que les modifications
+  // de taux.
+  //
+  // Ces assertions existent pour qu'un remaniement ne puisse pas refaire disparaitre la
+  // trace en silence.
+  // ---------------------------------------------------------------------------
+  {
+    logged.length = 0;
+    const analyse = await call('POST', '/api/icplus/parse', { body: { lines } });
+    ok('une analyse repond bien', analyse.status === 200 && analyse.body.ok, analyse.status);
+
+    const t = logged.find((a) => a[0] === 'icplus' && a[2] === 'statement_analyzed');
+    ok('une analyse laisse une trace', !!t, logged.map((a) => a[2]));
+    if (t) {
+      const meta = (t[5] && t[5].metadata) || {};
+      ok('la trace nomme le rep', t[4] === 'rep@example.com', t[4]);
+      ok('elle nomme le processeur', !!meta.processor, meta);
+      // ⚠️ Les trois chiffres sans lesquels on ne peut pas refaire le tri le jour ou une
+      // hypothese se revele fausse : ce que le marchand paie, ce que Cluster facturerait,
+      // et l'ecart qu'on lui a annonce.
+      ok('elle porte le total actuel', Number.isFinite(meta.currentPretax) && meta.currentPretax > 0, meta.currentPretax);
+      ok('elle porte le total Cluster', Number.isFinite(meta.clusterPretax), meta.clusterPretax);
+      ok('elle porte l ecart mensuel', Number.isFinite(meta.monthlyDiff), meta.monthlyDiff);
+      // ⚠️ La vintage des taux : une comparaison se juge contre les taux du JOUR ou elle a
+      // ete faite. Sans elle, on ne saurait pas distinguer une analyse d'avant correction
+      // d'une analyse d'apres.
+      ok('elle porte la version des taux', !!meta.rateVersion, meta.rateVersion);
+    }
+
+    // ⚠️ Le PDF est le geste qui compte le plus : ce fichier part chez un marchand.
+    logged.length = 0;
+    const doc = await call('POST', '/api/icplus/pdf', { body: { state: analyse.body.state, kind: 'client' } });
+    ok('le PDF client est produit', doc.status === 200, doc.status);
+    const tp = logged.find((a) => a[0] === 'icplus' && a[2] === 'proposal_exported');
+    ok('un document remis au client laisse une trace', !!tp, logged.map((a) => a[2]));
+    ok('et elle distingue le document client du detaille', tp && tp[1] === 'client', tp && tp[1]);
+  }
+
+
   server.close();
   if (db) await db.close();
   console.log(fail ? `\n${fail} FAILING` : '\nall green');

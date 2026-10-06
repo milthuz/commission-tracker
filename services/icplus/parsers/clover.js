@@ -93,7 +93,12 @@ const FISERV_MARKUP_RE = new RegExp([
 const INTERAC_RE = /(INTERAC\s*(FRAIS|SWITCH|INTERCHANGE)|FRAIS\s*-?\s*(DEBIT|FLASH)\s*(COMMUTATION|INTERCHANGE)|SWITCH\s*FEE|IDP\s*FLASH)/i;
 
 // Rows in the fee sections that are network brand fees rather than interchange or fixed.
-const BRAND_RE = /(VALUATION|ÉVALUATION|EVALUATION|ASSESSMENT|CROSS BORDER|IASF|ACQ CLEAR|CLEARING|CONNEC|CONNECTIVITY|VOLUME PERMIS|LICEN|NATL SETTLED|CARD BRAND|REDEV)/i;
+// ⚠️ « DIGITAL COMM » est un frais de RÉSEAU, pas une charge fixe de Fiserv. Les deux
+// lignes Visa Digital Commerce (CP et XBRD, 1,27 $ en juillet) tombaient faute de mot-clé
+// dans les frais fixes — et la distinction n'est pas cosmétique : une charge fixe est un
+// frais que Cluster REMPLACE par le sien, un frais de réseau est un transfert que Cluster
+// paie aussi. Mal rangé, l'avantage annoncé au marchand est surévalué d'autant.
+const BRAND_RE = /(VALUATION|ÉVALUATION|EVALUATION|ASSESSMENT|CROSS BORDER|IASF|ACQ CLEAR|CLEARING|CONNEC|CONNECTIVITY|VOLUME PERMIS|LICEN|NATL SETTLED|CARD BRAND|REDEV|DIGITAL COMM)/i;
 
 // Generic fixed charges.
 const FIXED_RE = /(EQUIPEMENT|EQUIPMENT|MENS\.|MONTHLY|LOCATION|RENTAL|RELEVÉ|STATEMENT)/i;
@@ -106,6 +111,12 @@ function detect(lines) {
 
 function parse(lines) {
   const L = lines.map(foldPunct);
+
+  // La mise en page 2026 se lit par un chemin entierement separe : voir le bloc en bas
+  // de ce fichier pour pourquoi elle n'est PAS entrelacee avec l'ancienne.
+  const newSummary = parseNewSummaryRows(L);
+  if (newSummary.length) return parseNewLayout(L, newSummary);
+
   const notes = [];
 
   const sections = splitSections(L);
@@ -393,9 +404,305 @@ function findMerchantName(lines) {
   return null;
 }
 
+// ============================================================================
+// Mise en page 2026 — le « relevé repensé » de Fiserv.
+//
+// Fiserv a refondu le relevé à compter d'août 2026. Ce n'est pas un habillage : les
+// données ont changé de place, de forme et de granularité. Un relevé neuf passé dans
+// l'ancienne lecture ressortait détecté comme Clover avec DES ZÉROS PARTOUT — pire qu'une
+// erreur, puisque la page affichait un comparatif d'apparence normale.
+//
+// ⚠️ Les deux lectures sont SÉPARÉES, pas entrelacées. Les anciens relevés circulent
+// encore des mois après le changement, et la lecture ancienne est vérifiée au cent près
+// contre de vrais documents. Un `if` de plus dans le chemin commun, c'est le risque de
+// déplacer un chiffre sur un relevé qui marchait. Ici, rien de commun n'est touché :
+// parse() bifurque une fois, au début, sur la présence d'une ligne du tableau §3.1.
+//
+// Vérifié contre Juillet-Saoko.pdf (07/2026), qui se referme ainsi :
+//   majoration Fiserv      67,90 $   (0,15 % du crédit + 0,03 $/transaction Interac)
+//   transfert réseau      427,39 $
+//   -------------------------------
+//   avant taxes           495,29 $   contre 495,23 $ imprimés (6 ¢ d'arrondi par ligne)
+// ============================================================================
+
+// §3.1 — « Résumé du traitement des cartes et des frais ».
+//   AmexCredit 35 $881.70 0 $0.00 0.1500 0.0000 $18.71 2.12%
+//   nom | art. vendus | montant | art. crédités | montant | escompte % | $/article |
+//   frais totaux | taux effectif
+//
+// ⚠️ C'est AUSSI le test de mise en page. L'ancien relevé n'a jamais produit de ligne de
+// cette forme : neuf champs dont trois préfixés d'un $. Un test sur la date ou sur un
+// libellé se serait fait avoir par la version anglaise, que personne n'a encore vue.
+const NEW_SUMMARY_RE = /^(.+?)\s+(\d+)\s+\$(-?[\d,]+\.\d{2})\s+(\d+)\s+\$(-?[\d,]+\.\d{2})\s+(-?[\d.]+)\s+(-?[\d.]+)\s+\$(-?[\d,]+\.\d{2})\s+(-?[\d.]+)%$/;
+
+function parseNewSummaryRows(lines) {
+  const out = [];
+  for (const raw of lines || []) {
+    const m = foldPunct(raw).match(NEW_SUMMARY_RE);
+    if (!m) continue;
+    const key = squash(m[1]).toUpperCase();
+    // La ligne « Total » n'a que cinq colonnes et ne peut pas correspondre ; la garde
+    // reste au cas où une mise en page future la remplirait.
+    if (key === 'TOTAL') continue;
+    out.push({
+      key,
+      label: m[1].trim(),
+      // ⚠️ Le $/article se facture sur chaque ARTICLE TRAITÉ, remboursements compris —
+      // le même comportement « deux jambes » relevé sur l'ancienne mise en page, où
+      // compter les ventes seules laissait un écart de 4 ¢ contre le total imprimé. Sur
+      // l'échantillon de juillet les crédits sont tous nuls, donc les deux lectures
+      // donnent le même chiffre : cette règle-ci reste à confirmer sur un relevé qui a
+      // des remboursements.
+      count: parseNum(m[2]) + parseNum(m[4]),
+      salesCount: parseNum(m[2]),
+      amount: parseNum(m[3]) - parseNum(m[5]),
+      pct: parseNum(m[6]) / 100,
+      perItem: parseNum(m[7]),
+      totalFees: Math.abs(parseNum(m[8])),
+    });
+  }
+  return out;
+}
+
+// §3.2 — le tableau des frais facturés.
+//   000075228 FRAIS DE VOLUME PERMIS DE MC Frais -$0.74
+//   Interac Flash 428521123 INTERAC FRAIS DE COMM-FLASH Frais de service -$12.59
+//
+// Le numéro de facture à neuf chiffres ancre la ligne. L'en-tête de catégorie
+// (« Interac Flash », « Visa », …) se colle parfois DEVANT, sur la même ligne.
+//
+// ⚠️ La colonne « Type » n'est pas décorative : « Frais » et « Frais de service » ne se
+// routent pas pareil (voir routeNewFeeRow). Les mots anglais sont une CONJECTURE — aucun
+// relevé anglais de la nouvelle mise en page n'a encore été vu.
+const NEW_FEE_RE = /^(?:(.*?)\s+)?(\d{9})\s+(.+?)\s+(Frais de service|Service Fees?|Service Charges?|Frais|Fees?)\s+-?\$(-?[\d,]+\.\d{2})$/i;
+const NEW_SERVICE_TYPE_RE = /^(Frais de service|Service Fees?|Service Charges?)$/i;
+
+function parseNewFeeRows(lines) {
+  const rows = [];
+  for (const raw of lines || []) {
+    const m = foldPunct(raw).match(NEW_FEE_RE);
+    if (!m) continue;
+    const total = Math.abs(parseNum(m[5]));
+    if (!Number.isFinite(total)) continue;
+    rows.push({
+      group: (m[1] || '').trim(),
+      invoice: m[2],
+      desc: m[3].trim(),
+      kind: NEW_SERVICE_TYPE_RE.test(m[4].trim()) ? 'service' : 'fee',
+      total,
+      rate: null, volume: 0, count: 0,
+    });
+  }
+  return rows;
+}
+
+// §3.3 — « Frais d'interchange / frais de programme ».
+//   MC-CAN ITR SM CONTACTLESS-WRLD $1,151.38 8% 41 8% 0.9300% 0.0000 %
+//
+// ⚠️ Le libellé est FACULTATIF. Les lignes Interac n'en portent pas — le nom de la marque
+// est seul sur la ligne précédente — et une expression exigeant un libellé les perdait en
+// silence. L'espace devant le dernier % est dans le document, pas une coquille.
+const NEW_IC_RE = /^(?:(.+?)\s+)?\$(-?[\d,]+\.\d{2})\s+-?\d+%\s+(\d+)\s+-?\d+%\s+(-?[\d.]+)%\s+(-?[\d.]+)\s*%$/;
+
+// Les en-têtes de marque, seuls sur leur ligne, au-dessus de leurs produits.
+const NEW_IC_BRANDS = ['AMEXCREDIT', 'DISCOVERCREDIT', 'INTERAC', 'INTERACFLASH',
+  'MASTERCARDCREDIT', 'MASTERCARDDEBIT', 'UPICREDIT', 'UPIDEBIT', 'VISADEBIT', 'VISACREDIT'];
+
+function parseNewInterchange(lines) {
+  const out = [];
+  let brand = '';
+  for (const raw of lines || []) {
+    const s = foldPunct(raw);
+    const sq = squash(s).toUpperCase();
+    if (NEW_IC_BRANDS.includes(sq)) { brand = sq; continue; }
+    // « AmexCredit Total $881.70 35 » ferme un groupe sans être un produit.
+    if (/\bTOTAL\b/i.test(s) && !/-/.test(s)) continue;
+    const m = s.match(NEW_IC_RE);
+    if (!m) continue;
+    const volume = parseNum(m[2]);
+    const count = parseNum(m[3]);
+    const rate = parseNum(m[4]) / 100;
+    if (!Number.isFinite(volume) || !Number.isFinite(rate)) continue;
+    out.push({
+      desc: (m[1] || '').trim() || brand,
+      brand,
+      volume,
+      count,
+      rate,
+      assessmentRate: parseNum(m[5]) / 100,
+      // Le tableau publie le TAUX, pas les dollars. Le montant est reconstitué ; il se
+      // vérifie contre les codes du tableau des frais (284,84 $ imprimés contre 284,90 $
+      // reconstitués sur l'échantillon de juillet, soit 6 ¢ d'arrondi par ligne).
+      total: round2(volume * rate),
+    });
+  }
+  return out;
+}
+
+// Le nom du marchand suit la PREMIÈRE ligne de période, avec le numéro de magasin collé
+// derrière : « SAOKO Numéro de magasin# 001 ».
+//
+// ⚠️ L'ancienne règle — la ligne après « Page 1 de N » — rend ici un NUMÉRO DE TÉLÉPHONE :
+// la nouvelle mise en page a déplacé le bloc d'adresse.
+function findNewMerchantName(lines) {
+  const i = lines.findIndex((l) => /(PÉRIODE|PERIOD)\s*:/i.test(foldPunct(l))
+    && /(Num[ée]ro de commer[çc]ant|Merchant Number)/i.test(foldPunct(l)));
+  if (i < 0) return null;
+  for (let j = i + 1; j < lines.length && j <= i + 3; j += 1) {
+    const s = foldPunct(lines[j])
+      .replace(/\s*(Num[ée]ro de magasin|Store Number)\s*#?.*$/i, '')
+      .trim();
+    if (/^[A-ZÀ-Ü0-9][A-ZÀ-Ü0-9 '&.\-]{2,}$/.test(s)) return s;
+  }
+  return null;
+}
+
+// Les lignes de type « Frais de service » qui sont des CODES D'INTERCHANGE (VSMELECONN,
+// CANCNTLSSMCR, AC REST T1…) sont écartées À DESSEIN : ce sont les mêmes dollars que le
+// tableau §3.3 reconstitue déjà à partir des taux publiés. Les compter des deux côtés
+// doublerait l'interchange du marchand — et le comparatif annoncerait une économie qui
+// n'existe pas. Ne survivent au filtre que les frais NOMMÉS, reconnaissables.
+function routeNewFeeRow(row, buckets, summaryByKey, volumes) {
+  const d = headerKey(row.desc);
+
+  // La majoration de Fiserv, déjà reproduite par taux × volume du tableau §3.1.
+  if (FISERV_MARKUP_RE.test(d)) { buckets.skippedMarkup += row.total; return; }
+
+  if (/^INTERAC/i.test(row.desc)) {
+    // -FLASH se rapporte au sans-contact, -CONTACT au débit à puce. Sans ce rattachement
+    // la ligne n'a ni nombre ni volume, donc aucun $/transaction à confronter aux paliers
+    // publiés : elle sortirait « À vérifier » sans catégorie.
+    const src = /FLASH/i.test(row.desc) ? summaryByKey.INTERACFLASH : summaryByKey.INTERAC;
+    buckets.interac.push({
+      ...row,
+      count: src ? src.count : 0,
+      volume: src ? src.amount : 0,
+      perItem: src && src.count > 0 ? row.total / src.count : null,
+    });
+    return;
+  }
+
+  // La redevance de marque : un pourcentage du volume de SA marque.
+  if (/(REDEV.*CARTE|CARD BRAND FEE)/i.test(d)) {
+    const base = /VISA|\bVI\b/i.test(row.desc) ? volumes.visa
+      : /(MASTERCARD|\bMC\b)/i.test(row.desc) ? volumes.mc
+        : /AMEX|AMERICAN/i.test(row.desc) ? volumes.amex : 0;
+    buckets.brand.push({ ...row, volume: base, rate: base > 0 ? row.total / base : null });
+    return;
+  }
+
+  if (BRAND_RE.test(d)) { buckets.brand.push(row); return; }
+
+  // Un frais de type « Frais » qui n'est pas un frais de réseau nommé est une charge fixe
+  // de Fiserv (location de terminal, relevé…). Aucune sur l'échantillon de juillet : ce
+  // chemin n'est pas vérifié contre du vrai papier.
+  if (row.kind === 'fee') {
+    buckets.fixed.push({ label: row.desc, qty: 1, unit: row.total, amount: row.total });
+    return;
+  }
+
+  // Code d'interchange : écarté, voir le commentaire au-dessus de la fonction.
+  buckets.skippedInterchangeCodes += row.total;
+}
+
+function parseNewLayout(L, summary) {
+  const notes = [];
+  const summaryByKey = {};
+  for (const r of summary) summaryByKey[r.key] = r;
+  const S = (k) => summaryByKey[k] || null;
+  const sum = (...keys) => keys.map(S).filter(Boolean);
+
+  const take = (rows, field) => rows.reduce((s, r) => s + (r[field] || 0), 0);
+  const debitRows = sum('INTERAC', 'INTERACFLASH');
+  const visaRows  = sum('VISACREDIT', 'VISADEBIT');
+  const mcRows    = sum('MASTERCARDCREDIT', 'MASTERCARDDEBIT');
+  const amexRows  = sum('AMEXCREDIT', 'DISCOVERCREDIT');
+
+  // ⚠️ débit = UNIQUEMENT les rails Interac facturés au montant fixe par transaction.
+  // Visa Debit est facturé au pourcentage du crédit et appartient donc à Visa — même
+  // règle que l'ancienne mise en page, où l'avoir rangé en débit faussait le comparatif.
+  const vol = {
+    debit_count: take(debitRows, 'count'), debit_amt: take(debitRows, 'amount'),
+    visa_count:  take(visaRows, 'count'),  visa_amt:  take(visaRows, 'amount'),
+    mc_count:    take(mcRows, 'count'),    mc_amt:    take(mcRows, 'amount'),
+    amex_count:  take(amexRows, 'count'),  amex_amt:  take(amexRows, 'amount'),
+  };
+
+  const asParts = (rows) => rows.map((r) => [{ pct: r.pct, perItem: r.perItem }, r.amount, r.count]);
+  const rates = {
+    debit: blend(asParts(debitRows)),
+    visa:  blend(asParts(visaRows)),
+    mc:    blend(asParts(mcRows)),
+    amex:  blend(asParts(amexRows)),
+  };
+
+  const buckets = {
+    interchange: [], brand: [], interac: [], fixed: [],
+    skippedMarkup: 0, skippedInterchangeCodes: 0,
+  };
+
+  // L'interchange vient du tableau §3.3, jamais des codes du tableau des frais.
+  for (const ic of parseNewInterchange(L)) {
+    // Un taux nul ne coûte rien et n'apprend rien ; les lignes Interac sont toutes à zéro
+    // ici, leur vrai coût étant dans les lignes nommées du tableau des frais.
+    if (!(ic.rate > 0) || !(ic.total > 0)) continue;
+    const row = { desc: ic.desc, rate: ic.rate, volume: ic.volume, count: ic.count, total: ic.total };
+    // Amex n'a pas de table d'interchange publiée chez nous ; ses lignes se comparent aux
+    // tables de frais de marque, comme sur l'ancienne mise en page.
+    if (/^AMEX/i.test(ic.desc)) buckets.brand.push(row);
+    else buckets.interchange.push(row);
+  }
+
+  const volumes = { visa: vol.visa_amt, mc: vol.mc_amt, amex: vol.amex_amt };
+  for (const row of parseNewFeeRows(L)) routeNewFeeRow(row, buckets, summaryByKey, volumes);
+
+  if (buckets.skippedMarkup > 0) {
+    notes.push(N.note('fiservMarkupExcluded', { amount: buckets.skippedMarkup }));
+  }
+
+  const line_audit = {
+    interchange: buildLineAudit(buckets.interchange, classifyInterchangeLine, { processor: 'clover' }),
+    brand:       buildLineAudit(buckets.brand, classifyBrandLine, { processor: 'clover' }),
+    interac:     buildLineAudit(buckets.interac, classifyInteracLine, { processor: 'clover' }),
+  };
+
+  const interchange = [...buckets.interchange, ...buckets.brand, ...buckets.interac]
+    .reduce((s, r) => s + r.total, 0);
+
+  const suspects = [...line_audit.interchange, ...line_audit.brand, ...line_audit.interac]
+    .filter((r) => r.status === STATUS.SUSPECT);
+  if (suspects.length) notes.push(N.note('suspectRows', { count: suspects.length, labels: suspects.map((s) => s.desc) }));
+
+  const allNotes = [
+    N.note('formatDetected', { processor: NAME, layoutSuffix: '' }),
+    N.note('cloverNewLayout', {}),
+    ...notes,
+  ];
+
+  return {
+    current_processor: {
+      name: NAME,
+      debit_rate: rates.debit.pct, debit_fee: rates.debit.perItem,
+      visa_rate:  rates.visa.pct,  visa_fee:  rates.visa.perItem,
+      mc_rate:    rates.mc.pct,    mc_fee:    rates.mc.perItem,
+      amex_rate:  rates.amex.pct,  amex_fee:  rates.amex.perItem,
+      interchange: round2(interchange),
+      fixed_rows: buckets.fixed,
+    },
+    volume: vol,
+    merchant_name: findNewMerchantName(L),
+    line_audit,
+    notes: allNotes,
+    _note: N.renderAll(allNotes, 'fr'),
+  };
+}
+
 const round = (v, d) => { const f = 10 ** d; return Math.round((Number(v) + Number.EPSILON) * f) / f; };
 const round2 = (v) => round(v, 2);
 // French decimal comma, to match the rest of the note text.
 const fmt = (v) => round2(v).toFixed(2).replace('.', ',');
 
-module.exports = { NAME, detect, parse, SECTIONS, parseCardTypes, parseGrossSales, blend };
+module.exports = {
+  NAME, detect, parse, SECTIONS, parseCardTypes, parseGrossSales, blend,
+  parseNewSummaryRows, parseNewFeeRows, parseNewInterchange, findNewMerchantName,
+};

@@ -83,6 +83,57 @@ function registerIcplusRoutes(app, deps) {
       notes: notes.toRecords(parsed.notes || [], lang(req)),
       ...extra,
     });
+    await trace(req, 'statement_analyzed', extra.processor || 'inconnu', state, result);
+  }
+
+  // ---------------------------------------------------------------------------
+  // ⚠️ POURQUOI CETTE TRACE EXISTE.
+  //
+  // Le 2026-09-24, on a decouvert que l'outil presentait Cluster comme ne facturant RIEN :
+  // toute comparaison produite depuis la mise en production annoncait une economie fausse.
+  // Impossible de savoir QUI prevenir — ni /parse, ni /import, ni /pdf n'ecrivaient quoi
+  // que ce soit. Le journal ne contenait que les modifications de taux.
+  //
+  // Un calcul qui finit sur le bureau d'un marchand doit laisser une trace : qui l'a fait,
+  // pour quel commercant, avec quels totaux. La prochaine fois qu'un chiffre se revele
+  // faux, on saura exactement quelles propositions refaire au lieu de deviner.
+  //
+  // ⚠️ La trace ne doit JAMAIS faire echouer l'analyse : elle est ecrite APRES la reponse
+  // et toute erreur y est avalee. Un journal indisponible ne prive pas un rep de son
+  // calcul.
+  // ---------------------------------------------------------------------------
+  async function trace(req, event, entityId, state, result, meta = {}) {
+    if (typeof logActivity !== 'function') return;
+    try {
+      const merchant = (state && state.merchantName) || 'commercant non nomme';
+      const cur = (result && result.current) || {};
+      const clu = (result && result.cluster) || {};
+      const sav = (result && result.savings) || {};
+      const $ = (v) => (Number(v) || 0).toFixed(2);
+      await logActivity('icplus', String(entityId), event,
+        `${merchant} — actuel ${$(cur.pretax)} $ avant taxes, Cluster ${$(clu.pretax)} $, `
+        + `ecart ${$(sav.monthly)} $/mois (${sav.clusterIsCheaper ? 'Cluster moins cher' : 'Cluster PLUS cher'}).`,
+        req.user && req.user.email,
+        {
+          // Le montant porte l'ECART mensuel : c'est ce qu'on voudra retrouver le jour ou
+          // une hypothese de calcul se revele fausse.
+          amount: Number(sav.monthly) || 0,
+          metadata: {
+            merchant,
+            processor: entityId,
+            currentPretax: Number(cur.pretax) || 0,
+            clusterPretax: Number(clu.pretax) || 0,
+            monthlyDiff: Number(sav.monthly) || 0,
+            clusterIsCheaper: !!sav.clusterIsCheaper,
+            // La vintage des taux : une comparaison se juge contre les taux du jour ou
+            // elle a ete faite, pas contre ceux d'aujourd'hui.
+            rateVersion: rateTables.DATA_VERSION,
+            ...meta,
+          },
+        });
+    } catch (e) {
+      console.warn('[icplus] trace non ecrite:', e.message);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -463,6 +514,15 @@ function registerIcplusRoutes(app, deps) {
         date: body.date,
         salesperson: body.salesperson,
         detailed,
+        lang: L,
+      });
+
+      // ⚠️ LE GESTE QUI COMPTE LE PLUS : ce fichier part chez un marchand. Trace AVANT
+      // l'envoi, parce qu'apres l'envoi la reponse est terminee et un echec passerait
+      // inapercu. `kind` distingue le document CLIENT du detaille interne.
+      await trace(req, 'proposal_exported', detailed ? 'detailed' : 'client', state, result, {
+        salesperson: body.salesperson || null,
+        validDays: body.validDays || null,
         lang: L,
       });
 

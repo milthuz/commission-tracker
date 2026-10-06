@@ -128,17 +128,29 @@ function keywordOverlap(desc, cat, minWords = DEFAULT_MIN_WORDS) {
 // dictionary, not in the shared guard.
 // ---------------------------------------------------------------------------
 const BRAND_TOKENS = [
-  ['visa',    /(^| )(VISA|VS)( |$)/],
-  ['mc',      /(^| )(MC|MASTERCARD)( |$)/],
-  ['amex',    /(^| )(AMEX|AMERICAN EXPRESS)( |$)/],
-  ['interac', /(^| )(INTERAC|IDP)( |$)/],
+  ['visa',     /(^| )(VISA|VS)( |$)/],
+  ['mc',       /(^| )(MC|MASTERCARD)( |$)/],
+  ['amex',     /(^| )(AMEX|AMERICAN EXPRESS)( |$)/],
+  ['interac',  /(^| )(INTERAC|IDP)( |$)/],
+  // ⚠️ DSCVR est la forme que Fiserv imprime. Sans elle, « DSCVR CAN INTERNATIONAL AIP »
+  // à 1,20 % s'est fait étiqueter « Visa Crédit conso. » et marquer CONFORME sur le relevé
+  // d'août de SAOKO : le marchand lisait que son Discover était conforme à un tarif Visa.
+  ['discover', /(^| )(DISCOVER|DSCVR|DSVR)( |$)/],
 ];
 
 function brandsIn(text) {
   // "/" separates brands rather than joining them — both "Visa/Mastercard — assessment
   // transfrontalier" and "VISA/MC - CARD BRAND MAINTENANCE" name two brands, and without
   // this split neither token sits at a space boundary so the row reads as brandless.
-  const t = norm(text).replace(/\//g, ' ');
+  //
+  // ⚠️ Le TRAIT D'UNION sépare lui aussi. La mise en page Fiserv 2026 préfixe chaque
+  // produit d'interchange de sa marque collée : « MC-INT CON RTE 2 CP CORE ». Le jeton
+  // « MC » n'étant alors pas à une frontière d'espace, la ligne passait pour SANS MARQUE,
+  // le garde-fou ne pouvait rien contredire, et douze lignes Mastercard sont ressorties
+  // étiquetées de catégories VISA — avec la mention « Conforme ». Une étiquette fausse et
+  // sûre d'elle est pire qu'un « À vérifier » honnête : c'est elle qui part chez le
+  // marchand.
+  const t = norm(text).replace(/[/-]/g, ' ');
   const out = new Set();
   for (const [brand, re] of BRAND_TOKENS) if (re.test(t)) out.add(brand);
   return out;
@@ -284,6 +296,67 @@ function interacTier(desc) {
   const m = String(desc || '').match(INTERAC_TIER_RE);
   return m ? m[0].trim() : null;
 }
+
+// ---------------------------------------------------------------------------
+// Un mois complet de Flash MÉLANGE les paliers.
+//
+// Les paliers Interac Flash sont des prix par transaction (0,02 $ / 0,025 $ / 0,035 $ /
+// 0,055 $), et le palier applicable dépend du montant de CHAQUE transaction. Un relevé
+// mensuel n'imprime qu'une seule ligne, donc un seul taux : la moyenne du mois. Cette
+// moyenne ne tombe sur aucun palier publié dès que le commerçant a franchi la frontière
+// des 100 $ ne serait-ce qu'une fois — ce qui est le cas courant, pas le cas rare.
+//
+// Sans ce qui suit, la ligne sortait « À vérifier » SANS catégorie, c'est-à-dire
+// indistinguable d'un frais que l'outil ne reconnaît pas, sur un document remis au
+// marchand. Le montant, lui, ne bougeait pas et ne bouge toujours pas : decide() rendait
+// déjà « À vérifier » dans ce cas. Seule la LECTURE de la ligne change.
+//
+// ⚠️ La bande ne suffit pas comme critère. Un frais de service du processeur facturé
+// 0,03 $/transaction tombe lui aussi entre deux paliers ; le nommer « Interac Flash »
+// reviendrait à bénir une majoration comme transfert réseau. D'où l'exigence d'un libellé
+// de la famille Flash EN PLUS de la bande. Une ligne Flash sans ce mot reste sans
+// catégorie — c'est le sens prudent de l'erreur.
+const FLASH_BLEND_TOLERANCE = 0.0006;
+const FLASH_LINE_RE = /\bFLASH\b|SANS[\s-]*CONTACT|CONTACTLESS/i;
+
+// Le $/transaction réellement facturé. La colonne du relevé quand elle existe, sinon le
+// quotient montant ÷ nombre — qui EST le taux moyen du mois, exactement ce qu'on cherche.
+function effectivePerItem(item) {
+  if (Number.isFinite(item.perItem) && item.perItem > 0) return item.perItem;
+  const count = Number.isFinite(item.count) ? item.count : 0;
+  const total = Number.isFinite(item.total) ? Math.abs(item.total) : 0;
+  return count > 0 && total > 0 ? total / count : null;
+}
+
+// Situe un $/transaction par rapport aux paliers Flash PUBLIÉS (lus à chaque appel : la
+// table est remplacée en place au chargement depuis la base).
+//   { single } — assez près d'un palier pour que ce soit celui-là.
+//   { below, above } — entre deux paliers : mois mélangé.
+//   null — hors de la bande, donc pas un Flash.
+function flashBlend(perItem) {
+  if (!Number.isFinite(perItem) || perItem <= 0) return null;
+  const tiers = (RATE_TABLES.interacFlash || [])
+    .filter((e) => e && Number.isFinite(e.perItem) && e.perItem > 0)
+    .sort((a, b) => a.perItem - b.perItem);
+  if (tiers.length < 2) return null;
+
+  const lo = tiers[0];
+  const hi = tiers[tiers.length - 1];
+  if (perItem < lo.perItem - FLASH_BLEND_TOLERANCE) return null;
+  if (perItem > hi.perItem + FLASH_BLEND_TOLERANCE) return null;
+
+  const near = tiers.find((e) => Math.abs(e.perItem - perItem) <= FLASH_BLEND_TOLERANCE);
+  if (near) return { single: near };
+
+  let below = lo;
+  let above = hi;
+  for (const e of tiers) if (e.perItem < perItem) below = e;
+  for (let i = tiers.length - 1; i >= 0; i -= 1) if (tiers[i].perItem > perItem) above = tiers[i];
+  return { below, above };
+}
+
+// 0,0342 -> « 0,0342 ». Les libellés de cette page sont en français.
+const perItemFr = (v) => Number(v).toFixed(4).replace('.', ',');
 
 // ---------------------------------------------------------------------------
 // The three category classifiers.
@@ -462,6 +535,42 @@ function classifyInteracLine(item, opts = {}) {
       why: 'Palier Interac reconnu, taux publié absent des tables',
     };
   }
+
+  // Pas de palier imprimé, pas de taux publié atteint : avant de rendre la ligne anonyme,
+  // voir si son $/transaction est simplement la MOYENNE d'un mois à paliers mélangés.
+  // Voir le bloc flashBlend plus haut pour pourquoi le libellé Flash est exigé en plus.
+  const eff = effectivePerItem(item);
+  const blend = FLASH_LINE_RE.test(String(item.desc || '')) ? flashBlend(eff) : null;
+  if (blend) {
+    const shown = perItemFr(eff);
+    const base = {
+      ...item, tier: null, blendedTiers: true,
+      // Le taux moyen RECONSTITUÉ quand le relevé n'imprime pas de colonne par
+      // transaction : sans lui, la colonne « Taux appliqué » retombe sur 0,0000 %.
+      perItem: eff,
+      publishedRate: null, theoretical: null, delta: null,
+      status: STATUS.A_VERIFIER,
+    };
+    if (blend.single) {
+      return {
+        ...base,
+        cat: blend.single.cat,
+        publishedPerItem: blend.single.perItem,
+        why: `Taux moyen de ${shown} $/transaction, voisin du palier publié de `
+          + `${perItemFr(blend.single.perItem)} $ sans l'atteindre exactement : `
+          + `moyenne d'un mois, à confirmer auprès du processeur.`,
+      };
+    }
+    return {
+      ...base,
+      cat: 'Interac Flash — paliers mélangés',
+      publishedPerItem: null,
+      why: `Taux moyen de ${shown} $/transaction, entre les paliers publiés de `
+        + `${perItemFr(blend.below.perItem)} $ et ${perItemFr(blend.above.perItem)} $ : `
+        + `un mois complet mélange les paliers, aucun palier unique ne s'applique.`,
+    };
+  }
+
   return decide(item, null, opts);
 }
 
