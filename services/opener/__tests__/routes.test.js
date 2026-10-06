@@ -235,6 +235,26 @@ const addr = (address, zip, extra = {}) => ({ address, street2: '', city: 'Montr
       assert.strictEqual(r.body.lastRun.source, 'test');
     });
 
+    await t('progression : chaque phase écrite pendant la synchro, montrée seulement pendant qu\'elle tourne', async () => {
+      // Kaizen lent : on lit l'état PENDANT le passage.
+      const real = kaizen.fetchAllStores;
+      let release; const gate = new Promise((r) => { release = r; });
+      kaizen.fetchAllStores = async () => { await gate; return real(); };
+      const running = mod.runAll({ source: 'prog', budget: 1 });
+      await new Promise((r) => setTimeout(r, 50));
+      const during = await call('GET', '/api/opener/locations/status');
+      assert.strictEqual(during.body.running, true);
+      assert.strictEqual(during.body.progress.phase, 'kaizen');
+      release();
+      await running;
+      kaizen.fetchAllStores = real;
+      const after = await call('GET', '/api/opener/locations/status');
+      assert.strictEqual(after.body.running, false);
+      assert.strictEqual(after.body.progress, null);
+      const last = JSON.parse((await pool.query(`SELECT value FROM sync_state WHERE key = 'opener_locations_progress'`)).rows[0].value);
+      assert.ok(['matching', 'twins'].includes(last.phase), last.phase);
+    });
+
     await t('liste : filtres version et source ; « à traiter » d\'abord les « à confirmer »', async () => {
       const v1 = await call('GET', '/api/opener/locations?status=all&version=v1');
       assert.strictEqual(v1.body.total, 4);

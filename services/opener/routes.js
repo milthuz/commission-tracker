@@ -43,6 +43,7 @@ const RETRY_NONE_DAYS = 30;
 const LOCK_KEY = 'opener_locations_lock';
 const STATE_LAST_RUN = 'opener_locations_last_run';
 const STATE_LAST_OK = 'opener_locations_last_ok';
+const STATE_PROGRESS = 'opener_locations_progress';
 const ORG_NAMES = { '697704869': 'Cluster Canada', '905113716': 'Xperio POS', '802470810': 'Cluster USA' };
 
 const SCHEMA = [
@@ -184,6 +185,16 @@ function registerOpenerRoutes(app, deps) {
   const isRunning = async () => (await pool.query(
     `SELECT 1 FROM sync_state WHERE key = $1 AND value = 'running'
         AND updated_at >= CURRENT_TIMESTAMP - INTERVAL '30 minutes'`, [LOCK_KEY])).rows.length > 0;
+  // Progression lisible par l'écran pendant la synchro (phase + n / total). Écrite au plus toutes
+  // les 1,5 s : la base est loin (proxy Railway), un aller-retour par recherche Google serait du
+  // gaspillage. Un changement de phase s'écrit tout de suite.
+  let progLast = { phase: null, at: 0 };
+  async function progress(phase, done = 0, total = 0, force = false) {
+    const now = Date.now();
+    if (!force && phase === progLast.phase && now - progLast.at < 1500) return;
+    progLast = { phase, at: now };
+    await putState(STATE_PROGRESS, { phase, done, total, at: new Date(now).toISOString() }).catch(() => {});
+  }
   const touchLock = () => pool.query(`UPDATE sync_state SET updated_at = CURRENT_TIMESTAMP WHERE key = $1 AND value = 'running'`, [LOCK_KEY]).catch(() => {});
   const releaseLock = () => pool.query(`UPDATE sync_state SET value = 'idle', updated_at = CURRENT_TIMESTAMP WHERE key = $1`, [LOCK_KEY]);
 
@@ -281,7 +292,8 @@ function registerOpenerRoutes(app, deps) {
       let { accessToken, apiDomain } = await L.getAdminBooksAuth();
       const orgs = B.billingOrgs();
       const customers = new Map();
-      for (const orgId of orgs) {
+      for (const [i, orgId] of orgs.entries()) {
+        await progress('billing_subs', i, orgs.length, true);
         const subs = await L.fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.All');
         for (const [k, c] of B.groupCustomers(orgId, subs, L.ACTIVE_STATUSES)) customers.set(k, c);
       }
@@ -295,7 +307,10 @@ function registerOpenerRoutes(app, deps) {
         .filter((c) => !known.has(c.key) || known.get(c.key) === true)
         .sort((a, b) => Number(b.active) - Number(a.active) || Number(known.has(a.key)) - Number(known.has(b.key)));
       let fetchedAddr = 0, addrErrors = 0, stopped = null;
-      for (const c of todo.slice(0, Math.max(0, addressBudget))) {
+      const batch = todo.slice(0, Math.max(0, addressBudget));
+      await progress('billing_addresses', 0, batch.length, true);
+      for (const c of batch) {
+        await progress('billing_addresses', fetchedAddr, batch.length);
         if (fetchedAddr && fetchedAddr % 10 === 0) {
           await touchLock();
           if (await L.saasScanShouldStop(owner)) { stopped = 'arrêt demandé par un autre scan Zoho'; break; }
@@ -465,7 +480,9 @@ function registerOpenerRoutes(app, deps) {
     const res = { tried: 0, auto: 0, review: 0, none: 0, no_address: 0, errors: 0, remaining: 0 };
     let streak = 0;
     let twinsDone = false;
-    for (const s of rows) {
+    await progress('matching', 0, rows.length, true);
+    for (const [i, s] of rows.entries()) {
+      await progress('matching', i, rows.length);
       // Premier client Billing du lot : les Kaizen actifs viennent d'être appariés, leurs jumeaux
       // reçoivent leur fiche maintenant — une seule fois, pas avant chaque client.
       if (s.source === 'billing' && !twinsDone) { await linkTwins(); twinsDone = true; }
@@ -497,12 +514,14 @@ function registerOpenerRoutes(app, deps) {
     if (!(await takeLock())) return null;
     const out = { at: new Date().toISOString(), source };
     try {
+      await progress('kaizen', 0, 0, true);
       if (kaizenReady()) {
         try { out.sync = await syncKaizen(); }
         catch (e) { out.syncError = e.message; }
       } else out.syncError = 'KAIZEN_API_EMAIL / KAIZEN_API_PASSWORD absents';
       try { out.billing = await syncBilling({ addressBudget }); }
       catch (e) { out.billingError = e.message; }
+      await progress('twins', 0, 0, true);
       try { out.twins = await linkTwins(); } catch (e) { out.twinsError = e.message; }
       try { out.match = await runMatching({ budget }); }
       catch (e) { out.matchError = e.message; }
@@ -581,6 +600,8 @@ function registerOpenerRoutes(app, deps) {
         configured: { kaizen: kaizenReady(), google: google.configured(), billing: !!deps.late },
         running: await isRunning(),
         lastRun: await getState(STATE_LAST_RUN),
+        // Pendant une synchro : la phase en cours et son avancement (n / total).
+        progress: (await isRunning()) ? await getState(STATE_PROGRESS) : null,
         counts, totals: tot,
       });
     } catch (e) { res.status(500).json({ error: e.message }); }
