@@ -515,6 +515,20 @@ function classifyInteracLine(item, opts = {}) {
   const sus = suspectLabel(item.desc, opts.processor);
   if (sus) return { ...item, cat: null, publishedRate: null, theoretical: null, delta: null, status: STATUS.SUSPECT, why: `Nom sans contrepartie réseau : ${sus}` };
 
+  // ⚠️ Le dictionnaire d'alias ne touchait JAMAIS les lignes Interac : les deux autres
+  // classificateurs le consultent, celui-ci avait été oublié. Conséquence mesurée sur les
+  // relevés Saoko — « INTERAC FRAIS DE COMM-FLASH » sortait sans catégorie, donc
+  // indistinguable d'un frais inconnu, alors que c'est le frais de commutation, que nos
+  // tables connaissent. Un libellé reconnu dont le CHIFFRE ne colle pas est une
+  // information ; un libellé muet n'en est pas une.
+  if (!opts._aliasDone) {
+    const alias = aliasFor(item.desc, opts.processor);
+    if (alias) {
+      const out = viaAliasWith(classifyInteracLine, item, alias, opts);
+      return { ...out, tier: interacTier(item.desc) };
+    }
+  }
+
   const tables = opts.tables || [RATE_TABLES.interacNetwork, RATE_TABLES.interacFlash];
   const tier   = interacTier(item.desc);
 

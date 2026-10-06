@@ -264,6 +264,30 @@ const schemeFeesCA = [
 ];
 
 // Interac Switch / Mobile Service Fee.
+//
+// ⚠️ CES TROIS VALEURS SONT LES PLUS FRAGILES DE TOUT LE FICHIER. Leur `src` annonce
+// « barème publié d'Interac » ; en vérité elles viennent du calculateur HTML de référence,
+// et rien n'a été retracé jusqu'à un document d'Interac. Confronté au vrai papier
+// (2026-10-06), le 0,013985 n'est corroboré par PERSONNE :
+//
+//   dictionnaire de terminologie (Christine)      0,0100 $/transaction
+//   cette table                                   0,013985
+//   facturé par Fiserv/Clover, 3 mesures          0,01535 · 0,01557 · 0,01571
+//   facturé par Payfacto                          0,021016
+//
+// Quatre chiffres, quatre sources, aucune rencontre. Et les deux acquéreurs sont en
+// désaccord entre eux — ce qui, par la règle de corroboration de ce projet, signifie
+// qu'au moins l'un ajoute sa marge et qu'AUCUN des deux n'est un taux publié.
+//
+// Conséquence pratique : une ligne de commutation sort « À vérifier » avec un écart
+// chiffré (+9,8 % chez Fiserv, +50,3 % chez Payfacto) calculé contre une référence
+// incertaine. L'écart est une PISTE, pas une accusation — ne pas le présenter à un
+// marchand comme une surfacturation établie tant que le barème d'Interac n'a pas été
+// obtenu. Le repli est sûr (on signale au lieu de bénir), mais le libellé de source
+// affirme plus que ce qu'on sait.
+//
+// ⏭️ Ce qui débloquerait : le barème de commutation publié par Interac. Demander à
+// Christine, comme pour les évaluations Visa/Mastercard en septembre.
 const interacNetwork = [
   { cat: 'Interac — Frais de commutation (retrait GAB)', perItem: 0.015881, src: 'interac_published' },
   { cat: 'Interac — Frais de commutation (Puce et NIP / sans contact)', perItem: 0.013985, src: 'interac_published' },

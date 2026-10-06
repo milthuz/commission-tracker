@@ -126,5 +126,37 @@ ok('la moyenne reconstituée s\'affiche aussi',
   N.fmtRateCell(derived.rate, derived.perItem, 'fr') === '0,0430 $/tr.',
   N.fmtRateCell(derived.rate, derived.perItem, 'fr'));
 
+// ---------------------------------------------------------------------------
+// 8. Les frais de COMMUTATION Interac. Le dictionnaire d alias ne touchait jamais les
+//    lignes Interac — les deux autres classificateurs le consultent, celui-ci avait ete
+//    oublie. « INTERAC FRAIS DE COMM-FLASH » sortait donc sans categorie, indistinguable
+//    d un frais inconnu, alors que nos tables connaissent ce frais.
+// ---------------------------------------------------------------------------
+console.log("" + String.fromCharCode(10) + "8. une ligne de commutation porte son nom");
+const comm = C.classifyInteracLine(
+  { desc: "INTERAC FRAIS DE COMM-FLASH", total: 12.59, count: 820, perItem: 12.59 / 820 },
+  { processor: "clover" });
+ok("la ligne est nommee", /commutation/i.test(comm.cat || ""), comm.cat);
+ok("statut A verifier, jamais Conforme", comm.status === C.STATUS.A_VERIFIER, comm.status);
+// Le taux facture NE DOIT PAS etre declare conforme : aucun acquereur ne facture notre
+// valeur de table, et les deux acquereurs sont en desaccord entre eux.
+ok("le taux publie est annonce pour que l ecart soit lisible",
+  Number(comm.publishedPerItem) > 0, comm.publishedPerItem);
+ok("la raison dit que c est le CHIFFRE qui diverge, pas le nom",
+  /taux factur/i.test(comm.why || ""), comm.why);
+
+// Le meme frais chez l autre acquereur, a un chiffre tres different.
+const commPf = C.classifyInteracLine(
+  { desc: "Frais de commutation Interac", total: 30.83, count: 1467, perItem: 30.83 / 1467 },
+  { processor: "payfacto" });
+ok("Payfacto nomme aussi sa ligne", /commutation/i.test(commPf.cat || ""), commPf.cat);
+ok("et reste A verifier malgre 50 % d ecart", commPf.status === C.STATUS.A_VERIFIER, commPf.status);
+
+// Garde-fou : un alias ne doit pas transformer un ecart en SUSPECT. SUSPECT vise le NOM,
+// pas le montant — accuser par le montant masquerait la vraie question (quel est le
+// barème publie ?).
+ok("un ecart de montant ne devient jamais SUSPECT",
+  comm.status !== C.STATUS.SUSPECT && commPf.status !== C.STATUS.SUSPECT);
+
 console.log(fails === 0 ? '\nTOUT PASSE\n' : `\n${fails} ECHEC(S)\n`);
 process.exit(fails === 0 ? 0 : 1);

@@ -115,6 +115,19 @@ const PROCESSOR_ALIASES = {
 
   // 43 alias
   clover: {
+    // Frais de commutation Interac. ⚠️ Ces clés sont des égalités EXACTES, pas des
+    // préfixes : « INTERAC FRAIS DE COMM-FLASH » n'a pas d'espace après « COMM », et
+    // l'appariement par préfixe exige une frontière d'espace. Les deux variantes de
+    // produit et les deux langues sont donc écrites séparément — c'est le piège « une
+    // langue couverte, l'autre pas » qui a déjà coûté 138 $/mois sur ce même processeur.
+    // Source du rattachement : le libellé, pas le taux. Voir le ⚠️ sur le taux publié dans
+    // rateTables.js — aucun relevé réel ne facture notre valeur de table.
+    'INTERAC FRAIS DE COMM-FLASH': 'Interac — Frais de commutation (Puce et NIP / sans contact)',
+    'INTERAC FRAIS DE COMM-CONTACT': 'Interac — Frais de commutation (Puce et NIP / sans contact)',
+    'INTERAC SWITCH FEE-FLASH': 'Interac — Frais de commutation (Puce et NIP / sans contact)',
+    'INTERAC SWITCH FEE-CONTACT': 'Interac — Frais de commutation (Puce et NIP / sans contact)',
+    'INTERACSWITCHFEE-FLASH': 'Interac — Frais de commutation (Puce et NIP / sans contact)',
+    'INTERACSWITCHFEE-CONTACT': 'Interac — Frais de commutation (Puce et NIP / sans contact)',
     'AMEXASSESSMENTFEES': 'Amex — Assessment',
     'BUSNATL': 'Visa Affaires — Standard (Business)',
     'CANCROSSBORDERFEE': 'Visa — IASF, achat multidevise (international)',
@@ -191,6 +204,14 @@ const PROCESSOR_ALIASES = {
 
   // 22 alias
   payfacto: {
+    // ⚠️ Payfacto facture cette ligne 0,021016 $/transaction, Fiserv l'équivalent
+    // 0,0154 $ — DEUX acquéreurs, DEUX chiffres. Par la règle de corroboration de ce
+    // projet, un écart entre acquéreurs veut dire qu'au moins l'un ajoute sa marge, donc
+    // ni l'un ni l'autre n'est un taux publié. L'alias rattache le LIBELLÉ pour que la
+    // ligne porte un nom ; il ne valide aucun des deux montants, et le statut reste
+    // « À vérifier » tant que le taux ne correspond pas.
+    'FRAIS DE COMMUTATION INTERAC': 'Interac — Frais de commutation (Puce et NIP / sans contact)',
+    'INTERAC SWITCH FEE': 'Interac — Frais de commutation (Puce et NIP / sans contact)',
     'COMMERCIAL PREM STANDARD': 'Mastercard International — Commercial Standard',  // Commercial Prem Standard
     'FLEXIBLE PPD ELECTRONIC': 'Mastercard Prépayée conso. — Électronique',  // Flexible PPD Electronic
     'MC CA ACQUIRER ASSESSMENT FEE': 'Mastercard — Frais d\'évaluation (assessment, domestique)',  // MC CA Acquirer Assessment Fee
