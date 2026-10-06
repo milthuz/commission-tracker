@@ -10886,13 +10886,40 @@ async function getAssistantUpdatesContext() {
       `SELECT version, name, date, notes FROM releases ORDER BY date DESC LIMIT 12`
     )).rows;
     if (!rows.length) { _assistantUpdatesCache = { text: '', at: now }; return ''; }
-    const lines = rows.map(r => {
+    // Combien de TEXTE chaque note reçoit, la plus récente d'abord.
+    //
+    // ⚠️ C'était 600 caractères pour toutes, et une note de version n'est pas un résumé :
+    // c'est la liste des commits du cycle, 8 000 à 14 000 caractères ici. Mesuré sur
+    // v0.2.38 (8 667 caractères), Sofia en voyait 7 % — et la première ligne concernant le
+    // calculateur IC+ commençait au caractère 618, soit DIX-HUIT caractères après la
+    // coupure. Publier la note ne suffisait donc pas à rendre la livraison visible, ce qui
+    // vide de son sens la moitié « dynamique » de l'assistante.
+    //
+    // Dégressif plutôt qu'uniforme : on demande à Sofia ce qui vient de changer, pas ce
+    // qu'il y avait il y a huit mois. Les vieilles notes gardent de quoi SITUER une
+    // version dans le temps, ce qui répond à « depuis quand ? » sans coûter un budget.
+    const RECENT_BUDGET = [4500, 2000, 2000];
+    const OLDER_BUDGET = 400;
+    const lines = rows.map((r, i) => {
       const d = r.date ? new Date(r.date).toISOString().slice(0, 10) : '';
-      const notes = String(r.notes || '').replace(/\s+/g, ' ').trim().slice(0, 600);
-      return `- v${r.version}${r.name ? ` "${r.name}"` : ''}${d ? ` (${d})` : ''}: ${notes || '(no notes)'}`;
+      const full = String(r.notes || '').replace(/\s+/g, ' ').trim();
+      const cap = RECENT_BUDGET[i] || OLDER_BUDGET;
+      // ⚠️ Une coupure SILENCIEUSE est le vrai piège, plus que sa longueur : sans marqueur,
+      // Sofia répond « voilà tout ce que contient cette version » après n'en avoir lu qu'un
+      // bout, avec le même aplomb que si elle avait tout vu.
+      const notes = full.length > cap ? `${full.slice(0, cap)} […note tronquée ici…]` : full;
+      // La colonne `version` porte déjà le « v » ; le préfixer donnait « vv0.2.38 ». Et le
+      // champ `name` répète souvent la version — ne l'afficher que s'il dit autre chose.
+      const label = String(r.version || '').replace(/^v/i, '');
+      const name = r.name && r.name !== r.version ? ` "${r.name}"` : '';
+      return `- v${label}${name}${d ? ` (${d})` : ''}: ${notes || '(no notes)'}`;
     });
-    let text = `RECENT UPDATES — the app's published release notes, newest first. Treat these as authoritative for which features exist and what changed recently. If the user asks "what's new", what changed, or about a recently added capability, answer from this list (in the user's language). Don't read them out verbatim unless asked; summarize what's relevant.\n${lines.join('\n')}`;
-    if (text.length > 7000) text = text.slice(0, 7000);
+    let text = `RECENT UPDATES — the app's published release notes, newest first. Treat these as authoritative for which features exist and what changed recently. If the user asks "what's new", what changed, or about a recently added capability, answer from this list (in the user's language). Don't read them out verbatim unless asked; summarize what's relevant. A note marked […note tronquée ici…] is CUT SHORT — when you answer from one, say you may not be seeing all of it rather than implying the list is complete.\n${lines.join('\n')}`;
+    // 14 000 et non 13 000 : le pire cas des budgets ci-dessus vaut ~13 265 caractères
+    // (8 500 pour les trois récentes + 3 600 pour les neuf autres + marqueurs, préfixes et
+    // en-tête). Mesuré contre la prod, pas estimé — à 13 000 le plafond coupait déjà la
+    // note la plus ancienne, ce qui aurait annulé en silence une partie du correctif.
+    if (text.length > 14000) text = `${text.slice(0, 14000)} […liste tronquée…]`;
     _assistantUpdatesCache = { text, at: now };
     return text;
   } catch (e) {
