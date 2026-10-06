@@ -229,8 +229,19 @@ const gPlace = (id, name, postal, num, extra = {}) => ({
       const before = kaizenCalls;
       await mod.runNightly();
       assert.strictEqual(kaizenCalls, before, 'aucun appel juste après un passage');
-      await pool.query(`UPDATE sync_state SET updated_at = CURRENT_TIMESTAMP - INTERVAL '21 hours' WHERE key = 'kaizen_last_run'`);
+      await pool.query(`UPDATE sync_state SET updated_at = CURRENT_TIMESTAMP - INTERVAL '21 hours' WHERE key = 'kaizen_last_ok'`);
       await mod.runNightly();
+      assert.strictEqual(kaizenCalls, before + 1);
+    });
+
+    await t('un passage EN ÉCHEC (identifiants absents) ne repousse pas le suivant', async () => {
+      await pool.query(`UPDATE sync_state SET updated_at = CURRENT_TIMESTAMP - INTERVAL '21 hours' WHERE key = 'kaizen_last_ok'`);
+      const real = kaizen.fetchAllStores;
+      kaizen.fetchAllStores = async () => { throw new Error('Kaizen : identifiants absents'); };
+      await mod.runNightly();                      // échoue
+      kaizen.fetchAllStores = real;
+      const before = kaizenCalls;
+      await mod.runNightly();                      // identifiants ajoutés → doit tourner tout de suite
       assert.strictEqual(kaizenCalls, before + 1);
     });
 

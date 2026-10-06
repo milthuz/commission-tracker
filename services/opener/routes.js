@@ -275,6 +275,9 @@ function registerOpenerRoutes(app, deps) {
       try { out.match = await runMatching({ budget }); }
       catch (e) { out.matchError = e.message; }
       await putState('kaizen_last_run', out);
+      // « Dernier passage RÉUSSI » : seul lui retient le passage planifié (voir runNightly). Un
+      // passage sans identifiants ou en panne ne doit pas repousser le suivant de 20 h.
+      if (out.sync && !out.matchError) await putState('kaizen_last_ok', { at: out.at });
       return out;
     } finally { await releaseLock().catch(() => {}); }
   }
@@ -469,7 +472,7 @@ function registerOpenerRoutes(app, deps) {
     // passe outre — c'est le moyen d'écouler l'arriéré plus vite.
     runNightly: () => schema()
       .then(() => pool.query(
-        `SELECT 1 FROM sync_state WHERE key = 'kaizen_last_run' AND updated_at > CURRENT_TIMESTAMP - INTERVAL '20 hours'`))
+        `SELECT 1 FROM sync_state WHERE key = 'kaizen_last_ok' AND updated_at > CURRENT_TIMESTAMP - INTERVAL '20 hours'`))
       .then((r) => (r.rows.length ? 'recent' : runAll({ source: 'scheduled' })))
       .then((out) => {
         if (out === 'recent') return;
