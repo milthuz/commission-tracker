@@ -183,6 +183,19 @@ const IN = (i) => [45.521 + i * 0.0003, -73.589 + i * 0.0004];   // points dans 
       await pool.query(`UPDATE sync_state SET value = $1 WHERE key = 'opener_scan_usage'`, [saved]);
     });
 
+    await t('quartier / adresse : résultats avec coordonnées, mémoire 1 h, réservé au manager', async () => {
+      let calls = 0;
+      const real = google.searchText;
+      google.searchText = async (q) => { calls++; return [{ displayName: { text: 'Plateau-Mont-Royal' }, formattedAddress: 'Montréal, QC', location: { latitude: 45.52, longitude: -73.58 } }, { displayName: { text: 'sans position' } }]; };
+      const r = await call('GET', '/api/opener/geocode?q=Plateau');
+      assert.deepStrictEqual(r.body.results, [{ name: 'Plateau-Mont-Royal', address: 'Montréal, QC', lat: 45.52, lng: -73.58 }]);
+      await call('GET', '/api/opener/geocode?q=plateau');
+      assert.strictEqual(calls, 1, 'même recherche (casse ignorée) → mémoire');
+      assert.strictEqual((await call('GET', '/api/opener/geocode?q=Plateau', undefined, 'jo@x.com')).status, 403);
+      assert.strictEqual((await call('GET', '/api/opener/geocode?q=ab')).status, 400);
+      google.searchText = real;
+    });
+
     await t('openers : les usagers dont un rôle porte opener:field, avec leur nom', async () => {
       const r = await call('GET', '/api/opener/openers');
       assert.deepStrictEqual(r.body.openers.map((o) => o.email).sort(), ['autre@x.com', 'jo@x.com']);
@@ -346,6 +359,18 @@ const IN = (i) => [45.521 + i * 0.0003, -73.589 + i * 0.0004];   // points dans 
       assert.strictEqual((await call('POST', `/api/opener/routes/${route.id}/close`, {}, 'jo@x.com')).status, 200);
       assert.strictEqual((await call('POST', `/api/opener/routes/${route.id}/close`, {}, 'jo@x.com')).status, 409);
       assert.strictEqual((await call('GET', '/api/opener/today', undefined, 'jo@x.com')).body.route.status, 'closed', 'toujours visible, fermée');
+    });
+
+    await t('suivi : avancement par route et dernier check-in (« où il est rendu »)', async () => {
+      const r = await call('GET', `/api/opener/routes-overview?from=${today}&to=${addDays(today, 1)}`);
+      assert.strictEqual(r.status, 200);
+      const mine = r.body.routes.find((x) => x.id === route.id);
+      assert.deepStrictEqual([mine.total, mine.done, mine.skipped], [3, 1, 2]);
+      assert.strictEqual(mine.lastCheckin.stopName, 'Tout Neuf');
+      assert.ok(mine.lastCheckin.lat && mine.lastCheckin.at);
+      assert.strictEqual(mine.openerName, 'Jonathan Opener');
+      assert.ok(r.body.routes.some((x) => x.date === addDays(today, 1)), 'la route du lendemain (reportée) est dans la période');
+      assert.strictEqual((await call('GET', '/api/opener/routes-overview', undefined, 'jo@x.com')).status, 403);
     });
 
     await t('liste des routes du manager : comptes d\'arrêts et de visites', async () => {

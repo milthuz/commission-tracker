@@ -306,6 +306,22 @@ function registerOpenerFieldRoutes(app, deps) {
     }
   });
 
+  // Trouver un quartier ou une adresse (« Plateau-Mont-Royal », « 4520 Saint-Denis ») : le point
+  // de départ d'une zone suggérée, sans dessiner. Une recherche Google, gardée 1 h en mémoire.
+  app.get('/api/opener/geocode', authenticateToken, async (req, res) => {
+    if (!(await guard(req, res, PERM_ROUTES))) return;
+    const q = String(req.query.q || '').trim().slice(0, 200);
+    if (q.length < 3) return res.status(400).json({ error: 'query_too_short' });
+    if (!google.configured()) return res.status(503).json({ error: 'GOOGLE_PLACES_API_KEY absente' });
+    try {
+      const places = await cached(`geo:${q.toLowerCase()}`, () => google.searchText(`${q}, Québec`, { max: 5 }));
+      res.json({ results: places.filter((p) => p.location).map((p) => ({
+        name: p.displayName?.text || q, address: p.formattedAddress || '',
+        lat: p.location.latitude, lng: p.location.longitude,
+      })) });
+    } catch (e) { res.status(502).json({ error: e.message }); }
+  });
+
   // Clé navigateur Google Maps (restreinte au domaine dans la console Google) : servie par l'API
   // et non compilée dans le site, pour la changer sans redéployer Netlify.
   app.get('/api/opener/config', authenticateToken, async (req, res) => {
@@ -427,6 +443,42 @@ function registerOpenerFieldRoutes(app, deps) {
           status: r.status, stops: r.stops, done: r.done, updatedAt: r.updated_at, version: r.version });
       }
       res.json({ routes: out, from, to });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Vue de suivi : les routes d'une période avec leurs arrêts (position + résultat) et le DERNIER
+  // check-in de chaque route — « où il est rendu ». Pas de suivi GPS continu : la dernière position
+  // connue est celle du dernier check-in, avec son heure.
+  app.get('/api/opener/routes-overview', authenticateToken, async (req, res) => {
+    if (!(await guard(req, res, PERM_ROUTES))) return;
+    try {
+      const today = ymdMtl();
+      const from = DATE_RE.test(String(req.query.from || '')) ? req.query.from : today;
+      const to = DATE_RE.test(String(req.query.to || '')) ? req.query.to : addDays(from, 6);
+      const routes = (await pool.query(
+        `SELECT ${ROUTE_COLS} FROM opener_routes r WHERE r.route_date BETWEEN $1 AND $2 ORDER BY r.route_date, r.id`, [from, to])).rows;
+      const ids = routes.map((r) => r.id);
+      const stops = ids.length ? (await pool.query(
+        `SELECT id, route_id, place_id, position, label, lat, lng, outcome, skip_reason, done_at
+           FROM opener_route_stops WHERE route_id = ANY($1::int[]) ORDER BY route_id, position`, [ids])).rows : [];
+      const last = ids.length ? (await pool.query(
+        `SELECT DISTINCT ON (s.route_id) s.route_id, c.at, c.lat, c.lng, c.distance_m, s.label
+           FROM opener_checkins c JOIN opener_route_stops s ON s.id = c.route_stop_id
+          WHERE s.route_id = ANY($1::int[]) ORDER BY s.route_id, c.at DESC`, [ids])).rows : [];
+      const lastBy = new Map(last.map((l) => [l.route_id, l]));
+      const out = [];
+      for (const r of routes) {
+        const st = stops.filter((s) => s.route_id === r.id);
+        const l = lastBy.get(r.id);
+        out.push({
+          id: r.id, name: r.name, date: r.route_date, status: r.status, openerEmail: r.opener_email,
+          openerName: await userName(r.opener_email), zone: r.zone,
+          total: st.length, done: st.filter((s) => s.outcome === 'done').length, skipped: st.filter((s) => s.outcome === 'skipped').length,
+          stops: st.map((s) => ({ id: s.id, name: s.label, lat: s.lat, lng: s.lng, outcome: s.outcome, doneAt: s.done_at })),
+          lastCheckin: l ? { at: l.at, lat: l.lat, lng: l.lng, stopName: l.label, distanceM: l.distance_m } : null,
+        });
+      }
+      res.json({ from, to, today, routes: out });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
