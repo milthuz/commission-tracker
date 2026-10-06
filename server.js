@@ -208,6 +208,10 @@ const PERMISSION_CATALOG = [
   // ventes et dans le suivi des commissions, ce que l'acceptation ordinaire ne fait pas.
   { key: 'leads:attach_existing',      label: 'Attach a lead to a merchant that already exists in Zoho (creates a deal, not a second lead)', category: 'Leads' },
 
+  // Module Opener (porte-à-porte). Lot 0 : l'appariement des magasins Cluster (Kaizen) à leur
+  // fiche Google — il décide quels restaurants s'afficheront « client » sur la carte des openers.
+  { key: 'opener:match',               label: 'Match Cluster stores (Kaizen) to their Google listing, run the Kaizen sync', category: 'Opener' },
+
   // Sofia (in-app assistant) — CRM tools. Split read/write on purpose: the write key is the
   // only thing standing between a chat message and a real record in Zoho, so it must be
   // grantable on its own, to a smaller set of people than the read key.
@@ -3832,6 +3836,7 @@ const DEMO_NAME_KEYS = new Set([
   'merchantname', 'accountname', 'dealname', 'companyname', 'clientname',
   'linked_customer_name', 'linkedcustomername',
   'legalname', 'legal_name', // crédits de compensation marchand
+  'storename', 'googlename', // Opener : magasins Kaizen et fiches Google
 ]);
 // SH-20 — identites de CONTACT (une personne physique, pas un commerce) portees par les pistes
 // entrantes. Elles ne peuvent pas passer par DEMO_NAME_KEYS : remplacer un courriel par
@@ -3952,6 +3957,12 @@ const leadBooking = require('./services/leadBooking').registerLeadBookingRoutes(
   mailChrome: (...a) => mailChrome(...a), mailShell: (...a) => mailShell(...a),
   ensureValidCrmToken: (...a) => ensureValidCrmToken(...a),
   late: () => ({ leadSettings, scheduleLeadCallback, tzParts, tzOffsetString }),
+});
+
+// Module Opener, lot 0 : magasins Cluster (API Kaizen) appariés à leur fiche Google.
+// services/opener/ ; plan dans design/opener/PLAN-TECHNIQUE.md. Passage de nuit : startAutoSync.
+const openerModule = require('./services/opener/routes').registerOpenerRoutes(app, {
+  authenticateToken, requirePerm, pool, logActivity,
 });
 
 // Pistes du site Webflow : webhook NATIF (form_submission), signé, connecté depuis Admin → Pistes.
@@ -14934,6 +14945,13 @@ function startAutoSync() {
     .catch(e => console.warn('[AVIS] echec:', e.message));
   setTimeout(passeAvis, 3 * 60 * 1000);        // premier passage 3 min apres le demarrage
   setInterval(passeAvis, 6 * 60 * 60 * 1000);
+
+  // Magasins Cluster (Kaizen) + appariement Google — quotidien. Premier passage 4 min apres le
+  // demarrage. Sans identifiants Kaizen ni cle Google : une ligne de journal, rien d'autre.
+  setTimeout(() => {
+    openerModule.runNightly();
+    setInterval(() => openerModule.runNightly(), 24 * 60 * 60 * 1000);
+  }, 4 * 60 * 1000);
 
   // Recalc-v2 — runs on its own 6h cadence, offset 30 min from sync to avoid
   // overlapping with the heavy sync window. Skips if already running (guard
