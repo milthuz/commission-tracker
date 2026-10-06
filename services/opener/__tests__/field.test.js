@@ -387,6 +387,41 @@ const IN = (i) => [45.521 + i * 0.0003, -73.589 + i * 0.0004];   // points dans 
       assert.strictEqual((await call('GET', '/api/opener/routes-overview', undefined, 'jo@x.com')).status, 403);
     });
 
+    await t('durée de la visite : arrivée → départ ; le verdict suit la position À L\'ARRIVÉE', async () => {
+      const d3 = addDays(today, 3);
+      const client = scanned.PLACE_CLIENT_0001;
+      let r = (await call('POST', '/api/opener/routes', { name: 'Durées', date: d3, openerEmail: 'autre@x.com',
+        stops: [{ placeId: client.placeId, name: client.name, lat: client.lat, lng: client.lng }, { placeId: 'PLACE_NEW_000001', name: 'Tout Neuf', lat: IN(3)[0], lng: IN(3)[1] }] })).body.route;
+      await call('POST', `/api/opener/routes/${r.id}/publish`);
+      const [s1, s2] = r.stops;
+      const end = new Date();
+      const start = new Date(end.getTime() - 17 * 60000);
+      // Arrivé devant le restaurant, reparti à ~400 m avant d'enregistrer.
+      const res1 = await call('POST', '/api/opener/checkins', { ...ck, id: crypto.randomUUID(), placeId: client.placeId, stopId: s1.id,
+        at: end.toISOString(), lat: client.lat + 0.0036, lng: client.lng, accuracy: 8,
+        startedAt: start.toISOString(), startLat: client.lat + 0.0001, startLng: client.lng, startAccuracy: 9 }, 'autre@x.com');
+      assert.strictEqual(res1.status, 200, JSON.stringify(res1.body));
+      assert.strictEqual(res1.body.durationMin, 17);
+      assert.ok(res1.body.distanceM < 30, 'distance À L\'ARRIVÉE');
+      // Arrivée incohérente (après le départ) : ignorée, pas de durée.
+      await call('POST', '/api/opener/checkins', { ...ck, id: crypto.randomUUID(), placeId: 'PLACE_NEW_000001', stopId: s2.id,
+        at: end.toISOString(), startedAt: new Date(end.getTime() + 60000).toISOString(), startLat: 1, startLng: 1 }, 'autre@x.com');
+      const ov = (await call('GET', `/api/opener/routes-overview?from=${d3}&to=${d3}`)).body.routes.find((x) => x.id === r.id);
+      const c1 = ov.stops.find((s) => s.id === s1.id).checkin;
+      assert.strictEqual(c1.durationMin, 17);
+      assert.strictEqual(c1.verdict, 'onsite', 'parti avant d\'enregistrer : la visite reste « sur place »');
+      assert.ok(c1.endDistanceM > 350, 'mais la distance au départ est gardée');
+      assert.ok(new Date(c1.startedAt).getTime() === start.getTime());
+      assert.strictEqual(ov.stops.find((s) => s.id === s2.id).checkin.durationMin, null);
+      assert.strictEqual(ov.visitMinutes, 17);
+      r = (await call('GET', `/api/opener/routes/${r.id}`)).body.route;
+      assert.strictEqual(r.stops[0].checkin.durationMin, 17);
+      const day = (await call('GET', `/api/opener/day?date=${today}`, undefined, 'autre@x.com')).body.stats;
+      assert.ok(day.visitMinutes === 0 || day.visitMinutes === 17);
+      const hist = (await call('GET', `/api/opener/place/${client.placeId}`, undefined, 'autre@x.com')).body.history;
+      assert.strictEqual(hist[0].durationMin, 17);
+    });
+
     await t('liste des routes du manager : comptes d\'arrêts et de visites', async () => {
       const r = await call('GET', '/api/opener/routes');
       const mine = r.body.routes.find((x) => x.id === route.id);

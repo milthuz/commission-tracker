@@ -108,6 +108,14 @@ const SCHEMA = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_opener_checkins_place ON opener_checkins (place_id, at DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_opener_checkins_user  ON opener_checkins (LOWER(user_email), at DESC)`,
+  // Durée de la visite (demande de David, 2026-10-06) : l'ARRIVÉE = l'ouverture de l'écran de
+  // check-in au restaurant, avec la position à ce moment-là ; le DÉPART = l'enregistrement (`at`,
+  // lat/lng). Le verdict « sur place » se fonde sur la position à l'arrivée quand elle existe.
+  `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ`,
+  `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS start_lat DOUBLE PRECISION`,
+  `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS start_lng DOUBLE PRECISION`,
+  `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS start_accuracy_m INTEGER`,
+  `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS start_distance_m INTEGER`,
 ];
 
 // AAAA-MM-JJ à Montréal. Jamais `new Date().toISOString()` : à 20 h à Montréal, c'est déjà demain en UTC.
@@ -124,6 +132,12 @@ const comp = (place, type, short = false) => {
 //   far        à plus de 150 m
 //   imprecise  à moins de 150 m mais précision GPS de plus de 100 m (intérieur, signal faible)
 //   nogps      aucune position (localisation refusée ou indisponible)
+// Projections SQL d'un check-in `c` : position qui atteste la visite (l'arrivée si elle est connue,
+// sinon le départ) et durée en minutes (null si l'arrivée est inconnue).
+const V_LAT = 'COALESCE(c.start_lat, c.lat)';
+const V_DIST = 'CASE WHEN c.start_lat IS NOT NULL THEN c.start_distance_m ELSE c.distance_m END';
+const V_ACC = 'CASE WHEN c.start_lat IS NOT NULL THEN c.start_accuracy_m ELSE c.accuracy_m END';
+const DUR_MIN = 'ROUND(EXTRACT(EPOCH FROM (c.at - c.started_at)) / 60)::int';
 const ONSITE_M = 150;
 const PRECISE_M = 100;
 function verdict(distanceM, accuracyM, lat) {
@@ -372,7 +386,8 @@ function registerOpenerFieldRoutes(app, deps) {
     const stops = (await pool.query(
       `SELECT s.*, (SELECT json_build_object('id', c.id, 'at', c.at, 'interest', c.interest_level, 'leadId', c.lead_id,
                                              'decisionMaker', c.decision_maker, 'currentPos', c.current_pos,
-                                             'lat', c.lat, 'distanceM', c.distance_m, 'accuracyM', c.accuracy_m)
+                                             'lat', ${V_LAT}, 'distanceM', ${V_DIST}, 'accuracyM', ${V_ACC},
+                                             'startedAt', c.started_at, 'durationMin', ${DUR_MIN}, 'endDistanceM', c.distance_m)
                       FROM opener_checkins c WHERE c.route_stop_id = s.id ORDER BY c.at DESC LIMIT 1) AS checkin
          FROM opener_route_stops s WHERE s.route_id = $1 ORDER BY s.position, s.id`, [id])).rows;
     const st = await statusOf(stops.map((s) => s.place_id));
@@ -475,10 +490,13 @@ function registerOpenerFieldRoutes(app, deps) {
       const ids = routes.map((r) => r.id);
       const stops = ids.length ? (await pool.query(
         `SELECT s.id, s.route_id, s.place_id, s.position, s.label, s.lat, s.lng, s.outcome, s.skip_reason, s.done_at,
-                c.at AS c_at, c.lat AS c_lat, c.lng AS c_lng, c.distance_m AS c_dist, c.accuracy_m AS c_acc
+                c.at AS c_at, c.lat AS c_lat, c.lng AS c_lng, c.distance_m AS c_dist, c.accuracy_m AS c_acc,
+                c.started_at AS c_start, c.duration_min AS c_dur, c.end_distance_m AS c_end_dist
            FROM opener_route_stops s
-           LEFT JOIN LATERAL (SELECT at, lat, lng, distance_m, accuracy_m FROM opener_checkins
-                               WHERE route_stop_id = s.id ORDER BY at DESC LIMIT 1) c ON true
+           LEFT JOIN LATERAL (SELECT c.at, ${V_LAT} AS lat, COALESCE(c.start_lng, c.lng) AS lng, ${V_DIST} AS distance_m,
+                                     ${V_ACC} AS accuracy_m, c.started_at, ${DUR_MIN} AS duration_min, c.distance_m AS end_distance_m
+                                FROM opener_checkins c
+                               WHERE c.route_stop_id = s.id ORDER BY c.at DESC LIMIT 1) c ON true
           WHERE s.route_id = ANY($1::int[]) ORDER BY s.route_id, s.position`, [ids])).rows : [];
       const last = ids.length ? (await pool.query(
         `SELECT DISTINCT ON (s.route_id) s.route_id, c.at, c.lat, c.lng, c.distance_m, s.label
@@ -497,8 +515,11 @@ function registerOpenerFieldRoutes(app, deps) {
             id: s.id, name: s.label, lat: s.lat, lng: s.lng, outcome: s.outcome, skipReason: s.skip_reason, doneAt: s.done_at,
             // La visite : où était le téléphone au check-in, et le verdict qui en découle.
             checkin: s.c_at ? { at: s.c_at, lat: s.c_lat, lng: s.c_lng, distanceM: s.c_dist, accuracyM: s.c_acc,
+              startedAt: s.c_start, durationMin: s.c_dur, endDistanceM: s.c_end_dist,
               verdict: verdict(s.c_dist, s.c_acc, s.c_lat) } : null,
           })),
+          // Temps passé en visite sur la route (somme des durées connues).
+          visitMinutes: st.reduce((a, s) => a + (s.c_dur > 0 ? s.c_dur : 0), 0),
           verdicts: st.reduce((acc, s) => {
             if (s.c_at) { const v = verdict(s.c_dist, s.c_acc, s.c_lat); acc[v] = (acc[v] || 0) + 1; }
             return acc;
@@ -673,7 +694,8 @@ function registerOpenerFieldRoutes(app, deps) {
       }
       const st = (await statusOf([pid])).get(pid);
       const history = (await pool.query(
-        `SELECT c.id, c.at, c.lat, c.distance_m, c.accuracy_m, COALESCE(c.user_name, c.user_email) AS by, c.current_pos, c.service_type, c.terminals,
+        `SELECT c.id, c.at, ${V_LAT} AS lat, ${V_DIST} AS distance_m, ${V_ACC} AS accuracy_m, ${DUR_MIN} AS duration_min,
+                COALESCE(c.user_name, c.user_email) AS by, c.current_pos, c.service_type, c.terminals,
                 c.decision_maker, c.interest_level, c.services, c.notes, ld.ref_code
            FROM opener_checkins c LEFT JOIN leads ld ON ld.id = c.lead_id
           WHERE c.place_id = $1 ORDER BY c.at DESC LIMIT 15`, [pid])).rows;
@@ -696,7 +718,7 @@ function registerOpenerFieldRoutes(app, deps) {
         googleError,
         cluster: st || { status: 'new', visits: 0 },
         history: history.map((h) => ({
-          id: h.id, at: h.at, by: h.by, distanceM: h.distance_m, verdict: verdict(h.distance_m, h.accuracy_m, h.lat), currentPos: h.current_pos, serviceType: h.service_type, terminals: h.terminals,
+          id: h.id, at: h.at, by: h.by, distanceM: h.distance_m, durationMin: h.duration_min, verdict: verdict(h.distance_m, h.accuracy_m, h.lat), currentPos: h.current_pos, serviceType: h.service_type, terminals: h.terminals,
           decisionMaker: h.decision_maker, interest: h.interest_level, services: h.services || [], notes: h.notes, leadRef: h.ref_code,
         })),
       });
@@ -725,6 +747,14 @@ function registerOpenerFieldRoutes(app, deps) {
       decisionMaker: ['yes', 'no', 'later'].includes(b.decisionMaker) ? b.decisionMaker : null,
       interest, services: Array.isArray(b.services) ? [...new Set(b.services.filter((s) => SERVICES.includes(s)))] : [],
       notes: clean(b.notes, 2000),
+      // Arrivée : retenue seulement si elle précède le départ de moins de 12 h.
+      startedAt: (() => {
+        const s = new Date(b.startedAt || '');
+        if (isNaN(s.getTime()) || s.getTime() > at.getTime() || at.getTime() - s.getTime() > 12 * 3600000) return null;
+        return s;
+      })(),
+      startLat: num(b.startLat), startLng: num(b.startLng),
+      startAccuracy: num(b.startAccuracy) != null ? Math.round(num(b.startAccuracy)) : null,
     } };
   }
 
@@ -749,20 +779,26 @@ function registerOpenerFieldRoutes(app, deps) {
       const place = (await pool.query(`SELECT lat, lng FROM opener_places WHERE place_id = $1`, [c.placeId])).rows[0];
       const ref = place?.lat != null ? [place.lat, place.lng] : stop?.lat != null ? [stop.lat, stop.lng] : null;
       const distance = c.lat != null && c.lng != null && ref ? Math.round(G.haversine([c.lat, c.lng], ref)) : null;
+      const hasStart = c.startedAt && c.startLat != null && c.startLng != null;
+      const startDistance = hasStart && ref ? Math.round(G.haversine([c.startLat, c.startLng], ref)) : null;
       await pool.query(
         `INSERT INTO opener_checkins (id, place_id, route_stop_id, user_email, user_name, at, lat, lng, accuracy_m, distance_m,
-                current_pos, service_type, terminals, online_delivery, decision_maker, interest_level, services, notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18)
+                current_pos, service_type, terminals, online_delivery, decision_maker, interest_level, services, notes,
+                started_at, start_lat, start_lng, start_accuracy_m, start_distance_m)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18,$19,$20,$21,$22,$23)
          ON CONFLICT (id) DO NOTHING`,
         [c.id, c.placeId, stop?.id || null, me(req), (await userName(me(req))) || req.user?.name || null, c.at.toISOString(),
          c.lat, c.lng, c.accuracy, distance, c.currentPos, c.serviceType, c.terminals, c.onlineDelivery, c.decisionMaker,
-         c.interest, JSON.stringify(c.services), c.notes]);
+         c.interest, JSON.stringify(c.services), c.notes,
+         c.startedAt ? c.startedAt.toISOString() : null, hasStart ? c.startLat : null, hasStart ? c.startLng : null,
+         hasStart ? c.startAccuracy : null, startDistance]);
       if (!place) await upsertPlaces([{ placeId: c.placeId, lat: stop?.lat, lng: stop?.lng }], 'checkin');
       if (stop) {
         await pool.query(`UPDATE opener_route_stops SET outcome = 'done', skip_reason = NULL, done_at = $2 WHERE id = $1`,
           [stop.id, c.at.toISOString()]);
       }
-      res.json({ checkin: { id: c.id }, distanceM: distance, duplicate: false });
+      res.json({ checkin: { id: c.id }, distanceM: hasStart ? startDistance : distance,
+        durationMin: c.startedAt ? Math.round((c.at - c.startedAt) / 60000) : null, duplicate: false });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
@@ -860,7 +896,8 @@ function registerOpenerFieldRoutes(app, deps) {
       const route = await myRoute(req, date);
       // Les check-ins de la JOURNÉE (heure de Montréal), route ou pas.
       const checkins = (await pool.query(
-        `SELECT id, place_id, at, lat, lng, decision_maker, interest_level, lead_id
+        `SELECT id, place_id, at, lat, lng, decision_maker, interest_level, lead_id,
+                ROUND(EXTRACT(EPOCH FROM (at - started_at)) / 60)::int AS duration_min
            FROM opener_checkins WHERE LOWER(user_email) = $1 AND (at AT TIME ZONE '${TZ}')::date = $2::date ORDER BY at`,
         [me(req), date])).rows;
       const leads = (await pool.query(
@@ -884,6 +921,12 @@ function registerOpenerFieldRoutes(app, deps) {
           decisionMakers: checkins.filter((c) => c.decision_maker === 'yes').length,
           distanceM: Math.round(G.pathLength(pts)),
           durationMin: first && last ? Math.round((last - first) / 60000) : 0,
+          // Temps passé DANS les restaurants (arrivée → départ), et la durée moyenne d'une visite.
+          visitMinutes: checkins.reduce((a, c) => a + (c.duration_min > 0 ? c.duration_min : 0), 0),
+          avgVisitMin: (() => {
+            const d = checkins.map((c) => c.duration_min).filter((x) => x > 0);
+            return d.length ? Math.round(d.reduce((a, x) => a + x, 0) / d.length) : null;
+          })(),
         },
         leads: leads.map((l) => ({ id: l.id, refCode: l.ref_code, businessName: l.business_name, status: l.status,
           interest: Array.isArray(l.interest) ? l.interest : [], level: l.level })),
