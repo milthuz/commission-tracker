@@ -234,7 +234,7 @@ function registerOpenerRoutes(app, deps) {
   }
 
   async function runMatching({ budget = DEFAULT_MATCH_BUDGET } = {}) {
-    if (!google.configured()) return { skipped: 'GOOGLE_MAPS_API_KEY absente' };
+    if (!google.configured()) return { skipped: 'GOOGLE_PLACES_API_KEY absente' };
     const { rows } = await pool.query(
       `SELECT uuid, name, street, unit, city, region, postal_code FROM kaizen_stores
         WHERE missing_since IS NULL

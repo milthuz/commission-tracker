@@ -121,8 +121,10 @@ function storeQuery(store) {
 }
 
 // ----------------------------------------------------------------------------
-// Google Places (New). La clé serveur GOOGLE_MAPS_API_KEY doit avoir « Places API (New) »
-// activée (la lecture des avis utilise l'ancienne API ; ce n'est pas la même activation).
+// Google Places (New). Clé DÉDIÉE : GOOGLE_PLACES_API_KEY, avec « Places API (New) » activée.
+// ⚠️ Volontairement distincte de GOOGLE_MAPS_API_KEY (avis Google, ancienne API) : chaque usage
+// a sa clé, ses restrictions et son plafond de coût dans la console Google. Jamais de repli sur
+// l'autre clé — un repli masquerait une configuration incomplète.
 // ----------------------------------------------------------------------------
 const FIELDS = [
   'places.id', 'places.displayName', 'places.formattedAddress', 'places.location',
@@ -130,19 +132,19 @@ const FIELDS = [
 ];
 
 function createGooglePlaces({ http = axios, env = process.env } = {}) {
-  const key = () => env.GOOGLE_MAPS_API_KEY;
+  const key = () => env.GOOGLE_PLACES_API_KEY;
   function explain(e) {
     const d = e?.response?.data?.error;
     const st = e?.response?.status;
     const msg = d?.message || e?.message || 'erreur';
     if (st === 403 && /not been used|disabled|PERMISSION_DENIED/i.test(`${msg} ${d?.status || ''}`)) {
-      return new Error('Google : « Places API (New) » n\'est pas activée sur la clé GOOGLE_MAPS_API_KEY');
+      return new Error('Google : « Places API (New) » n\'est pas activée sur la clé GOOGLE_PLACES_API_KEY');
     }
     return new Error(`Google Places : ${st ? `HTTP ${st} — ` : ''}${String(msg).slice(0, 200)}`);
   }
 
   async function searchText(textQuery, { max = 5 } = {}) {
-    if (!key()) throw new Error('GOOGLE_MAPS_API_KEY absente');
+    if (!key()) throw new Error('GOOGLE_PLACES_API_KEY absente');
     try {
       const r = await http.post('https://places.googleapis.com/v1/places:searchText',
         { textQuery, regionCode: 'CA', languageCode: 'fr', maxResultCount: max },
@@ -152,7 +154,7 @@ function createGooglePlaces({ http = axios, env = process.env } = {}) {
   }
 
   async function details(placeId) {
-    if (!key()) throw new Error('GOOGLE_MAPS_API_KEY absente');
+    if (!key()) throw new Error('GOOGLE_PLACES_API_KEY absente');
     try {
       const r = await http.get(`https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`,
         { headers: { 'X-Goog-Api-Key': key(), 'X-Goog-FieldMask': FIELDS.map((f) => f.replace('places.', '')).join(',') }, timeout: 15000 });

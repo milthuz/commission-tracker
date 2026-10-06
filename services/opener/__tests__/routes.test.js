@@ -248,7 +248,7 @@ const gPlace = (id, name, postal, num, extra = {}) => ({
     await t('Google non activé → passage arrêté au premier échec', async () => {
       const real = google.searchText;
       let calls = 0;
-      google.searchText = async () => { calls++; throw new Error("Google : « Places API (New) » n'est pas activée sur la clé GOOGLE_MAPS_API_KEY"); };
+      google.searchText = async () => { calls++; throw new Error("Google : « Places API (New) » n'est pas activée sur la clé GOOGLE_PLACES_API_KEY"); };
       await pool.query(`UPDATE kaizen_stores SET match_status = 'pending' WHERE match_status = 'auto'`);
       out = await mod.runAll({ source: 'nokey' });
       assert.strictEqual(calls, 1);

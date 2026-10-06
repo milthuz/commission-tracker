@@ -63,4 +63,17 @@ t('numéro civique : premier nombre de la rue seulement', () => {
   assert.strictEqual(M.civic('rue X'), null);
 });
 
-console.log(`matching : ${n} tests OK`);
+t('clé Google : GOOGLE_PLACES_API_KEY seulement, jamais de repli sur GOOGLE_MAPS_API_KEY', () => {
+  assert.strictEqual(M.createGooglePlaces({ env: { GOOGLE_MAPS_API_KEY: 'vieille' } }).configured(), false);
+  assert.strictEqual(M.createGooglePlaces({ env: { GOOGLE_PLACES_API_KEY: 'neuve' } }).configured(), true);
+});
+
+(async () => {
+  // La clé envoyée à Google est bien la nouvelle.
+  let sent = null;
+  const http = { post: async (_u, _b, cfg) => { sent = cfg.headers['X-Goog-Api-Key']; return { data: { places: [] } }; } };
+  await M.createGooglePlaces({ http, env: { GOOGLE_PLACES_API_KEY: 'neuve', GOOGLE_MAPS_API_KEY: 'vieille' } }).searchText('x y z');
+  assert.strictEqual(sent, 'neuve');
+  n++; console.log('  ✓ la requête Text Search porte la clé dédiée');
+  console.log(`matching : ${n} tests OK`);
+})().catch((e) => { console.error('ÉCHEC :', e); process.exit(1); });
