@@ -10,7 +10,7 @@ const crypto = require('crypto');
 let PGlite;
 try { ({ PGlite } = require('@electric-sql/pglite')); } catch { console.error('ÉCHEC : @electric-sql/pglite manquant (npm install --no-save @electric-sql/pglite)'); process.exit(1); }
 const { registerOpenerRoutes } = require('../routes');
-const { registerOpenerFieldRoutes, ymdMtl, addDays } = require('../field');
+const { registerOpenerFieldRoutes, ymdMtl, addDays, verdict } = require('../field');
 
 // Zone : ~1 km² sur le Plateau.
 const ZONE = [[45.520, -73.590], [45.520, -73.577], [45.529, -73.577], [45.529, -73.590]];
@@ -117,6 +117,16 @@ const IN = (i) => [45.521 + i * 0.0003, -73.589 + i * 0.0004];   // points dans 
   const today = ymdMtl();
 
   try {
+    await t("verdict d'une visite : sur place, à distance, imprécise, sans position", async () => {
+      assert.strictEqual(verdict(40, 12, 45.5), 'onsite');
+      assert.strictEqual(verdict(150, 100, 45.5), 'onsite', 'seuils inclus');
+      assert.strictEqual(verdict(151, 10, 45.5), 'far');
+      assert.strictEqual(verdict(900, 500, 45.5), 'far', 'loin prime sur imprécis');
+      assert.strictEqual(verdict(80, 250, 45.5), 'imprecise');
+      assert.strictEqual(verdict(null, null, null), 'nogps');
+      assert.strictEqual(verdict(80, 10, null), 'nogps');
+    });
+
     await t('date de Montréal : 23 h 30 à Montréal = encore aujourd\'hui (pas demain UTC)', async () => {
       assert.strictEqual(ymdMtl(new Date('2026-10-07T03:30:00Z')), '2026-10-06');
       assert.strictEqual(addDays('2026-10-31', 1), '2026-11-01');
@@ -369,6 +379,10 @@ const IN = (i) => [45.521 + i * 0.0003, -73.589 + i * 0.0004];   // points dans 
       assert.strictEqual(mine.lastCheckin.stopName, 'Tout Neuf');
       assert.ok(mine.lastCheckin.lat && mine.lastCheckin.at);
       assert.strictEqual(mine.openerName, 'Jonathan Opener');
+      const visited = mine.stops.find((s) => s.outcome === 'done');
+      assert.strictEqual(visited.checkin.verdict, 'onsite', 'check-in à ~55 m, précision 12 m');
+      assert.ok(visited.checkin.distanceM > 40 && visited.checkin.distanceM < 70);
+      assert.deepStrictEqual(mine.verdicts, { onsite: 1 });
       assert.ok(r.body.routes.some((x) => x.date === addDays(today, 1)), 'la route du lendemain (reportée) est dans la période');
       assert.strictEqual((await call('GET', '/api/opener/routes-overview', undefined, 'jo@x.com')).status, 403);
     });

@@ -119,6 +119,19 @@ const comp = (place, type, short = false) => {
   const c = (place?.addressComponents || []).find((x) => (x.types || []).includes(type));
   return c ? (short ? c.shortText || c.longText : c.longText || c.shortText) : null;
 };
+// Verdict d'une visite, d'après la position GPS du téléphone AU MOMENT du check-in.
+//   onsite     ≤ 150 m du restaurant, précision ≤ 100 m
+//   far        à plus de 150 m
+//   imprecise  à moins de 150 m mais précision GPS de plus de 100 m (intérieur, signal faible)
+//   nogps      aucune position (localisation refusée ou indisponible)
+const ONSITE_M = 150;
+const PRECISE_M = 100;
+function verdict(distanceM, accuracyM, lat) {
+  if (lat == null || distanceM == null) return 'nogps';
+  if (distanceM > ONSITE_M) return 'far';
+  if (accuracyM != null && accuracyM > PRECISE_M) return 'imprecise';
+  return 'onsite';
+}
 const num = (v) => (v === null || v === undefined || v === '' ? null : (Number.isFinite(Number(v)) ? Number(v) : null));
 
 function registerOpenerFieldRoutes(app, deps) {
@@ -358,7 +371,8 @@ function registerOpenerFieldRoutes(app, deps) {
     if (!r) return null;
     const stops = (await pool.query(
       `SELECT s.*, (SELECT json_build_object('id', c.id, 'at', c.at, 'interest', c.interest_level, 'leadId', c.lead_id,
-                                             'decisionMaker', c.decision_maker, 'currentPos', c.current_pos)
+                                             'decisionMaker', c.decision_maker, 'currentPos', c.current_pos,
+                                             'lat', c.lat, 'distanceM', c.distance_m, 'accuracyM', c.accuracy_m)
                       FROM opener_checkins c WHERE c.route_stop_id = s.id ORDER BY c.at DESC LIMIT 1) AS checkin
          FROM opener_route_stops s WHERE s.route_id = $1 ORDER BY s.position, s.id`, [id])).rows;
     const st = await statusOf(stops.map((s) => s.place_id));
@@ -369,7 +383,8 @@ function registerOpenerFieldRoutes(app, deps) {
       closedAt: r.closed_at, version: r.version, updatedAt: r.updated_at,
       stops: stops.map((s) => ({
         id: s.id, placeId: s.place_id, position: s.position, name: s.label, address: s.address, lat: s.lat, lng: s.lng,
-        outcome: s.outcome, skipReason: s.skip_reason, doneAt: s.done_at, checkin: s.checkin || null,
+        outcome: s.outcome, skipReason: s.skip_reason, doneAt: s.done_at,
+        checkin: s.checkin ? { ...s.checkin, verdict: verdict(s.checkin.distanceM, s.checkin.accuracyM, s.checkin.lat) } : null,
         ...(st.get(s.place_id) || { status: 'new' }),
       })),
     };
@@ -459,8 +474,12 @@ function registerOpenerFieldRoutes(app, deps) {
         `SELECT ${ROUTE_COLS} FROM opener_routes r WHERE r.route_date BETWEEN $1 AND $2 ORDER BY r.route_date, r.id`, [from, to])).rows;
       const ids = routes.map((r) => r.id);
       const stops = ids.length ? (await pool.query(
-        `SELECT id, route_id, place_id, position, label, lat, lng, outcome, skip_reason, done_at
-           FROM opener_route_stops WHERE route_id = ANY($1::int[]) ORDER BY route_id, position`, [ids])).rows : [];
+        `SELECT s.id, s.route_id, s.place_id, s.position, s.label, s.lat, s.lng, s.outcome, s.skip_reason, s.done_at,
+                c.at AS c_at, c.lat AS c_lat, c.lng AS c_lng, c.distance_m AS c_dist, c.accuracy_m AS c_acc
+           FROM opener_route_stops s
+           LEFT JOIN LATERAL (SELECT at, lat, lng, distance_m, accuracy_m FROM opener_checkins
+                               WHERE route_stop_id = s.id ORDER BY at DESC LIMIT 1) c ON true
+          WHERE s.route_id = ANY($1::int[]) ORDER BY s.route_id, s.position`, [ids])).rows : [];
       const last = ids.length ? (await pool.query(
         `SELECT DISTINCT ON (s.route_id) s.route_id, c.at, c.lat, c.lng, c.distance_m, s.label
            FROM opener_checkins c JOIN opener_route_stops s ON s.id = c.route_stop_id
@@ -474,7 +493,16 @@ function registerOpenerFieldRoutes(app, deps) {
           id: r.id, name: r.name, date: r.route_date, status: r.status, openerEmail: r.opener_email,
           openerName: await userName(r.opener_email), zone: r.zone,
           total: st.length, done: st.filter((s) => s.outcome === 'done').length, skipped: st.filter((s) => s.outcome === 'skipped').length,
-          stops: st.map((s) => ({ id: s.id, name: s.label, lat: s.lat, lng: s.lng, outcome: s.outcome, doneAt: s.done_at })),
+          stops: st.map((s) => ({
+            id: s.id, name: s.label, lat: s.lat, lng: s.lng, outcome: s.outcome, skipReason: s.skip_reason, doneAt: s.done_at,
+            // La visite : où était le téléphone au check-in, et le verdict qui en découle.
+            checkin: s.c_at ? { at: s.c_at, lat: s.c_lat, lng: s.c_lng, distanceM: s.c_dist, accuracyM: s.c_acc,
+              verdict: verdict(s.c_dist, s.c_acc, s.c_lat) } : null,
+          })),
+          verdicts: st.reduce((acc, s) => {
+            if (s.c_at) { const v = verdict(s.c_dist, s.c_acc, s.c_lat); acc[v] = (acc[v] || 0) + 1; }
+            return acc;
+          }, {}),
           lastCheckin: l ? { at: l.at, lat: l.lat, lng: l.lng, stopName: l.label, distanceM: l.distance_m } : null,
         });
       }
@@ -645,7 +673,7 @@ function registerOpenerFieldRoutes(app, deps) {
       }
       const st = (await statusOf([pid])).get(pid);
       const history = (await pool.query(
-        `SELECT c.id, c.at, COALESCE(c.user_name, c.user_email) AS by, c.current_pos, c.service_type, c.terminals,
+        `SELECT c.id, c.at, c.lat, c.distance_m, c.accuracy_m, COALESCE(c.user_name, c.user_email) AS by, c.current_pos, c.service_type, c.terminals,
                 c.decision_maker, c.interest_level, c.services, c.notes, ld.ref_code
            FROM opener_checkins c LEFT JOIN leads ld ON ld.id = c.lead_id
           WHERE c.place_id = $1 ORDER BY c.at DESC LIMIT 15`, [pid])).rows;
@@ -668,7 +696,7 @@ function registerOpenerFieldRoutes(app, deps) {
         googleError,
         cluster: st || { status: 'new', visits: 0 },
         history: history.map((h) => ({
-          id: h.id, at: h.at, by: h.by, currentPos: h.current_pos, serviceType: h.service_type, terminals: h.terminals,
+          id: h.id, at: h.at, by: h.by, distanceM: h.distance_m, verdict: verdict(h.distance_m, h.accuracy_m, h.lat), currentPos: h.current_pos, serviceType: h.service_type, terminals: h.terminals,
           decisionMaker: h.decision_maker, interest: h.interest_level, services: h.services || [], notes: h.notes, leadRef: h.ref_code,
         })),
       });
@@ -917,4 +945,4 @@ function registerOpenerFieldRoutes(app, deps) {
   return { scanZone, statusOf, ymdMtl };
 }
 
-module.exports = { registerOpenerFieldRoutes, PERM_FIELD, PERM_ROUTES, SERVICES, SKIP_REASONS, ymdMtl, addDays };
+module.exports = { registerOpenerFieldRoutes, PERM_FIELD, PERM_ROUTES, SERVICES, SKIP_REASONS, ymdMtl, addDays, verdict };
