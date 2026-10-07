@@ -351,6 +351,37 @@ const addr = (address, zip, extra = {}) => ({ address, street2: '', city: 'Montr
       assert.ok(k[`${CA}:C6`] && k[`${CA}:C7`] && k[`${CA}:C8`]);
     });
 
+    await t('lecture des adresses interrompue : les clients aux adresses DÉJÀ connues sont écrits quand même', async () => {
+      // Vécu le 2026-10-06 : un passage tué à 1 208 adresses sur 1 500 n'avait créé aucun emplacement.
+      await pool.query(`DELETE FROM cluster_locations WHERE source = 'billing'`);
+      subs.push(sub(CA, 'C9', 'Jamais Lu Encore', 'live'));
+      contacts[`${CA}:C9`] = { billing_address: addr('9 Rue Neuf', 'H2C 9C9') };
+      // Une lecture d'adresse qui ne répond jamais = le processus tué en plein passage : on regarde
+      // la base PENDANT que le passage est bloqué.
+      const real = books.fetchContact;
+      let release; const hang = new Promise((r) => { release = r; });
+      books.fetchContact = async (...a) => { await hang; return real(...a); };
+      const running = mod.runAll({ source: 'interrompu', budget: 1 });
+      await new Promise((r) => setTimeout(r, 200));
+      const k = await byKey();
+      assert.ok(k[`${CA}:C1`] && k[`${XP}:X1`] && k[`${CA}:C6`], 'les adresses en cache ont donné leurs emplacements');
+      assert.ok(!k[`${CA}:C9`], 'pas encore d\'adresse → pas encore d\'emplacement');
+      release(); books.fetchContact = real;
+      out = await running;
+      out = await mod.runAll({ source: 'reprise2', budget: 1 });
+      assert.ok((await byKey())[`${CA}:C9`], 'repris au passage suivant');
+    });
+
+    await t('verrou abandonné depuis plus de 5 min (passage tué) : repris', async () => {
+      await pool.query(`INSERT INTO sync_state (key, value, updated_at) VALUES ('opener_locations_lock', 'running', CURRENT_TIMESTAMP - INTERVAL '6 minutes')
+                        ON CONFLICT (key) DO UPDATE SET value = 'running', updated_at = CURRENT_TIMESTAMP - INTERVAL '6 minutes'`);
+      assert.strictEqual((await call('GET', '/api/opener/locations/status')).body.running, false);
+      assert.ok(await mod.runAll({ source: 'apres-mort', budget: 1 }));
+      await pool.query(`UPDATE sync_state SET value = 'running', updated_at = CURRENT_TIMESTAMP - INTERVAL '2 minutes' WHERE key = 'opener_locations_lock'`);
+      assert.strictEqual(await mod.runAll({ source: 'vivant', budget: 1 }), null, 'un verrou récent bloque toujours');
+      await pool.query(`UPDATE sync_state SET value = 'idle' WHERE key = 'opener_locations_lock'`);
+    });
+
     await t('Zoho occupé par un scan SaaS : Billing reporté, Kaizen et appariement tournent quand même', async () => {
       zohoLockBusy = true;
       const before = kaizenCalls;

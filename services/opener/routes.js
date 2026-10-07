@@ -41,6 +41,10 @@ const NIGHTLY_ADDRESS_BUDGET = 1500;  // la nuit, personne n'attend
 const ADDRESS_REFRESH_DAYS = 30;
 const RETRY_NONE_DAYS = 30;
 const LOCK_KEY = 'opener_locations_lock';
+// Un verrou non renouvelé depuis 5 min appartient à un passage mort (redémarrage, déploiement) :
+// il est repris. Le passage vivant le renouvelle à chaque écriture de progression (≤ 1,5 s) et
+// toutes les 10 adresses / 20 recherches. Il était de 30 min : un passage tué bloquait la suite.
+const LOCK_STALE_MIN = 5;
 const STATE_LAST_RUN = 'opener_locations_last_run';
 const STATE_LAST_OK = 'opener_locations_last_ok';
 const STATE_PROGRESS = 'opener_locations_progress';
@@ -176,7 +180,7 @@ function registerOpenerRoutes(app, deps) {
     const r = await pool.query(
       `INSERT INTO sync_state (key, value, updated_at) VALUES ($1, 'running', CURRENT_TIMESTAMP)
        ON CONFLICT (key) DO UPDATE SET value = 'running', updated_at = CURRENT_TIMESTAMP
-        WHERE sync_state.value <> 'running' OR sync_state.updated_at < CURRENT_TIMESTAMP - INTERVAL '30 minutes'
+        WHERE sync_state.value <> 'running' OR sync_state.updated_at < CURRENT_TIMESTAMP - INTERVAL '${LOCK_STALE_MIN} minutes'
        RETURNING key`, [LOCK_KEY]);
     return r.rows.length > 0;
   }
@@ -184,7 +188,7 @@ function registerOpenerRoutes(app, deps) {
   // comparer à Date.now() dépendrait du fuseau du processus Node.
   const isRunning = async () => (await pool.query(
     `SELECT 1 FROM sync_state WHERE key = $1 AND value = 'running'
-        AND updated_at >= CURRENT_TIMESTAMP - INTERVAL '30 minutes'`, [LOCK_KEY])).rows.length > 0;
+        AND updated_at >= CURRENT_TIMESTAMP - INTERVAL '${LOCK_STALE_MIN} minutes'`, [LOCK_KEY])).rows.length > 0;
   // Progression lisible par l'écran pendant la synchro (phase + n / total). Écrite au plus toutes
   // les 1,5 s : la base est loin (proxy Railway), un aller-retour par recherche Google serait du
   // gaspillage. Un changement de phase s'écrit tout de suite.
@@ -194,6 +198,7 @@ function registerOpenerRoutes(app, deps) {
     if (!force && phase === progLast.phase && now - progLast.at < 1500) return;
     progLast = { phase, at: now };
     await putState(STATE_PROGRESS, { phase, done, total, at: new Date(now).toISOString() }).catch(() => {});
+    await touchLock();
   }
   const touchLock = () => pool.query(`UPDATE sync_state SET updated_at = CURRENT_TIMESTAMP WHERE key = $1 AND value = 'running'`, [LOCK_KEY]).catch(() => {});
   const releaseLock = () => pool.query(`UPDATE sync_state SET value = 'idle', updated_at = CURRENT_TIMESTAMP WHERE key = $1`, [LOCK_KEY]);
@@ -306,8 +311,39 @@ function registerOpenerRoutes(app, deps) {
       const todo = [...customers.values()]
         .filter((c) => !known.has(c.key) || known.get(c.key) === true)
         .sort((a, b) => Number(b.active) - Number(a.active) || Number(known.has(a.key)) - Number(known.has(b.key)));
+      // ⚠️ Les emplacements s'écrivent AU FUR ET À MESURE (vécu le 2026-10-06 : un passage de nuit
+      // tué par un redémarrage à 1 208 adresses sur 1 500 n'avait créé AUCUN emplacement, tout
+      // n'étant écrit qu'à la fin). D'abord tous les clients dont l'adresse est déjà connue, puis
+      // chaque lot de 25 adresses lues.
+      const start = await dbNow();
+      const tally = { inserted: 0, updated: 0, rematch: 0, outsideCanada: 0 };
+      const flush = async (list) => {
+        if (!list.length) return;
+        const keys = list.map((c) => c.key);
+        const addrs = new Map((await pool.query(
+          `SELECT * FROM opener_billing_addresses WHERE source_key = ANY($1::text[])`, [keys])).rows.map((r) => [r.source_key, r]));
+        const items = [];
+        for (const c of list) {
+          const a = addrs.get(c.key);
+          if (!a) continue;
+          if (!B.isCanada(a.country)) { tally.outsideCanada++; continue; }
+          items.push({
+            sourceKey: c.key, orgId: c.orgId, storeId: c.customerId,
+            name: (c.name || '(sans nom)').slice(0, 255),
+            street: a.street, unit: a.unit, city: a.city, region: a.region, postalCode: a.postal_code, country: a.country,
+            active: c.active,
+            extra: { org: ORG_NAMES[c.orgId] || c.orgId, plans: [...c.plans].slice(0, 8), subs: c.subs, activeSubs: c.activeSubs,
+              subNumbers: c.subNumbers, addressFrom: a.which, addressError: a.error || undefined },
+          });
+        }
+        const up = await upsertLocations('billing', items, start);
+        tally.inserted += up.inserted; tally.updated += up.updated; tally.rematch += up.rematch;
+      };
+      await flush([...customers.values()].filter((c) => known.has(c.key)));
+
       let fetchedAddr = 0, addrErrors = 0, stopped = null;
       const batch = todo.slice(0, Math.max(0, addressBudget));
+      let pendingFlush = [];
       await progress('billing_addresses', 0, batch.length, true);
       for (const c of batch) {
         await progress('billing_addresses', fetchedAddr, batch.length);
@@ -326,6 +362,7 @@ function registerOpenerRoutes(app, deps) {
                country = $7, which = $8, error = NULL, fetched_at = CURRENT_TIMESTAMP`,
             [c.key, a.street, a.unit, a.city, a.region, a.postalCode, a.country, a.which]);
           fetchedAddr++;
+          pendingFlush.push(c);
         } catch (e) {
           // Quota Zoho atteint : on s'arrête là, la suite au prochain passage. Rien n'est noté pour
           // ce client — il sera relu.
@@ -337,28 +374,16 @@ function registerOpenerRoutes(app, deps) {
             [c.key, String(e.message).slice(0, 200)]);
           fetchedAddr++;
         }
+        if (pendingFlush.length >= 25) { await flush(pendingFlush); pendingFlush = []; }
         if (pace) await sleep(pace);
       }
+      await flush(pendingFlush);
 
-      // Emplacements : chaque client dont l'adresse est connue, au Canada.
-      const addrs = new Map((await pool.query(`SELECT * FROM opener_billing_addresses`)).rows.map((r) => [r.source_key, r]));
-      const items = [];
-      let outsideCanada = 0, withoutAddress = 0;
-      for (const c of customers.values()) {
-        const a = addrs.get(c.key);
-        if (!a) { withoutAddress++; continue; }
-        if (!B.isCanada(a.country)) { outsideCanada++; continue; }
-        items.push({
-          sourceKey: c.key, orgId: c.orgId, storeId: c.customerId,
-          name: (c.name || '(sans nom)').slice(0, 255),
-          street: a.street, unit: a.unit, city: a.city, region: a.region, postalCode: a.postal_code, country: a.country,
-          active: c.active,
-          extra: { org: ORG_NAMES[c.orgId] || c.orgId, plans: [...c.plans].slice(0, 8), subs: c.subs, activeSubs: c.activeSubs,
-            subNumbers: c.subNumbers, addressFrom: a.which, addressError: a.error || undefined },
-        });
-      }
-      const start = await dbNow();
-      const up = await upsertLocations('billing', items, start);
+      const withoutAddress = (await pool.query(
+        `SELECT COUNT(*)::int AS n FROM unnest($1::text[]) k WHERE k NOT IN (SELECT source_key FROM opener_billing_addresses)`,
+        [[...customers.keys()]])).rows[0].n;
+      const outsideCanada = tally.outsideCanada;
+      const up = { inserted: tally.inserted, updated: tally.updated, rematch: tally.rematch };
       // Un client toujours abonné mais dont l'adresse n'est pas encore lue n'est pas « disparu ».
       const stillThere = [...customers.keys()];
       if (stillThere.length) {
