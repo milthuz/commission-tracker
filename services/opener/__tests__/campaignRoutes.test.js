@@ -117,6 +117,7 @@ const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
       const list = (await call('GET', '/api/opener/excluded')).body.excluded;
       assert.strictEqual(list[0].placeId, anyPlaces[1]);
       assert.strictEqual(list[0].reason, 'pas un restaurant');
+      assert.strictEqual(list[0].name, `Nom ${anyPlaces[1].slice(-4)}`, 'le nom vient de Google, pas de la base');
     });
 
     let campaign;

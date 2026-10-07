@@ -388,7 +388,19 @@ function registerOpenerFieldRoutes(app, deps) {
       const { rows } = await pool.query(
         `SELECT place_id, lat, lng, excluded_at, excluded_by, excluded_reason FROM opener_places
           WHERE excluded_at IS NOT NULL ORDER BY excluded_at DESC LIMIT 500`);
-      res.json({ excluded: rows.map((r) => ({ placeId: r.place_id, lat: r.lat, lng: r.lng, at: r.excluded_at, by: r.excluded_by, reason: r.excluded_reason })) });
+      // Nom et adresse : lus chez Google (gardés 1 h en mémoire, jamais en base) pour les 60 plus
+      // récents — assez pour reconnaître un lieu exclu par erreur.
+      const names = new Map();
+      if (google.configured()) {
+        await Promise.all(rows.slice(0, 60).map(async (r) => {
+          try {
+            const d = await cached(`lite:${r.place_id}`, () => google.details(r.place_id));
+            names.set(r.place_id, { name: d?.displayName?.text || null, address: d?.formattedAddress ? d.formattedAddress.split(',').slice(0, 2).join(',') : null });
+          } catch { /* nom absent : la ligne reste rétablissable */ }
+        }));
+      }
+      res.json({ excluded: rows.map((r) => ({ placeId: r.place_id, lat: r.lat, lng: r.lng, at: r.excluded_at, by: r.excluded_by, reason: r.excluded_reason,
+        name: names.get(r.place_id)?.name || null, address: names.get(r.place_id)?.address || null })) });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
