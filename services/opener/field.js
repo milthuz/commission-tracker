@@ -123,6 +123,10 @@ const SCHEMA = [
   `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS start_lng DOUBLE PRECISION`,
   `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS start_accuracy_m INTEGER`,
   `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS start_distance_m INTEGER`,
+  // Visite d'un CLIENT Cluster (2026-10-08) : est-il satisfait (1 à 5), et qui traite ses
+  // paiements (cluster | other | unknown) — la porte d'entrée pour proposer les paiements.
+  `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS satisfaction SMALLINT`,
+  `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS payments_by VARCHAR(10)`,
 ];
 
 // AAAA-MM-JJ à Montréal. Jamais `new Date().toISOString()` : à 20 h à Montréal, c'est déjà demain en UTC.
@@ -225,7 +229,8 @@ function registerOpenerFieldRoutes(app, deps) {
            WHERE l.place_id = p.pid AND l.missing_since IS NULL AND l.match_status <> 'ignored'
            ORDER BY l.active DESC, (l.source = 'kaizen') DESC, l.id LIMIT 1) AS loc,
          (SELECT json_build_object('at', c.at, 'by', COALESCE(c.user_name, c.user_email), 'currentPos', c.current_pos,
-                                   'serviceType', c.service_type, 'interest', c.interest_level)
+                                   'serviceType', c.service_type, 'interest', c.interest_level,
+                                   'satisfaction', c.satisfaction, 'paymentsBy', c.payments_by)
             FROM opener_checkins c WHERE c.place_id = p.pid ORDER BY c.at DESC LIMIT 1) AS last,
          (SELECT json_build_object('id', ld.id, 'refCode', ld.ref_code, 'status', ld.status)
             FROM opener_places op JOIN leads ld ON ld.id = op.lead_id WHERE op.place_id = p.pid) AS lead,
@@ -238,6 +243,7 @@ function registerOpenerFieldRoutes(app, deps) {
         status, version: loc?.version || null, clusterName: loc?.name || null, source: loc?.source || null,
         lastVisitAt: r.last?.at || null, lastVisitBy: r.last?.by || null, competitorPos: r.last?.currentPos || null,
         serviceTypeSeen: r.last?.serviceType || null, lastInterest: r.last?.interest ?? null,
+        lastSatisfaction: r.last?.satisfaction ?? null, lastPaymentsBy: r.last?.paymentsBy || null,
         lead: r.lead || null, visits: r.visits || 0,
       });
     }
@@ -767,7 +773,7 @@ function registerOpenerFieldRoutes(app, deps) {
       const history = (await pool.query(
         `SELECT c.id, c.at, ${V_LAT} AS lat, ${V_DIST} AS distance_m, ${V_ACC} AS accuracy_m, ${DUR_MIN} AS duration_min,
                 COALESCE(c.user_name, c.user_email) AS by, c.current_pos, c.service_type, c.terminals,
-                c.decision_maker, c.interest_level, c.services, c.notes, ld.ref_code
+                c.decision_maker, c.interest_level, c.services, c.notes, c.satisfaction, c.payments_by, ld.ref_code
            FROM opener_checkins c LEFT JOIN leads ld ON ld.id = c.lead_id
           WHERE c.place_id = $1 ORDER BY c.at DESC LIMIT 15`, [pid])).rows;
       res.json({
@@ -791,6 +797,7 @@ function registerOpenerFieldRoutes(app, deps) {
         history: history.map((h) => ({
           id: h.id, at: h.at, by: h.by, distanceM: h.distance_m, durationMin: h.duration_min, verdict: verdict(h.distance_m, h.accuracy_m, h.lat), currentPos: h.current_pos, serviceType: h.service_type, terminals: h.terminals,
           decisionMaker: h.decision_maker, interest: h.interest_level, services: h.services || [], notes: h.notes, leadRef: h.ref_code,
+          satisfaction: h.satisfaction ?? null, paymentsBy: h.payments_by || null,
         })),
       });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -818,6 +825,8 @@ function registerOpenerFieldRoutes(app, deps) {
       decisionMaker: ['yes', 'no', 'later'].includes(b.decisionMaker) ? b.decisionMaker : null,
       interest, services: Array.isArray(b.services) ? [...new Set(b.services.filter((s) => SERVICES.includes(s)))] : [],
       notes: clean(b.notes, 2000),
+      satisfaction: (() => { const v = parseInt(b.satisfaction, 10); return v >= 1 && v <= 5 ? v : null; })(),
+      paymentsBy: ['cluster', 'other', 'unknown'].includes(b.paymentsBy) ? b.paymentsBy : null,
       // Arrivée : retenue seulement si elle précède le départ de moins de 12 h.
       startedAt: (() => {
         const s = new Date(b.startedAt || '');
@@ -855,14 +864,14 @@ function registerOpenerFieldRoutes(app, deps) {
       await pool.query(
         `INSERT INTO opener_checkins (id, place_id, route_stop_id, user_email, user_name, at, lat, lng, accuracy_m, distance_m,
                 current_pos, service_type, terminals, online_delivery, decision_maker, interest_level, services, notes,
-                started_at, start_lat, start_lng, start_accuracy_m, start_distance_m)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18,$19,$20,$21,$22,$23)
+                started_at, start_lat, start_lng, start_accuracy_m, start_distance_m, satisfaction, payments_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18,$19,$20,$21,$22,$23,$24,$25)
          ON CONFLICT (id) DO NOTHING`,
         [c.id, c.placeId, stop?.id || null, me(req), (await userName(me(req))) || req.user?.name || null, c.at.toISOString(),
          c.lat, c.lng, c.accuracy, distance, c.currentPos, c.serviceType, c.terminals, c.onlineDelivery, c.decisionMaker,
          c.interest, JSON.stringify(c.services), c.notes,
          c.startedAt ? c.startedAt.toISOString() : null, hasStart ? c.startLat : null, hasStart ? c.startLng : null,
-         hasStart ? c.startAccuracy : null, startDistance]);
+         hasStart ? c.startAccuracy : null, startDistance, c.satisfaction, c.paymentsBy]);
       if (!place) await upsertPlaces([{ placeId: c.placeId, lat: stop?.lat, lng: stop?.lng }], 'checkin');
       if (stop) {
         await pool.query(`UPDATE opener_route_stops SET outcome = 'done', skip_reason = NULL, done_at = $2 WHERE id = $1`,

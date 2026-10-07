@@ -146,7 +146,11 @@ const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
     });
 
     let campaign;
-    await t('découpage : chaque restaurant visé dans UNE route, sans les clients, les exclus ni les « autres »', async () => {
+    await t('découpage : chaque restaurant visé dans UNE route, clients COMPRIS, sans les exclus ni les « autres »', async () => {
+      // Un client apparié au lot 0 que l'inventaire n'a pas vu (catégorie « magasin », sans région) :
+      // il est quand même mis sur une route, sa région calculée depuis ses coordonnées.
+      await pool.query(`INSERT INTO opener_places (place_id, lat, lng, source, kind) VALUES ('PL_CLIENT_HORS_INV', 45.5017, -73.5673, 'match', 'other')`);
+      await pool.query(`INSERT INTO cluster_locations (source, source_key, name, active, place_id, match_status, software_version) VALUES ('billing', 'b-hors', 'Client hors inventaire', true, 'PL_CLIENT_HORS_INV', 'auto', 'v1')`);
       const r = await call('POST', '/api/opener/campaign/recompute');
       assert.strictEqual(r.status, 200, JSON.stringify(r.body));
       assert.ok(r.body.routes > 0);
@@ -155,12 +159,16 @@ const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
       assert.strictEqual(all.length, r.body.routes);
       const pids = (await pool.query(`SELECT jsonb_array_elements_text(place_ids) AS p FROM opener_campaign_routes`)).rows.map((x) => x.p);
       assert.strictEqual(pids.length, new Set(pids).size, 'aucun doublon');
-      assert.ok(!pids.includes(anyPlaces[0]), 'client actif écarté');
+      assert.ok(pids.includes(anyPlaces[0]), 'client actif INCLUS (satisfaction, paiements)');
+      assert.ok(pids.includes('PL_CLIENT_HORS_INV'), 'client hors inventaire inclus');
+      assert.strictEqual(r.body.clients, 2);
       assert.ok(!pids.includes(anyPlaces[1]), 'établissement exclu écarté');
-      const others = (await pool.query(`SELECT place_id FROM opener_places WHERE kind = 'other'`)).rows.map((x) => x.place_id);
+      const others = (await pool.query(`SELECT place_id FROM opener_places WHERE kind = 'other' AND place_id <> 'PL_CLIENT_HORS_INV'`)).rows.map((x) => x.place_id);
       assert.ok(others.length > 0 && others.every((o) => !pids.includes(o)), 'les « autres » (barbier…) écartés');
-      const target = (await pool.query(`SELECT COUNT(*)::int n FROM opener_places WHERE kind <> 'other' AND excluded_at IS NULL`)).rows[0].n;
-      assert.strictEqual(pids.length, target - 1, 'tous les autres restaurants sont couverts');
+      const target = (await pool.query(`SELECT COUNT(*)::int n FROM opener_places WHERE kind <> 'other' AND excluded_at IS NULL AND region IS NOT NULL`)).rows[0].n;
+      assert.strictEqual(pids.length, target + 1, 'tous les restaurants + le client hors inventaire');
+      const withClients = (await call('GET', '/api/opener/campaign')).body.routes.filter((x) => x.clients > 0);
+      assert.strictEqual(withClients.reduce((s, x) => s + x.clients, 0), 2, 'nombre de clients par route');
     });
 
     await t('vue campagne : progression de la cartographie par région, routes avec zone et statut', async () => {

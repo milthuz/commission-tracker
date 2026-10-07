@@ -10,8 +10,10 @@
 //      région. Les exclus (« pas un restaurant ») ne reviennent jamais.
 //   2. DÉCOUPAGE — campaign.planCampaign : routes d'une journée (5 h), compactes, sans
 //      chevauchement, à pied en ville et en voiture en banlieue, numérotées de proche en proche.
-//      Exclus du découpage : clients actifs, restaurants visités depuis moins de 90 jours, ceux
-//      déjà dans une route planifiée ou faite.
+//      Les CLIENTS ACTIFS de Cluster sont inclus, quelle que soit leur catégorie Google : l'opener
+//      vérifie qu'ils sont satisfaits et propose les paiements (décision de David, 2026-10-08).
+//      Exclus du découpage : restaurants visités depuis moins de 90 jours, exclus « pas un
+//      restaurant », ceux déjà dans une route planifiée ou faite.
 //   3. PLANIFICATION — « Planifier la semaine » : chaque opener coché reçoit 5 routes voisines
 //      du lundi au vendredi, publiées, et UN courriel récapitulatif.
 //
@@ -277,16 +279,22 @@ function registerOpenerCampaignRoutes(app, deps) {
   async function recompute({ actor = 'system' } = {}) {
     await schema();
     await syncStatuses();
-    const { rows } = await pool.query(
-      `SELECT p.place_id, p.lat, p.lng, p.region FROM opener_places p
-        WHERE p.region IS NOT NULL AND p.excluded_at IS NULL AND p.lat IS NOT NULL
-          AND p.kind = ANY($1::text[])
-          AND NOT EXISTS (SELECT 1 FROM cluster_locations l WHERE l.place_id = p.place_id AND l.active
-                            AND l.missing_since IS NULL AND l.match_status <> 'ignored')
+    // Un client apparié au lot 0 n'a pas forcément été vu par l'inventaire (catégorie Google
+    // « magasin », hors des cercles déjà balayés) : sa région se calcule depuis ses coordonnées.
+    const { rows: found } = await pool.query(
+      `SELECT p.place_id, p.lat, p.lng, p.region,
+              EXISTS (SELECT 1 FROM cluster_locations l WHERE l.place_id = p.place_id AND l.active
+                        AND l.missing_since IS NULL AND l.match_status <> 'ignored') AS is_client
+         FROM opener_places p
+        WHERE p.excluded_at IS NULL AND p.lat IS NOT NULL
+          AND (p.kind = ANY($1::text[])
+               OR EXISTS (SELECT 1 FROM cluster_locations l WHERE l.place_id = p.place_id AND l.active
+                            AND l.missing_since IS NULL AND l.match_status <> 'ignored'))
           AND NOT EXISTS (SELECT 1 FROM opener_checkins c WHERE c.place_id = p.place_id
                             AND c.at > CURRENT_TIMESTAMP - INTERVAL '${RECENT_VISIT_DAYS} days')
           AND p.place_id NOT IN (SELECT jsonb_array_elements_text(place_ids) FROM opener_campaign_routes WHERE status IN ('planned','done'))`,
       [TARGET_KINDS]);
+    const rows = found.map((r) => ({ ...r, region: r.region || (r.is_client ? T.regionOf(r.lat, r.lng) : null) })).filter((r) => r.region);
     const routes = C.planCampaign(rows.map((r) => ({ placeId: r.place_id, lat: r.lat, lng: r.lng, region: r.region })));
     await pool.query(`DELETE FROM opener_campaign_routes WHERE status = 'todo'`);
     for (let i = 0; i < routes.length; i += 100) {
@@ -301,7 +309,7 @@ function registerOpenerCampaignRoutes(app, deps) {
         `INSERT INTO opener_campaign_routes (seq, region, mode, place_ids, n, minutes, meters, hull, centroid_lat, centroid_lng)
          VALUES ${rowsSql.join(',')}`, vals);
     }
-    const res = { at: new Date().toISOString(), routes: routes.length, places: rows.length,
+    const res = { at: new Date().toISOString(), routes: routes.length, places: rows.length, clients: rows.filter((r) => r.is_client).length,
       walk: routes.filter((r) => r.mode === 'walk').length, car: routes.filter((r) => r.mode === 'car').length };
     await putState('opener_campaign_computed', res);
     log(0, 'recomputed', `Campagne recalculée : ${res.routes} routes pour ${res.places} restaurants`, actor);
@@ -433,7 +441,10 @@ function registerOpenerCampaignRoutes(app, deps) {
       const routes = (await pool.query(
         `SELECT cr.id, cr.seq, cr.region, cr.mode, cr.n, cr.minutes, cr.meters, cr.hull, cr.centroid_lat, cr.centroid_lng, cr.status, cr.route_id,
                 r.route_date::text AS date, r.opener_email,
-                (SELECT COUNT(*)::int FROM opener_route_stops s WHERE s.route_id = r.id AND s.outcome = 'done') AS visited
+                (SELECT COUNT(*)::int FROM opener_route_stops s WHERE s.route_id = r.id AND s.outcome = 'done') AS visited,
+                (SELECT COUNT(*)::int FROM jsonb_array_elements_text(cr.place_ids) x(pid)
+                  WHERE EXISTS (SELECT 1 FROM cluster_locations l WHERE l.place_id = x.pid AND l.active
+                                  AND l.missing_since IS NULL AND l.match_status <> 'ignored')) AS clients
            FROM opener_campaign_routes cr LEFT JOIN opener_routes r ON r.id = cr.route_id
           ORDER BY cr.status <> 'todo', cr.seq`)).rows;
       const names = new Map();
@@ -451,6 +462,7 @@ function registerOpenerCampaignRoutes(app, deps) {
           id: r.id, seq: r.seq, region: r.region, mode: r.mode, n: r.n, minutes: r.minutes, meters: r.meters, hull: r.hull,
           centroid: [r.centroid_lat, r.centroid_lng], status: r.status, routeId: r.route_id, date: r.date,
           openerEmail: r.opener_email, openerName: r.opener_email ? names.get(r.opener_email) : null, visited: r.visited || 0,
+          clients: r.clients || 0,
         })),
       });
     } catch (e) { res.status(500).json({ error: e.message }); }

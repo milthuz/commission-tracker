@@ -422,6 +422,23 @@ const IN = (i) => [45.521 + i * 0.0003, -73.589 + i * 0.0004];   // points dans 
       assert.strictEqual(hist[0].durationMin, 17);
     });
 
+    await t('visite d\'un client Cluster : satisfaction et paiements gardés, visibles dans l\'historique et la fiche', async () => {
+      const client = scanned.PLACE_CLIENT_0001;
+      const r = await call('POST', '/api/opener/checkins', { ...ck, id: crypto.randomUUID(), placeId: client.placeId,
+        currentPos: 'Cluster', satisfaction: 2, paymentsBy: 'other', interest: 4, notes: 'Lent le vendredi soir' }, 'autre@x.com');
+      assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+      const card = (await call('GET', `/api/opener/place/${client.placeId}`, undefined, 'autre@x.com')).body;
+      assert.strictEqual(card.cluster.status, 'client');
+      assert.deepStrictEqual([card.history[0].satisfaction, card.history[0].paymentsBy], [2, 'other']);
+      assert.deepStrictEqual([card.cluster.lastSatisfaction, card.cluster.lastPaymentsBy], [2, 'other']);
+      // Valeurs hors bornes : ignorées, pas un refus (un prospect n'a pas de satisfaction).
+      const bad = await call('POST', '/api/opener/checkins', { ...ck, id: crypto.randomUUID(), placeId: client.placeId,
+        satisfaction: 9, paymentsBy: 'bidon' }, 'autre@x.com');
+      assert.strictEqual(bad.status, 200);
+      const h = (await call('GET', `/api/opener/place/${client.placeId}`, undefined, 'autre@x.com')).body.history[0];
+      assert.deepStrictEqual([h.satisfaction, h.paymentsBy], [null, null]);
+    });
+
     await t('liste des routes du manager : comptes d\'arrêts et de visites', async () => {
       const r = await call('GET', '/api/opener/routes');
       const mine = r.body.routes.find((x) => x.id === route.id);
