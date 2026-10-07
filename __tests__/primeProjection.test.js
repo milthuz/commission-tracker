@@ -59,3 +59,78 @@ describe('prochainVersementPrime', () => {
     expect(await prochainVersementPrime(le(2027, 1, 1), rienDeCommite)).toEqual({ year: 2027, month: 6 });
   });
 });
+
+// ── bornesRevenus ───────────────────────────────────────────────────────────────────────────
+// Le prédicat qui décide si la prime d'un compte est DÉFINITIVE. Partagé par l'écran du
+// représentant et l'onglet Bonus de l'admin : s'il divergeait, un rep lirait un montant et son
+// gestionnaire un autre.
+//
+// 🔑 La comparaison se fait en chaîne « AAAA-MM ». Aucun objet Date n'est construit, donc aucun
+// fuseau ne peut décaler le mois — le piège qui guette toute colonne `date` relue en JavaScript.
+const vm2 = require('vm');
+const fs2 = require('fs');
+const path2 = require('path');
+
+function monterBornes(moisMax) {
+  const SRC = fs2.readFileSync(path2.join(__dirname, '..', 'server.js'), 'utf8');
+  const prendre = (entete) => {
+    const d = SRC.indexOf(entete);
+    if (d === -1) throw new Error(`${entete} introuvable`);
+    return SRC.slice(d, SRC.indexOf('\n}', d) + 2);
+  };
+  const bac = {
+    console,
+    Date, String, Number,
+    // Le pilote pg rend un Date à MINUIT LOCAL pour une colonne `date`.
+    pool: { query: async () => ({ rows: [{ m: moisMax ? new Date(...moisMax) : null }] }) },
+  };
+  vm2.createContext(bac);
+  vm2.runInContext(`${prendre('const ymd = (v) => {')}\n${prendre('async function bornesRevenus() {')}`, bac);
+  return bac.bornesRevenus();
+}
+
+describe('bornesRevenus', () => {
+  test('témoin : les données vont jusqu’au mois trouvé en base', async () => {
+    const { dataThrough } = await monterBornes([2026, 9, 1]);   // octobre (mois 0-indexé)
+    expect(dataThrough).toBe('2026-10');
+  });
+
+  test('une fenêtre qui se termine AVANT la fin des données est close', async () => {
+    const { clos } = await monterBornes([2026, 9, 1]);          // données → 2026-10
+    expect(clos('2026-06')).toBe(true);
+    expect(clos('2026-09')).toBe(true);
+  });
+
+  test('une fenêtre qui se termine LE mois des données est close', async () => {
+    const { clos } = await monterBornes([2026, 9, 1]);
+    expect(clos('2026-10')).toBe(true);     // le mois est couvert, donc définitif
+  });
+
+  test('une fenêtre qui dépasse les données reste OUVERTE', async () => {
+    const { clos } = await monterBornes([2026, 9, 1]);
+    expect(clos('2026-11')).toBe(false);
+    expect(clos('2027-01')).toBe(false);
+  });
+
+  // Le passage d'année : « 2027-01 » > « 2026-12 » en comparaison de chaînes, ce qui est bien
+  // l'ordre chronologique. C'est ce qui rend l'astuce valable.
+  test('le passage d’année est correct en comparaison de chaînes', async () => {
+    const { clos } = await monterBornes([2026, 11, 1]);         // données → 2026-12
+    expect(clos('2026-12')).toBe(true);
+    expect(clos('2027-01')).toBe(false);
+    const b2 = await monterBornes([2027, 0, 1]);                // données → 2027-01
+    expect(b2.clos('2026-12')).toBe(true);
+    expect(b2.clos('2027-02')).toBe(false);
+  });
+
+  test('sans données de revenus, RIEN n’est déclaré définitif', async () => {
+    const { dataThrough, clos } = await monterBornes(null);
+    expect(dataThrough).toBeNull();
+    expect(clos('2026-06')).toBe(false);    // prudence : on n'annonce pas un acquis qu'on ignore
+  });
+
+  test('une fenêtre absente n’est pas close', async () => {
+    const { clos } = await monterBornes([2026, 9, 1]);
+    for (const v of [null, undefined, '']) expect(clos(v)).toBe(false);
+  });
+});

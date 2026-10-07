@@ -33552,6 +33552,28 @@ app.post('/api/commissions/pay-stub/email', authenticateToken, async (req, res) 
   }
 });
 
+// Jusqu'ou vont les donnees de revenus, et le predicat qui dit si la fenetre de 6 mois d'un
+// compte est CLOSE — donc si sa prime est definitive ou encore mouvante.
+//
+// UN SEUL endroit : l'ecran du representant et l'onglet Bonus de l'admin doivent repondre
+// exactement le meme chiffre. Deux copies finiraient par diverger, et c'est justement le genre
+// d'ecart qu'un representant remarque.
+//
+// ⚠️ « Close » se juge sur les DONNEES, pas sur le calendrier : un mois civil ecoule dont les
+// revenus ne sont pas encore importes ferait passer pour definitif un chiffre qui va bouger.
+//
+// 🔑 La comparaison se fait en CHAINE « AAAA-MM » : lexicographique = chronologique, et aucun
+// objet Date n'est construit. Aucun fuseau ne peut donc decaler le mois — le piege qui guette
+// toute colonne `date` relue en JavaScript (voir `ymd`).
+async function bornesRevenus() {
+  const row = (await pool.query(
+    `SELECT MAX(make_date(year, month, 1))::date AS m FROM zentact_merchant_revenue`)).rows[0];
+  const iso = ymd(row?.m);                              // 'AAAA-MM-JJ' ou null
+  const dataThrough = iso ? iso.slice(0, 7) : null;     // 'AAAA-MM'
+  const clos = (windowEnd) => !!dataThrough && !!windowEnd && String(windowEnd) <= dataThrough;
+  return { dataThrough, clos };
+}
+
 // Le PROCHAIN versement semestriel : juin ou decembre. Si celui qui vient est deja commite on
 // vise le suivant — sinon on annoncerait une projection pour une periode deja payee, et le
 // representant verrait deux fois le meme argent.
@@ -33608,17 +33630,7 @@ app.get('/api/commissions/processing-bonus/projection', authenticateToken, async
     const result = await computeProcessingBonuses(year, month);
     const mien = result?.byRep?.get(targetRep) || { accounts: [], total: 0 };
 
-    // Jusqu'ou vont les donnees de revenus. C'est CA qui dit si la fenetre d'un compte est
-    // close, et non le calendrier : un mois civil ecoule dont les revenus ne sont pas encore
-    // importes laisserait croire qu'un chiffre est definitif alors qu'il va bouger.
-    const dataThrough = (await pool.query(
-      `SELECT MAX(make_date(year, month, 1))::date AS m FROM zentact_merchant_revenue`)).rows[0]?.m || null;
-    const fin = dataThrough ? new Date(dataThrough) : null;
-    const clos = (windowEnd) => {
-      if (!fin || !windowEnd) return false;
-      const [a, mo] = String(windowEnd).split('-').map(Number);
-      return new Date(Date.UTC(a, mo - 1, 1)) <= new Date(Date.UTC(fin.getUTCFullYear(), fin.getUTCMonth(), 1));
-    };
+    const { dataThrough, clos } = await bornesRevenus();
 
     const accounts = mien.accounts.map((a) => ({
       merchantName: a.business_name,
@@ -33641,7 +33653,7 @@ app.get('/api/commissions/processing-bonus/projection', authenticateToken, async
       pendingAmount: Math.round((total - settled) * 100) / 100,
       accounts,
       openAccounts: accounts.filter((a) => !a.settled).length,
-      dataThrough: dataThrough ? new Date(dataThrough).toISOString().slice(0, 7) : null,
+      dataThrough,
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -36006,8 +36018,20 @@ app.get('/api/admin/processing-bonus', requireOpsSecretOrSession, async (req, re
   if (!year || (month !== 6 && month !== 12)) return res.status(400).json({ error: 'year + month (6 or 12) required' });
   try {
     const result = await computeProcessingBonuses(year, month);
-    const reps = [...result.byRep.entries()].map(([rep, v]) => ({ rep, total: v.total, accounts: v.accounts }))
-      .sort((a, b) => b.total - a.total);
+    // Meme separation que sur l'ecran du representant, et par le MEME point de passage :
+    // l'admin doit lire exactement ce que le rep lit, sinon la premiere question qui arrive
+    // est « pourquoi tu dis 3 846 et mon ecran dit 2 521 ».
+    const { dataThrough, clos } = await bornesRevenus();
+    const reps = [...result.byRep.entries()].map(([rep, v]) => {
+      const accounts = v.accounts.map((a) => ({ ...a, settled: clos(a.windowEnd) }));
+      return {
+        rep,
+        total: v.total,
+        settledAmount: Math.round(accounts.filter((a) => a.settled).reduce((t, a) => t + a.bonus, 0) * 100) / 100,
+        openAccounts: accounts.filter((a) => !a.settled).length,
+        accounts,
+      };
+    }).sort((a, b) => b.total - a.total);
     // Already-committed (platform payout) for this period: bonus_type='processing', import_id NULL
     // (imports carry an import_id), paid_for_period = the payout month.
     const period = `${year}-${String(month).padStart(2, '0')}-01`;
@@ -36018,8 +36042,9 @@ app.get('/api/admin/processing-bonus', requireOpsSecretOrSession, async (req, re
       [period]
     )).rows[0];
     res.json({
-      year, month,
+      year, month, dataThrough,
       grandTotal: Math.round(reps.reduce((a, r) => a + r.total, 0) * 100) / 100,
+      grandSettledAmount: Math.round(reps.reduce((a, r) => a + r.settledAmount, 0) * 100) / 100,
       reps,
       committed: { count: committed.count, total: Math.round(committed.total * 100) / 100 },
     });
