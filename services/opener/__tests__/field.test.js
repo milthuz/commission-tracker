@@ -303,12 +303,12 @@ const IN = (i) => [45.521 + i * 0.0003, -73.589 + i * 0.0004];   // points dans 
     const leadBody = { clientRef: crypto.randomUUID(), placeId: 'PLACE_NEW_000001', checkinId: ck.id, businessName: 'Tout Neuf',
       address: '123 Rue Neuve', city: 'Montréal', province: 'QC', postalCode: 'H2J 1A1', interest: ['pos', 'beverage_control', 'xx'],
       notes: 'Rappeler lundi', language: 'fr' };
-    await t('piste : source walk_in, détail « Opener · route · date », adresse dans les notes, liée au check-in', async () => {
+    await t('piste : source opener, détail « Opener · route · date », adresse dans les notes, liée au check-in', async () => {
       const r = await call('POST', '/api/opener/leads', { ...leadBody, stopId: stopNew().id }, 'jo@x.com');
       assert.strictEqual(r.status, 200, JSON.stringify(r.body));
       lead = r.body;
       const row = (await pool.query(`SELECT * FROM leads WHERE id = $1`, [lead.id])).rows[0];
-      assert.strictEqual(row.source, 'walk_in');
+      assert.strictEqual(row.source, 'opener');
       assert.strictEqual(row.source_detail, `Opener · Plateau · ${today}`);
       assert.deepStrictEqual(row.interest, ['pos', 'beverage_control']);
       assert.ok(row.notes.startsWith('Adresse : 123 Rue Neuve'));

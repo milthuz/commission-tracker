@@ -893,7 +893,7 @@ function registerOpenerFieldRoutes(app, deps) {
   });
 
   // Piste créée depuis le terrain : le même chemin que la saisie interne (file de révision,
-  // doublons Zoho, attribution), source « walk_in ». Idempotente par `clientRef`.
+  // doublons Zoho, attribution), source « opener ». Idempotente par `clientRef`.
   app.post('/api/opener/leads', authenticateToken, async (req, res) => {
     if (!(await guard(req, res, PERM_FIELD))) return;
     const b = req.body || {};
@@ -919,9 +919,9 @@ function registerOpenerFieldRoutes(app, deps) {
         firstName: b.firstName, lastName: b.lastName, title: b.title, email: b.email, phone: b.phone,
         city: b.city, province: b.province, postalCode: b.postalCode, language: b.language,
         interest, locationsCount: b.locationsCount, currentPos: b.currentPos, timeline: b.timeline, notes,
-      }, { source: 'walk_in' });
+      }, { source: 'opener' });
       if (!input.businessName) return res.status(400).json({ error: 'businessName is required' });
-      input.source = 'walk_in';
+      input.source = 'opener';
       input.sourceDetail = stop ? `Opener · ${stop.route_name} · ${stop.route_date}`.slice(0, 160) : 'Opener · porte-à-porte';
       const checkinId = UUID_RE.test(String(b.checkinId || '')) ? String(b.checkinId).toLowerCase() : null;
       const out = await L.createLeadRow(input, {
