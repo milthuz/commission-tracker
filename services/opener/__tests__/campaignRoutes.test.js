@@ -202,6 +202,9 @@ const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
       assert.strictEqual(mails.length, 0, 'aucun courriel pour un aperçu');
       const planned = (await pool.query(`SELECT COUNT(*)::int n FROM opener_campaign_routes WHERE status <> 'todo'`)).rows[0].n;
       assert.strictEqual(planned, 0);
+      // Opener jamais connecté (aucun nom en base) : nom tiré de l'adresse, jamais l'adresse entière.
+      const anon = await call('POST', '/api/opener/campaign/plan-week', { openers: ['jean-luc.tremblay@x.com'], weekStart: '2026-10-12', days: 1, preview: true });
+      assert.strictEqual(anon.body.openers[0].openerName, 'Jean Luc Tremblay');
     });
 
     await t('planifier la semaine : 5 routes par opener, du lundi au vendredi, aucune en double, UN courriel chacun', async () => {

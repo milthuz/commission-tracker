@@ -382,7 +382,7 @@ function registerOpenerCampaignRoutes(app, deps) {
       const L = late();
       if (L.sendMail && L.mailShell) {
         const mail = E.weekPublishedEmail(L.mailShell, {
-          openerName: (await field.userName(openerEmail)) || '', weekFr: fmtDay(days[0].date, 'fr'), weekEn: fmtDay(days[0].date, 'en'),
+          openerName: await field.displayName(openerEmail), weekFr: fmtDay(days[0].date, 'fr'), weekEn: fmtDay(days[0].date, 'en'),
           days: days.map((x) => ({ ...x, dateFr: fmtDay(x.date, 'fr'), dateEn: fmtDay(x.date, 'en') })),
           publishedBy: (await field.userName(actor)) || actor, link: `${field.frontend()}/opener`,
         });
@@ -448,7 +448,7 @@ function registerOpenerCampaignRoutes(app, deps) {
            FROM opener_campaign_routes cr LEFT JOIN opener_routes r ON r.id = cr.route_id
           ORDER BY cr.status <> 'todo', cr.seq`)).rows;
       const names = new Map();
-      for (const e of new Set(routes.map((r) => r.opener_email).filter(Boolean))) names.set(e, (await field.userName(e)) || e);
+      for (const e of new Set(routes.map((r) => r.opener_email).filter(Boolean))) names.set(e, await field.displayName(e));
       res.json({
         regions: T.REGIONS.map((r) => ({
           key: r.key, fr: r.fr, en: r.en, polygon: r.polygon,
@@ -548,13 +548,13 @@ function registerOpenerCampaignRoutes(app, deps) {
         }
         if (preview) {
           const dates = await freeDates(email, weekStart, week.length);
-          out.push({ openerEmail: email, openerName: (await field.userName(email)) || email,
+          out.push({ openerEmail: email, openerName: await field.displayName(email),
             days: week.map((w, i) => ({ date: dates[i], campaignRouteId: w.id, seq: w.seq, region: w.region,
               name: `R${w.seq} · ${regionLabel(w.region)}${w.mode === 'car' ? ' (voiture)' : ''}`, stops: w.n, minutes: w.minutes, mode: w.mode })) });
           continue;
         }
         const r = await assignRoutes(week.map((w) => w.id), email, weekStart, actorOf(req));
-        out.push({ openerEmail: email, openerName: (await field.userName(email)) || email, ...r });
+        out.push({ openerEmail: email, openerName: await field.displayName(email), ...r });
       }
       res.json({ openers: out, left: todo.length - taken.size });
     } catch (e) { res.status(500).json({ error: e.message }); }

@@ -214,6 +214,16 @@ function registerOpenerFieldRoutes(app, deps) {
     return r.rows[0]?.n || null;
   }
 
+  // Nom à AFFICHER : le nom Sales Hub, sinon tiré de l'adresse (« haominh.phung@… » → « Haominh
+  // Phung »). Un opener qui ne s'est jamais connecté n'a pas de nom en base, et une adresse
+  // courriel complète débordait sur la carte de campagne (2026-10-08).
+  const prettyEmail = (email) => String(email || '').split('@')[0].split(/[._-]+/).filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ') || String(email || '');
+  async function displayName(email) {
+    if (!email) return null;
+    return (await userName(email)) || prettyEmail(email);
+  }
+
   // --------------------------------------------------------------------------
   // Statut Cluster d'un lot de fiches Google
   // --------------------------------------------------------------------------
@@ -446,7 +456,7 @@ function registerOpenerFieldRoutes(app, deps) {
         `SELECT DISTINCT LOWER(ur.user_email) AS email FROM user_roles ur JOIN roles r ON r.id = ur.role_id
           WHERE r.permissions ? $1 OR r.permissions ? 'opener:*'`, [PERM_FIELD]);
       const out = [];
-      for (const r of rows) out.push({ email: r.email, name: (await userName(r.email)) || r.email });
+      for (const r of rows) out.push({ email: r.email, name: await displayName(r.email) });
       out.sort((a, b) => a.name.localeCompare(b.name, 'fr'));
       res.json({ openers: out });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -469,7 +479,7 @@ function registerOpenerFieldRoutes(app, deps) {
          FROM opener_route_stops s WHERE s.route_id = $1 ORDER BY s.position, s.id`, [id])).rows;
     const st = await statusOf(stops.map((s) => s.place_id));
     return {
-      id: r.id, name: r.name, date: r.route_date, openerEmail: r.opener_email, openerName: await userName(r.opener_email),
+      id: r.id, name: r.name, date: r.route_date, openerEmail: r.opener_email, openerName: await displayName(r.opener_email),
       status: r.status, zone: r.zone, start: r.start_lat != null ? [r.start_lat, r.start_lng] : null,
       createdBy: r.created_by, updatedBy: r.updated_by, publishedAt: r.published_at, publishedBy: r.published_by,
       closedAt: r.closed_at, version: r.version, updatedAt: r.updated_at,
@@ -546,7 +556,7 @@ function registerOpenerFieldRoutes(app, deps) {
           ORDER BY r.route_date DESC, r.id DESC`, [from, to]);
       const out = [];
       for (const r of rows) {
-        out.push({ id: r.id, name: r.name, date: r.route_date, openerEmail: r.opener_email, openerName: await userName(r.opener_email),
+        out.push({ id: r.id, name: r.name, date: r.route_date, openerEmail: r.opener_email, openerName: await displayName(r.opener_email),
           status: r.status, stops: r.stops, done: r.done, updatedAt: r.updated_at, version: r.version });
       }
       res.json({ routes: out, from, to });
@@ -586,7 +596,7 @@ function registerOpenerFieldRoutes(app, deps) {
         const l = lastBy.get(r.id);
         out.push({
           id: r.id, name: r.name, date: r.route_date, status: r.status, openerEmail: r.opener_email,
-          openerName: await userName(r.opener_email), zone: r.zone,
+          openerName: await displayName(r.opener_email), zone: r.zone,
           total: st.length, done: st.filter((s) => s.outcome === 'done').length, skipped: st.filter((s) => s.outcome === 'skipped').length,
           stops: st.map((s) => ({
             id: s.id, name: s.label, lat: s.lat, lng: s.lng, outcome: s.outcome, skipReason: s.skip_reason, doneAt: s.done_at,
@@ -1066,7 +1076,7 @@ function registerOpenerFieldRoutes(app, deps) {
   });
 
   // Outils partagés avec la campagne (campaignRoutes.js).
-  return { scanZone, statusOf, ymdMtl, upsertPlaces, scanBudget, userName, cached, loadRoute, schema, google, frontend, can };
+  return { scanZone, statusOf, ymdMtl, upsertPlaces, scanBudget, userName, displayName, cached, loadRoute, schema, google, frontend, can };
 }
 
 module.exports = { registerOpenerFieldRoutes, PERM_FIELD, PERM_ROUTES, SERVICES, SKIP_REASONS, ymdMtl, addDays, verdict };
