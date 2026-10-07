@@ -233,6 +233,18 @@ const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
       assert.ok(r.body.route && r.body.route.stops.length > 0);
     });
 
+    await t('quelques jours seulement (« des routes pour demain ») : date de départ libre, fins de semaine sautées', async () => {
+      // Un mercredi, 1 jour : ce mercredi.
+      let r = await call('POST', '/api/opener/campaign/plan-week', { openers: ['b@x.com'], weekStart: '2026-10-21', days: 1, preview: true });
+      assert.deepStrictEqual(r.body.openers[0].days.map((d) => d.date), ['2026-10-21']);
+      // Un samedi, 2 jours : lundi et mardi.
+      r = await call('POST', '/api/opener/campaign/plan-week', { openers: ['b@x.com'], weekStart: '2026-10-24', days: 2, preview: true });
+      assert.deepStrictEqual(r.body.openers[0].days.map((d) => d.date), ['2026-10-26', '2026-10-27']);
+      // Un jour déjà pris par une route publiée est sauté (b@x.com a sa semaine du 12 au 16).
+      r = await call('POST', '/api/opener/campaign/plan-week', { openers: ['b@x.com'], weekStart: '2026-10-15', days: 2, preview: true });
+      assert.deepStrictEqual(r.body.openers[0].days.map((d) => d.date), ['2026-10-19', '2026-10-20']);
+    });
+
     await t('la semaine suivante repart du secteur de l\'opener (voisinage)', async () => {
       const before = week[0].days[week[0].days.length - 1];
       const r = await call('POST', '/api/opener/campaign/plan-week', { openers: ['a@x.com'], weekStart: '2026-10-19', days: 2 });
@@ -258,18 +270,48 @@ const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
       assert.strictEqual((await pool.query(`SELECT 1 FROM opener_routes WHERE id = $1`, [tue.routeId])).rows.length, 0);
     });
 
-    await t('recalcul : les routes planifiées et faites sont gardées, leurs restaurants pas redistribués', async () => {
-      const keep = (await pool.query(`SELECT id, place_ids FROM opener_campaign_routes WHERE status IN ('planned','done')`)).rows;
+    await t('recalcul : routes planifiées gardées ; les NON VISITÉS d\'une route faite sont redistribués, pas les visités ni les refus', async () => {
+      // Route du mercredi : 1 visité, 1 fermé, 1 refus, le reste jamais touché ; journée fermée.
+      const wed = week[0].days[2];
+      const stops = (await pool.query(`SELECT id, place_id FROM opener_route_stops WHERE route_id = $1 ORDER BY position`, [wed.routeId])).rows;
+      assert.ok(stops.length >= 4);
+      const [visited, closed, refused, untouched] = stops;
+      await pool.query(`UPDATE opener_route_stops SET outcome = 'done', done_at = CURRENT_TIMESTAMP WHERE id = $1`, [visited.id]);
+      await pool.query(`UPDATE opener_route_stops SET outcome = 'skipped', skip_reason = 'closed', done_at = CURRENT_TIMESTAMP WHERE id = $1`, [closed.id]);
+      await pool.query(`UPDATE opener_route_stops SET outcome = 'skipped', skip_reason = 'refused', done_at = CURRENT_TIMESTAMP WHERE id = $1`, [refused.id]);
+      await pool.query(`UPDATE opener_routes SET status = 'closed', closed_at = CURRENT_TIMESTAMP WHERE id = $1`, [wed.routeId]);
+      const planned = (await pool.query(`SELECT id, place_ids FROM opener_campaign_routes WHERE status = 'planned' AND id <> $1`, [wed.campaignRouteId])).rows;
+      assert.ok(planned.length > 0);
       await call('POST', '/api/opener/campaign/recompute');
       const after = (await pool.query(`SELECT id, status, place_ids FROM opener_campaign_routes`)).rows;
-      for (const k of keep) assert.ok(after.find((a) => a.id === k.id), `route ${k.id} gardée`);
-      const kept = new Set(keep.flatMap((k) => k.place_ids));
-      const todoP = after.filter((a) => a.status === 'todo').flatMap((a) => a.place_ids);
-      assert.ok(todoP.every((p) => !kept.has(p)));
+      for (const k of planned) {
+        const info = (await pool.query(`SELECT r.route_date::text d, r.status, (SELECT COUNT(*)::int FROM opener_route_stops s WHERE s.route_id = r.id AND s.outcome = 'planned') p
+          FROM opener_routes r JOIN opener_campaign_routes cr ON cr.route_id = r.id WHERE cr.id = $1`, [k.id])).rows;
+        assert.ok(after.find((a) => a.id === k.id && a.status === 'planned'), `route planifiée ${k.id} gardée : ${after.find((a) => a.id === k.id)?.status} ${JSON.stringify(info)}`);
+      }
+      assert.strictEqual(after.find((a) => a.id === wed.campaignRouteId).status, 'done', 'la route du mercredi reste « faite »');
+      const todoP = new Set(after.filter((a) => a.status === 'todo').flatMap((a) => a.place_ids));
+      assert.ok(todoP.has(closed.place_id), 'fermé à l\'arrivée → redistribué');
+      assert.ok(todoP.has(untouched.place_id), 'jamais touché → redistribué');
+      assert.ok(!todoP.has(visited.place_id), 'visité → pas redistribué');
+      assert.ok(!todoP.has(refused.place_id), 'refus d\'entrer → pas redistribué (90 jours)');
+      const stillPlanned = new Set(planned.flatMap((k) => k.place_ids));
+      assert.ok([...todoP].every((p) => !stillPlanned.has(p)), 'rien d\'une route encore planifiée');
+    });
+
+    await t('route dont la date est passée sans fermer la journée → « faite », ses restaurants non visités reviennent', async () => {
+      const thu = week[0].days[3];
+      await pool.query(`UPDATE opener_routes SET route_date = DATE '2026-01-05' WHERE id = $1`, [thu.routeId]);
+      const one = (await pool.query(`SELECT place_id FROM opener_route_stops WHERE route_id = $1 LIMIT 1`, [thu.routeId])).rows[0].place_id;
+      await call('POST', '/api/opener/campaign/recompute');
+      const cr = (await pool.query(`SELECT status FROM opener_campaign_routes WHERE id = $1`, [thu.campaignRouteId])).rows[0];
+      assert.strictEqual(cr.status, 'done');
+      const todoP = (await pool.query(`SELECT jsonb_array_elements_text(place_ids) p FROM opener_campaign_routes WHERE status = 'todo'`)).rows.map((x) => x.p);
+      assert.ok(todoP.includes(one));
     });
 
     await t('exclu depuis le terrain : l\'arrêt passe « non visité (exclu) »', async () => {
-      const wed = week[0].days[2];
+      const wed = week[0].days[4]; // vendredi : route encore à faire
       const stop = (await pool.query(`SELECT id, place_id FROM opener_route_stops WHERE route_id = $1 ORDER BY position LIMIT 1`, [wed.routeId])).rows[0];
       const r = await call('POST', `/api/opener/places/${stop.place_id}/exclude`, { reason: 'pas un restaurant', stopId: stop.id }, 'a@x.com');
       assert.strictEqual(r.status, 200);

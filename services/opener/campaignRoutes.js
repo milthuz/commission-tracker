@@ -13,7 +13,9 @@
 //      Les CLIENTS ACTIFS de Cluster sont inclus, quelle que soit leur catégorie Google : l'opener
 //      vérifie qu'ils sont satisfaits et propose les paiements (décision de David, 2026-10-08).
 //      Exclus du découpage : restaurants visités depuis moins de 90 jours, exclus « pas un
-//      restaurant », ceux déjà dans une route planifiée ou faite.
+//      restaurant », ceux d'une route encore planifiée. Ceux d'une route faite qui n'ont PAS été
+//      visités (fermé, manque de temps, journée pas finie) reviennent dans une nouvelle route ;
+//      un refus d'entrer est écarté 90 jours, comme une visite.
 //   3. PLANIFICATION — « Planifier la semaine » : chaque opener coché reçoit 5 routes voisines
 //      du lundi au vendredi, publiées, et UN courriel récapitulatif.
 //
@@ -264,12 +266,14 @@ function registerOpenerCampaignRoutes(app, deps) {
   // 2. Découpage en routes
   // ==========================================================================
   async function syncStatuses() {
-    // Planifiée → faite : la route est terminée, ou plus aucun arrêt n'est à faire.
+    // Planifiée → faite : la route est terminée, plus aucun arrêt n'est à faire, ou sa DATE EST
+    // PASSÉE (l'opener n'a pas fermé sa journée : la route ne doit pas bloquer ses restaurants).
     await pool.query(
       `UPDATE opener_campaign_routes cr SET status = 'done'
          FROM opener_routes r
         WHERE cr.route_id = r.id AND cr.status = 'planned'
-          AND (r.status = 'closed' OR NOT EXISTS (SELECT 1 FROM opener_route_stops s WHERE s.route_id = r.id AND s.outcome = 'planned'))`);
+          AND (r.status = 'closed' OR r.route_date < $1::date
+               OR NOT EXISTS (SELECT 1 FROM opener_route_stops s WHERE s.route_id = r.id AND s.outcome = 'planned'))`, [field.ymdMtl()]);
     // La route a été supprimée : la campagne la reprend.
     await pool.query(
       `UPDATE opener_campaign_routes SET status = 'todo', route_id = NULL
@@ -292,8 +296,20 @@ function registerOpenerCampaignRoutes(app, deps) {
                             AND l.missing_since IS NULL AND l.match_status <> 'ignored'))
           AND NOT EXISTS (SELECT 1 FROM opener_checkins c WHERE c.place_id = p.place_id
                             AND c.at > CURRENT_TIMESTAMP - INTERVAL '${RECENT_VISIT_DAYS} days')
-          AND p.place_id NOT IN (SELECT jsonb_array_elements_text(place_ids) FROM opener_campaign_routes WHERE status IN ('planned','done'))`,
-      [TARGET_KINDS]);
+          -- REDISTRIBUTION (David, 2026-10-08) : un restaurant d'une route FAITE qui n'a pas été
+          -- visité (fermé, manque de temps, autre raison, journée pas finie) revient dans une
+          -- nouvelle route au prochain recalcul. Restent écartés : les visités et les REFUS
+          -- d'entrer (90 jours), les routes encore planifiées, et tout arrêt encore à faire sur une
+          -- route publiée à venir (un arrêt « reporté à demain » y est déjà).
+          AND NOT EXISTS (SELECT 1 FROM opener_route_stops s JOIN opener_routes r ON r.id = s.route_id
+                           WHERE s.place_id = p.place_id
+                             AND (s.outcome = 'done' OR s.skip_reason = 'refused')
+                             AND COALESCE(s.done_at, r.route_date::timestamp) > CURRENT_TIMESTAMP - INTERVAL '${RECENT_VISIT_DAYS} days')
+          AND NOT EXISTS (SELECT 1 FROM opener_route_stops s JOIN opener_routes r ON r.id = s.route_id
+                           WHERE s.place_id = p.place_id AND s.outcome = 'planned'
+                             AND r.status = 'published' AND r.route_date >= $2::date)
+          AND p.place_id NOT IN (SELECT jsonb_array_elements_text(place_ids) FROM opener_campaign_routes WHERE status = 'planned')`,
+      [TARGET_KINDS, field.ymdMtl()]);
     const rows = found.map((r) => ({ ...r, region: r.region || (r.is_client ? T.regionOf(r.lat, r.lng) : null) })).filter((r) => r.region);
     const routes = C.planCampaign(rows.map((r) => ({ placeId: r.place_id, lat: r.lat, lng: r.lng, region: r.region })));
     await pool.query(`DELETE FROM opener_campaign_routes WHERE status = 'todo'`);
