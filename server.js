@@ -3978,9 +3978,17 @@ const openerModule = require('./services/opener/routes').registerOpenerRoutes(ap
 // Module Opener, lots 1 à 4 : balayage Google d'une zone, routes du manager, terrain de l'opener
 // (check-ins, pistes, journée). services/opener/field.js. `late` : la création de piste et le
 // courriel, définis plus bas.
-require('./services/opener/field').registerOpenerFieldRoutes(app, {
+const openerField = require('./services/opener/field').registerOpenerFieldRoutes(app, {
   authenticateToken, requirePerm, hasPerm, pool, logActivity, baseSchema: openerModule.ensureReady,
   late: () => ({ normalizeLeadInput, createLeadRow, sendMail: (...a) => sendMail(...a), mailShell: (...a) => mailShell(...a) }),
+});
+
+// Campagne Opener : inventaire de Montréal, Laval, Rive-Nord et Rive-Sud, découpage en routes
+// d'une journée, « Planifier la semaine ». services/opener/campaignRoutes.js. Passage de nuit :
+// startAutoSync.
+const openerCampaign = require('./services/opener/campaignRoutes').registerOpenerCampaignRoutes(app, {
+  authenticateToken, requirePerm, pool, logActivity, field: openerField,
+  late: () => ({ sendMail: (...a) => sendMail(...a), mailShell: (...a) => mailShell(...a) }),
 });
 
 // Pistes du site Webflow : webhook NATIF (form_submission), signé, connecté depuis Admin → Pistes.
@@ -4710,7 +4718,7 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // sampleEmail(), dans TEMPLATE_TYPES de EmailPreview.tsx, et dans les libellés i18n.
 // Les quatre `pass_*` sont les courriels du programme La Passe ; ils sont les seuls de la
 // liste à partir d'une adresse et d'une enveloppe qui ne sont pas celles de Sales Hub.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder', 'lead_review', 'lead_assigned', 'lead_welcome', 'lead_booking_client', 'lead_booking_cancelled', 'lead_booking_rep', 'partner_lead_assigned', 'hr_sign_request', 'hr_countersign', 'hr_completed', 'hr_declined', 'opener_route_published'];
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder', 'lead_review', 'lead_assigned', 'lead_welcome', 'lead_booking_client', 'lead_booking_cancelled', 'lead_booking_rep', 'partner_lead_assigned', 'hr_sign_request', 'hr_countersign', 'hr_completed', 'hr_declined', 'opener_route_published', 'opener_week_published'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -4719,6 +4727,15 @@ function sampleEmail(type, lang) {
   // un aperçu qui recopierait le gabarit à côté finirait par montrer autre chose que ce
   // qui part réellement, ce qui est exactement le contraire du but d'un outil d'aperçu.
   // RH : les vrais constructeurs de services/hr/emails.js, avec un candidat fictif.
+  if (type === 'opener_week_published') {
+    const days = [['lundi 12 octobre', 'Monday, October 12', 'R12 · Île de Montréal', 18, 290, 'walk'],
+      ['mardi 13 octobre', 'Tuesday, October 13', 'R13 · Île de Montréal', 21, 295, 'walk'],
+      ['mercredi 14 octobre', 'Wednesday, October 14', 'R27 · Laval (voiture)', 12, 280, 'car']]
+      .map(([dateFr, dateEn, name, stops, minutes, mode]) => ({ dateFr, dateEn, name, stops, minutes, mode }));
+    return require('./services/opener/emails').weekPublishedEmail(mailShell, {
+      openerName: 'Jonathan', weekFr: 'lundi 12 octobre', weekEn: 'Monday, October 12', days, publishedBy: 'Marie Manager', link: `${base}/opener`,
+    });
+  }
   if (type === 'opener_route_published') {
     return require('./services/opener/emails').routePublishedEmail(mailShell, {
       openerName: 'Jonathan', routeName: 'Plateau / Mile End', dateFr: 'mardi 6 octobre', dateEn: 'Tuesday, October 6',
@@ -14978,6 +14995,14 @@ function startAutoSync() {
     openerModule.runNightly();
     setInterval(() => openerModule.runNightly(), 24 * 60 * 60 * 1000);
   }, 4 * 60 * 1000);
+
+  // Campagne Opener — inventaire du territoire (1 200 cercles Google par nuit) puis découpage en
+  // routes. 7 min après le démarrage (après les emplacements), puis toutes les 24 h ; sauté si le
+  // dernier inventaire date de moins de 20 h (le worker redémarre à chaque déploiement).
+  setTimeout(() => {
+    openerCampaign.runNightly();
+    setInterval(() => openerCampaign.runNightly(), 24 * 60 * 60 * 1000);
+  }, 7 * 60 * 1000);
 
   // Recalc-v2 — runs on its own 6h cadence, offset 30 min from sync to avoid
   // overlapping with the heavy sync window. Skips if already running (guard

@@ -208,13 +208,14 @@ function createGooglePlaces({ http = axios, env = process.env } = {}) {
   // Plafond Google : 20 résultats — le quadrillage (geo.splitCircle) découpe les cercles pleins.
   // Les champs dineIn / takeout / delivery placent l'appel dans la tranche de prix la plus haute
   // de Nearby Search ; ils servent le filtre « type de service » du concepteur de routes.
-  async function searchNearby(center, radius, types) {
+  // `fields` : masque plus léger pour l'inventaire du territoire (sans note ni type de service).
+  async function searchNearby(center, radius, types, { fields } = {}) {
     if (!key()) throw new Error('GOOGLE_PLACES_API_KEY absente');
     try {
       const r = await http.post('https://places.googleapis.com/v1/places:searchNearby', {
         includedTypes: types, maxResultCount: 20, rankPreference: 'DISTANCE', languageCode: 'fr', regionCode: 'CA',
         locationRestriction: { circle: { center: { latitude: center[0], longitude: center[1] }, radius: Math.min(50000, Math.max(1, radius)) } },
-      }, { headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': key(), 'X-Goog-FieldMask': NEARBY_FIELDS.join(',') }, timeout: 15000 });
+      }, { headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': key(), 'X-Goog-FieldMask': (fields || NEARBY_FIELDS).join(',') }, timeout: 15000 });
       return Array.isArray(r?.data?.places) ? r.data.places : [];
     } catch (e) { throw explain(e); }
   }

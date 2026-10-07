@@ -39,7 +39,7 @@ const SCAN_START_RADIUS = 700;       // m — cercle de départ du quadrillage
 const SCAN_MIN_RADIUS = 120;         // m — en dessous, on ne découpe plus
 const SCAN_MAX_CALLS = 80;           // appels Nearby Search par zone
 const SCAN_MAX_AREA = 25e6;          // m² — au-delà, la zone est refusée (≈ 5 km × 5 km)
-const SCAN_MONTHLY_BUDGET = 4000;    // appels Nearby Search par mois, toutes zones confondues
+const SCAN_MONTHLY_BUDGET = 6000;    // appels Nearby Search par mois (balayages + inventaire de la campagne). Variable OPENER_SCAN_MONTHLY_BUDGET
 const MAX_STOPS = 60;
 const CACHE_MS = 60 * 60 * 1000;     // mémoire des réponses Google (jamais en base)
 const SERVICES = ['payments', 'pos', 'beverage_control'];
@@ -48,6 +48,13 @@ const SKIP_REASONS = ['closed', 'no_time', 'refused', 'other'];
 const SCHEMA = [
   `ALTER TABLE opener_places ADD COLUMN IF NOT EXISTS last_seen_in_scan TIMESTAMP`,
   `ALTER TABLE opener_places ADD COLUMN IF NOT EXISTS lead_id INTEGER`,
+  // Inventaire du territoire (campagne) : catégorie et région de chaque établissement.
+  `ALTER TABLE opener_places ADD COLUMN IF NOT EXISTS kind VARCHAR(12)`,
+  `ALTER TABLE opener_places ADD COLUMN IF NOT EXISTS region VARCHAR(20)`,
+  // Exclu (« pas un restaurant », fermé…) : ne revient plus dans les balayages, les routes, la campagne.
+  `ALTER TABLE opener_places ADD COLUMN IF NOT EXISTS excluded_at TIMESTAMP`,
+  `ALTER TABLE opener_places ADD COLUMN IF NOT EXISTS excluded_by VARCHAR(255)`,
+  `ALTER TABLE opener_places ADD COLUMN IF NOT EXISTS excluded_reason VARCHAR(200)`,
   `CREATE TABLE IF NOT EXISTS opener_routes (
     id            SERIAL PRIMARY KEY,
     name          VARCHAR(160) NOT NULL,
@@ -323,14 +330,66 @@ function registerOpenerFieldRoutes(app, deps) {
     try {
       const r = await scanZone(poly);
       await upsertPlaces(r.places.map((p) => ({ placeId: p.id, lat: p.location?.latitude, lng: p.location?.longitude })), 'scan');
-      const st = await statusOf(r.places.map((p) => p.id));
-      const places = r.places.map((p) => shapeScanned(p, st.get(p.id)));
+      const excluded = new Set((await pool.query(
+        `SELECT place_id FROM opener_places WHERE excluded_at IS NOT NULL AND place_id = ANY($1::text[])`,
+        [r.places.map((p) => p.id)])).rows.map((x) => x.place_id));
+      const kept = r.places.filter((p) => !excluded.has(p.id));
+      const st = await statusOf(kept.map((p) => p.id));
+      const places = kept.map((p) => shapeScanned(p, st.get(p.id)));
       const budget = await scanBudget(0);
-      res.json({ places, calls: r.calls, fromCache: r.fromCache, truncated: r.truncated, budget });
+      res.json({ places, calls: r.calls, fromCache: r.fromCache, truncated: r.truncated, budget, excluded: excluded.size });
     } catch (e) {
       if (e.code === 429) return res.status(429).json({ error: 'scan_budget_exhausted', budget: await scanBudget(0) });
       res.status(502).json({ error: e.message });
     }
+  });
+
+  // Exclure un établissement (« pas un restaurant », fermé, entrepôt…) : il ne revient plus dans
+  // les balayages, les routes suggérées ni la campagne. Demande de David (2026-10-07). Le manager
+  // ET l'opener peuvent exclure (l'opener le constate sur place) ; seul le manager rétablit.
+  // Depuis une route, l'arrêt est marqué « non visité » avec la raison.
+  app.post('/api/opener/places/:placeId/exclude', authenticateToken, async (req, res) => {
+    if (!(await guardAny(req, res, [PERM_ROUTES, PERM_FIELD]))) return;
+    const pid = String(req.params.placeId || '');
+    if (!PLACE_RE.test(pid)) return res.status(404).json({ error: 'not_found' });
+    const reason = clean(req.body?.reason, 200) || 'not_restaurant';
+    try {
+      await pool.query(
+        `INSERT INTO opener_places (place_id, excluded_at, excluded_by, excluded_reason, source) VALUES ($1, CURRENT_TIMESTAMP, $2, $3, 'exclude')
+         ON CONFLICT (place_id) DO UPDATE SET excluded_at = CURRENT_TIMESTAMP, excluded_by = $2, excluded_reason = $3`,
+        [pid, actorOf(req), reason]);
+      const stopId = parseInt(req.body?.stopId, 10) || 0;
+      if (stopId) {
+        const stop = await myStop(req, stopId);
+        if (stop && stop.place_id === pid && stop.outcome === 'planned') {
+          await pool.query(`UPDATE opener_route_stops SET outcome = 'skipped', skip_reason = 'excluded', done_at = CURRENT_TIMESTAMP WHERE id = $1`, [stop.id]);
+        }
+      }
+      log('opener_place', pid, 'excluded', `Établissement exclu (${reason})`, actorOf(req));
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.delete('/api/opener/places/:placeId/exclude', authenticateToken, async (req, res) => {
+    if (!(await guard(req, res, PERM_ROUTES))) return;
+    const pid = String(req.params.placeId || '');
+    try {
+      const r = await pool.query(`UPDATE opener_places SET excluded_at = NULL, excluded_by = NULL, excluded_reason = NULL WHERE place_id = $1`, [pid]);
+      if (!r.rowCount) return res.status(404).json({ error: 'not_found' });
+      log('opener_place', pid, 'unexcluded', 'Établissement rétabli', actorOf(req));
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Les établissements exclus (pour les rétablir).
+  app.get('/api/opener/excluded', authenticateToken, async (req, res) => {
+    if (!(await guard(req, res, PERM_ROUTES))) return;
+    try {
+      const { rows } = await pool.query(
+        `SELECT place_id, lat, lng, excluded_at, excluded_by, excluded_reason FROM opener_places
+          WHERE excluded_at IS NOT NULL ORDER BY excluded_at DESC LIMIT 500`);
+      res.json({ excluded: rows.map((r) => ({ placeId: r.place_id, lat: r.lat, lng: r.lng, at: r.excluded_at, by: r.excluded_by, reason: r.excluded_reason })) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
   // Trouver un quartier ou une adresse (« Plateau-Mont-Royal », « 4520 Saint-Denis ») : le point
@@ -985,7 +1044,8 @@ function registerOpenerFieldRoutes(app, deps) {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
-  return { scanZone, statusOf, ymdMtl };
+  // Outils partagés avec la campagne (campaignRoutes.js).
+  return { scanZone, statusOf, ymdMtl, upsertPlaces, scanBudget, userName, cached, loadRoute, schema, google, frontend, can };
 }
 
 module.exports = { registerOpenerFieldRoutes, PERM_FIELD, PERM_ROUTES, SERVICES, SKIP_REASONS, ymdMtl, addDays, verdict };
