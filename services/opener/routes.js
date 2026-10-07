@@ -220,7 +220,10 @@ function registerOpenerRoutes(app, deps) {
           s.postalCode, s.country, s.active, addrKey(s), dedupKey(s.name, s.postalCode), s.extra ? JSON.stringify(s.extra) : null);
         return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8},$${b + 9},$${b + 10},$${b + 11},`
           + `$${b + 12}::boolean,$${b + 13},$${b + 14},$${b + 15}::jsonb,$${part.length * COLS + 1}::timestamp,`
-          + `${source === 'kaizen' ? `'v2'` : 'NULL'})`;
+          // Version dès l'écriture : Kaizen = V2 ; un client Billing est V1 jusqu'à ce que linkTwins
+          // (fin du passage) lui trouve un jumeau Kaizen. Sans ça, la tuile V1 restait à 0 pendant
+          // toute la lecture des adresses. L'UPDATE ne touche pas la version : celle déjà calculée reste.
+          + `${source === 'kaizen' ? `'v2'` : `'v1'`})`;
       });
       vals.push(start);
       const changed = `cluster_locations.addr_key IS DISTINCT FROM EXCLUDED.addr_key
