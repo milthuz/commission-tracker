@@ -88,6 +88,66 @@ t('adresse ≠ commerce : un immeuble est reconnu, un restaurant non', () => {
   assert.strictEqual(M.addressQuery({ street: null }), null);
 });
 
+// Les deux cas signalés par David le 2026-10-07 (« dans 95 % des cas ça devrait matcher »).
+t('vrai cas : « La terasse du Trad » au 195 contre « La terrasse du Trad » au 194, même code postal → auto', () => {
+  const s = { name: 'La terasse du Trad', street: '195 Chem. Métivier', postal_code: 'G0R 2Y0' };
+  const sc = M.scoreCandidate(s, place('T', 'La terrasse du Trad', 'G0R 2Y0', '194'));
+  assert.strictEqual(sc.parts.civic, 'near');
+  assert.strictEqual(M.decide([{ id: 'T', ...sc }]).status, 'auto', JSON.stringify(sc));
+});
+t('vrai cas : « Pizza 2 Freres » contre « Pizza Deux Frères — Blainville », même adresse → auto', () => {
+  const s = { name: 'Pizza 2 Freres', street: '1185 Bd Curé-Labelle', postal_code: 'J7C 4K6' };
+  const sc = M.scoreCandidate(s, place('P', 'Pizza Deux Frères — Blainville', 'J7C 4K6', '1185'));
+  assert.strictEqual(sc.parts.name, 1);
+  assert.strictEqual(M.decide([{ id: 'P', ...sc }]).status, 'auto');
+});
+t('garde-fous : numéro à plus de 4 portes → pénalité ; nom différent à la même adresse → pas auto', () => {
+  const s = { name: 'La terasse du Trad', street: '195 Chem. Métivier', postal_code: 'G0R 2Y0' };
+  assert.strictEqual(M.scoreCandidate(s, place('T', 'La terrasse du Trad', 'G0R 2Y0', '205')).parts.civic, 'diff');
+  const other = M.scoreCandidate({ name: 'Pizza 2 Freres', street: '1185 Bd Curé-Labelle', postal_code: 'J7C 4K6' },
+    place('Q', 'Dépanneur Couche-Tard', 'J7C 4K6', '1185'));
+  assert.notStrictEqual(M.decide([{ id: 'Q', ...other }]).status, 'auto', JSON.stringify(other));
+});
+// Cas réels de la prod (2026-10-07), notés via la vue gardée (adresse formatée), comme en renotation.
+const viaView = (s, name, address) => { const r = M.rescoreStored(s, [{ id: 'G', googleName: name, address }]); return { d: M.decide(r), p: r[0].view.parts }; };
+t('même porte + code postal approximatif dans Billing → auto (Sawadika, Metro Pizza sans code postal)', () => {
+  let x = viaView({ name: 'Sawadika Saint-Hubert', street: '6078, Ch. de Chambly', postal_code: 'J3Y 3R5', city: 'Saint-Hubert' }, 'Sawadika Saint-Hubert', '6078 Ch. de Chambly, Saint-Hubert, QC J3Y 3R6, Canada');
+  assert.strictEqual(x.d.status, 'auto', JSON.stringify(x.p)); assert.strictEqual(x.p.address, 'same');
+  x = viaView({ name: 'METRO PIZZA VERDUN', street: '5101 Rue Bannantyne', postal_code: null }, 'Metro Pizza Verdun', '5101 Av Bannantyne, Verdun, QC H4H 1E5, Canada');
+  assert.strictEqual(x.d.status, 'auto', JSON.stringify(x.p));
+});
+t('garde-fou : même porte mais code postal ET ville différents (CrepOne Gloucester / Gatineau) → pas auto', () => {
+  const x = viaView({ name: 'CrepOne', street: '668 Saint Joseph Boulevard', postal_code: 'K1C 7L1', city: 'Gloucester' }, 'CrepOne', '668 Bd Saint-Joseph, Gatineau, QC J8Y 4A8, Canada');
+  assert.notStrictEqual(x.d.status, 'auto', JSON.stringify(x.p));
+});
+t('local et numéro civique mêlés (« 40-9415 Boul. Leduc », « Unit 8 Blvd 425 ») → même numéro', () => {
+  let x = viaView({ name: 'Madame Poulet ‐ Châteauguay (NEW)', street: '136 - 72 boul. Saint-Jean-Baptiste', postal_code: 'J6K4Y7' }, 'Madame Poulet', '72 Bd Saint-Jean-Baptiste #136, Châteauguay, QC J6K 4Y7, Canada');
+  assert.strictEqual(x.p.civic, 'same'); assert.strictEqual(x.d.status, 'auto');
+  x = viaView({ name: 'Izakaya Kobachi', street: 'Unit 8 Blvd 425 St-Joseph', postal_code: 'J8Y 0A8' }, 'Izakaya Kobachi', '425 Bd Saint-Joseph #8, Gatineau, QC J8Y 3Z5, Canada');
+  assert.strictEqual(x.p.civic, 'same'); assert.strictEqual(x.d.status, 'auto');
+});
+t('mot distinctif commun (« Superbol », « boulle »/« bulle ») → auto ; mot de métier seul (« Lounge », « Golf ») → non', () => {
+  let x = viaView({ name: "Superbol Val D'Or", street: '1603 3e avenue', postal_code: 'J9P4N5' }, 'Superbol Abitibi', "1603 3e Avenue, Val-d'Or, QC J9P 4N5, Canada");
+  assert.strictEqual(x.p.token, 'superbol'); assert.strictEqual(x.d.status, 'auto');
+  x = viaView({ name: 'boulle et bol', street: '3460 rue peel', postal_code: 'H3A 2M1' }, 'Bulle & Bol', '3460 Rue Peel, Montréal, QC H3A 2M1, Canada');
+  assert.strictEqual(x.d.status, 'auto', JSON.stringify(x.p));
+  x = viaView({ name: 'Golf Le 19 - Marieville', street: '655 Rue Sainte-Marie', postal_code: 'J3M 1J4' }, 'Le19 Golf Lounge', '655 Rue Sainte-Marie, Marieville, QC J3M 1J4, Canada');
+  assert.notStrictEqual(x.d.status, 'auto', JSON.stringify(x.p));
+  x = viaView({ name: 'Bol express St-Leonard', street: '8770, Boul. Langelier', postal_code: 'H1P 3A3' }, 'Pro Gym', '8770 Boul Langelier, Montréal, QC H1P 3A3, Canada');
+  assert.notStrictEqual(x.d.status, 'auto', 'autre commerce à la même adresse');
+});
+t('« rue St.Vincent » = « Rue St Vincent » (St. avec point)', () => {
+  const x = viaView({ name: 'Restaurant Chez Mikael (NEW)', street: '67 rue St.Vincent', postal_code: 'J8C 2A5' }, 'Restaurant Mikael', '67 Rue St Vincent, Sainte-Agathe-des-Monts, QC J8C 2A1, Canada');
+  assert.strictEqual(x.p.address, 'same', JSON.stringify(x.p)); assert.strictEqual(x.d.status, 'auto');
+});
+t('renotation SANS Google à partir des candidats gardés (adresse formatée relue)', () => {
+  const s = { name: 'Pizza 2 Freres', street: '1185 Bd Curé-Labelle', postal_code: 'J7C 4K6' };
+  const r = M.rescoreStored(s, [{ id: 'P', googleName: 'Pizza Deux Frères — Blainville', address: '1185 Bd Curé-Labelle, Blainville, QC J7C 4K6, Canada', lat: 45.6, lng: -73.8 }]);
+  assert.strictEqual(r[0].id, 'P');
+  assert.strictEqual(M.decide(r).status, 'auto');
+  assert.strictEqual(r[0].view.lat, 45.6, 'la vue garde les coordonnées pour la fiche');
+});
+
 t('clé Google : GOOGLE_PLACES_API_KEY seulement, jamais de repli sur GOOGLE_MAPS_API_KEY', () => {
   assert.strictEqual(M.createGooglePlaces({ env: { GOOGLE_MAPS_API_KEY: 'vieille' } }).configured(), false);
   assert.strictEqual(M.createGooglePlaces({ env: { GOOGLE_PLACES_API_KEY: 'neuve' } }).configured(), true);

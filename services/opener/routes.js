@@ -497,7 +497,41 @@ function registerOpenerRoutes(app, deps) {
     return d.status;
   }
 
+  // Renotation GRATUITE (aucun appel Google) des « à confirmer » / « non trouvés » notés par une
+  // version antérieure, à partir des candidats déjà gardés. Ceux qui passent le seuil deviennent
+  // « auto » ; les autres prennent la nouvelle note et la version courante (pas de nouvelle
+  // recherche pour eux). Les « non trouvés » SANS candidat gardé restent pour la recherche.
+  async function rescoreStoredMatches() {
+    const { rows } = await pool.query(
+      `SELECT id, source, name, street, city, postal_code, match_candidates FROM cluster_locations
+        WHERE missing_since IS NULL AND match_status IN ('review','none') AND match_version < ${M.MATCH_VERSION}
+          AND match_candidates IS NOT NULL AND jsonb_array_length(match_candidates) > 0`);
+    const out = { rescored: 0, auto: 0 };
+    for (const loc of rows) {
+      const scored = M.rescoreStored(loc, loc.match_candidates);
+      const d = M.decide(scored);
+      if (d.status === 'auto') {
+        const best = scored[0].view;
+        const r = await pool.query(
+          `UPDATE cluster_locations SET match_status = 'auto', place_id = $2, match_score = $3, match_candidates = NULL,
+                  matched_by = 'auto', matched_at = CURRENT_TIMESTAMP, match_note = NULL, match_version = ${M.MATCH_VERSION}
+            WHERE id = $1 AND match_status IN ('review','none')`, [loc.id, d.placeId, d.score]);
+        if (r.rowCount) { out.auto++; await upsertPlace(best.id, best.lat, best.lng, loc.source); }
+      } else {
+        await pool.query(
+          `UPDATE cluster_locations SET match_status = $2, match_score = $3, match_candidates = $4::jsonb, match_version = ${M.MATCH_VERSION}
+            WHERE id = $1 AND match_status IN ('review','none')`,
+          [loc.id, d.status, d.score || null, JSON.stringify(scored.slice(0, 3).map((c) => c.view))]);
+      }
+      out.rescored++;
+    }
+    if (out.rescored) console.log('[OPENER] renotation sans Google :', JSON.stringify(out));
+    return out;
+  }
+
   async function runMatching({ budget = DEFAULT_MATCH_BUDGET } = {}) {
+    // D'abord la renotation gratuite : un changement de règle ne coûte pas une recherche par fiche.
+    await rescoreStoredMatches().catch((e) => console.error('[OPENER] renotation :', e.message));
     if (!google.configured()) return { skipped: 'GOOGLE_PLACES_API_KEY absente' };
     // Kaizen d'abord : un client Billing jumeau d'un Kaizen apparié recevra sa fiche sans recherche.
     const { rows } = await pool.query(

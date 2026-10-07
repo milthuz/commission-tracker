@@ -403,7 +403,7 @@ const addr = (address, zip, extra = {}) => ({ address, street2: '', city: 'Montr
 
     await t('« none » n\'est pas retenté avant 30 jours', async () => {
       const id = (await byKey())[U(4)].id;
-      await pool.query(`UPDATE cluster_locations SET match_status = 'none', match_version = 2, match_attempted_at = CURRENT_TIMESTAMP WHERE id = $1`, [id]);
+      await pool.query(`UPDATE cluster_locations SET match_status = 'none', match_version = ${require('../matching').MATCH_VERSION}, match_attempted_at = CURRENT_TIMESTAMP WHERE id = $1`, [id]);
       const before = googleCalls.length;
       await mod.runAll({ source: 'none1' });
       assert.ok(!googleCalls.slice(before).some((q) => q.includes('Bistro')));
@@ -424,6 +424,23 @@ const addr = (address, zip, extra = {}) => ({ address, street2: '', city: 'Montr
       const b2 = googleCalls.length;
       await mod.runAll({ source: 'v2-bis' });
       assert.ok(!googleCalls.slice(b2).some((q) => q.includes('Bistro')), 'une seule fois : pas de boucle');
+    });
+
+    await t('renotation sans Google : un « à confirmer » d\'une version antérieure qui passe la nouvelle règle devient « auto »', async () => {
+      const cand = [{ id: 'PL_PIZZA2F', googleName: 'Pizza Deux Frères — Blainville', address: '1185 Bd Curé-Labelle, Blainville, QC J7C 4K6, Canada', lat: 45.64, lng: -73.83, score: 0.72 }];
+      const id = (await pool.query(
+        `INSERT INTO cluster_locations (source, source_key, name, street, city, postal_code, active, match_status, match_score, match_candidates, match_version, match_attempted_at)
+         VALUES ('billing', 'b-pizza2f', 'Pizza 2 Freres', '1185 Bd Curé-Labelle', 'Blainville', 'J7C 4K6', true, 'review', 0.72, $1::jsonb, 2, CURRENT_TIMESTAMP) RETURNING id`,
+        [JSON.stringify(cand)])).rows[0].id;
+      const before = googleCalls.length;
+      await mod.runMatching({ budget: 5 });
+      assert.ok(!googleCalls.slice(before).some((q) => q.includes('Pizza 2')), 'aucune recherche Google pour lui');
+      const row = (await pool.query(`SELECT match_status, place_id, match_version FROM cluster_locations WHERE id = $1`, [id])).rows[0];
+      assert.deepStrictEqual([row.match_status, row.place_id], ['auto', 'PL_PIZZA2F']);
+      assert.strictEqual(row.match_version, require('../matching').MATCH_VERSION);
+      const pl = (await pool.query(`SELECT lat FROM opener_places WHERE place_id = 'PL_PIZZA2F'`)).rows[0];
+      assert.ok(pl && pl.lat, 'la fiche Google est gardée pour la carte');
+      await pool.query(`DELETE FROM cluster_locations WHERE id = $1`, [id]);   // hors du parc simulé
     });
 
     await t('magasin disparu de Kaizen → missing_since, revenu → effacé', async () => {
