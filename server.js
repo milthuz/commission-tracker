@@ -95,6 +95,10 @@ const PERMISSION_CATALOG = [
   { key: 'report:view_salary',         label: 'View base salary & total compensation',       category: 'Commission Report' },
   { key: 'report:annual_reconciliation', label: 'View the annual reconciliation report (paid vs calculated)', category: 'Commission Report' },
   { key: 'report:adjustments',         label: 'Manage commission adjustments & reconciliation suggestions', category: 'Commission Report' },
+  // Voir sur son tableau de bord une PROJECTION de sa prime semestrielle, avant qu'elle soit
+  // commitee. Cle a part : c'est un chiffre qui BOUGE encore, et montrer un montant qui peut
+  // baisser est une decision de gestion, pas un simple droit de lecture.
+  { key: 'report:bonus_forecast',      label: 'See a running projection of my next bi-annual processing bonus on my dashboard', category: 'Commission Report' },
   { key: 'report:quota_review',        label: 'Review quota-gated (forfeited) commissions',  category: 'Commission Report' },
   { key: 'reviews:manage',             label: 'Record, assign and approve Google review payouts', category: 'Commission Report' },
   { key: 'pass:manage',                label: 'Configure The Pass (merchant referral program)', category: 'The Pass' },
@@ -33548,6 +33552,99 @@ app.post('/api/commissions/pay-stub/email', authenticateToken, async (req, res) 
   }
 });
 
+// Le PROCHAIN versement semestriel : juin ou decembre. Si celui qui vient est deja commite on
+// vise le suivant — sinon on annoncerait une projection pour une periode deja payee, et le
+// representant verrait deux fois le meme argent.
+//
+// `estCommite(annee, mois)` est injecte pour que la regle soit testable sans base de donnees.
+async function prochainVersementPrime(maintenant, estCommite) {
+  let year = maintenant.getFullYear();
+  let month = maintenant.getMonth() + 1 <= 6 ? 6 : 12;
+  if (await estCommite(year, month)) {
+    if (month === 6) month = 12; else { month = 6; year += 1; }
+  }
+  return { year, month };
+}
+
+// GET /api/commissions/processing-bonus/projection?repName=
+//
+// « Ce que je devrais recevoir au prochain versement, en date d'aujourd'hui » — demande de
+// David le 2026-10-07, pour le tableau de bord des representants.
+//
+// 🔑 Honnetete du chiffre. La prime d'un compte vaut (moyenne mensuelle du profit sur sa
+// fenetre de 6 mois − 100 $), plafonnee a 400 $, et seulement a partir de 3 mois actifs. Tant
+// que la fenetre d'un compte n'est pas entierement couverte par les donnees de revenus, son
+// chiffre peut MONTER **ou DESCENDRE** — c'est une moyenne, pas un cumul. On separe donc
+// toujours deux montants :
+//   `settled` — les comptes dont la fenetre se termine avant la fin des donnees : definitif ;
+//   `total`   — la projection complete, dont la difference est encore mouvante.
+// Montrer un seul chiffre qui peut baisser serait demotivant le jour ou il baisse.
+//
+// On ne renvoie QUE ce que le releve officiel montre deja au representant apres le commit
+// (nom du marchand + montant). Surtout PAS la moyenne mensuelle : c'est le profit de Cluster
+// sur ce marchand, et le releve le retient deliberement.
+app.get('/api/commissions/processing-bonus/projection', authenticateToken, async (req, res) => {
+  const { email, isAdmin, name: jwtName } = req.user;
+  if (!isAdmin) {
+    const perms = await getUserPermissions(email);
+    if (!userHasPermission(perms, 'report:bonus_forecast')) {
+      return res.status(403).json({ error: 'Permission required: report:bonus_forecast' });
+    }
+  }
+  try {
+    const tokenResult = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
+    const myName = tokenResult.rows[0]?.display_name || jwtName || email;
+    // Meme resolution que le releve officiel : un non-admin ne voit JAMAIS que lui-meme.
+    const targetRep = await resolveTargetRep(req, req.query.repName, myName);
+
+    // Le prochain versement : juin ou decembre. Si celui qui vient est deja commite, on vise
+    // le suivant — sinon on annoncerait une projection pour une periode deja payee.
+    const dejaCommite = async (y, m) => (await pool.query(
+      `SELECT 1 FROM commission_bonuses WHERE bonus_type = 'processing' AND import_id IS NULL
+         AND paid_for_period = $1::date LIMIT 1`,
+      [`${y}-${String(m).padStart(2, '0')}-01`])).rows.length > 0;
+    const { year, month } = await prochainVersementPrime(new Date(), dejaCommite);
+
+    const result = await computeProcessingBonuses(year, month);
+    const mien = result?.byRep?.get(targetRep) || { accounts: [], total: 0 };
+
+    // Jusqu'ou vont les donnees de revenus. C'est CA qui dit si la fenetre d'un compte est
+    // close, et non le calendrier : un mois civil ecoule dont les revenus ne sont pas encore
+    // importes laisserait croire qu'un chiffre est definitif alors qu'il va bouger.
+    const dataThrough = (await pool.query(
+      `SELECT MAX(make_date(year, month, 1))::date AS m FROM zentact_merchant_revenue`)).rows[0]?.m || null;
+    const fin = dataThrough ? new Date(dataThrough) : null;
+    const clos = (windowEnd) => {
+      if (!fin || !windowEnd) return false;
+      const [a, mo] = String(windowEnd).split('-').map(Number);
+      return new Date(Date.UTC(a, mo - 1, 1)) <= new Date(Date.UTC(fin.getUTCFullYear(), fin.getUTCMonth(), 1));
+    };
+
+    const accounts = mien.accounts.map((a) => ({
+      merchantName: a.business_name,
+      amount: a.bonus,
+      windowEnd: a.windowEnd,
+      settled: clos(a.windowEnd),
+    })).sort((x, y2) => y2.amount - x.amount);
+    const settled = Math.round(accounts.filter((a) => a.settled).reduce((t, a) => t + a.amount, 0) * 100) / 100;
+    const total = Math.round(mien.total * 100) / 100;
+
+    res.json({
+      repName: targetRep,
+      period: `${year}-${String(month).padStart(2, '0')}`,
+      // ⚠️ Les clefs d'argent portent « amount » A DESSEIN : le brouillage du mode demo
+      // n'echelonne que les nombres dont la CLEF ressemble a de l'argent. Nommes `settled` et
+      // `pending`, ces deux montants seraient restes reels a cote d'un `total` divise — un
+      // acquis superieur au total, et une demo qui a l'air cassee.
+      total,
+      settledAmount: settled,
+      pendingAmount: Math.round((total - settled) * 100) / 100,
+      accounts,
+      openAccounts: accounts.filter((a) => !a.settled).length,
+      dataThrough: dataThrough ? new Date(dataThrough).toISOString().slice(0, 7) : null,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 // POST /api/commissions/processing-bonus-statement/email — email a branded copy of a rep's
 // bi-annual processing-bonus statement. Body: { repName, period, to, accounts[], total }.
 app.post('/api/commissions/processing-bonus-statement/email', authenticateToken, async (req, res) => {
