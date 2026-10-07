@@ -510,16 +510,37 @@ function registerOpenerCampaignRoutes(app, deps) {
     const days = Math.max(1, Math.min(5, parseInt(req.body?.days, 10) || 5));
     if (!openers.length) return res.status(400).json({ error: 'openers_required' });
     if (!DATE_RE.test(weekStart)) return res.status(400).json({ error: 'invalid_date' });
+    // Aperçu (`preview: true`) : les routes proposées à chacun et leurs dates, RIEN n'est publié —
+    // David veut voir les routes avant de planifier (2026-10-08). La confirmation renvoie ces
+    // choix (`assignments`) pour publier exactement ce qui a été montré, même si le manager a
+    // retiré une route de la proposition.
+    const preview = req.body?.preview === true;
+    const chosen = new Map((Array.isArray(req.body?.assignments) ? req.body.assignments : [])
+      .map((a) => [String(a?.openerEmail || '').trim().toLowerCase(), (Array.isArray(a?.ids) ? a.ids : []).map((x) => parseInt(x, 10)).filter((x) => x > 0)]));
     try {
       await syncStatuses();
       const todo = (await pool.query(`SELECT * FROM opener_campaign_routes WHERE status = 'todo' ORDER BY seq`)).rows;
       const taken = new Set();
       const out = [];
       for (const email of openers) {
-        const last = (await pool.query(
-          `SELECT cr.centroid_lat, cr.centroid_lng FROM opener_campaign_routes cr JOIN opener_routes r ON r.id = cr.route_id
-            WHERE LOWER(r.opener_email) = $1 ORDER BY r.route_date DESC LIMIT 1`, [email])).rows[0];
-        const week = pickWeek(todo, last ? [last.centroid_lat, last.centroid_lng] : null, days, taken);
+        let week;
+        if (chosen.has(email)) {
+          const byId = new Map(todo.map((r) => [r.id, r]));
+          week = chosen.get(email).map((id) => byId.get(id)).filter((r) => r && !taken.has(r.id)).slice(0, days);
+          week.forEach((r) => taken.add(r.id));
+        } else {
+          const last = (await pool.query(
+            `SELECT cr.centroid_lat, cr.centroid_lng FROM opener_campaign_routes cr JOIN opener_routes r ON r.id = cr.route_id
+              WHERE LOWER(r.opener_email) = $1 ORDER BY r.route_date DESC LIMIT 1`, [email])).rows[0];
+          week = pickWeek(todo, last ? [last.centroid_lat, last.centroid_lng] : null, days, taken);
+        }
+        if (preview) {
+          const dates = await freeDates(email, weekStart, week.length);
+          out.push({ openerEmail: email, openerName: (await field.userName(email)) || email,
+            days: week.map((w, i) => ({ date: dates[i], campaignRouteId: w.id, seq: w.seq, region: w.region,
+              name: `R${w.seq} · ${regionLabel(w.region)}${w.mode === 'car' ? ' (voiture)' : ''}`, stops: w.n, minutes: w.minutes, mode: w.mode })) });
+          continue;
+        }
         const r = await assignRoutes(week.map((w) => w.id), email, weekStart, actorOf(req));
         out.push({ openerEmail: email, openerName: (await field.userName(email)) || email, ...r });
       }

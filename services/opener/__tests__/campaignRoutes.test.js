@@ -181,10 +181,28 @@ const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
     });
 
     let week;
+    let proposal;
+    await t('aperçu de la semaine : les routes proposées à chacun, RIEN de publié, aucun courriel', async () => {
+      const r = await call('POST', '/api/opener/campaign/plan-week', { openers: ['a@x.com', 'b@x.com'], weekStart: '2026-10-12', days: 5, preview: true });
+      assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+      proposal = r.body.openers;
+      assert.strictEqual(proposal[0].days.length, 5);
+      assert.deepStrictEqual(proposal[0].days.map((d) => d.date), ['2026-10-12', '2026-10-13', '2026-10-14', '2026-10-15', '2026-10-16']);
+      assert.ok(proposal[0].days[0].name.startsWith('R') && proposal[0].days[0].stops > 0);
+      const n = (await pool.query(`SELECT COUNT(*)::int n FROM opener_routes`)).rows[0].n;
+      assert.strictEqual(n, 0, 'aucune route créée par un aperçu');
+      assert.strictEqual(mails.length, 0, 'aucun courriel pour un aperçu');
+      const planned = (await pool.query(`SELECT COUNT(*)::int n FROM opener_campaign_routes WHERE status <> 'todo'`)).rows[0].n;
+      assert.strictEqual(planned, 0);
+    });
+
     await t('planifier la semaine : 5 routes par opener, du lundi au vendredi, aucune en double, UN courriel chacun', async () => {
-      const r = await call('POST', '/api/opener/campaign/plan-week', { openers: ['a@x.com', 'b@x.com'], weekStart: '2026-10-12', days: 5 });
+      // Confirmation de l'aperçu : on publie EXACTEMENT ce qui a été montré.
+      const assignments = proposal.map((o) => ({ openerEmail: o.openerEmail, ids: o.days.map((d) => d.campaignRouteId) }));
+      const r = await call('POST', '/api/opener/campaign/plan-week', { openers: ['a@x.com', 'b@x.com'], weekStart: '2026-10-12', days: 5, assignments });
       assert.strictEqual(r.status, 200, JSON.stringify(r.body));
       week = r.body.openers;
+      assert.deepStrictEqual(week.map((o) => o.days.map((d) => d.campaignRouteId)), assignments.map((a) => a.ids), 'la confirmation publie l\'aperçu tel quel');
       assert.strictEqual(week.length, 2);
       const dates = week[0].days.map((d) => d.date);
       assert.deepStrictEqual(dates, ['2026-10-12', '2026-10-13', '2026-10-14', '2026-10-15', '2026-10-16']);
