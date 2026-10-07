@@ -38,6 +38,10 @@ const PLACE_RE = /^[A-Za-z0-9_-]{10,300}$/;
 const DEFAULT_MATCH_BUDGET = 300;     // recherches Text Search par passage ; ~0,03 $US l'une
 const DEFAULT_ADDRESS_BUDGET = 400;   // contacts Books lus par passage manuel (~5 min)
 const NIGHTLY_ADDRESS_BUDGET = 1500;  // la nuit, personne n'attend
+// Restaurants cherchés dans Google par passage de NUIT (décision de David, 2026-10-07 : 900, pour
+// finir le parc en 3-4 nuits ; même coût total). Un restaurant peut demander 2 recherches : si le
+// plafond quotidien Google est atteint, le passage s'arrête proprement (voir runMatching).
+const NIGHTLY_MATCH_BUDGET = 900;
 const ADDRESS_REFRESH_DAYS = 30;
 const RETRY_NONE_DAYS = 30;
 const LOCK_KEY = 'opener_locations_lock';
@@ -527,6 +531,9 @@ function registerOpenerRoutes(app, deps) {
         res.errors++;
         res.lastError = e.message;
         // Clé non activée, quota épuisé, réseau coupé : inutile de brûler le reste du lot.
+        // Clé non activée, plafond Google du jour atteint : inutile d'insister, le reste attend le
+        // passage suivant (rien n'est marqué pour ce restaurant, il reste « en attente »).
+        if (e.quota) { res.aborted = true; res.quota = true; break; }
         if (/n'est pas activée|absente/.test(e.message) || ++streak >= 5) { res.aborted = true; break; }
       }
       if (res.tried % 20 === 0) await touchLock();
@@ -803,7 +810,7 @@ function registerOpenerRoutes(app, deps) {
     runNightly: () => schema()
       .then(() => pool.query(
         `SELECT 1 FROM sync_state WHERE key = $1 AND updated_at > CURRENT_TIMESTAMP - INTERVAL '20 hours'`, [STATE_LAST_OK]))
-      .then((r) => (r.rows.length ? 'recent' : runAll({ source: 'scheduled', addressBudget: NIGHTLY_ADDRESS_BUDGET })))
+      .then((r) => (r.rows.length ? 'recent' : runAll({ source: 'scheduled', addressBudget: NIGHTLY_ADDRESS_BUDGET, budget: NIGHTLY_MATCH_BUDGET })))
       .then((out) => {
         if (out === 'recent') return;
         if (!out) return console.log('[OPENER] synchro des emplacements déjà en cours — passage ignoré');

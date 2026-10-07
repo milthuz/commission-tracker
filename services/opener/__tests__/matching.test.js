@@ -100,5 +100,13 @@ t('clé Google : GOOGLE_PLACES_API_KEY seulement, jamais de repli sur GOOGLE_MAP
   await M.createGooglePlaces({ http, env: { GOOGLE_PLACES_API_KEY: 'neuve', GOOGLE_MAPS_API_KEY: 'vieille' } }).searchText('x y z');
   assert.strictEqual(sent, 'neuve');
   n++; console.log('  ✓ la requête Text Search porte la clé dédiée');
+  // Plafond du jour : Google répond 429 / RESOURCE_EXHAUSTED → erreur marquée « quota ».
+  for (const resp of [{ status: 429, data: { error: { message: 'Quota exceeded', status: 'RESOURCE_EXHAUSTED' } } },
+                      { status: 403, data: { error: { message: 'x', status: 'RESOURCE_EXHAUSTED' } } }]) {
+    const http429 = { post: async () => { const e = new Error('rq'); e.response = resp; throw e; } };
+    const err = await M.createGooglePlaces({ http: http429, env: { GOOGLE_PLACES_API_KEY: 'k' } }).searchText('abc').catch((e) => e);
+    assert.strictEqual(err.quota, true, JSON.stringify(resp));
+  }
+  n++; console.log('  ✓ plafond Google (429 / RESOURCE_EXHAUSTED) → erreur « quota »');
   console.log(`matching : ${n} tests OK`);
 })().catch((e) => { console.error('ÉCHEC :', e); process.exit(1); });

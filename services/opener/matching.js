@@ -176,6 +176,12 @@ function createGooglePlaces({ http = axios, env = process.env } = {}) {
     if (st === 403 && /not been used|disabled|PERMISSION_DENIED/i.test(`${msg} ${d?.status || ''}`)) {
       return new Error('Google : « Places API (New) » n\'est pas activée sur la clé GOOGLE_PLACES_API_KEY');
     }
+    // Plafond (quota du jour, ou trop de requêtes) : erreur marquée, l'appelant s'arrête net.
+    if (st === 429 || /RESOURCE_EXHAUSTED/i.test(`${msg} ${d?.status || ''}`)) {
+      const q = new Error('Google : plafond de recherches du jour atteint — la suite au prochain passage');
+      q.quota = true;
+      return q;
+    }
     return new Error(`Google Places : ${st ? `HTTP ${st} — ` : ''}${String(msg).slice(0, 200)}`);
   }
 

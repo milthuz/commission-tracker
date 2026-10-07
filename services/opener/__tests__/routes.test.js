@@ -489,6 +489,29 @@ const addr = (address, zip, extra = {}) => ({ address, street2: '', city: 'Montr
       assert.strictEqual(kaizenCalls, before + 1);
     });
 
+    await t('plafond Google du jour atteint → arrêt net, les restaurants restent « en attente »', async () => {
+      const real = google.searchText;
+      let calls = 0;
+      google.searchText = async () => { calls++; const e = new Error('Google : plafond de recherches du jour atteint'); e.quota = true; throw e; };
+      await pool.query(`UPDATE cluster_locations SET match_status = 'pending' WHERE source = 'kaizen' AND match_status = 'auto'`);
+      const pendingBefore = (await pool.query(`SELECT COUNT(*)::int n FROM cluster_locations WHERE match_status = 'pending'`)).rows[0].n;
+      out = await mod.runAll({ source: 'quota-google' });
+      assert.strictEqual(calls, 1, 'aucune insistance après le premier refus');
+      assert.strictEqual(out.match.quota, true);
+      assert.strictEqual((await pool.query(`SELECT COUNT(*)::int n FROM cluster_locations WHERE match_status = 'pending'`)).rows[0].n, pendingBefore);
+      google.searchText = real;
+    });
+
+    await t('passage de nuit : jusqu\'à 900 restaurants cherchés (300 pour un clic)', async () => {
+      const big = Array.from({ length: 350 }, (_, i) => kStore(500 + i, `Nuit ${i}`, `${i} Rue Nuit`, 'H3A 1A1'));
+      parc = parc.concat(big);
+      await pool.query(`UPDATE sync_state SET updated_at = CURRENT_TIMESTAMP - INTERVAL '21 hours' WHERE key = 'opener_locations_last_ok'`);
+      const before = googleCalls.length;
+      await mod.runNightly();
+      const nightly = googleCalls.slice(before).filter((q) => q.startsWith('Nuit')).length;
+      assert.strictEqual(nightly, 350, "les 350 cherchés en UN passage de nuit (un clic s'arrêterait à 300)");
+    });
+
     await t('Google non activé → passage arrêté au premier échec', async () => {
       const real = google.searchText;
       let calls = 0;
