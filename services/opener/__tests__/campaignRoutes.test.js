@@ -28,6 +28,9 @@ const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
   // centre ; un cercle précis (le premier balayé) revient PLEIN (20) pour forcer le découpage.
   let nearbyCalls = 0;
   let quotaAt = Infinity;
+  let quotaFails = 0;          // refus de quota passagers (limite par minute)
+  const sleeps = [];
+  const seen = [];             // cercles demandés, dans l'ordre
   const fullOnce = new Set();
   const google = {
     configured: () => true,
@@ -35,6 +38,8 @@ const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
     details: async (pid) => ({ id: pid, displayName: { text: `Nom ${pid.slice(-4)}` }, formattedAddress: `${pid.slice(-3)} Rue Test, Montréal, QC` }),
     searchNearby: async (center, radius, types, { fields } = {}) => {
       nearbyCalls++;
+      seen.push(`${center[0].toFixed(5)},${center[1].toFixed(5)},${radius}`);
+      if (quotaFails > 0) { quotaFails--; const e = new Error('RESOURCE_EXHAUSTED'); e.quota = true; throw e; }
       if (nearbyCalls > quotaAt) { const e = new Error('plafond'); e.quota = true; throw e; }
       assert.ok(fields && !fields.includes('places.rating'), 'masque léger pour l\'inventaire');
       const key = `${center[0].toFixed(4)},${center[1].toFixed(4)}`;
@@ -62,7 +67,8 @@ const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
   const requirePerm = async (req, res, p) => { if (await hasPerm(req, p)) return true; res.status(403).json({ error: 'forbidden' }); return false; };
   const lot0 = registerOpenerRoutes(app, { authenticateToken, requirePerm, pool, logActivity: async () => {}, kaizen: { fetchAllStores: async () => [] }, google, kaizenConfigured: () => false });
   const field = registerOpenerFieldRoutes(app, { authenticateToken, requirePerm, hasPerm, pool, logActivity: async () => {}, google, late, baseSchema: lot0.ensureReady });
-  const camp = registerOpenerCampaignRoutes(app, { authenticateToken, requirePerm, pool, logActivity: async () => {}, field, google, late });
+  const camp = registerOpenerCampaignRoutes(app, { authenticateToken, requirePerm, pool, logActivity: async () => {}, field, google, late,
+    sleep: async (ms) => { sleeps.push(ms); }, paceMs: 0 });
   await field.schema();
 
   const server = http.createServer(app).listen(0);
@@ -99,12 +105,31 @@ const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
       assert.strictEqual(u.calls, 60);
     });
 
-    await t('inventaire : plafond Google du jour → arrêt net, cercles restants en file', async () => {
+    await t('inventaire : refus de quota passager (limite par minute) → pause d\'une minute, puis reprise du même cercle', async () => {
+      sleeps.length = 0;
+      seen.length = 0;
+      quotaFails = 2;
+      const out = await camp.runInventory({ budget: 4, source: 'quota-minute' });
+      assert.strictEqual(out.stopped, undefined, 'pas d\'arrêt sur un refus passager');
+      assert.strictEqual(out.quotaPauses, 2);
+      assert.strictEqual(out.calls, 4, 'le budget est quand même consommé');
+      assert.strictEqual(sleeps.filter((ms) => ms >= 60000).length, 2, 'une pause d\'au moins une minute par refus');
+      // Les deux refus et le premier succès portent sur le MÊME cercle : rien n'est sauté.
+      assert.strictEqual(seen.length, 6);
+      assert.ok(seen[0] === seen[1] && seen[1] === seen[2], `même cercle réessayé : ${seen.slice(0, 3).join(' | ')}`);
+      assert.strictEqual(out.cells, 4);
+    });
+
+    await t('inventaire : refus de quota persistant → arrêt après 3 pauses, cercles restants en file', async () => {
       quotaAt = nearbyCalls + 3;
+      sleeps.length = 0;
       const out = await camp.runInventory({ budget: 50, source: 'quota' });
-      assert.strictEqual(out.stopped, 'plafond Google du jour atteint');
+      assert.strictEqual(out.stopped, 'quota Google atteint');
       assert.strictEqual(out.calls, 3);
+      assert.strictEqual(out.quotaPauses, 3);
       quotaAt = Infinity;
+      const lock = (await pool.query(`SELECT value FROM sync_state WHERE key = 'opener_inventory_lock'`)).rows[0].value;
+      assert.strictEqual(lock, 'idle', 'verrou relâché');
     });
 
     // Un client actif sur un des restaurants inventoriés, et un établissement exclu.

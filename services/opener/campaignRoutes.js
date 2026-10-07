@@ -36,6 +36,13 @@ const REFRESH_DAYS = 30;          // coordonnées : 30 jours au plus (conditions
 const RECENT_VISIT_DAYS = 90;     // un restaurant visité depuis moins de 90 jours n'est pas re-proposé
 const LOCK_KEY = 'opener_inventory_lock';
 const LOCK_STALE_MIN = 5;
+// Rythme : Google refuse au-delà d'environ 600 recherches Nearby PAR MINUTE (quota par défaut).
+// Le premier passage en prod (2026-10-07) en a lancé 624 en 41 s et s'est arrêté net. On reste
+// sous 400/min ; un refus de quota attend une minute puis reprend le même cercle (3 fois au plus
+// d'affilée — au-delà, c'est un vrai plafond, quotidien ou de facturation).
+const PACE_MS = 150;
+const QUOTA_WAIT_MS = 65 * 1000;
+const QUOTA_RETRIES = 3;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -82,6 +89,8 @@ const regionLabel = (key, lang = 'fr') => (T.REGIONS.find((r) => r.key === key) 
 function registerOpenerCampaignRoutes(app, deps) {
   const { authenticateToken, requirePerm, pool, logActivity, field } = deps;
   const google = deps.google || field.google;
+  const sleep = deps.sleep || ((ms) => new Promise((res) => setTimeout(res, ms)));
+  const paceMs = deps.paceMs ?? PACE_MS;
   const late = () => (deps.late ? deps.late() : {});
   const actorOf = (req) => req.user?.realAdminEmail || req.user?.email || 'unknown';
   const log = (id, event, desc, actor, extra) =>
@@ -185,8 +194,9 @@ function registerOpenerCampaignRoutes(app, deps) {
       const left = (await field.scanBudget(0)).left;
       const maxCalls = Math.max(0, Math.min(budget, left));
       if (!maxCalls) { out.stopped = 'budget mensuel Google épuisé'; return out; }
-      let streak = 0;
-      while (out.calls < maxCalls) {
+      let streak = 0, quotaStreak = 0, lastCall = 0;
+      out.quotaPauses = 0;
+      while (out.calls < maxCalls && !out.stopped) {
         const cells = (await pool.query(
           `SELECT * FROM opener_inventory_cells WHERE status = 'pending'
             ORDER BY CASE region WHEN 'montreal' THEN 0 WHEN 'laval' THEN 1 WHEN 'rive-sud' THEN 2 ELSE 3 END, depth DESC, id
@@ -196,10 +206,20 @@ function registerOpenerCampaignRoutes(app, deps) {
           if (out.calls >= maxCalls) break;
           let places;
           try {
+            const wait = lastCall + paceMs - Date.now();
+            if (wait > 0) await sleep(wait);
+            lastCall = Date.now();
             places = await google.searchNearby([c.lat, c.lng], c.radius, SCAN_TYPES, { fields: INVENTORY_FIELDS });
-            out.calls++; unbilled++; streak = 0;
+            out.calls++; unbilled++; streak = 0; quotaStreak = 0;
           } catch (e) {
-            if (e.quota) { out.stopped = 'plafond Google du jour atteint'; break; }
+            if (e.quota) {
+              if (++quotaStreak > QUOTA_RETRIES) { out.stopped = 'quota Google atteint'; break; }
+              out.quotaPauses++;
+              await touchLock();
+              await sleep(QUOTA_WAIT_MS);
+              await touchLock();
+              break; // relit la file : le même cercle (toujours en attente) repasse en premier
+            }
             out.lastError = e.message;
             if (++streak >= 5) { out.stopped = `erreurs Google : ${e.message}`; break; }
             continue;
