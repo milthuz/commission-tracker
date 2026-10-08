@@ -126,6 +126,7 @@ const PERMISSION_CATALOG = [
   { key: 'admin:data_health',          label: 'View the "Needs attention" data-health page', category: 'Admin Panel' },
   { key: 'reports:investigate',        label: 'Re-run the automatic diagnosis on a rep report', category: 'Admin Panel' },
   { key: 'admin:notifications',        label: 'Configure notification recipients & email templates', category: 'Admin Panel' },
+  { key: 'users:role_requests',        label: 'See and handle role requests from new users who have no role yet', category: 'Admin Panel' },
   { key: 'admin:demo_mode',            label: 'Toggle demo mode on user accounts',            category: 'Admin Panel' },
   { key: 'admin:audit_dashboard',      label: 'View who is connected + connection-time stats', category: 'Admin Panel' },
   { key: 'admin:audit_logs',           label: 'View the full action log across the app',      category: 'Admin Panel' },
@@ -4722,7 +4723,7 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // sampleEmail(), dans TEMPLATE_TYPES de EmailPreview.tsx, et dans les libellés i18n.
 // Les quatre `pass_*` sont les courriels du programme La Passe ; ils sont les seuls de la
 // liste à partir d'une adresse et d'une enveloppe qui ne sont pas celles de Sales Hub.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder', 'lead_review', 'lead_assigned', 'lead_welcome', 'lead_booking_client', 'lead_booking_cancelled', 'lead_booking_rep', 'partner_lead_assigned', 'hr_sign_request', 'hr_countersign', 'hr_completed', 'hr_declined', 'opener_route_published', 'opener_week_published'];
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder', 'lead_review', 'lead_assigned', 'lead_welcome', 'lead_booking_client', 'lead_booking_cancelled', 'lead_booking_rep', 'partner_lead_assigned', 'hr_sign_request', 'hr_countersign', 'hr_completed', 'hr_declined', 'opener_route_published', 'opener_week_published', 'role_request'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -4928,6 +4929,8 @@ function sampleEmail(type, lang) {
           `<strong>Amy Spicer</strong> — fin de probation le <strong>2026-07-18</strong> (dans 15 jours). Après cette date, le quota mensuel s'applique.<br><br>Amy Spicer's new-hire probation ends on 2026-07-18 (in 15 days). The monthly quota gate applies after that.`, null, null) };
     case 'new_user':
       return newUserEmail('Marie Dubois', 'marie@example.com', 'Zoho');
+    case 'role_request':
+      return roleRequestEmail('Marie Dubois', 'marie@example.com', 'Bonjour, je suis la nouvelle opener de l’équipe de Laval.');
     case 'new_partner_opportunity':
       return newPartnerOpportunityEmail('Resto Untel', 'Moneris', 'tony.soprano@example.com');
     case 'partner_invoice_uploaded':
@@ -10851,6 +10854,7 @@ THE APP'S SECTIONS (left sidebar):
   PLANNING: in "Plan routes", pick the start date ("Tomorrow", "Next Monday" or any date) and 1 to 5 days, tick the openers: a PREVIEW shows each opener's neighbouring routes (near where they last worked, one per business day, weekends and already-booked days skipped) on the map and in a list; a route can be opened or removed; nothing is published until "Publish these N routes", then each opener gets one email listing their days. A single route can also be given to one opener on a date, or taken back before it starts. "Not a restaurant — exclude" (designer card, campaign route, or the field app where it also skips the stop) removes a place for good; the excluded list (link in the mapping card) lets a manager restore one. The "Planner" tab still allows drawing a zone and building a route by hand; the "Tracking" tab shows each route's progress and verifies every visit from the phone's GPS AT check-in: on site (≤ 150 m, accuracy ≤ 100 m), at a distance (a line joins the restaurant to where the check-in was made), imprecise, or no location — with arrival time, departure time and visit duration. Location is recorded only at arrival and departure of a check-in, never tracked in between; the opener is told so.
   FIELD APP (/opener): signs in with Zoho ("Sign in with Zoho"), full screen on the phone, light or dark. Map and list of the day's route, restaurant card (Google rating, hours, phone + Cluster data + visit history), check-in opened AT THE DOOR (arrival time and position, visit timer) and finished on the way out: current POS (Lightspeed, Square, Toast, Clover, Maitre'D, Veloce, Auphan, Cluster, None, or Other with the name typed — required), service type, terminals, online delivery, decision maker, interest 1–5, services, notes. At a Cluster CUSTOMER the check-in switches to "Visiting a Cluster customer": satisfaction 1–5 (required; ≤ 2 is flagged and the opener is asked to note why), who processes their payments (Cluster / someone else / don't know), interest in Cluster payments, "Create an opportunity (payments)"; the last satisfaction shows on the place card and history. Lead creation is prefilled from Google and the check-in; the lead goes into Sales Hub Leads with source "Opener" and waits for human review like every lead — the reviewer picks the rep, and only then is it created in Zoho (Zoho Lead_Source uses the "Lead_Source — opener" setting in Admin → Leads, falling back to the phone value while empty). Also: "My leads", mark a stop not visited with a reason, postpone unvisited stops to tomorrow, end-of-day summary, finish the day; works offline and sends when back online. A manager with no route that day can tap "Try a demo route" to load a real campaign route where NOTHING is saved (check-ins, leads, skips and end of day are simulated, with a purple "Demo" banner) — to see the app before assigning routes.
   CLUSTER LOCATIONS (/admin/opener): every Cluster customer restaurant linked to its Google listing, with its SOFTWARE VERSION — V2 = a store in Kaizen (the Kaizen API only knows V2); V1 = a Zoho Billing subscriber of Cluster Canada or Xperio POS with no matching Kaizen store (a Billing customer at the same restaurant as a Kaizen store is V2). The address comes from the Zoho Books contact (shipping first). Matching to Google is automatic when certain; doubtful cases are confirmed by hand and never overwritten; the version can be forced by hand. A nightly sync, plus "Sync now" with a progress bar.
+- New users with NO ROLE: instead of an empty Sales Hub they see a "Welcome — your account has no role yet" screen and can send a role request with an optional message (their position, what they need). The request emails the "new user without a role" recipients (Admin → Notifications; all admins if that list is empty) and shows at the top of Admin → Users; it closes by itself once a role is assigned, or can be dismissed. Permission users:role_requests.
 - Leads (Pistes, /leads): the intake layer in front of Zoho CRM. Leads come from the Cluster website forms (Contact Us, Get in Touch / Prenez contact, Kaizen Early Access — every submission becomes a lead, existing customers included; the form's New/Existing answer is in the lead's message), from phone intake by staff, and from openers in the field (source "Opener"). Every lead waits in a REVIEW QUEUE: a human reviews it before anything goes to Zoho (a red counter next to "Pistes" in the menu shows how many are waiting, for reviewers only; reviewers can also get an email for each new lead, set in Admin → Notifications). Ordered rules suggest a rep (source, province, language, business type, postal prefix), with a round-robin fallback. Reps RECEIVE leads, they never pick from a common pool: a rep only sees the leads assigned to them and the ones they entered. On acceptance: the lead is created in Zoho CRM, a Call is scheduled in the rep's name about an hour later, the rep gets an email, and the customer gets a welcome email FROM THE REP'S ADDRESS in their language saying the rep will call within the hour. If that is not a good time, the customer can pick another slot from the rep's availability on a Cluster page (the Google Calendar event with Google Meet is created only then, the Zoho Call moves and the rep is told not to call before). Reps must keep their email signature (Profile → Email signature) and their Google Calendar up to date, and must not move the event by hand in Google Calendar. Permissions: leads:view_own, leads:view_all, leads:review, leads:intake, leads:manage_rules.
 - Merchant Processor Credits (Crédits processeur marchand), menu under Resources: compensation credits that cover the early-termination penalty a merchant pays their previous payment processor to switch to Cluster. Who does what:
   • Rep / Customer Success (permission credits:send; credits:view_all to see everyone's files, otherwise only their own): clicks "Nouveau crédit / New credit", picks the merchant from the ZENTACT merchant list (the only allowed source; closed, rejected or revoked merchants are excluded), SETS THE CREDIT AMOUNT (Cluster's offer: the customer can never change it), enters the signer's email (the only required contact field; legal name comes from Zentact, contact person and phone are optional because the customer completes them), picks FR or EN, saves the draft, can attach proof documents, then "Envoyer au client pour signature / Send to merchant for signature". The customer gets an email from the rep's address with a personal link valid 14 days; status goes Sent → Viewed. "Renvoyer le lien / Resend link" sends a new link for the same document. After sending, the amount cannot be changed: cancel the file and create a new one.
@@ -28627,6 +28631,128 @@ async function notifyNewUserWithoutRole(email, displayName, source) {
     console.log(`📣 [NEWUSER] notified ${recipients.length} recipient(s) about ${email} (no role)`);
   } catch (e) { console.warn('[NEWUSER] notify failed:', e.message); }
 }
+
+// ============================================================================
+// Demandes de rôle (2026-10-08, demande de David : « quand un nouvel usager sans rôle se branche,
+// il faudrait l'aviser qu'il n'a pas de rôle et qu'il devra faire la demande »).
+// L'usager SANS rôle (et non admin) voit un écran « pas encore de rôle » au lieu d'un menu vide et
+// envoie une demande avec un message. Elle part aux destinataires « nouvel usager sans rôle »
+// (Admin → Notifications) — à défaut aux administrateurs, pour qu'une demande n'aille jamais
+// nulle part — et s'affiche dans Admin → Usagers. Elle se ferme d'elle-même dès qu'un rôle est
+// attribué (vérifié à chaque lecture de la liste). Permission : users:role_requests.
+// ============================================================================
+let roleRequestsReady = null;
+const ensureRoleRequests = () => (roleRequestsReady = roleRequestsReady || pool.query(
+  `CREATE TABLE IF NOT EXISTS role_requests (
+     id           SERIAL PRIMARY KEY,
+     email        VARCHAR(255) NOT NULL,
+     display_name VARCHAR(255),
+     message      TEXT,
+     status       VARCHAR(12) NOT NULL DEFAULT 'pending',
+     created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     notified_at  TIMESTAMP,
+     handled_at   TIMESTAMP,
+     handled_by   VARCHAR(255)
+   )`).catch((e) => { roleRequestsReady = null; throw e; }));
+
+function roleRequestEmail(displayName, email, message) {
+  const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
+  const who = esc(displayName || email);
+  const msg = message ? `<br><br><em>« ${esc(message).replace(/\n/g, '<br>')} »</em>` : '';
+  return {
+    subject: `Demande de rôle — ${displayName || email}`,
+    html: mailShell('Demande de rôle / Role request',
+      `<strong>${who}</strong> (${esc(email)}) n'a pas encore de rôle dans Sales Hub et demande un accès.${msg}<br><br>${who} has no role in Sales Hub yet and is asking for access.`,
+      'Assigner un rôle / Assign a role', `${base}/admin/users`),
+  };
+}
+async function roleRequestRecipients() {
+  const list = await getNewUserRecipients();
+  if (list.length) return list;
+  const r = await pool.query(`SELECT LOWER(email) AS email FROM user_tokens WHERE is_admin = true AND email IS NOT NULL`).catch(() => ({ rows: [] }));
+  return r.rows.map((x) => x.email);
+}
+async function userHasAnyRole(email) {
+  const r = await pool.query(
+    `SELECT EXISTS (SELECT 1 FROM user_roles WHERE LOWER(user_email) = LOWER($1))
+         OR COALESCE((SELECT is_admin FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1), false) AS ok`, [email]);
+  return r.rows[0]?.ok === true;
+}
+// Ferme les demandes des usagers qui ont reçu un rôle depuis.
+async function closeGrantedRoleRequests() {
+  await pool.query(
+    `UPDATE role_requests rr SET status = 'done', handled_at = CURRENT_TIMESTAMP, handled_by = COALESCE(handled_by, 'rôle attribué')
+      WHERE rr.status = 'pending' AND EXISTS (SELECT 1 FROM user_roles ur WHERE LOWER(ur.user_email) = LOWER(rr.email))`);
+}
+const roleRequestView = (r) => r && ({ id: r.id, email: r.email, name: r.display_name, message: r.message, status: r.status, createdAt: r.created_at });
+
+app.get('/api/me/role-request', authenticateToken, async (req, res) => {
+  const email = req.user?.email;
+  if (!email) return res.json({ hasRole: true, request: null });
+  try {
+    await ensureRoleRequests();
+    const hasRole = await userHasAnyRole(email);
+    if (hasRole) await closeGrantedRoleRequests();
+    const r = (await pool.query(`SELECT * FROM role_requests WHERE LOWER(email) = LOWER($1) AND status = 'pending' ORDER BY id DESC LIMIT 1`, [email])).rows[0];
+    res.json({ hasRole, request: roleRequestView(r) || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/me/role-request', authenticateToken, async (req, res) => {
+  const email = req.user?.email;
+  if (!email) return res.status(400).json({ error: 'no_identity' });
+  const message = String(req.body?.message || '').trim().slice(0, 1000) || null;
+  try {
+    await ensureRoleRequests();
+    if (await userHasAnyRole(email)) return res.status(409).json({ error: 'has_role' });
+    const name = (await pool.query(`SELECT display_name FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1`, [email])).rows[0]?.display_name
+      || req.user?.name || null;
+    let r = (await pool.query(`SELECT * FROM role_requests WHERE LOWER(email) = LOWER($1) AND status = 'pending' ORDER BY id DESC LIMIT 1`, [email])).rows[0];
+    if (r) {
+      r = (await pool.query(`UPDATE role_requests SET message = COALESCE($2, message) WHERE id = $1 RETURNING *`, [r.id, message])).rows[0];
+    } else {
+      r = (await pool.query(`INSERT INTO role_requests (email, display_name, message) VALUES (LOWER($1), $2, $3) RETURNING *`, [email, name, message])).rows[0];
+    }
+    // Un courriel au plus toutes les 24 h par usager : redemander ne bombarde pas les admins.
+    let notified = false;
+    if (!r.notified_at || Date.now() - new Date(r.notified_at).getTime() > 24 * 3600 * 1000) {
+      const to = await roleRequestRecipients();
+      if (to.length) {
+        const { subject, html } = roleRequestEmail(name, email, message || r.message);
+        await sendMail(to.join(','), subject, html);
+        await pool.query(`UPDATE role_requests SET notified_at = CURRENT_TIMESTAMP WHERE id = $1`, [r.id]);
+        notified = true;
+      }
+    }
+    logActivity('role_request', String(r.id), 'requested', `Demande de rôle de ${name || email}`, email);
+    res.json({ request: roleRequestView(r), notified });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/admin/role-requests', authenticateToken, async (req, res) => {
+  if (!(await requirePermAny(req, res, ['users:role_requests', 'admin:users']))) return;
+  try {
+    await ensureRoleRequests();
+    await closeGrantedRoleRequests();
+    const { rows } = await pool.query(`SELECT * FROM role_requests WHERE status = 'pending' ORDER BY created_at`);
+    res.json({ requests: rows.map(roleRequestView) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/role-requests/:id/dismiss', authenticateToken, async (req, res) => {
+  if (!(await requirePermAny(req, res, ['users:role_requests', 'admin:users']))) return;
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  try {
+    await ensureRoleRequests();
+    const r = await pool.query(
+      `UPDATE role_requests SET status = 'dismissed', handled_at = CURRENT_TIMESTAMP, handled_by = $2
+        WHERE id = $1 AND status = 'pending' RETURNING id, email`, [parseInt(req.params.id, 10) || 0, actor]);
+    if (!r.rowCount) return res.status(404).json({ error: 'not_found' });
+    logActivity('role_request', String(r.rows[0].id), 'dismissed', `Demande de rôle de ${r.rows[0].email} classée`, actor);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // app_settings key 'partner_opportunity_recipients' — who gets notified when a partner submits
 // a new opportunity through the Partner Portal. Empty = nobody. Gated on partners:manage (not
