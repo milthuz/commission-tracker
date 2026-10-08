@@ -14997,20 +14997,32 @@ function startAutoSync() {
   setTimeout(passeAvis, 3 * 60 * 1000);        // premier passage 3 min apres le demarrage
   setInterval(passeAvis, 6 * 60 * 60 * 1000);
 
-  // Magasins Cluster (Kaizen) + appariement Google — quotidien. Premier passage 4 min apres le
-  // demarrage. Sans identifiants Kaizen ni cle Google : une ligne de journal, rien d'autre.
-  setTimeout(() => {
-    openerModule.runNightly();
-    setInterval(() => openerModule.runNightly(), 24 * 60 * 60 * 1000);
-  }, 4 * 60 * 1000);
-
-  // Campagne Opener — inventaire du territoire (1 200 cercles Google par nuit) puis découpage en
-  // routes. 7 min après le démarrage (après les emplacements), puis toutes les 24 h ; sauté si le
-  // dernier inventaire date de moins de 20 h (le worker redémarre à chaque déploiement).
-  setTimeout(() => {
-    openerCampaign.runNightly();
-    setInterval(() => openerCampaign.runNightly(), 24 * 60 * 60 * 1000);
-  }, 7 * 60 * 1000);
+  // Opener — passes de NUIT : emplacements Cluster (Kaizen + Billing + appariement Google), puis
+  // campagne (inventaire Google + découpage en routes). Vérifié TOUTES LES HEURES : lancé entre 1 h
+  // et 6 h (heure de Montréal), ou à n'importe quelle heure si la dernière passe a plus de 30 h
+  // (nuit manquée). Chaque module garde sa propre garde de 20 h, donc une seule passe par jour.
+  // ⚠️ Avant le 2026-10-08 : un passage 4 min après le démarrage puis toutes les 24 h. Le worker
+  // redémarre à chaque déploiement ; un déploiement en fin d'après-midi faisait sauter le passage
+  // (moins de 20 h) et renvoyait le suivant au lendemain même heure — aucune passe la nuit du 7 au
+  // 8 octobre, 2 687 emplacements en attente.
+  let openerNightBusy = false;
+  const openerNightTick = async () => {
+    if (openerNightBusy) return;
+    openerNightBusy = true;
+    try {
+      const hour = Number(new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Toronto', hour: '2-digit', hourCycle: 'h23' }).format(new Date()));
+      const stale = (await pool.query(
+        `SELECT
+           COALESCE((SELECT updated_at < CURRENT_TIMESTAMP - INTERVAL '30 hours' FROM sync_state WHERE key = 'opener_locations_last_ok'), true) AS loc,
+           COALESCE((SELECT updated_at < CURRENT_TIMESTAMP - INTERVAL '30 hours' FROM sync_state WHERE key = 'opener_inventory_last_run'), true) AS inv`)).rows[0];
+      const night = hour >= 1 && hour < 6;
+      if (night || stale.loc) await openerModule.runNightly();
+      if (night || stale.inv) await openerCampaign.runNightly();
+    } catch (e) { console.error('[OPENER] passe de nuit :', e.message); }
+    finally { openerNightBusy = false; }
+  };
+  setTimeout(openerNightTick, 4 * 60 * 1000);
+  setInterval(openerNightTick, 60 * 60 * 1000);
 
   // Recalc-v2 — runs on its own 6h cadence, offset 30 min from sync to avoid
   // overlapping with the heavy sync window. Skips if already running (guard
