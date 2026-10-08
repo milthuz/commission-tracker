@@ -11774,6 +11774,27 @@ app.get('/api/auth/crm-callback', async (req, res) => {
     if (!adminEmail) {
       return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/admin/sync?crm=state_invalide`);
     }
+    // Desk : QUI a vraiment signé chez Zoho ? (2026-10-08) Le flux « connecter avec le compte de
+    // service » range l'autorisation sous l'adresse demandée (`as`), mais c'est la session Zoho du
+    // navigateur qui signe. David, resté connecté à Zoho, a signé en tant que lui-même : son jeton
+    // a été rangé et épinglé sous saleshub@, avec SON profil (qui ne peut pas créer de contacts) —
+    // et rien ne le disait. On demande donc à Desk l'identité du jeton et on REFUSE s'il ne
+    // correspond pas au compte attendu. Lecture ratée → on ne bloque pas (journal seulement).
+    if (genre === 'desk-oauth') {
+      try {
+        const org = (await pool.query(`SELECT value FROM sync_state WHERE key = 'desk_org_id'`)).rows[0]?.value;
+        const me = await axios.get('https://desk.zoho.com/api/v1/myinfo', {
+          headers: { Authorization: `Zoho-oauthtoken ${access_token}`, ...(org ? { orgId: org } : {}) },
+          validateStatus: () => true, timeout: 15000,
+        });
+        const signe = String(me.data?.emailId || '').toLowerCase();
+        if (me.status === 200 && signe && signe !== String(adminEmail).toLowerCase()) {
+          console.warn(`[desk-oauth] autorisation signée par ${signe}, attendue pour ${adminEmail} — refusée`);
+          return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}${back}?desk=mauvais_compte&signe=${encodeURIComponent(signe)}&attendu=${encodeURIComponent(adminEmail)}`);
+        }
+      } catch (e) { console.warn('[desk-oauth] identité non vérifiée :', e.message); }
+    }
+
     const colonnes = genre === 'desk-oauth'
       ? { a: 'desk_access_token', r: 'desk_refresh_token', e: 'desk_expires_at' }
       : { a: 'crm_access_token',  r: 'crm_refresh_token',  e: 'crm_expires_at' };
