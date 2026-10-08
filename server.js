@@ -39265,8 +39265,33 @@ app.post('/api/leads/:id/to-ticket', authenticateToken, async (req, res) => {
       `Source : ${lead.source}${lead.source_detail ? ` (${lead.source_detail})` : ''}`,
     ].filter(Boolean).join('\n');
 
+    // Le CONTACT d'abord, en étapes séparées (2026-10-08). L-00014 échouait en 403 alors que
+    // L-00015 passait, dans le même département : le contact de L-00015 existait déjà dans Desk,
+    // celui de L-00014 non — Desk devait le créer au passage, et c'est cette création qui était
+    // refusée, sous le même 403 vague. On cherche donc le contact par courriel, on le crée s'il
+    // manque (refus → message qui nomme l'étape), puis le billet porte son contactId.
+    let contactId = null;
+    if (lead.contact_email) {
+      try {
+        const found = await deskGet('/contacts/search', { email: lead.contact_email, limit: 1 });
+        contactId = found?.data?.[0]?.id || null;
+      } catch (e) { console.warn('[leads→desk] recherche du contact :', e.message); }
+      if (!contactId) {
+        const c = await deskPost('/contacts', Object.fromEntries(Object.entries(contact).filter(([, v]) => v)));
+        if (c.status >= 200 && c.status < 300 && c.data?.id) contactId = c.data.id;
+        else {
+          const brut = JSON.stringify(c.data || {}).slice(0, 400);
+          const motif = deskRefusalKind(c.status, brut) === 'desk_forbidden' ? 'desk_contact_forbidden' : deskRefusalKind(c.status, brut);
+          logActivity('lead', String(id), 'desk_ticket_failed',
+            `${lead.ref_code} — Desk refuse de CRÉER LE CONTACT (HTTP ${c.status}) : ${brut}`, actor);
+          return res.status(502).json({ error: motif, step: 'contact', departmentId: String(departmentId), detail: brut });
+        }
+      }
+    }
+
     const r = await deskPost('/tickets', {
-      subject, departmentId, contact, description,
+      subject, departmentId, description,
+      ...(contactId ? { contactId } : { contact }),
       email: lead.contact_email || undefined, phone: lead.contact_phone || undefined,
       channel: lead.source === 'phone' ? 'Phone' : 'Web',
     });
