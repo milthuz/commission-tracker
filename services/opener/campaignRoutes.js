@@ -87,6 +87,9 @@ const SCHEMA = [
 const r6 = (v) => Math.round(v * 1e6) / 1e6;
 const addDays = (ymd, n) => { const d = new Date(`${ymd}T12:00:00Z`); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
 const isWeekday = (ymd) => { const w = new Date(`${ymd}T12:00:00Z`).getUTCDay(); return w !== 0 && w !== 6; };
+// Jour ouvrable = ni fin de semaine ni jour férié du Québec (holidays.js, 2026-10-09).
+const { isHoliday } = require('./holidays');
+const isWorkday = (ymd) => isWeekday(ymd) && !isHoliday(ymd);
 const fmtDay = (ymd, lang) => new Date(`${ymd}T12:00:00Z`).toLocaleDateString(lang === 'en' ? 'en-CA' : 'fr-CA', { timeZone: 'UTC', weekday: 'long', day: 'numeric', month: 'long' });
 const regionLabel = (key, lang = 'fr') => (T.REGIONS.find((r) => r.key === key) || {})[lang] || key;
 
@@ -359,7 +362,7 @@ function registerOpenerCampaignRoutes(app, deps) {
       [openerEmail.toLowerCase(), startDate])).rows.map((r) => r.d));
     const out = [];
     for (let d = startDate, guard = 0; out.length < count && guard < 400; d = addDays(d, 1), guard++) {
-      if (isWeekday(d) && !taken.has(d)) out.push(d);
+      if (isWorkday(d) && !taken.has(d)) out.push(d);
     }
     return out;
   }

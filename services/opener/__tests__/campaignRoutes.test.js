@@ -191,11 +191,11 @@ const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
     let week;
     let proposal;
     await t('aperçu de la semaine : les routes proposées à chacun, RIEN de publié, aucun courriel', async () => {
-      const r = await call('POST', '/api/opener/campaign/plan-week', { openers: ['a@x.com', 'b@x.com'], weekStart: '2026-10-12', days: 5, preview: true });
+      const r = await call('POST', '/api/opener/campaign/plan-week', { openers: ['a@x.com', 'b@x.com'], weekStart: '2026-11-02', days: 5, preview: true });
       assert.strictEqual(r.status, 200, JSON.stringify(r.body));
       proposal = r.body.openers;
       assert.strictEqual(proposal[0].days.length, 5);
-      assert.deepStrictEqual(proposal[0].days.map((d) => d.date), ['2026-10-12', '2026-10-13', '2026-10-14', '2026-10-15', '2026-10-16']);
+      assert.deepStrictEqual(proposal[0].days.map((d) => d.date), ['2026-11-02', '2026-11-03', '2026-11-04', '2026-11-05', '2026-11-06']);
       assert.ok(proposal[0].days[0].name.startsWith('R') && proposal[0].days[0].stops > 0);
       const n = (await pool.query(`SELECT COUNT(*)::int n FROM opener_routes`)).rows[0].n;
       assert.strictEqual(n, 0, 'aucune route créée par un aperçu');
@@ -203,20 +203,20 @@ const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
       const planned = (await pool.query(`SELECT COUNT(*)::int n FROM opener_campaign_routes WHERE status <> 'todo'`)).rows[0].n;
       assert.strictEqual(planned, 0);
       // Opener jamais connecté (aucun nom en base) : nom tiré de l'adresse, jamais l'adresse entière.
-      const anon = await call('POST', '/api/opener/campaign/plan-week', { openers: ['jean-luc.tremblay@x.com'], weekStart: '2026-10-12', days: 1, preview: true });
+      const anon = await call('POST', '/api/opener/campaign/plan-week', { openers: ['jean-luc.tremblay@x.com'], weekStart: '2026-11-02', days: 1, preview: true });
       assert.strictEqual(anon.body.openers[0].openerName, 'Jean Luc Tremblay');
     });
 
     await t('planifier la semaine : 5 routes par opener, du lundi au vendredi, aucune en double, UN courriel chacun', async () => {
       // Confirmation de l'aperçu : on publie EXACTEMENT ce qui a été montré.
       const assignments = proposal.map((o) => ({ openerEmail: o.openerEmail, ids: o.days.map((d) => d.campaignRouteId) }));
-      const r = await call('POST', '/api/opener/campaign/plan-week', { openers: ['a@x.com', 'b@x.com'], weekStart: '2026-10-12', days: 5, assignments });
+      const r = await call('POST', '/api/opener/campaign/plan-week', { openers: ['a@x.com', 'b@x.com'], weekStart: '2026-11-02', days: 5, assignments });
       assert.strictEqual(r.status, 200, JSON.stringify(r.body));
       week = r.body.openers;
       assert.deepStrictEqual(week.map((o) => o.days.map((d) => d.campaignRouteId)), assignments.map((a) => a.ids), 'la confirmation publie l\'aperçu tel quel');
       assert.strictEqual(week.length, 2);
       const dates = week[0].days.map((d) => d.date);
-      assert.deepStrictEqual(dates, ['2026-10-12', '2026-10-13', '2026-10-14', '2026-10-15', '2026-10-16']);
+      assert.deepStrictEqual(dates, ['2026-11-02', '2026-11-03', '2026-11-04', '2026-11-05', '2026-11-06']);
       const allIds = week.flatMap((o) => o.days.map((d) => d.campaignRouteId));
       assert.strictEqual(allIds.length, Math.min(10, campaign.routes.length));
       assert.strictEqual(new Set(allIds).size, allIds.length);
@@ -229,7 +229,7 @@ const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
     });
 
     await t('l\'opener voit sa route du lundi dans l\'application', async () => {
-      const r = await call('GET', '/api/opener/today?date=2026-10-12', undefined, 'a@x.com');
+      const r = await call('GET', '/api/opener/today?date=2026-11-02', undefined, 'a@x.com');
       assert.ok(r.body.route && r.body.route.stops.length > 0);
     });
 
@@ -240,9 +240,12 @@ const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
       // Un samedi, 2 jours : lundi et mardi.
       r = await call('POST', '/api/opener/campaign/plan-week', { openers: ['b@x.com'], weekStart: '2026-10-24', days: 2, preview: true });
       assert.deepStrictEqual(r.body.openers[0].days.map((d) => d.date), ['2026-10-26', '2026-10-27']);
-      // Un jour déjà pris par une route publiée est sauté (b@x.com a sa semaine du 12 au 16).
-      r = await call('POST', '/api/opener/campaign/plan-week', { openers: ['b@x.com'], weekStart: '2026-10-15', days: 2, preview: true });
-      assert.deepStrictEqual(r.body.openers[0].days.map((d) => d.date), ['2026-10-19', '2026-10-20']);
+      // Un jour déjà pris par une route publiée est sauté (b@x.com a sa semaine du 2 au 6 novembre).
+      r = await call('POST', '/api/opener/campaign/plan-week', { openers: ['b@x.com'], weekStart: '2026-11-05', days: 2, preview: true });
+      assert.deepStrictEqual(r.body.openers[0].days.map((d) => d.date), ['2026-11-09', '2026-11-10']);
+      // Jour férié : lundi 12 octobre 2026 = Action de grâce → mardi et mercredi.
+      r = await call('POST', '/api/opener/campaign/plan-week', { openers: ['jean-luc.tremblay@x.com'], weekStart: '2026-10-12', days: 2, preview: true });
+      assert.deepStrictEqual(r.body.openers[0].days.map((d) => d.date), ['2026-10-13', '2026-10-14'], 'Action de grâce sautée');
     });
 
     await t('la semaine suivante repart du secteur de l\'opener (voisinage)', async () => {
