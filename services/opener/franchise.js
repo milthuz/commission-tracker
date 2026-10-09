@@ -33,6 +33,10 @@ const KNOWN_LABELS = [
   'Chez Victor', 'Prêt à Manger', 'Mandy\'s', 'Lola Rosa', 'Café Myriade', 'Crémy', 'Marble Slab', 'Cinnabon',
   'Cultures', 'Sushi Taxi', 'Sushi À La Maison', 'Gyu-Kaku', 'Kinton Ramen', 'Pho Bang New York', 'Poulet Rouge',
   'Mon Ami Poké', 'Poke Box', 'Nouilles de Lan Zhou', 'Shawarma Djouné', 'Beavertails', 'Queues de Castor',
+  // Ajoutées après le premier vrai passage (2026-10-09) : succursales au nom différent ou trop peu nombreuses ici.
+  'Kojax', 'Kojax Souvlaki', 'Rockaberry', 'Baskin Robbins', 'Couche-Tard', 'Mito Sushi', 'Onigiri Shop', 'Poke Monster', 'Bento Sushi',
+  'Sushi Sama', 'Aki Sushi', "L'Œufrier", 'Columbus Café', 'Dagwoods', 'Mr. Puffs', 'Uniburger', 'Au Pain Doré', 'Double Pizza', 'Pizza Salvatoré',
+  'Juliette & Chocolat', 'Cacao 70', 'DAVIDsTEA', 'Tim Hortons Express', 'Pizzeria Bros', 'Spicebros', "Osmow's", 'Lafleur Restaurants',
 ];
 const KNOWN = new Set(KNOWN_LABELS.map(normName).filter((k) => k.length >= 2));
 // Libellé lisible d'une chaîne connue (le premier de la liste) : « Sushi Shop », pas « Sushi Shop Kirkland ».
@@ -44,7 +48,8 @@ const PREFIXES = [...KNOWN].filter((k) => k.length >= 6).sort((a, b) => b.length
 const ALIASES = { pfk: 'kfc', toujoursmikes: 'mikes', coradejeunersetdiners: 'cora', chezcora: 'cora',
   rotisseriesthubert: 'sthubert', awcanada: 'aw', quesadaburritostacos: 'quesada', chipotlemexicangrill: 'chipotle',
   popeyeslouisianakitchen: 'popeyes', dixieleechicken: 'dixielee', rotisseriescores: 'scores', restaurantslafleur: 'lafleur',
-  cagebrasseriesportive: 'cage', queuesdecastor: 'beavertails', dominos: 'dominospizza' };
+  cagebrasseriesportive: 'cage', queuesdecastor: 'beavertails', dominos: 'dominospizza',
+  kojaxsouflaki: 'kojax', kojaxsouvlaki: 'kojax', timhortonsexpress: 'timhortons', lafleurrestaurants: 'lafleur' };
 // Noms GÉNÉRIQUES (premier passage réel, 2026-10-09 : 13 « Pizzéria », 4 « Boulangerie »,
 // 7 « Le Café » sans lien entre eux) : jamais une bannière.
 const GENERIC = new Set(['restaurant', 'restaurants', 'resto', 'cafe', 'pizzeria', 'pizza', 'boulangerie', 'patisserie',
@@ -164,7 +169,7 @@ async function refreshCounts(pool, keys) {
 // Les règles de reconnaissance ont changé (CANON_VERSION) : les clés déjà en base sont
 // recalculées depuis la clé elle-même, sans relire Google. Les décisions du gestionnaire suivent
 // la bannière quand elle est fusionnée dans une autre qui n'en a pas.
-const CANON_VERSION = 3;
+const CANON_VERSION = 4;
 async function recanonicalize(pool) {
   const st = (await pool.query(`SELECT value FROM sync_state WHERE key = 'opener_brand_canon'`)).rows[0]?.value;
   if (Number(st) >= CANON_VERSION) return null;
