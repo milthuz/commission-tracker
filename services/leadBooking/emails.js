@@ -218,7 +218,7 @@ function welcomeEmail(mailChrome, { lang, firstName, businessName, rep, at, call
 // annoncé : c'est le visiteur qui choisit son moment sur /rdv. Même carte du conseiller, mêmes
 // 3 étapes et même signature que le courriel de bienvenue — un prospect qui reçoit les deux ne
 // doit pas croire écrire à deux entreprises.
-function eventThanksEmail(mailChrome, { lang, firstName, businessName, eventName, rep, bookingUrl, home, signatureHtml }) {
+function eventThanksEmail(mailChrome, { lang, firstName, businessName, eventName, rep, bookingUrl, photoUrl = null, photoCaption = null, home, signatureHtml }) {
   const fr = lang !== 'en';
   const T = (a, b) => (fr ? a : b);
   const repName = rep?.name || null;
@@ -237,6 +237,14 @@ function eventThanksEmail(mailChrome, { lang, firstName, businessName, eventName
     `Pour poursuivre la conversation, ${repName ? esc(repName) : 'votre conseillère'} sera votre personne-ressource. Choisissez le moment qui vous convient pour une première rencontre : la disponibilité est à jour.`,
     `To keep the conversation going, ${repName ? esc(repName) : 'your advisor'} will be your point of contact. Pick a time that suits you for a first meeting — the calendar is live.`);
 
+  // La photo du kiosque : une vraie personne, au salon où le visiteur l'a rencontrée. Largeur fixe
+  // en attribut (Outlook ignore max-width) et 100 % en style pour les écrans de téléphone.
+  const photo = photoUrl ? `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:4px 0 18px"><tr><td>
+      <img src="${esc(photoUrl)}" width="528" alt="${esc(photoCaption || (repName ? T(`${repName} à notre kiosque`, `${repName} at our booth`) : 'Cluster'))}"
+        style="display:block;width:100%;max-width:528px;height:auto;border:0;border-radius:12px">
+      ${photoCaption ? `<p style="margin:8px 0 0;font-size:12.5px;color:#64748b;line-height:1.5">${esc(photoCaption)}</p>` : ''}
+    </td></tr></table>` : '';
   const cta = bookingUrl ? button(first ? T(`Planifier une rencontre avec ${first}`, `Book a meeting with ${first}`) : T('Planifier une rencontre', 'Book a meeting'), bookingUrl) : '';
   const note = `<p style="margin:10px 0 20px;font-size:12.5px;color:#94a3b8;line-height:1.6">${T(
     `Vous préférez discuter tout de suite ? Répondez simplement à ce courriel, ${who} vous reviendra rapidement.`,
@@ -248,6 +256,7 @@ function eventThanksEmail(mailChrome, { lang, firstName, businessName, eventName
     <p style="margin:0 0 6px;color:#c2410c;font-size:11px;font-weight:700;letter-spacing:.6px;text-transform:uppercase">${T('Merci de votre visite', 'Thanks for visiting')}</p>
     <h1 style="margin:0 0 10px;color:#0f1722;font-size:22px;font-weight:700;line-height:1.3">${title}</h1>
     <p style="${P}">${intro}</p>
+    ${photo}
     <p style="${P}">${next}</p>
     ${repCardHtml(rep, T, initials)}${cta}${note}${nextStepsHtml(who, businessName, T)}${signOff}`;
   return {

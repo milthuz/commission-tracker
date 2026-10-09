@@ -1109,6 +1109,9 @@ async function initializeDatabase() {
     // configured yet, so nothing is appended.
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS signature_role TEXT`);
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS signature_role2 TEXT`);
+    // Titre en ANGLAIS (2026-10-09) : le titre ci-dessus est saisi dans une seule langue, et un courriel
+    // anglais au marchand affichait « Représentante aux ventes ». Vide = on retombe sur signature_role.
+    await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS signature_role_en TEXT`);
     await pool.query(`ALTER TABLE salespeople ADD COLUMN IF NOT EXISTS signature_phone TEXT`);
     // Textos des nouvelles pistes (Profil → Alertes SMS, permission leads:sms_alerts). Le
     // cellulaire est DISTINCT du téléphone de signature : celui-là s'imprime dans les courriels
@@ -17029,7 +17032,7 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
     const stats = statsResult.rows[0] || {};
 
     const spResult = await pool.query(
-      'SELECT name, is_active, commission_rate, signature_role, signature_role2, signature_phone FROM salespeople WHERE name = $1',
+      'SELECT name, is_active, commission_rate, signature_role, signature_role2, signature_role_en, signature_phone FROM salespeople WHERE name = $1',
       [repName]
     );
     const sp = spResult.rows[0];
@@ -17058,6 +17061,7 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
         commissionRate: parseFloat(sp.commission_rate) || 10,
         signatureRole:  sp.signature_role || null,
         signatureRole2: sp.signature_role2 || null,
+        signatureRoleEn: sp.signature_role_en || null,
         signaturePhone: sp.signature_phone || null,
       } : null,
       stats: {
@@ -17108,13 +17112,17 @@ app.put('/api/user/signature', authenticateToken, async (req, res) => {
   const role = (req.body.signatureRole || '').trim() || null;
   const role2 = (req.body.signatureRole2 || '').trim() || null;
   const phone = (req.body.signaturePhone || '').trim() || null;
+  // Absent du corps (ancien écran encore ouvert) = on n'y touche pas, plutôt que de l'effacer.
+  const hasRoleEn = Object.prototype.hasOwnProperty.call(req.body || {}, 'signatureRoleEn');
+  const roleEn = (req.body.signatureRoleEn || '').trim() || null;
   try {
     const tokenResult = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
     const repName = tokenResult.rows[0]?.display_name || req.user.name || email;
     const r = await pool.query(
-      `UPDATE salespeople SET signature_role = $1, signature_role2 = $2, signature_phone = $3, updated_at = CURRENT_TIMESTAMP
+      `UPDATE salespeople SET signature_role = $1, signature_role2 = $2, signature_phone = $3,
+              signature_role_en = CASE WHEN $5 THEN $6 ELSE signature_role_en END, updated_at = CURRENT_TIMESTAMP
        WHERE name = $4 RETURNING name`,
-      [role, role2, phone, repName]
+      [role, role2, phone, repName, hasRoleEn, roleEn]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'No linked salesperson record — contact an admin to set one up first.' });
     res.json({ success: true });
@@ -37801,10 +37809,12 @@ async function crmRepDirectory(force = false) {
 
 // Nom → { name, email, crmUserId }. Le courriel suit la meme chaine que partout ailleurs dans
 // l'application : le compte de connexion Zoho d'abord, la fiche salesperson ensuite.
-async function leadRepContact(repName) {
+// `lang` : la langue du courriel au MARCHAND. En anglais, le titre anglais du profil remplace le
+// titre saisi (souvent en français) — sur la carte du conseiller ET dans la signature.
+async function leadRepContact(repName, { lang = null } = {}) {
   if (!repName) return null;
   const row = (await pool.query(
-    `SELECT s.name, s.signature_role, s.signature_role2, s.signature_phone,
+    `SELECT s.name, s.signature_role, s.signature_role2, s.signature_role_en, s.signature_phone,
             COALESCE((SELECT email FROM user_tokens WHERE LOWER(display_name) = LOWER(s.name) LIMIT 1), s.email) AS email
        FROM salespeople s WHERE LOWER(s.name) = LOWER($1) LIMIT 1`,
     [repName]
@@ -37815,12 +37825,13 @@ async function leadRepContact(repName) {
   const hit = dir.find((u) => String(u.name || '').trim().toLowerCase() === name.trim().toLowerCase())
     || (email ? dir.find((u) => String(u.email || '').trim().toLowerCase() === email.toLowerCase()) : null);
   const finalEmail = email || hit?.email || null;
+  const role = (lang === 'en' && row?.signature_role_en) ? row.signature_role_en : (row?.signature_role || null);
   // Signature de profil (Profil → Signature courriel) : titre et téléphone pour le courriel de
   // bienvenue au marchand. Vide tant que le représentant ne l'a pas configurée.
   return {
     name, email: finalEmail, crmUserId: hit?.id || null,
-    signatureRole: row?.signature_role || null, signaturePhone: row?.signature_phone || null,
-    signatureHtml: buildSignatureHtml({ name, role: row?.signature_role, role2: row?.signature_role2, phone: row?.signature_phone, email: finalEmail }),
+    signatureRole: role, signaturePhone: row?.signature_phone || null,
+    signatureHtml: buildSignatureHtml({ name, role, role2: row?.signature_role2, phone: row?.signature_phone, email: finalEmail }),
   };
 }
 
@@ -38561,7 +38572,7 @@ async function acceptLead(leadId, actor, opts = {}) {
   const settings = { ...(await leadSettings()), ...(opts.settingsOverride || {}) };
   const repName = String(opts.repName || '').trim() || lead.assigned_rep_name || lead.suggested_rep_name;
   if (!repName) return { error: 'no_rep' };
-  const rep = await leadRepContact(repName);
+  const rep = await leadRepContact(repName, { lang: lead.language === 'en' ? 'en' : 'fr' });
 
   const steps = {};
   const contactMethod = lead.source === 'website' ? settings.contactMethodWebsite

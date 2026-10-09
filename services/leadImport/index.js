@@ -25,6 +25,11 @@ const multer = require('multer');
 const { parseLeadWorkbook, leadNotes } = require('./parse');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+const crypto = require('crypto');
+const PHOTO_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+// L'adresse PUBLIQUE de l'API : l'image du courriel est chargée par le client de courriel du
+// visiteur, directement chez nous.
+const apiBase = () => process.env.BACKEND_URL || process.env.PUBLIC_API_URL || 'https://commission-tracker-production-b7f9.up.railway.app';
 const MAX_ROWS = 300;
 const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
@@ -53,6 +58,12 @@ function registerLeadImportRoutes(app, deps) {
             emailed_at  TIMESTAMP
           )`);
         await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS import_batch_id INTEGER`);
+        // La photo du kiosque (2026-10-09) : gardée DANS la base comme les Ressources (aucun stockage
+        // objet), servie publiquement sous un jeton aléatoire — un client de courriel ne s'authentifie pas.
+        await pool.query(`ALTER TABLE lead_import_batches ADD COLUMN IF NOT EXISTS photo BYTEA`);
+        await pool.query(`ALTER TABLE lead_import_batches ADD COLUMN IF NOT EXISTS photo_type VARCHAR(40)`);
+        await pool.query(`ALTER TABLE lead_import_batches ADD COLUMN IF NOT EXISTS photo_token VARCHAR(64)`);
+        await pool.query(`ALTER TABLE lead_import_batches ADD COLUMN IF NOT EXISTS photo_caption VARCHAR(200)`);
         await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS external_ref VARCHAR(160)`);
         await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_external_ref ON leads(external_ref) WHERE external_ref IS NOT NULL`);
       })().catch((e) => { schemaReady = null; throw e; });
@@ -65,8 +76,12 @@ function registerLeadImportRoutes(app, deps) {
 
   // Le lot + l'état de chacune de ses pistes déjà créées.
   async function loadBatch(id) {
-    const b = (await pool.query(`SELECT * FROM lead_import_batches WHERE id = $1`, [id])).rows[0];
+    const b = (await pool.query(
+      `SELECT id, file_name, event_name, language, zoho_source, default_rep, status, rows, summary, created_by,
+              created_at, accepted_at, emailed_at, photo_token, photo_caption FROM lead_import_batches WHERE id = $1`, [id])).rows[0];
     if (!b) return null;
+    b.photoUrl = b.photo_token ? `${apiBase()}/api/public/lead-import-photo/${b.photo_token}` : null;
+    delete b.photo_token;
     const leads = (await pool.query(
       `SELECT id, ref_code, external_ref, status, assigned_rep_name, crm_lead_id, crm_lead_error,
               merchant_notified_at, contact_email, automation
@@ -263,17 +278,73 @@ function registerLeadImportRoutes(app, deps) {
     }
   });
 
+  // ── La photo du kiosque ──────────────────────────────────────────────────
+  // L'écran la réduit AVANT l'envoi (une photo de téléphone fait 4 Mo ; un courriel doit rester
+  // léger). Nouvelle photo = nouveau jeton : un courriel déjà parti garde l'image qu'il montrait
+  // seulement tant qu'on ne la remplace pas — d'où l'avertissement de l'écran après l'envoi.
+  app.post('/api/leads/import/batches/:id/photo', authenticateToken, upload.single('photo'), async (req, res) => {
+    if (!(await requirePerm(req, res, 'leads:import'))) return;
+    try {
+      await ensureSchema();
+      const id = Number(req.params.id);
+      const caption = String(req.body?.caption || '').trim().slice(0, 200) || null;
+      if (!req.file?.buffer) {
+        // Seulement la légende.
+        const r = await pool.query(`UPDATE lead_import_batches SET photo_caption = $2 WHERE id = $1`, [id, caption]);
+        if (!r.rowCount) return res.status(404).json({ error: 'not_found' });
+        return res.json({ batch: await loadBatch(id) });
+      }
+      if (!PHOTO_TYPES.includes(req.file.mimetype)) return res.status(400).json({ error: 'bad_photo_type' });
+      const token = crypto.randomBytes(24).toString('base64url');
+      const r = await pool.query(
+        `UPDATE lead_import_batches SET photo = $2, photo_type = $3, photo_token = $4, photo_caption = $5 WHERE id = $1`,
+        [id, req.file.buffer, req.file.mimetype, token, caption]);
+      if (!r.rowCount) return res.status(404).json({ error: 'not_found' });
+      logActivity('lead_import', id, 'photo_set', `Photo du kiosque ajoutée (${Math.round(req.file.size / 1024)} Ko)`, actorOf(req));
+      res.json({ batch: await loadBatch(id) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.delete('/api/leads/import/batches/:id/photo', authenticateToken, async (req, res) => {
+    if (!(await requirePerm(req, res, 'leads:import'))) return;
+    try {
+      await ensureSchema();
+      const id = Number(req.params.id);
+      await pool.query(`UPDATE lead_import_batches SET photo = NULL, photo_type = NULL, photo_token = NULL, photo_caption = NULL WHERE id = $1`, [id]);
+      res.json({ batch: await loadBatch(id) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // PUBLIQUE, sans authentification : c'est le client de courriel du visiteur qui la charge.
+  // Le jeton aléatoire (24 octets) est la seule clé ; il ne dit rien du lot.
+  app.get('/api/public/lead-import-photo/:token', async (req, res) => {
+    try {
+      await ensureSchema();
+      const token = String(req.params.token || '').replace(/\.[a-z]+$/i, '');
+      if (!/^[A-Za-z0-9_-]{20,64}$/.test(token)) return res.status(404).end();
+      const r = (await pool.query(`SELECT photo, photo_type FROM lead_import_batches WHERE photo_token = $1`, [token])).rows[0];
+      if (!r?.photo) return res.status(404).end();
+      res.set('Content-Type', r.photo_type || 'image/jpeg');
+      res.set('Cache-Control', 'public, max-age=31536000, immutable');
+      res.set('Cross-Origin-Resource-Policy', 'cross-origin');
+      res.send(Buffer.from(r.photo));   // Buffer explicite : un Uint8Array partirait en JSON
+    } catch { res.status(500).end(); }
+  });
+
   // ── 3. Le courriel de remerciement ────────────────────────────────────────
   async function renderFor(batch, lead, bookingUrl) {
-    const rep = await h().leadRepContact(lead.assigned_rep_name || batch.default_rep);
+    const lang = lead.language === 'fr' ? 'fr' : 'en';
+    const rep = await h().leadRepContact(lead.assigned_rep_name || batch.default_rep, { lang });
     const settings = await h().leadSettings();
     const mail = h().eventThanksEmail({
-      lang: lead.language === 'fr' ? 'fr' : 'en',
+      lang,
       firstName: lead.contact_first_name || null,
       businessName: lead.business_name,
       eventName: batch.event_name,
       rep: rep ? { name: rep.name, email: rep.email, role: rep.signatureRole || null, phone: rep.signaturePhone || null } : null,
       bookingUrl,
+      photoUrl: batch.photo_token ? `${apiBase()}/api/public/lead-import-photo/${batch.photo_token}` : null,
+      photoCaption: batch.photo_caption || null,
       home: settings.merchantSiteUrl,
       signatureHtml: rep?.signatureHtml || '',
     });
