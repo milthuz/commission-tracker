@@ -219,6 +219,7 @@ const PERMISSION_CATALOG = [
   // Lots 1 à 4. Le manager prépare et publie les routes (et dépense des recherches Google en
   // balayant des zones) ; l'opener fait SA route sur son téléphone : check-ins, pistes, journée.
   { key: 'opener:routes',              label: 'Design opener routes: scan a zone for restaurants (Google), build, order and publish a route to an opener', category: 'Opener' },
+  { key: 'opener:reports',             label: 'Opener daily report: choose recipients, send time and openers; preview and send now', category: 'Opener' },
   { key: 'opener:field',               label: 'Opener in the field: see my route of the day, restaurant cards, check-ins, create leads, day summary', category: 'Opener' },
 
   // Sofia (in-app assistant) — CRM tools. Split read/write on purpose: the write key is the
@@ -3996,6 +3997,13 @@ const openerCampaign = require('./services/opener/campaignRoutes').registerOpene
   late: () => ({ sendMail: (...a) => sendMail(...a), mailShell: (...a) => mailShell(...a) }),
 });
 
+// Rapport quotidien des openers (services/opener/report.js) : réglages et aperçu dans
+// Opener → Campagne et routes → Rapports ; envoi par le worker (startAutoSync).
+const openerReport = require('./services/opener/report').registerOpenerReport(app, {
+  authenticateToken, requirePerm, pool, logActivity, field: openerField,
+  late: () => ({ sendMail: (...a) => sendMail(...a), mailShell: (...a) => mailShell(...a) }),
+});
+
 // Pistes du site Webflow : webhook NATIF (form_submission), signé, connecté depuis Admin → Pistes.
 require('./services/webflowLeads').registerWebflowLeadRoutes(app, {
   authenticateToken, requirePerm, pool, logActivity,
@@ -4723,7 +4731,7 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // sampleEmail(), dans TEMPLATE_TYPES de EmailPreview.tsx, et dans les libellés i18n.
 // Les quatre `pass_*` sont les courriels du programme La Passe ; ils sont les seuls de la
 // liste à partir d'une adresse et d'une enveloppe qui ne sont pas celles de Sales Hub.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder', 'lead_review', 'lead_assigned', 'lead_welcome', 'lead_booking_client', 'lead_booking_cancelled', 'lead_booking_rep', 'partner_lead_assigned', 'hr_sign_request', 'hr_countersign', 'hr_completed', 'hr_declined', 'opener_route_published', 'opener_week_published', 'role_request'];
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder', 'lead_review', 'lead_assigned', 'lead_welcome', 'lead_booking_client', 'lead_booking_cancelled', 'lead_booking_rep', 'partner_lead_assigned', 'hr_sign_request', 'hr_countersign', 'hr_completed', 'hr_declined', 'opener_route_published', 'opener_week_published', 'role_request', 'opener_daily_report'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -4732,6 +4740,19 @@ function sampleEmail(type, lang) {
   // un aperçu qui recopierait le gabarit à côté finirait par montrer autre chose que ce
   // qui part réellement, ce qui est exactement le contraire du but d'un outil d'aperçu.
   // RH : les vrais constructeurs de services/hr/emails.js, avec un candidat fictif.
+  if (type === 'opener_daily_report') {
+    const at = (h, m) => new Date(Date.UTC(2026, 9, 13, h + 4, m)).toISOString();
+    return require('./services/opener/report').dailyReportEmail(mailShell, '2026-10-13', [{
+      name: 'Hao Nguyen', route: { name: 'R13 · Île de Montréal' },
+      visits: [
+        { startedAt: at(10, 5), at: at(10, 20), durationMin: 15, name: 'Pizzeria Bella', isClient: true, verdict: 'onsite', currentPos: 'Cluster', interest: 3, satisfaction: 2, paymentsBy: 'other', notes: 'Lent le vendredi soir' },
+        { startedAt: at(14, 10), at: at(14, 22), durationMin: 12, name: 'Café Olimpico', verdict: 'far', distanceM: 850, currentPos: 'Square', interest: 4, decisionMaker: 'yes', leadRef: 'L-00042' },
+      ],
+      notVisited: [{ name: 'Chez Lucie', skipReason: 'closed' }],
+      leads: [{ ref_code: 'L-00042' }],
+      totals: { stops: 3, done: 2, visits: 2, leads: 1, onsite: 1, far: 1, firstAt: at(10, 5), lastAt: at(14, 22), visitMinutes: 27 },
+    }], `${base}/opener-routes`);
+  }
   if (type === 'opener_week_published') {
     const days = [['lundi 12 octobre', 'Monday, October 12', 'R12 · Île de Montréal', 18, 290, 'walk'],
       ['mardi 13 octobre', 'Tuesday, October 13', 'R13 · Île de Montréal', 21, 295, 'walk'],
@@ -10853,6 +10874,7 @@ THE APP'S SECTIONS (left sidebar):
   CAMPAIGN (default tab of /opener-routes): Montreal island, Laval, the North Shore and the South Shore are mapped automatically from Google (about 1,200 searches each night; a progress bar per region; "Continue mapping now") and already split into one-day routes of about 5 hours (on foot in dense areas, by car in the suburbs). Map: one numbered dot per route, coloured by status (grey to do, blue planned, green done, or the opener's colour in a week proposal); hovering a dot shows its summary and outline, clicking it shows its restaurants as small numbered dots in visiting order (green customer, blue-grey former customer, orange prospect, grey never visited) with a card on hover; a legend explains the colours with counts. Active Cluster CUSTOMERS are INCLUDED on purpose: the opener checks they are happy and offers Cluster payments. Left out: places visited in the last 90 days, "turned away" refusals (90 days), excluded places, and stops still planned on a published route. NOT VISITED stops of a finished route (closed on arrival, out of time, day not finished, or the route date passed) go back into a new route at the next recalculation (nightly, or "Recompute routes"). The screen estimates the finish date for a number of openers (5 h × 5 days) and how many openers are needed to finish in N weeks.
   PLANNING: in "Plan routes", pick the start date ("Tomorrow", "Next Monday" or any date) and 1 to 5 days, tick the openers: a PREVIEW shows each opener's neighbouring routes (near where they last worked, one per business day, weekends and already-booked days skipped) on the map and in a list; a route can be opened or removed; nothing is published until "Publish these N routes", then each opener gets one email listing their days. A single route can also be given to one opener on a date, or taken back before it starts. "Not a restaurant — exclude" (designer card, campaign route, or the field app where it also skips the stop) removes a place for good; the excluded list (link in the mapping card) lets a manager restore one. The "Planner" tab still allows drawing a zone and building a route by hand; the "Tracking" tab shows each route's progress and verifies every visit from the phone's GPS AT check-in: on site (≤ 150 m, accuracy ≤ 100 m), at a distance (a line joins the restaurant to where the check-in was made), imprecise, or no location — with arrival time, departure time and visit duration. Location is recorded only at arrival and departure of a check-in, never tracked in between; the opener is told so.
   FIELD APP (/opener): signs in with Zoho ("Sign in with Zoho"), full screen on the phone, light or dark. Map and list of the day's route, restaurant card (Google rating, hours, phone + Cluster data + visit history), check-in opened AT THE DOOR (arrival time and position, visit timer) and finished on the way out: current POS (Lightspeed, Square, Toast, Clover, Maitre'D, Veloce, Auphan, Cluster, None, or Other with the name typed — required), service type, terminals, online delivery, decision maker, interest 1–5, services, notes. At a Cluster CUSTOMER the check-in switches to "Visiting a Cluster customer": satisfaction 1–5 (required; ≤ 2 is flagged and the opener is asked to note why), who processes their payments (Cluster / someone else / don't know), interest in Cluster payments, "Create an opportunity (payments)"; the last satisfaction shows on the place card and history. Lead creation is prefilled from Google and the check-in; the lead goes into Sales Hub Leads with source "Opener" and waits for human review like every lead — the reviewer picks the rep, and only then is it created in Zoho (Zoho Lead_Source uses the "Lead_Source — opener" setting in Admin → Leads, falling back to the phone value while empty). Also: "My leads", mark a stop not visited with a reason, postpone unvisited stops to tomorrow, end-of-day summary, finish the day; works offline and sends when back online. A manager with no route that day can tap "Try a demo route" to load a real campaign route where NOTHING is saved (check-ins, leads, skips and end of day are simulated, with a purple "Demo" banner) — to see the app before assigning routes.
+  DAILY REPORT (Campaign & routes → "Reports" tab, permission opener:reports): one email per business day at a chosen time (default 18:00 Montréal, never weekends or Québec holidays) to chosen recipients, with one section per opener who had a route or check-ins: each visit (arrival, departure, duration, GPS check on site / at a distance, current POS, interest, a customer's satisfaction and who processes their payments, decision maker, lead, notes), unvisited stops with their reason, and totals. Can be limited to some openers; "Preview" and "Send now" work for any date.
   CLUSTER LOCATIONS (/admin/opener): every Cluster customer restaurant linked to its Google listing, with its SOFTWARE VERSION — V2 = a store in Kaizen (the Kaizen API only knows V2); V1 = a Zoho Billing subscriber of Cluster Canada or Xperio POS with no matching Kaizen store (a Billing customer at the same restaurant as a Kaizen store is V2). The address comes from the Zoho Books contact (shipping first). Matching to Google is automatic when certain; doubtful cases are confirmed by hand and never overwritten; the version can be forced by hand. A nightly sync, plus "Sync now" with a progress bar.
 - New users with NO ROLE: instead of an empty Sales Hub they see a "Welcome — your account has no role yet" screen and can send a role request with an optional message (their position, what they need). The request emails the "new user without a role" recipients (Admin → Notifications; all admins if that list is empty) and shows at the top of Admin → Users; it closes by itself once a role is assigned, or can be dismissed. Permission users:role_requests.
 - Leads (Pistes, /leads): the intake layer in front of Zoho CRM. Leads come from the Cluster website forms (Contact Us, Get in Touch / Prenez contact, Kaizen Early Access — every submission becomes a lead, existing customers included; the form's New/Existing answer is in the lead's message), from phone intake by staff, and from openers in the field (source "Opener"). Every lead waits in a REVIEW QUEUE: a human reviews it before anything goes to Zoho (a red counter next to "Pistes" in the menu shows how many are waiting, for reviewers only; reviewers can also get an email for each new lead, set in Admin → Notifications). Ordered rules suggest a rep (source, province, language, business type, postal prefix), with a round-robin fallback. Reps RECEIVE leads, they never pick from a common pool: a rep only sees the leads assigned to them and the ones they entered. On acceptance: the lead is created in Zoho CRM, a Call is scheduled in the rep's name about an hour later, the rep gets an email, and the customer gets a welcome email FROM THE REP'S ADDRESS in their language saying the rep will call within the hour. If that is not a good time, the customer can pick another slot from the rep's availability on a Cluster page (the Google Calendar event with Google Meet is created only then, the Zoho Call moves and the rep is told not to call before). Reps must keep their email signature (Profile → Email signature) and their Google Calendar up to date, and must not move the event by hand in Google Calendar. Permissions: leads:view_own, leads:view_all, leads:review, leads:intake, leads:manage_rules.
@@ -15047,6 +15069,10 @@ function startAutoSync() {
     finally { openerNightBusy = false; }
   };
   setTimeout(openerNightTick, 4 * 60 * 1000);
+  // Rapport quotidien des openers : vérifié toutes les 10 min, envoyé une fois par jour ouvrable
+  // à l'heure choisie (Opener → Campagne et routes → Rapports).
+  setTimeout(() => openerReport.runDue(), 6 * 60 * 1000);
+  setInterval(() => openerReport.runDue(), 10 * 60 * 1000);
   setInterval(openerNightTick, 60 * 60 * 1000);
 
   // Recalc-v2 — runs on its own 6h cadence, offset 30 min from sync to avoid
