@@ -9,6 +9,7 @@ try { ({ PGlite } = require('@electric-sql/pglite')); } catch { console.error('�
 const { registerOpenerRoutes } = require('../routes');
 const { registerOpenerFieldRoutes } = require('../field');
 const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
+const F = require('../franchise');
 
 (async () => {
   const db = new PGlite();
@@ -42,6 +43,7 @@ const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
       if (quotaFails > 0) { quotaFails--; const e = new Error('RESOURCE_EXHAUSTED'); e.quota = true; throw e; }
       if (nearbyCalls > quotaAt) { const e = new Error('plafond'); e.quota = true; throw e; }
       assert.ok(fields && !fields.includes('places.rating'), 'masque léger pour l\'inventaire');
+      assert.ok(fields.includes('places.displayName'), 'le nom sert à reconnaître les franchises');
       const key = `${center[0].toFixed(4)},${center[1].toFixed(4)}`;
       const n = nearbyCalls === 1 && !fullOnce.has(key) ? (fullOnce.add(key), 20) : 6;
       return Array.from({ length: n }, (_, i) => ({
@@ -49,6 +51,7 @@ const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
         location: { latitude: center[0] + ((i % 3) - 1) * radius / 3 / 111320, longitude: center[1] + (Math.floor(i / 3) - 1) * radius / 3 / 78000 },
         primaryType: i === 5 ? 'barber_shop' : i === 4 ? 'cafe' : 'restaurant',
         businessStatus: i === 3 ? 'CLOSED_PERMANENTLY' : 'OPERATIONAL',
+        displayName: { text: `Resto ${key} ${radius} ${i}` },   // tous différents : aucune franchise
       }));
     },
   };
@@ -60,7 +63,7 @@ const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
 
   const app = express();
   app.use(express.json());
-  const perms = { 'mgr@x.com': ['opener:routes'], 'a@x.com': ['opener:field'] };
+  const perms = { 'mgr@x.com': ['opener:routes'], 'boss@x.com': ['opener:routes', 'opener:franchises'], 'a@x.com': ['opener:field'] };
   app.use((req, _res, next) => { req.user = { email: req.headers['x-user'] }; next(); });
   const authenticateToken = (req, res, next) => (req.user.email ? next() : res.status(401).end());
   const hasPerm = async (req, p) => (perms[req.user.email] || []).includes(p);
@@ -320,6 +323,85 @@ const { registerOpenerCampaignRoutes } = require('../campaignRoutes');
       assert.strictEqual(r.status, 200);
       const s = (await pool.query(`SELECT outcome, skip_reason FROM opener_route_stops WHERE id = $1`, [stop.id])).rows[0];
       assert.deepStrictEqual([s.outcome, s.skip_reason], ['skipped', 'excluded']);
+    });
+
+    await t('bannières : reconnaissance du nom (succursale retirée, chaînes connues, préfixe)', async () => {
+      assert.strictEqual(F.brandKey('Thai Express - Plateau'), 'thaiexpress');
+      assert.strictEqual(F.brandKey('St-Hubert (Laval)'), 'sthubert');
+      assert.strictEqual(F.brandKey('Tim Hortons #1234'), 'timhortons');
+      assert.strictEqual(F.brandKey('Allô mon Coco Plateau Gatineau'), 'allomoncoco');
+      assert.ok(F.isKnown('sushishop') && !F.isKnown(F.brandKey('Pizzeria Bella')));
+      const tagged = (await pool.query(`SELECT COUNT(*)::int n FROM opener_places WHERE source = 'inventory' AND brand_key IS NULL`)).rows[0].n;
+      assert.strictEqual(tagged, 0, 'chaque établissement inventorié porte sa bannière');
+    });
+
+    await t('franchises : écartées des routes (connue OU ≥ 3 adresses), sauf chez un client ; décision du gestionnaire', async () => {
+      const todoP = (await pool.query(`SELECT jsonb_array_elements_text(place_ids) p FROM opener_campaign_routes WHERE status = 'todo'`)).rows.map((x) => x.p);
+      const cand = (await pool.query(
+        `SELECT place_id FROM opener_places WHERE place_id = ANY($1::text[]) AND kind = 'restaurant' AND region IS NOT NULL AND excluded_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM cluster_locations l WHERE l.place_id = opener_places.place_id) ORDER BY place_id LIMIT 4`, [todoP])).rows.map((x) => x.place_id);
+      assert.strictEqual(cand.length, 4);
+      const [g1, g2, g3, tim] = cand;
+      // Un client Cluster d'une chaîne : on le visite toujours (satisfaction, paiements).
+      await pool.query(`INSERT INTO opener_places (place_id, lat, lng, source, kind, region) VALUES ('PL_TIM_CLIENT', 45.52, -73.58, 'inventory', 'restaurant', 'montreal')`);
+      await pool.query(`INSERT INTO cluster_locations (source, source_key, name, active, place_id, match_status, software_version) VALUES ('billing', 'b-tim', 'Tim client', true, 'PL_TIM_CLIENT', 'auto', 'v1')`);
+      const c0 = (await call('POST', '/api/opener/campaign/recompute')).body;
+      await F.tagPlaces(pool, [
+        { id: g1, name: 'Chez Gus - Plateau' }, { id: g2, name: 'Chez Gus - Rosemont' }, { id: g3, name: 'Chez Gus (Verdun)' },
+        { id: tim, name: 'Tim Hortons #12' }, { id: 'PL_TIM_CLIENT', name: 'Tim Hortons - Client' },
+      ]);
+      const rc = (await call('POST', '/api/opener/campaign/recompute')).body;
+      const pids = async () => new Set((await pool.query(`SELECT jsonb_array_elements_text(place_ids) p FROM opener_campaign_routes WHERE status = 'todo'`)).rows.map((x) => x.p));
+      let all = await pids();
+      for (const p of cand) assert.ok(!all.has(p), `franchise ${p} écartée`);
+      // Le client (« Tim Hortons - Client ») est compté dans la campagne avant comme après.
+      assert.ok(c0.clients > 0);
+      assert.strictEqual(rc.clients, c0.clients, 'un CLIENT d\'une franchise reste sur sa route');
+      assert.strictEqual(rc.places, c0.places - 4);
+      assert.ok(all.has('PL_TIM_CLIENT'), 'le client Tim Hortons est sur une route');
+      const c = (await call('GET', '/api/opener/campaign')).body;
+      assert.deepStrictEqual(c.franchises, { places: 4, brands: 2 });
+      const st = (await field.statusOf([tim, anyPlaces[0]]));
+      assert.strictEqual(st.get(tim).franchise, true);
+      assert.strictEqual(st.get(tim).brand, 'Tim Hortons');
+
+      let b = (await call('GET', '/api/opener/brands')).body;
+      assert.strictEqual(b.canDecide, false);
+      const gus = b.brands.find((x) => x.key === 'chezgus');
+      assert.deepStrictEqual([gus.label, gus.n, gus.known, gus.franchise], ['Chez Gus', 3, false, true]);
+      const th = b.brands.find((x) => x.key === 'timhortons');
+      assert.deepStrictEqual([th.known, th.clients, th.franchise], [true, 1, true]);
+
+      // « À visiter quand même » : permission opener:franchises, puis retour dans la campagne.
+      assert.strictEqual((await call('PATCH', '/api/opener/brands/chezgus', { decision: 'visit' })).status, 403);
+      assert.strictEqual((await call('PATCH', '/api/opener/brands/chezgus', { decision: 'bof' }, 'boss@x.com')).status, 400);
+      assert.strictEqual((await call('PATCH', '/api/opener/brands/chezgus', { decision: 'visit' }, 'boss@x.com')).status, 200);
+      await new Promise((res) => setTimeout(res, 300));
+      all = await pids();
+      for (const p of [g1, g2, g3]) assert.ok(all.has(p), 'Chez Gus revient');
+      assert.ok(!all.has(tim), 'Tim Hortons reste écarté');
+      // Forcer une bannière indépendante (1 adresse) en franchise.
+      await F.tagPlaces(pool, [{ id: cand[0], name: 'Chez Gus - Plateau' }]);
+      b = (await call('GET', '/api/opener/brands', undefined, 'boss@x.com')).body;
+      assert.strictEqual(b.canDecide, true);
+      assert.strictEqual(b.brands.find((x) => x.key === 'chezgus').franchise, false);
+      assert.strictEqual((await call('PATCH', '/api/opener/brands/chezgus', { decision: null }, 'boss@x.com')).status, 200);
+      await new Promise((res) => setTimeout(res, 300));
+      assert.ok(!(await pids()).has(g2), 'règle automatique : de nouveau écartée');
+    });
+
+    await t('rattrapage unique : les cercles « feuilles » déjà balayés repassent une fois pour lire les noms', async () => {
+      await pool.query(`DELETE FROM sync_state WHERE key = 'opener_brand_backfill'`);
+      const before = (await pool.query(`SELECT COUNT(*) FILTER (WHERE status = 'pending')::int p, COUNT(*) FILTER (WHERE status = 'done' AND found >= 20)::int full FROM opener_inventory_cells`)).rows[0];
+      await camp.runInventory({ budget: 1, source: 'backfill' });
+      const flag = JSON.parse((await pool.query(`SELECT value FROM sync_state WHERE key = 'opener_brand_backfill'`)).rows[0].value);
+      assert.ok(flag.cells > 0);
+      const after = (await pool.query(`SELECT COUNT(*) FILTER (WHERE status = 'pending')::int p, COUNT(*) FILTER (WHERE status = 'done' AND found >= 20)::int full FROM opener_inventory_cells`)).rows[0];
+      assert.strictEqual(after.p, before.p + flag.cells - 1, 'feuilles remises en file (une déjà rebalayée)');
+      assert.strictEqual(after.full, before.full, 'un cercle plein (déjà découpé) n\'est pas repassé');
+      await camp.runInventory({ budget: 1, source: 'again' });
+      const again = (await pool.query(`SELECT COUNT(*) FILTER (WHERE status = 'pending')::int p FROM opener_inventory_cells`)).rows[0].p;
+      assert.strictEqual(again, after.p - 1, 'une seule fois');
     });
 
     console.log(`campaignRoutes : ${n} tests OK (${nearbyCalls} appels Nearby simulés)`);

@@ -25,6 +25,7 @@
 const crypto = require('crypto');
 const G = require('./geo');
 const M = require('./matching');
+const F = require('./franchise');
 const E = require('./emails');
 
 const PERM_FIELD = 'opener:field';
@@ -170,6 +171,7 @@ function registerOpenerFieldRoutes(app, deps) {
     // opener_places est créée par le lot 0 (routes.js) ; on attend qu'elle existe.
     if (deps.baseSchema) await deps.baseSchema();
     for (const sql of SCHEMA) await pool.query(sql);
+    for (const sql of F.SCHEMA) await pool.query(sql);
   })().catch((e) => { ready = null; throw e; }));
   if (pool) schema().catch((e) => console.error('opener field schema:', e.message));
 
@@ -244,7 +246,9 @@ function registerOpenerFieldRoutes(app, deps) {
             FROM opener_checkins c WHERE c.place_id = p.pid ORDER BY c.at DESC LIMIT 1) AS last,
          (SELECT json_build_object('id', ld.id, 'refCode', ld.ref_code, 'status', ld.status)
             FROM opener_places op JOIN leads ld ON ld.id = op.lead_id WHERE op.place_id = p.pid) AS lead,
-         (SELECT COUNT(*)::int FROM opener_checkins c WHERE c.place_id = p.pid) AS visits
+         (SELECT COUNT(*)::int FROM opener_checkins c WHERE c.place_id = p.pid) AS visits,
+         (SELECT json_build_object('key', op.brand_key, 'label', fb.label, 'n', fb.n, 'franchise', ${F.franchiseSql('op')})
+            FROM opener_places op JOIN opener_brands fb ON fb.brand_key = op.brand_key WHERE op.place_id = p.pid) AS brand
        FROM unnest($1::text[]) AS p(pid)`, [ids]);
     for (const r of rows) {
       const loc = r.loc || null;
@@ -257,6 +261,8 @@ function registerOpenerFieldRoutes(app, deps) {
         serviceTypeSeen: r.last?.serviceType || null, lastInterest: r.last?.interest ?? null,
         lastSatisfaction: r.last?.satisfaction ?? null, lastPaymentsBy: r.last?.paymentsBy || null,
         lead: r.lead || null, visits: r.visits || 0,
+        // Franchise (2026-10-09) : même POS dans toute la bannière, on ne se déplace pas pour rien.
+        franchise: r.brand?.franchise === true, brand: r.brand?.franchise ? r.brand.label : null, brandKey: r.brand?.key || null,
       });
     }
     return out;
@@ -348,6 +354,7 @@ function registerOpenerFieldRoutes(app, deps) {
     try {
       const r = await scanZone(poly);
       await upsertPlaces(r.places.map((p) => ({ placeId: p.id, lat: p.location?.latitude, lng: p.location?.longitude })), 'scan');
+      await F.tagPlaces(pool, r.places.map((p) => ({ id: p.id, name: p.displayName?.text })));
       const excluded = new Set((await pool.query(
         `SELECT place_id FROM opener_places WHERE excluded_at IS NOT NULL AND place_id = ANY($1::text[])`,
         [r.places.map((p) => p.id)])).rows.map((x) => x.place_id));

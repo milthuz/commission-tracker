@@ -28,10 +28,14 @@ const C = require('./campaign');
 const E = require('./emails');
 
 const PERM = 'opener:routes';
+const PERM_FRANCHISES = 'opener:franchises';
+const F = require('./franchise');
+const BRAND_BACKFILL_KEY = 'opener_brand_backfill';
 const SCAN_TYPES = ['restaurant', 'cafe', 'bar', 'bakery', 'meal_takeaway'];
 const TARGET_KINDS = ['restaurant', 'takeout', 'cafe', 'bar', 'bakery'];
-// Masque léger : l'inventaire n'a besoin que de la position et du type (tranche « Pro »).
-const INVENTORY_FIELDS = ['places.id', 'places.location', 'places.primaryType', 'places.businessStatus'];
+// Masque léger : position, type et nom (même tranche « Pro », aucun surcoût). Le nom ne sert
+// qu'à reconnaître la bannière d'une franchise (franchise.js) ; il n'est pas gardé.
+const INVENTORY_FIELDS = ['places.id', 'places.location', 'places.primaryType', 'places.businessStatus', 'places.displayName'];
 const START_RADIUS = 1000;
 const MIN_RADIUS = 150;
 const MANUAL_CALLS = 300;
@@ -162,6 +166,15 @@ function registerOpenerCampaignRoutes(app, deps) {
     // est remis en file.
     await pool.query(
       `UPDATE opener_inventory_cells SET status = 'pending' WHERE status = 'done' AND done_at < CURRENT_TIMESTAMP - INTERVAL '${REFRESH_DAYS} days'`);
+    // Franchises (2026-10-09) : les cercles balayés avant que l'inventaire lise les noms sont
+    // repassés UNE fois — seulement les feuilles (moins de 20 résultats, ou au rayon minimal) :
+    // un cercle plein a déjà été découpé, ses enfants couvrent son terrain.
+    if (!(await getState(BRAND_BACKFILL_KEY))) {
+      const r = await pool.query(
+        `UPDATE opener_inventory_cells SET status = 'pending'
+          WHERE status = 'done' AND (found < 20 OR radius <= ${MIN_RADIUS})`);
+      await putState(BRAND_BACKFILL_KEY, { at: new Date().toISOString(), cells: r.rowCount });
+    }
   }
 
   async function savePlaces(list) {
@@ -237,9 +250,10 @@ function registerOpenerCampaignRoutes(app, deps) {
             if (lat == null || lng == null || p.businessStatus === 'CLOSED_PERMANENTLY') continue;
             const region = T.regionOf(lat, lng);
             if (!region) continue;
-            keep.push({ id: p.id, lat, lng, region, kind: T.kindOf(p.primaryType) });
+            keep.push({ id: p.id, lat, lng, region, kind: T.kindOf(p.primaryType), name: p.displayName?.text });
           }
           await savePlaces(keep);
+          await F.tagPlaces(pool, keep);
           out.places += keep.length;
           // Cercle plein (Google plafonne à 20) : découpé en 4, les sous-cercles passent en file.
           if (places.length >= 20 && c.radius > MIN_RADIUS) {
@@ -286,6 +300,7 @@ function registerOpenerCampaignRoutes(app, deps) {
   async function recompute({ actor = 'system' } = {}) {
     await schema();
     await syncStatuses();
+    await F.refreshCounts(pool);
     // Un client apparié au lot 0 n'a pas forcément été vu par l'inventaire (catégorie Google
     // « magasin », hors des cercles déjà balayés) : sa région se calcule depuis ses coordonnées.
     const { rows: found } = await pool.query(
@@ -311,7 +326,12 @@ function registerOpenerCampaignRoutes(app, deps) {
           AND NOT EXISTS (SELECT 1 FROM opener_route_stops s JOIN opener_routes r ON r.id = s.route_id
                            WHERE s.place_id = p.place_id AND s.outcome = 'planned'
                              AND r.status = 'published' AND r.route_date >= $2::date)
-          AND p.place_id NOT IN (SELECT jsonb_array_elements_text(place_ids) FROM opener_campaign_routes WHERE status = 'planned')`,
+          AND p.place_id NOT IN (SELECT jsonb_array_elements_text(place_ids) FROM opener_campaign_routes WHERE status = 'planned')
+          -- Franchises (2026-10-09) : même POS dans toute la bannière, on ne se déplace pas pour
+          -- rien — sauf chez nos clients, qu'on visite toujours.
+          AND (NOT ${F.franchiseSql('p')}
+               OR EXISTS (SELECT 1 FROM cluster_locations l WHERE l.place_id = p.place_id AND l.active
+                            AND l.missing_since IS NULL AND l.match_status <> 'ignored'))`,
       [TARGET_KINDS, field.ymdMtl()]);
     const rows = found.map((r) => ({ ...r, region: r.region || (r.is_client ? T.regionOf(r.lat, r.lng) : null) })).filter((r) => r.region);
     const routes = C.planCampaign(rows.map((r) => ({ placeId: r.place_id, lat: r.lat, lng: r.lng, region: r.region })));
@@ -457,6 +477,11 @@ function registerOpenerCampaignRoutes(app, deps) {
            FROM opener_places p WHERE p.region IS NOT NULL AND p.excluded_at IS NULL AND p.kind = ANY($1::text[]) GROUP BY p.region`,
         [TARGET_KINDS])).rows;
       const excluded = (await pool.query(`SELECT COUNT(*)::int AS n FROM opener_places WHERE excluded_at IS NOT NULL`)).rows[0].n;
+      const franchises = (await pool.query(
+        `SELECT COUNT(*)::int AS places, COUNT(DISTINCT p.brand_key)::int AS brands FROM opener_places p
+          WHERE p.excluded_at IS NULL AND p.region IS NOT NULL AND p.kind = ANY($1::text[]) AND ${F.franchiseSql('p')}
+            AND NOT EXISTS (SELECT 1 FROM cluster_locations l WHERE l.place_id = p.place_id AND l.active
+                              AND l.missing_since IS NULL AND l.match_status <> 'ignored')`, [TARGET_KINDS])).rows[0];
       const routes = (await pool.query(
         `SELECT cr.id, cr.seq, cr.region, cr.mode, cr.n, cr.minutes, cr.meters, cr.hull, cr.centroid_lat, cr.centroid_lng, cr.status, cr.route_id,
                 r.route_date::text AS date, r.opener_email,
@@ -475,6 +500,8 @@ function registerOpenerCampaignRoutes(app, deps) {
           places: places.find((p) => p.region === r.key) || { total: 0, clients: 0, visited: 0 },
         })),
         excluded,
+        franchises,
+        brandBackfill: await getState(BRAND_BACKFILL_KEY),
         inventory: { running: await isRunning(), progress: (await isRunning()) ? await getState('opener_inventory_progress') : null, last: await getState('opener_inventory_last_run') },
         computed: await getState('opener_campaign_computed'),
         routes: routes.map((r) => ({
@@ -579,6 +606,51 @@ function registerOpenerCampaignRoutes(app, deps) {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
+  // ==========================================================================
+  // Franchises : la liste des bannières et la décision du gestionnaire
+  // ==========================================================================
+  // Un recalcul à la fois : deux décisions rapprochées ne doivent pas se marcher dessus.
+  let recomputing = Promise.resolve();
+  const recomputeSoon = (actor) => (recomputing = recomputing.then(() => recompute({ actor })).catch((e) => console.error('[OPENER] recalcul :', e.message)));
+
+  app.get('/api/opener/brands', authenticateToken, async (req, res) => {
+    if (!(await guard(req, res))) return;
+    try {
+      await F.refreshCounts(pool);
+      const { rows } = await pool.query(
+        `SELECT b.brand_key, b.label, b.known, b.n, b.decision, b.decided_by, b.decided_at,
+                (b.decision = 'skip' OR (b.decision IS NULL AND (b.known OR b.n >= ${F.MIN_LOCATIONS}))) AS franchise,
+                (SELECT COUNT(*)::int FROM opener_places p WHERE p.brand_key = b.brand_key AND p.excluded_at IS NULL
+                    AND EXISTS (SELECT 1 FROM cluster_locations l WHERE l.place_id = p.place_id AND l.active
+                                  AND l.missing_since IS NULL AND l.match_status <> 'ignored')) AS clients
+           FROM opener_brands b
+          WHERE b.n > 0 AND (b.decision IS NOT NULL OR b.known OR b.n >= 2)
+          ORDER BY b.n DESC, b.label`);
+      res.json({ minLocations: F.MIN_LOCATIONS, canDecide: await field.can(req, PERM_FRANCHISES),
+        brands: rows.map((b) => ({ key: b.brand_key, label: b.label, known: b.known, n: b.n, clients: b.clients,
+          decision: b.decision, decidedBy: b.decided_by, decidedAt: b.decided_at, franchise: b.franchise })) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // decision : 'skip' (franchise, écartée), 'visit' (à visiter quand même) ou null (règle automatique).
+  app.patch('/api/opener/brands/:key', authenticateToken, async (req, res) => {
+    if (!(await requirePerm(req, res, PERM_FRANCHISES))) return;
+    await schema();
+    const key = String(req.params.key || '').slice(0, 120);
+    const decision = req.body?.decision ?? null;
+    if (decision !== null && decision !== 'skip' && decision !== 'visit') return res.status(400).json({ error: 'invalid_decision' });
+    try {
+      const r = await pool.query(
+        `UPDATE opener_brands SET decision = $2, decided_by = $3, decided_at = CURRENT_TIMESTAMP WHERE brand_key = $1 RETURNING label`,
+        [key, decision, decision ? actorOf(req) : null]);
+      if (!r.rows.length) return res.status(404).json({ error: 'not_found' });
+      const what = decision === 'skip' ? 'franchise (écartée des routes)' : decision === 'visit' ? 'à visiter quand même' : 'règle automatique';
+      log(0, 'brand_decision', `${r.rows[0].label} : ${what}`, actorOf(req), { brand: key, decision });
+      recomputeSoon(actorOf(req));
+      res.json({ ok: true, recomputing: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
   // Retirer une route planifiée (tant que rien n'est commencé) : elle revient dans la campagne.
   app.post('/api/opener/campaign/routes/:id/unassign', authenticateToken, async (req, res) => {
     if (!(await guard(req, res))) return;
@@ -617,4 +689,4 @@ function registerOpenerCampaignRoutes(app, deps) {
   };
 }
 
-module.exports = { registerOpenerCampaignRoutes, TARGET_KINDS, INVENTORY_FIELDS };
+module.exports = { registerOpenerCampaignRoutes, TARGET_KINDS, INVENTORY_FIELDS, PERM_FRANCHISES };
