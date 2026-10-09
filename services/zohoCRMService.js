@@ -178,7 +178,10 @@ class ZohoCRMService {
           headers: { ...this.headers, 'Content-Type': 'application/json' },
         });
         const deals = response.data?.data || [];
-        recentDeals.push(...deals);
+        // A lost deal has a Closing_Date too (Zoho stamps it on loss) but was never sold.
+        // Filtered here, not in the query: COQL rejects `Stage != '...'` with a SYNTAX_ERROR,
+        // which would silently empty this whole step.
+        recentDeals.push(...deals.filter(d => d.Stage !== 'Closed Lost'));
         hasMore = response.data?.info?.more_records === true;
         offset += limit;
       }
