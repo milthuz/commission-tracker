@@ -4032,7 +4032,7 @@ require('./services/leadImport').registerLeadImportRoutes(app, {
   authenticateToken, requirePerm, pool, logActivity,
   late: () => ({
     normalizeLeadInput, createLeadRow, acceptLead, leadRepContact, leadSettings, checkCrmDuplicate,
-    sendMail, mailShell,
+    sendMail, mailShell, crmPost,
     eventThanksEmail: (o) => leadBooking.emails.eventThanksEmail(mailChrome, o),
     senderFor: leadBooking.senderFor, issueLink: leadBooking.issueLink,
     base: () => process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com',
@@ -39070,6 +39070,12 @@ function publicLead(r) {
     booking: { status: r.booking_status || null, updatedAt: r.booking_updated_at || null, changes: r.booking_changes || 0,
                inGoogleCalendar: !!r.gcal_event_id, meetUrl: r.gcal_meet_url || null },
     automation: r.automation || {},
+    // Remerciement de salon (services/leadImport) : pixel d'ouverture (sous-compte) et ouverture du
+    // lien de réservation (fiable). Colonnes créées par le module : absentes = undefined → null.
+    eventThanks: r.event_open_count != null || r.booking_link_open_count != null
+      ? { openedAt: r.event_opened_at || null, openCount: Number(r.event_open_count) || 0,
+          linkOpenedAt: r.booking_link_opened_at || null, linkOpenCount: Number(r.booking_link_open_count) || 0 }
+      : null,
     // Client existant (null = pas encore vérifié). Les clés `customerName`/`contactEmail` sont
     // couvertes par le mode démo (DEMO_NAME_KEYS / DEMO_CONTACT_KEYS).
     existingCustomer: r.existing_customer || null,

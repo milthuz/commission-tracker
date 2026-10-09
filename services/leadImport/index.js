@@ -371,6 +371,22 @@ function registerLeadImportRoutes(app, deps) {
   // Glissé juste avant </body> : le pixel n'appartient pas au gabarit (l'aperçu et le test n'en ont pas).
   const withPixel = (html, token) => (html.includes('</body>') ? html.replace('</body>', `${pixelFor(token)}</body>`) : html + pixelFor(token));
 
+  // La NOTE dans Zoho (demande de David, 2026-10-09) : le représentant suit ses pistes dans Zoho,
+  // c'est là qu'il doit voir que le visiteur a déjà reçu le remerciement et un lien de réservation.
+  // Ne bloque jamais l'envoi : un courriel parti reste parti, la note est un témoin.
+  async function zohoNote(batch, lead, step, kind) {
+    if (!lead.crm_lead_id) return { ok: false, skipped: 'no_crm_lead' };
+    try {
+      const r = await h().crmPost('/Notes', { data: [{
+        Note_Title: `${kind === 'resend' ? 'Remerciement renvoyé' : 'Courriel de remerciement'} — ${batch.event_name || 'salon'}`.slice(0, 120),
+        Note_Content: eventNoteText(batch, lead, step, kind),
+        Parent_Id: { id: String(lead.crm_lead_id) },
+        se_module: 'Leads',
+      }] });
+      return r.ok ? { ok: true, id: r.id } : { ok: false, error: r.error };
+    } catch (e) { return { ok: false, error: e.message.slice(0, 300) }; }
+  }
+
   async function renderFor(batch, lead, bookingUrl) {
     const lang = lead.language === 'fr' ? 'fr' : 'en';
     const rep = await h().leadRepContact(lead.assigned_rep_name || batch.default_rep, { lang });
@@ -446,6 +462,11 @@ function registerLeadImportRoutes(app, deps) {
           step = m.sent ? { ok: true, at: new Date().toISOString(), to: lead.contact_email, from: sender.from || null, by: actor }
                         : { ok: false, at: new Date().toISOString(), error: m.reason };
         } catch (e) { step = { ok: false, at: new Date().toISOString(), error: e.message.slice(0, 300) }; }
+        if (step.ok) {
+          step.zohoNote = await zohoNote(batch, lead, step, 'send');
+          logActivity('lead', lead.id, 'event_thanks_sent',
+            `${lead.ref_code} — remerciement « ${batch.event_name} » envoyé à ${lead.contact_email}`, actor);
+        }
         await pool.query(
           `UPDATE leads SET automation = jsonb_set(COALESCE(automation, '{}'::jsonb), '{eventThanks}', $2::jsonb),
                   merchant_notified_at = CASE WHEN $3 THEN CURRENT_TIMESTAMP ELSE merchant_notified_at END
@@ -486,6 +507,7 @@ function registerLeadImportRoutes(app, deps) {
       if (!m.sent) return res.status(502).json({ error: 'send_failed', detail: m.reason || null });
       const step = { ...prev, ok: true, resentAt: new Date().toISOString(), resentBy: actor,
                      resendCount: (Number(prev.resendCount) || 0) + 1, to: lead.contact_email, from: sender.from || null };
+      step.resendZohoNote = await zohoNote(batch, lead, step, 'resend');
       await pool.query(
         `UPDATE leads SET automation = jsonb_set(COALESCE(automation, '{}'::jsonb), '{eventThanks}', $2::jsonb),
                 merchant_notified_at = CURRENT_TIMESTAMP WHERE id = $1`, [lead.id, JSON.stringify(step)]);
@@ -494,6 +516,21 @@ function registerLeadImportRoutes(app, deps) {
       res.json({ sent: true, to: lead.contact_email, batch: await loadBatch(batch.id) });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
+}
+
+// Le texte de la note Zoho — exporté pour le rattrapage des lots envoyés avant la note.
+function eventNoteText(batch, lead, step, kind) {
+  const when = new Date(kind === 'resend' ? (step.resentAt || Date.now()) : (step.at || Date.now()))
+    .toLocaleString('fr-CA', { timeZone: 'America/Toronto', dateStyle: 'long', timeStyle: 'short' });
+  return [
+    kind === 'resend'
+      ? `Courriel de remerciement RENVOYÉ le ${when} à ${step.to || lead.contact_email} (renvoi no ${step.resendCount || 1}). Il contient un NOUVEAU lien de réservation ; celui du courriel précédent ne fonctionne plus.`
+      : `Courriel de remerciement envoyé le ${when} à ${step.to || lead.contact_email}.`,
+    `Salon : ${batch.event_name || '—'}`,
+    step.from ? `Expéditeur : ${step.from}` : null,
+    `Le visiteur a reçu un lien pour réserver une rencontre directement dans l'agenda de ${lead.assigned_rep_name || 'son représentant'} : s'il réserve, le rendez-vous et un rappel apparaîtront ici.`,
+    `Référence Sales Hub : ${lead.ref_code}`,
+  ].filter(Boolean).join('\n');
 }
 
 // Le récapitulatif au représentant — interne, bilingue, enveloppe Sales Hub comme les autres avis.
@@ -513,4 +550,4 @@ function repSummaryEmail(mailShell, eventName, rep, list, base) {
           mailShell(`Salon ${esc(eventName)} — ${n} piste${n > 1 ? 's' : ''}`, intro, 'Voir mes pistes / View my leads', `${base}/leads`, undefined, 'saleshub')];
 }
 
-module.exports = { registerLeadImportRoutes, repSummaryEmail };
+module.exports = { registerLeadImportRoutes, repSummaryEmail, eventNoteText };
