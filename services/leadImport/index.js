@@ -92,7 +92,7 @@ function registerLeadImportRoutes(app, deps) {
       return { ...r, lead: l ? {
         id: l.id, refCode: l.ref_code, status: l.status, rep: l.assigned_rep_name,
         crmLeadId: l.crm_lead_id, crmError: l.crm_lead_error,
-        emailedAt: l.merchant_notified_at, emailError: l.automation?.eventThanks?.ok === false ? l.automation.eventThanks.error : null,
+        emailedAt: l.merchant_notified_at, resendCount: Number(l.automation?.eventThanks?.resendCount) || 0, emailError: l.automation?.eventThanks?.ok === false ? l.automation.eventThanks.error : null,
       } : null };
     });
     return { ...b, rows };
@@ -417,6 +417,42 @@ function registerLeadImportRoutes(app, deps) {
       if (sent || failed.length) logActivity('lead_import', batch.id, 'emailed',
         `Lot « ${batch.event_name} » : remerciement envoyé à ${sent} visiteurs${failed.length ? `, ${failed.length} en échec` : ''}`, actor);
       res.json({ sent, failed, batch: await loadBatch(batch.id) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // ── Renvoyer à UNE personne (demande de David, 2026-10-09) ─────────────────
+  // Pour le client qui ne retrouve plus le courriel. Seulement une piste DÉJÀ servie : le premier
+  // envoi passe par « Envoyer à N visiteurs », qui garde son aperçu et sa confirmation.
+  // ⚠️ Nouveau lien /rdv : seul le hachage du jeton est gardé (services/leadBooking), on ne peut donc
+  // pas renvoyer l'ancien — et l'émettre à nouveau fait mourir celui du premier courriel. L'écran le dit.
+  app.post('/api/leads/import/batches/:id/resend/:leadId', authenticateToken, async (req, res) => {
+    if (!(await requirePerm(req, res, 'leads:import'))) return;
+    const actor = actorOf(req);
+    try {
+      await ensureSchema();
+      const batch = (await pool.query(`SELECT * FROM lead_import_batches WHERE id = $1`, [Number(req.params.id)])).rows[0];
+      if (!batch) return res.status(404).json({ error: 'not_found' });
+      const lead = (await pool.query(
+        `SELECT * FROM leads WHERE id = $1 AND import_batch_id = $2 AND status = 'accepted'`,
+        [Number(req.params.leadId), batch.id])).rows[0];
+      if (!lead) return res.status(404).json({ error: 'not_found' });
+      if (!lead.contact_email) return res.status(400).json({ error: 'no_email' });
+      if (!lead.merchant_notified_at) return res.status(409).json({ error: 'not_sent_yet' });
+
+      const prev = lead.automation?.eventThanks || {};
+      const bookingUrl = await h().issueLink(lead.id);
+      const { mail, rep, settings } = await renderFor(batch, lead, bookingUrl);
+      const sender = h().senderFor(rep, settings);
+      const m = await h().sendMail(lead.contact_email, mail.subject, mail.html, sender);
+      if (!m.sent) return res.status(502).json({ error: 'send_failed', detail: m.reason || null });
+      const step = { ...prev, ok: true, resentAt: new Date().toISOString(), resentBy: actor,
+                     resendCount: (Number(prev.resendCount) || 0) + 1, to: lead.contact_email, from: sender.from || null };
+      await pool.query(
+        `UPDATE leads SET automation = jsonb_set(COALESCE(automation, '{}'::jsonb), '{eventThanks}', $2::jsonb),
+                merchant_notified_at = CURRENT_TIMESTAMP WHERE id = $1`, [lead.id, JSON.stringify(step)]);
+      logActivity('lead', lead.id, 'event_thanks_resent',
+        `${lead.ref_code} — remerciement « ${batch.event_name} » renvoyé à ${lead.contact_email}`, actor);
+      res.json({ sent: true, to: lead.contact_email, batch: await loadBatch(batch.id) });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 }
