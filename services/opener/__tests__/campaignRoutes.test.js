@@ -390,6 +390,35 @@ const F = require('../franchise');
       assert.ok(!(await pids()).has(g2), 'règle automatique : de nouveau écartée');
     });
 
+    await t('bannières : noms génériques ignorés, fiches au même endroit = une adresse, anciennes clés recalculées', async () => {
+      assert.strictEqual(F.brandKey('Pizzéria'), null);
+      assert.strictEqual(F.brandKey('Le Café'), null);
+      assert.strictEqual(F.brandKey('Restaurant Boustan'), 'boustan');
+      assert.strictEqual(F.brandKey('Express St-Hubert'), 'sthubert');
+      assert.strictEqual(F.brandKey('Restaurant Scores'), 'scores');
+      assert.strictEqual(F.brandKey('PFK'), 'kfc');
+      assert.strictEqual(F.brandKey('Café Olimpico'), 'cafeolimpico', 'une bannière inconnue garde son nom entier');
+      // Trois fiches Google d'un même restaurant (à quelques mètres) : UNE adresse, pas une franchise.
+      const ids = ['PL_SAME_1', 'PL_SAME_2', 'PL_SAME_3'];
+      for (const [i, id] of ids.entries()) await pool.query(
+        `INSERT INTO opener_places (place_id, lat, lng, source, kind, region) VALUES ($1, $2, -73.6001, 'inventory', 'restaurant', 'montreal')`, [id, 45.5001 + i * 0.00002]);
+      await F.tagPlaces(pool, ids.map((id) => ({ id, name: 'Bergham' })));
+      const b = (await pool.query(`SELECT n FROM opener_brands WHERE brand_key = 'bergham'`)).rows[0];
+      assert.strictEqual(b.n, 1);
+      // Clés d'avant la version 2 : recalculées sans Google, décision conservée, libellé lisible.
+      await pool.query(`INSERT INTO opener_brands (brand_key, label, decision, decided_by) VALUES ('restaurantboustan', 'Restaurant Boustan', 'visit', 'boss@x.com'), ('pizzeria', 'Pizzéria', NULL, NULL)`);
+      await pool.query(`UPDATE opener_places SET brand_key = 'restaurantboustan' WHERE place_id = 'PL_SAME_1'`);
+      await pool.query(`UPDATE opener_places SET brand_key = 'pizzeria' WHERE place_id = 'PL_SAME_2'`);
+      await pool.query(`UPDATE sync_state SET value = '2' WHERE key = 'opener_brand_canon'`);
+      const out = await F.recanonicalize(pool);
+      assert.deepStrictEqual(out, { moved: 1, cleared: 1 });
+      const p = (await pool.query(`SELECT place_id, brand_key FROM opener_places WHERE place_id IN ('PL_SAME_1', 'PL_SAME_2') ORDER BY place_id`)).rows;
+      assert.deepStrictEqual(p.map((x) => x.brand_key), ['boustan', null]);
+      const bo = (await pool.query(`SELECT label, known, decision FROM opener_brands WHERE brand_key = 'boustan'`)).rows[0];
+      assert.deepStrictEqual([bo.label, bo.known, bo.decision], ['Boustan', true, 'visit']);
+      assert.strictEqual(await F.recanonicalize(pool), null, 'une seule fois par version');
+    });
+
     await t('rattrapage unique : les cercles « feuilles » déjà balayés repassent une fois pour lire les noms', async () => {
       await pool.query(`DELETE FROM sync_state WHERE key = 'opener_brand_backfill'`);
       const before = (await pool.query(`SELECT COUNT(*) FILTER (WHERE status = 'pending')::int p, COUNT(*) FILTER (WHERE status = 'done' AND found >= 20)::int full FROM opener_inventory_cells`)).rows[0];

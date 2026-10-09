@@ -35,8 +35,53 @@ const KNOWN_LABELS = [
   'Mon Ami Poké', 'Poke Box', 'Nouilles de Lan Zhou', 'Shawarma Djouné', 'Beavertails', 'Queues de Castor',
 ];
 const KNOWN = new Set(KNOWN_LABELS.map(normName).filter((k) => k.length >= 2));
+// Libellé lisible d'une chaîne connue (le premier de la liste) : « Sushi Shop », pas « Sushi Shop Kirkland ».
+const KNOWN_LABEL = new Map();
+for (const l of KNOWN_LABELS) { const k = normName(l); if (!KNOWN_LABEL.has(k)) KNOWN_LABEL.set(k, l); }
 // Préfixes sûrs (≥ 6 lettres) : « Allô mon Coco Plateau Gatineau » → allomoncoco.
 const PREFIXES = [...KNOWN].filter((k) => k.length >= 6).sort((a, b) => b.length - a.length);
+// Autres noms d'une même chaîne.
+const ALIASES = { pfk: 'kfc', toujoursmikes: 'mikes', coradejeunersetdiners: 'cora', chezcora: 'cora',
+  rotisseriesthubert: 'sthubert', awcanada: 'aw', quesadaburritostacos: 'quesada', chipotlemexicangrill: 'chipotle',
+  popeyeslouisianakitchen: 'popeyes', dixieleechicken: 'dixielee', rotisseriescores: 'scores', restaurantslafleur: 'lafleur',
+  cagebrasseriesportive: 'cage', queuesdecastor: 'beavertails', dominos: 'dominospizza' };
+// Noms GÉNÉRIQUES (premier passage réel, 2026-10-09 : 13 « Pizzéria », 4 « Boulangerie »,
+// 7 « Le Café » sans lien entre eux) : jamais une bannière.
+const GENERIC = new Set(['restaurant', 'restaurants', 'resto', 'cafe', 'pizzeria', 'pizza', 'boulangerie', 'patisserie',
+  'bistro', 'bar', 'pub', 'brasserie', 'traiteur', 'depanneur', 'sushi', 'grill', 'deli', 'bakery', 'cassecroute',
+  'shawarma', 'poutine', 'bagel', 'cuisine', 'comptoir', 'epicerie', 'marche', 'cafebar', 'restobar', 'momos', 'snackbar']);
+// Mots de tête retirés SEULEMENT pour retrouver une chaîne connue (« Restaurant Boustan » → Boustan,
+// « Express St-Hubert » → St-Hubert) ; une bannière inconnue garde son nom entier.
+const LEAD_WORDS = ['restaurantetbar', 'restaurants', 'restaurant', 'resto', 'boulangerie', 'cafe', 'express', 'rotisseries', 'rotisserie', 'chez'];
+
+// Clé normalisée → clé de bannière retenue (null = pas une bannière). S'applique aussi aux clés
+// déjà en base (sans relire Google) : voir recanonicalize().
+function canonicalKey(k) {
+  if (!k || GENERIC.has(k)) return null;
+  if (ALIASES[k]) return ALIASES[k];
+  if (KNOWN.has(k)) return k;
+  let p = PREFIXES.find((x) => k.startsWith(x));
+  if (p) return p;
+  // Toutes les façons de retirer 1 à 3 mots de tête (« restaurantscores » = restaurant + scores,
+  // pas restaurants + cores).
+  let level = [k];
+  for (let i = 0; i < 3 && level.length; i++) {
+    const next = [];
+    for (const s of level) {
+      for (const w of LEAD_WORDS) {
+        if (!s.startsWith(w) || s.length <= w.length) continue;
+        const t = s.slice(w.length);
+        if (ALIASES[t]) return ALIASES[t];
+        if (KNOWN.has(t)) return t;
+        p = PREFIXES.find((x) => t.startsWith(x));
+        if (p) return p;
+        next.push(t);
+      }
+    }
+    level = next;
+  }
+  return k.length >= 3 ? k.slice(0, 120) : null;
+}
 
 // Libellé de bannière : le nom avant le séparateur de succursale.
 function brandLabel(name) {
@@ -48,13 +93,10 @@ function brandLabel(name) {
 function brandKey(name) {
   const label = brandLabel(name);
   if (!label) return null;
-  const k = normName(label);
-  if (KNOWN.has(k)) return k;
-  const p = PREFIXES.find((x) => k.startsWith(x));
-  if (p) return p;
-  return k.length >= 3 ? k.slice(0, 120) : null;
+  return canonicalKey(normName(label));
 }
 const isKnown = (key) => !!key && KNOWN.has(key);
+const labelFor = (key, name) => KNOWN_LABEL.get(key) || brandLabel(name);
 
 // ---------------------------------------------------------------------------- stockage
 // opener_places.brand_key + opener_brands (une ligne par bannière : libellé, connue ?, nombre
@@ -88,14 +130,15 @@ async function tagPlaces(pool, list) {
     const key = brandKey(p.name);
     if (!p.id || !key) continue;
     ids.push(p.id); keys.push(key);
-    if (!byKey.has(key)) byKey.set(key, brandLabel(p.name));
+    if (!byKey.has(key)) byKey.set(key, labelFor(key, p.name));
   }
   if (!ids.length) return 0;
   const bk = [...byKey.keys()];
   await pool.query(
     `INSERT INTO opener_brands (brand_key, label, known)
      SELECT k, l, kn FROM unnest($1::text[], $2::text[], $3::bool[]) AS t(k, l, kn)
-     ON CONFLICT (brand_key) DO UPDATE SET known = EXCLUDED.known`,
+     ON CONFLICT (brand_key) DO UPDATE SET known = EXCLUDED.known,
+       label = CASE WHEN EXCLUDED.known THEN EXCLUDED.label ELSE opener_brands.label END`,
     [bk, bk.map((k) => byKey.get(k)), bk.map(isKnown)]);
   await pool.query(
     `UPDATE opener_places p SET brand_key = t.k FROM unnest($1::text[], $2::text[]) AS t(id, k)
@@ -104,15 +147,57 @@ async function tagPlaces(pool, list) {
   return ids.length;
 }
 
-// Nombre d'adresses (non exclues) par bannière ; toutes les bannières si keys est absent.
+// Nombre d'ADRESSES (non exclues) par bannière ; toutes les bannières si keys est absent. Deux
+// fiches Google à moins d'environ 100 m comptent pour une adresse : un même restaurant a parfois
+// 3 fiches (café, bar, traiteur) et passait pour 3 succursales (premier passage, 2026-10-09).
 async function refreshCounts(pool, keys) {
   await pool.query(
     `UPDATE opener_brands b SET n = COALESCE(c.n, 0), updated_at = CURRENT_TIMESTAMP
        FROM opener_brands b2
-       LEFT JOIN (SELECT brand_key, COUNT(*)::int AS n FROM opener_places
+       LEFT JOIN (SELECT brand_key, COUNT(DISTINCT COALESCE(ROUND(lat::numeric, 3)::text || ',' || ROUND(lng::numeric, 3)::text, place_id))::int AS n
+                    FROM opener_places
                    WHERE brand_key IS NOT NULL AND excluded_at IS NULL GROUP BY brand_key) c ON c.brand_key = b2.brand_key
       WHERE b.brand_key = b2.brand_key AND ($1::text[] IS NULL OR b.brand_key = ANY($1::text[]))
         AND b.n IS DISTINCT FROM COALESCE(c.n, 0)`, [keys || null]);
 }
 
-module.exports = { brandKey, brandLabel, isKnown, MIN_LOCATIONS, KNOWN, SCHEMA, franchiseSql, tagPlaces, refreshCounts };
+// Les règles de reconnaissance ont changé (CANON_VERSION) : les clés déjà en base sont
+// recalculées depuis la clé elle-même, sans relire Google. Les décisions du gestionnaire suivent
+// la bannière quand elle est fusionnée dans une autre qui n'en a pas.
+const CANON_VERSION = 3;
+async function recanonicalize(pool) {
+  const st = (await pool.query(`SELECT value FROM sync_state WHERE key = 'opener_brand_canon'`)).rows[0]?.value;
+  if (Number(st) >= CANON_VERSION) return null;
+  const old = (await pool.query(
+    `SELECT DISTINCT p.brand_key AS k, b.label, b.decision, b.decided_by, b.decided_at
+       FROM opener_places p LEFT JOIN opener_brands b ON b.brand_key = p.brand_key WHERE p.brand_key IS NOT NULL`)).rows;
+  let moved = 0, cleared = 0;
+  for (const o of old) {
+    const k = canonicalKey(o.k);
+    if (k === o.k) continue;
+    if (!k) {
+      await pool.query(`UPDATE opener_places SET brand_key = NULL WHERE brand_key = $1`, [o.k]);
+      cleared++; continue;
+    }
+    await pool.query(
+      `INSERT INTO opener_brands (brand_key, label, known, decision, decided_by, decided_at) VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (brand_key) DO UPDATE SET
+         decision = COALESCE(opener_brands.decision, EXCLUDED.decision),
+         decided_by = CASE WHEN opener_brands.decision IS NULL THEN EXCLUDED.decided_by ELSE opener_brands.decided_by END,
+         decided_at = CASE WHEN opener_brands.decision IS NULL THEN EXCLUDED.decided_at ELSE opener_brands.decided_at END`,
+      [k, KNOWN_LABEL.get(k) || o.label || k, isKnown(k), o.decision || null, o.decided_by || null, o.decided_at || null]);
+    await pool.query(`UPDATE opener_places SET brand_key = $2 WHERE brand_key = $1`, [o.k, k]);
+    moved++;
+  }
+  // Liste des chaînes connues élargie : drapeau et libellé lisible à jour partout.
+  const known = [...KNOWN];
+  await pool.query(`UPDATE opener_brands SET known = (brand_key = ANY($1::text[])) WHERE known IS DISTINCT FROM (brand_key = ANY($1::text[]))`, [known]);
+  for (const [k, l] of KNOWN_LABEL) await pool.query(`UPDATE opener_brands SET label = $2 WHERE brand_key = $1 AND label <> $2`, [k, l]);
+  await refreshCounts(pool);
+  await pool.query(
+    `INSERT INTO sync_state (key, value, updated_at) VALUES ('opener_brand_canon', $1, CURRENT_TIMESTAMP)
+     ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = CURRENT_TIMESTAMP`, [String(CANON_VERSION)]);
+  return { moved, cleared };
+}
+
+module.exports = { brandKey, brandLabel, canonicalKey, isKnown, MIN_LOCATIONS, KNOWN, SCHEMA, franchiseSql, tagPlaces, refreshCounts, recanonicalize };

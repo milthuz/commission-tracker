@@ -111,6 +111,9 @@ function registerOpenerCampaignRoutes(app, deps) {
   const schema = () => (ready = ready || (async () => {
     await field.schema();
     for (const sql of SCHEMA) await pool.query(sql);
+    // Règles de bannière revues : les clés déjà en base sont recalculées une fois (franchise.js).
+    const canon = await F.recanonicalize(pool);
+    if (canon) console.log('[OPENER] bannières recalculées :', JSON.stringify(canon));
   })().catch((e) => { ready = null; throw e; }));
   if (pool) schema().catch((e) => console.error('opener campaign schema:', e.message));
 
