@@ -409,7 +409,7 @@ const F = require('../franchise');
       await pool.query(`INSERT INTO opener_brands (brand_key, label, decision, decided_by) VALUES ('restaurantboustan', 'Restaurant Boustan', 'visit', 'boss@x.com'), ('pizzeria', 'Pizzéria', NULL, NULL)`);
       await pool.query(`UPDATE opener_places SET brand_key = 'restaurantboustan' WHERE place_id = 'PL_SAME_1'`);
       await pool.query(`UPDATE opener_places SET brand_key = 'pizzeria' WHERE place_id = 'PL_SAME_2'`);
-      await pool.query(`UPDATE sync_state SET value = '3' WHERE key = 'opener_brand_canon'`);
+      await pool.query(`UPDATE sync_state SET value = '4' WHERE key = 'opener_brand_canon'`);
       const out = await F.recanonicalize(pool);
       assert.deepStrictEqual(out, { moved: 1, cleared: 1 });
       const p = (await pool.query(`SELECT place_id, brand_key FROM opener_places WHERE place_id IN ('PL_SAME_1', 'PL_SAME_2') ORDER BY place_id`)).rows;
