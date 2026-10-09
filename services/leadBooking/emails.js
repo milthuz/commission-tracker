@@ -63,6 +63,48 @@ function welcomeBookingBlock({ lang, at, bookingUrl, meetUrl }) {
     + button(when ? (fr ? 'Choisir un autre moment' : 'Pick another time') : (fr ? 'Choisir un moment' : 'Pick a time'), bookingUrl);
 }
 
+// Carte du conseiller — partagée par le courriel de bienvenue et le remerciement de salon.
+function repCardHtml(rep, T, initials) {
+  const repName = rep?.name || null;
+  return repName ? `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:6px 0 18px;border:1px solid #e2e8f0;border-radius:12px">
+      <tr>
+        <td width="76" style="padding:14px 0 14px 16px;vertical-align:middle">
+          <table role="presentation" cellpadding="0" cellspacing="0"><tr><td align="center" style="width:48px;height:48px;border-radius:24px;background:#fff1e8;color:#c2410c;font-weight:700;font-size:16px">${esc(initials)}</td></tr></table>
+        </td>
+        <td style="padding:14px 16px 14px 0;vertical-align:middle">
+          <div style="font-weight:700;font-size:15px;color:#0f1722">${esc(repName)}</div>
+          <div style="font-size:12.5px;color:#64748b">${esc(rep.role || T('Votre conseiller', 'Your advisor'))} · Cluster</div>
+          ${rep.email ? `<div style="font-size:13px;margin-top:2px"><a href="mailto:${esc(rep.email)}" style="color:#3c50e0;text-decoration:none">${esc(rep.email)}</a></div>` : ''}
+          ${rep.phone ? `<div style="font-size:13px;margin-top:1px"><a href="tel:${esc(String(rep.phone).replace(/[^\d+]/g, ''))}" style="color:#0f1722;text-decoration:none">${esc(rep.phone)}</a></div>` : ''}
+        </td>
+      </tr>
+    </table>` : '';
+}
+
+// Les 3 prochaines étapes (textes validés par David le 2026-09-28).
+function nextStepsHtml(who, businessName, T) {
+  const step = (n, t, d) => `<tr><td width="36" style="vertical-align:top;padding:0 0 12px">
+      <table role="presentation" cellpadding="0" cellspacing="0"><tr><td align="center" style="width:24px;height:24px;border-radius:12px;background:#0f1722;color:#ffffff;font-size:12px;font-weight:700">${n}</td></tr></table>
+    </td><td style="vertical-align:top;padding:0 0 12px">
+      <div style="font-size:14px;font-weight:700;color:#0f1722">${t}</div>
+      <div style="font-size:13px;color:#64748b;line-height:1.5">${d}</div>
+    </td></tr>`;
+  const biz = esc(businessName);
+  return `
+    <div style="border-top:1px solid #eef1f6;padding-top:16px">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+        ${step(1, T('On fait connaissance', "Let's get to know you"),
+          T(`${who.charAt(0).toUpperCase() + who.slice(1)} apprend comment roule ${biz} : vos services, votre équipe, ce qui vous ralentit.`,
+            `${who.charAt(0).toUpperCase() + who.slice(1)} learns how ${biz} runs: your services, your team, what slows you down.`))}
+        ${step(2, T('Une proposition sur mesure', 'A tailored proposal'),
+          T('Le bon système et les bons tarifs pour vous, sans surprise.', 'The right system and the right rates for you, with no surprises.'))}
+        ${step(3, T('On vous installe', 'We get you set up'),
+          T("Installation, migration et formation de votre équipe, avec un suivi après le lancement.", 'Installation, migration and training for your team, with follow-up after launch.'))}
+      </table>
+    </div>`;
+}
+
 // ── Le courriel de BIENVENUE au marchand (refonte du 2026-09-28, maquette approuvée par David) ──
 // Carte du conseiller (initiales, titre et téléphone de sa SIGNATURE de profil), rendez-vous au
 // format « calendrier » avec Google Meet, les 3 prochaines étapes (textes validés par David), et la
@@ -88,21 +130,7 @@ function welcomeEmail(mailChrome, { lang, firstName, businessName, rep, at, call
     `Merci d'avoir pensé à nous pour <strong style="color:#0f1722">${esc(businessName)}</strong>. Une vraie personne, pas une file d'attente, s'occupe maintenant de votre dossier.`,
     `Thanks for thinking of us for <strong style="color:#0f1722">${esc(businessName)}</strong>. A real person, not a queue, is now looking after your request.`);
 
-  // Carte du conseiller.
-  const repCard = repName ? `
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:6px 0 18px;border:1px solid #e2e8f0;border-radius:12px">
-      <tr>
-        <td width="76" style="padding:14px 0 14px 16px;vertical-align:middle">
-          <table role="presentation" cellpadding="0" cellspacing="0"><tr><td align="center" style="width:48px;height:48px;border-radius:24px;background:#fff1e8;color:#c2410c;font-weight:700;font-size:16px">${esc(initials)}</td></tr></table>
-        </td>
-        <td style="padding:14px 16px 14px 0;vertical-align:middle">
-          <div style="font-weight:700;font-size:15px;color:#0f1722">${esc(repName)}</div>
-          <div style="font-size:12.5px;color:#64748b">${esc(rep.role || T('Votre conseiller', 'Your advisor'))} · Cluster</div>
-          ${rep.email ? `<div style="font-size:13px;margin-top:2px"><a href="mailto:${esc(rep.email)}" style="color:#3c50e0;text-decoration:none">${esc(rep.email)}</a></div>` : ''}
-          ${rep.phone ? `<div style="font-size:13px;margin-top:1px"><a href="tel:${esc(String(rep.phone).replace(/[^\d+]/g, ''))}" style="color:#0f1722;text-decoration:none">${esc(rep.phone)}</a></div>` : ''}
-        </td>
-      </tr>
-    </table>` : '';
+  const repCard = repCardHtml(rep, T, initials);
 
   // Le rendez-vous, au format calendrier.
   let appt = '';
@@ -165,26 +193,7 @@ function welcomeEmail(mailChrome, { lang, firstName, businessName, rep, at, call
         `${repName ? esc(repName) : 'Votre conseiller'} vous contactera sous peu. Vous pouvez aussi répondre directement à ce courriel.`,
         `${repName ? esc(repName) : 'Your advisor'} will be in touch shortly. You can also just reply to this email.`)}</p>`;
 
-  // Les 3 prochaines étapes (textes validés par David le 2026-09-28).
-  const step = (n, t, d) => `<tr><td width="36" style="vertical-align:top;padding:0 0 12px">
-      <table role="presentation" cellpadding="0" cellspacing="0"><tr><td align="center" style="width:24px;height:24px;border-radius:12px;background:#0f1722;color:#ffffff;font-size:12px;font-weight:700">${n}</td></tr></table>
-    </td><td style="vertical-align:top;padding:0 0 12px">
-      <div style="font-size:14px;font-weight:700;color:#0f1722">${t}</div>
-      <div style="font-size:13px;color:#64748b;line-height:1.5">${d}</div>
-    </td></tr>`;
-  const biz = esc(businessName);
-  const steps = `
-    <div style="border-top:1px solid #eef1f6;padding-top:16px">
-      <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-        ${step(1, T('On fait connaissance', "Let's get to know you"),
-          T(`${who.charAt(0).toUpperCase() + who.slice(1)} apprend comment roule ${biz} : vos services, votre équipe, ce qui vous ralentit.`,
-            `${who.charAt(0).toUpperCase() + who.slice(1)} learns how ${biz} runs: your services, your team, what slows you down.`))}
-        ${step(2, T('Une proposition sur mesure', 'A tailored proposal'),
-          T('Le bon système et les bons tarifs pour vous, sans surprise.', 'The right system and the right rates for you, with no surprises.'))}
-        ${step(3, T('On vous installe', 'We get you set up'),
-          T("Installation, migration et formation de votre équipe, avec un suivi après le lancement.", 'Installation, migration and training for your team, with follow-up after launch.'))}
-      </table>
-    </div>`;
+  const steps = nextStepsHtml(who, businessName, T);
 
   const dayWord = at ? new Date(at).toLocaleString(fr ? 'fr-CA' : 'en-CA', { timeZone: TZ, weekday: 'long' }) : null;
   const signOff = `<p style="margin:18px 0 0;font-size:14.5px;color:#475569;line-height:1.6">${
@@ -200,6 +209,51 @@ function welcomeEmail(mailChrome, { lang, firstName, businessName, rep, at, call
 
   return {
     subject: T(`Bienvenue chez Cluster — votre demande pour ${businessName}`, `Welcome to Cluster — your request for ${businessName}`),
+    html: mailChrome(inner, title.replace(/<[^>]+>/g, ''), 'cluster-plain', fr ? 'fr' : 'en', home, rep?.email || null),
+  };
+}
+
+// ── Le REMERCIEMENT DE SALON (2026-10-09, demande de David après GFS) ───────────────────────────
+// Envoyé APRÈS l'import d'une liste de salon, sur commande (aperçu + test d'abord). Pas de rappel
+// annoncé : c'est le visiteur qui choisit son moment sur /rdv. Même carte du conseiller, mêmes
+// 3 étapes et même signature que le courriel de bienvenue — un prospect qui reçoit les deux ne
+// doit pas croire écrire à deux entreprises.
+function eventThanksEmail(mailChrome, { lang, firstName, businessName, eventName, rep, bookingUrl, home, signatureHtml }) {
+  const fr = lang !== 'en';
+  const T = (a, b) => (fr ? a : b);
+  const repName = rep?.name || null;
+  const initials = (repName || 'C').split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0].toUpperCase()).join('');
+  const first = repName ? esc(repName.split(/\s+/)[0]) : null;
+  const ev = eventName ? esc(eventName) : null;
+  const who = first || T('votre conseiller', 'your advisor');
+
+  const title = firstName
+    ? T(`Merci de votre visite, ${esc(firstName)}`, `Thanks for stopping by, ${esc(firstName)}`)
+    : T('Merci de votre visite', 'Thanks for stopping by');
+  const intro = T(
+    `Merci d'être passé à notre kiosque${ev ? ` au <strong style="color:#0f1722">${ev}</strong>` : ''}. Ce fut un plaisir d'en apprendre un peu sur <strong style="color:#0f1722">${esc(businessName)}</strong>.`,
+    `Thank you for visiting the Cluster booth${ev ? ` at <strong style="color:#0f1722">${ev}</strong>` : ''}. It was great learning a little about <strong style="color:#0f1722">${esc(businessName)}</strong>.`);
+  const next = T(
+    `Pour poursuivre la conversation, ${repName ? esc(repName) : 'votre conseillère'} sera votre personne-ressource. Choisissez le moment qui vous convient pour une première rencontre : la disponibilité est à jour.`,
+    `To keep the conversation going, ${repName ? esc(repName) : 'your advisor'} will be your point of contact. Pick a time that suits you for a first meeting — the calendar is live.`);
+
+  const cta = bookingUrl ? button(first ? T(`Planifier une rencontre avec ${first}`, `Book a meeting with ${first}`) : T('Planifier une rencontre', 'Book a meeting'), bookingUrl) : '';
+  const note = `<p style="margin:10px 0 20px;font-size:12.5px;color:#94a3b8;line-height:1.6">${T(
+    `Vous préférez discuter tout de suite ? Répondez simplement à ce courriel, ${who} vous reviendra rapidement.`,
+    `Rather talk right away? Just reply to this email and ${who} will get back to you quickly.`)}</p>`;
+  const signOff = `<p style="margin:18px 0 0;font-size:14.5px;color:#475569;line-height:1.6">${T('Au plaisir,', 'Talk soon,')}</p>`
+    + (signatureHtml || `<p style="margin:6px 0 0;font-size:14.5px;line-height:1.6"><strong style="color:#0f1722">${esc(repName || 'Cluster')}</strong><br><span style="color:#475569">Cluster</span></p>`);
+
+  const inner = `
+    <p style="margin:0 0 6px;color:#c2410c;font-size:11px;font-weight:700;letter-spacing:.6px;text-transform:uppercase">${T('Merci de votre visite', 'Thanks for visiting')}</p>
+    <h1 style="margin:0 0 10px;color:#0f1722;font-size:22px;font-weight:700;line-height:1.3">${title}</h1>
+    <p style="${P}">${intro}</p>
+    <p style="${P}">${next}</p>
+    ${repCardHtml(rep, T, initials)}${cta}${note}${nextStepsHtml(who, businessName, T)}${signOff}`;
+  return {
+    subject: ev
+      ? T(`Merci de votre visite au ${eventName} — Cluster`, `Thanks for visiting us at ${eventName} — Cluster`)
+      : T('Merci de votre visite — Cluster', 'Thanks for visiting Cluster'),
     html: mailChrome(inner, title.replace(/<[^>]+>/g, ''), 'cluster-plain', fr ? 'fr' : 'en', home, rep?.email || null),
   };
 }
@@ -291,4 +345,4 @@ function ics({ uid, at, minutes, title, description, location, organizerName, or
   return lines.join('\r\n') + '\r\n';
 }
 
-module.exports = { whenLabel, callbackPhrase, welcomeBookingBlock, welcomeEmail, clientConfirmEmail, repChangedEmail, ics };
+module.exports = { whenLabel, callbackPhrase, welcomeBookingBlock, welcomeEmail, eventThanksEmail, clientConfirmEmail, repChangedEmail, ics };

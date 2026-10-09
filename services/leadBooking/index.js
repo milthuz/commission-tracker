@@ -185,8 +185,12 @@ function registerLeadBookingRoutes(app, deps) {
     const pad = (n) => String(n).padStart(2, '0');
     const kind = lead.crm_followup_kind === 'Tasks' ? 'Tasks' : 'Calls';
     if (!lead.crm_followup_id) {
-      if (!lead.crm_lead_id) return { ok: false, skipped: 'no_crm_lead' };
-      const cb = await h().scheduleLeadCallback(lead, rep, lead.crm_lead_id, new Date(at), settings);
+      // La cible est un OBJET { module, id } : un id nu donnait `cible.id` indéfini, et le rappel
+      // partait dans Zoho sans être rattaché à rien. Piste rattachée à un compte = son opportunité.
+      const cible = lead.crm_lead_id ? { module: 'Leads', id: lead.crm_lead_id }
+        : lead.crm_deal_id ? { module: 'Deals', id: lead.crm_deal_id } : null;
+      if (!cible) return { ok: false, skipped: 'no_crm_lead' };
+      const cb = await h().scheduleLeadCallback(lead, rep, cible, new Date(at), settings);
       return cb.ok ? { ok: true, created: true, id: cb.id, kind: cb.kind } : { ok: false, error: cb.error };
     }
     const d = new Date(at);

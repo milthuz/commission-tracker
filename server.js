@@ -212,6 +212,9 @@ const PERMISSION_CATALOG = [
   // compte. Cle distincte de `leads:review` a dessein — un Deal entre dans le pipeline des
   // ventes et dans le suivi des commissions, ce que l'acceptation ordinaire ne fait pas.
   { key: 'leads:attach_existing',      label: 'Attach a lead to a merchant that already exists in Zoho (creates a deal, not a second lead)', category: 'Leads' },
+  // Liste de salon (XLSX) : l'écran du lot EST l'examen — la clé fait donc entrer des pistes dans
+  // Zoho et partir un courriel aux visiteurs, comme `leads:review`, mais en lot (2026-10-09).
+  { key: 'leads:import',               label: 'Import a trade-show lead list (XLSX), accept it in bulk into Zoho and email the visitors', category: 'Leads' },
 
   // Module Opener (porte-à-porte). Lot 0 : l'appariement des magasins Cluster (Kaizen) à leur
   // fiche Google — il décide quels restaurants s'afficheront « client » sur la carte des openers.
@@ -4021,6 +4024,18 @@ require('./services/webflowLeads').registerWebflowLeadRoutes(app, {
   late: () => ({ normalizeLeadInput, createLeadRow }),
 });
 
+// Liste de salon (XLSX) → pistes acceptées en lot → courriel de remerciement avec lien /rdv.
+require('./services/leadImport').registerLeadImportRoutes(app, {
+  authenticateToken, requirePerm, pool, logActivity,
+  late: () => ({
+    normalizeLeadInput, createLeadRow, acceptLead, leadRepContact, leadSettings, checkCrmDuplicate,
+    sendMail, mailShell,
+    eventThanksEmail: (o) => leadBooking.emails.eventThanksEmail(mailChrome, o),
+    senderFor: leadBooking.senderFor, issueLink: leadBooking.issueLink,
+    base: () => process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com',
+  }),
+});
+
 // ============================================================================
 // ZOHO OAUTH CONFIG
 // ============================================================================
@@ -4742,7 +4757,7 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // sampleEmail(), dans TEMPLATE_TYPES de EmailPreview.tsx, et dans les libellés i18n.
 // Les quatre `pass_*` sont les courriels du programme La Passe ; ils sont les seuls de la
 // liste à partir d'une adresse et d'une enveloppe qui ne sont pas celles de Sales Hub.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder', 'lead_review', 'lead_assigned', 'lead_welcome', 'lead_booking_client', 'lead_booking_cancelled', 'lead_booking_rep', 'partner_lead_assigned', 'hr_sign_request', 'hr_countersign', 'hr_completed', 'hr_declined', 'opener_route_published', 'opener_week_published', 'role_request', 'opener_daily_report'];
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder', 'lead_review', 'lead_assigned', 'lead_welcome', 'lead_booking_client', 'lead_booking_cancelled', 'lead_booking_rep', 'lead_event_thanks', 'lead_import_rep', 'partner_lead_assigned', 'hr_sign_request', 'hr_countersign', 'hr_completed', 'hr_declined', 'opener_route_published', 'opener_week_published', 'role_request', 'opener_daily_report'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -4845,6 +4860,21 @@ function sampleEmail(type, lang) {
       repName: rep.name, repEmail: rep.email, at: kind === 'cancelled' ? null : callbackAt, bookingUrl, meetUrl, kind,
       home: LEAD_SETTINGS_DEFAULTS.merchantSiteUrl,
     });
+    if (type === 'lead_event_thanks') {
+      return leadBooking.emails.eventThanksEmail(mailChrome, {
+        lang: lead.language, firstName: lead.contact_first_name, businessName: lead.business_name,
+        eventName: 'GFS Food Show', rep: { name: rep.name, email: rep.email, role: rep.signatureRole, phone: rep.signaturePhone },
+        bookingUrl, home: LEAD_SETTINGS_DEFAULTS.merchantSiteUrl, signatureHtml: rep.signatureHtml,
+      });
+    }
+    if (type === 'lead_import_rep') {
+      const [subject, html] = require('./services/leadImport').repSummaryEmail(mailShell, 'GFS Food Show', rep, [
+        { businessName: lead.business_name, firstName: lead.contact_first_name, lastName: lead.contact_last_name,
+          email: lead.contact_email, phone: lead.contact_phone, comments: ['Kiosk + V2'], refCode: lead.ref_code },
+        { businessName: 'Bistro Heron', firstName: 'Andrew', lastName: 'Moffat', email: 'info@bistroheron.ca', comments: [], refCode: 'L-00043' },
+      ], base);
+      return { subject, html };
+    }
     if (type === 'lead_booking_client') return confirm('booked');
     if (type === 'lead_booking_cancelled') return confirm('cancelled');
     if (type === 'lead_booking_rep') {
@@ -37984,7 +38014,7 @@ function normalizeLeadInput(b, defaults = {}) {
 // `waitForDuplicate` renverse ce choix pour la saisie telephonique — l'employe est au telephone
 // avec la personne, savoir tout de suite « on l'a deja, et c'est Amy qui la suit » vaut la
 // seconde d'attente.
-async function createLeadRow(input, { createdBy = null, raw = null, waitForDuplicate = false } = {}) {
+async function createLeadRow(input, { createdBy = null, raw = null, waitForDuplicate = false, notifyReviewers = true } = {}) {
   const suggestion = await suggestLeadAssignment({
     source: input.source, province: input.province, language: input.language,
     business_type: input.businessType, postal_code: input.postalCode,
@@ -38025,7 +38055,9 @@ async function createLeadRow(input, { createdBy = null, raw = null, waitForDupli
   // Client existant ? Détaché comme le doublon : un formulaire public ne doit pas attendre Zoho.
   refreshLeadExistingCustomer(id, input.email).catch(() => {});
 
-  notifyLeadReviewers(id).catch(() => {});
+  // Un import de salon ne prévient pas les examinateurs ligne par ligne : il est accepté en lot,
+  // par la personne même qui l'importe (services/leadImport).
+  if (notifyReviewers) notifyLeadReviewers(id).catch(() => {});
 
   return { id, refCode, suggestion, duplicate: waitForDuplicate ? await dup : null };
 }
@@ -38524,16 +38556,20 @@ async function acceptLead(leadId, actor, opts = {}) {
     return { error: 'duplicate_unconfirmed' };
   }
 
-  const settings = await leadSettings();
+  // `settingsOverride` : un appelant peut couper une automatisation pour CET appel seulement —
+  // l'import de salon accepte sans rappel ni courriel de bienvenue (services/leadImport).
+  const settings = { ...(await leadSettings()), ...(opts.settingsOverride || {}) };
   const repName = String(opts.repName || '').trim() || lead.assigned_rep_name || lead.suggested_rep_name;
   if (!repName) return { error: 'no_rep' };
   const rep = await leadRepContact(repName);
 
   const steps = {};
   const contactMethod = lead.source === 'website' ? settings.contactMethodWebsite
-    : lead.source === 'opener' ? (settings.contactMethodOpener || settings.contactMethodPhone) : settings.contactMethodPhone;
+    : lead.source === 'opener' ? (settings.contactMethodOpener || settings.contactMethodPhone)
+    : lead.source === 'event' ? (settings.contactMethodEvent || settings.contactMethodPhone) : settings.contactMethodPhone;
   const leadSource    = lead.source === 'website' ? settings.leadSourceWebsite
-    : lead.source === 'opener' ? (settings.leadSourceOpener || settings.leadSourcePhone) : settings.leadSourcePhone;
+    : lead.source === 'opener' ? (settings.leadSourceOpener || settings.leadSourcePhone)
+    : lead.source === 'event' ? (settings.leadSourceEvent || settings.leadSourcePhone) : settings.leadSourcePhone;
   const contactName = leadDisplayName(lead);
 
   const noteBody = [
@@ -38569,7 +38605,7 @@ async function acceptLead(leadId, actor, opts = {}) {
     approver_email:     actor,
     approver_name:      opts.approverName || null,
     description:        noteBody,
-    note_title:         `Piste ${lead.ref_code} — ${lead.source === 'website' ? 'formulaire du site' : 'saisie Sales Hub'}`,
+    note_title:         `Piste ${lead.ref_code} — ${lead.source === 'website' ? 'formulaire du site' : lead.source === 'event' ? `salon${lead.source_detail ? ` ${lead.source_detail}` : ''}` : 'saisie Sales Hub'}`,
     note_body:          noteBody,
   };
 
@@ -38795,6 +38831,7 @@ async function leadAccess(req) {
     remove:  has('leads:delete'),
     toTicket: has('leads:to_ticket'),
     attachExisting: has('leads:attach_existing'),
+    import: has('leads:import'),
   };
 }
 
