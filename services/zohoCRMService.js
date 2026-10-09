@@ -67,7 +67,7 @@ class ZohoCRMService {
       let hasMore = true;
 
       while (hasMore) {
-        const query = `SELECT id, Deal_Name, Stage, Owner, Closing_Date, Deposit_Information_Received, Lead_Source_Group, Lead_Source, Account_Name, Amount, Created_Time, Modified_Time FROM Deals WHERE Deposit_Information_Received is not null LIMIT ${limit} OFFSET ${offset}`;
+        const query = `SELECT id, Deal_Name, Stage, Owner, Closing_Date, Deposit_Information_Received, Lead_Source_Group, Lead_Source, Account_Name, Amount, Created_Time, Modified_Time, Deal_Lost_Date FROM Deals WHERE Deposit_Information_Received is not null LIMIT ${limit} OFFSET ${offset}`;
 
         const response = await axios.post(`${CRM_BASE_URL}/coql`, { select_query: query }, {
           headers: { ...this.headers, 'Content-Type': 'application/json' },
@@ -104,7 +104,7 @@ class ZohoCRMService {
             criteria: `(Stage:equals:Deposit Information Received)`,
             per_page: 200,
             page,
-            fields: 'Deal_Name,Stage,Owner,Closing_Date,Deposit_Information_Received,Lead_Source_Group,Lead_Source,Account_Name,Amount,Created_Time,Modified_Time',
+            fields: 'Deal_Name,Stage,Owner,Closing_Date,Deposit_Information_Received,Lead_Source_Group,Lead_Source,Account_Name,Amount,Created_Time,Modified_Time,Deal_Lost_Date',
           },
         });
 
@@ -236,6 +236,21 @@ class ZohoCRMService {
   // Fetch an Account by ID. Used to resolve lead source for "Additional Location"
   // deals, where the deal itself doesn't carry the real source (it's on the parent
   // Account, since these are new branches of existing customers).
+  // Stage of specific deals, by id (100 per call — Zoho's limit for `ids`). Used for deals we
+  // already count but that no sync query returns any more. A deal Zoho no longer has is simply
+  // absent from the answer — the caller must treat absence as "unknown", never as "lost".
+  async getDealsByIds(ids) {
+    const out = [];
+    for (let i = 0; i < ids.length; i += 100) {
+      const response = await axios.get(`${CRM_BASE_URL}/Deals`, {
+        headers: this.headers,
+        params: { ids: ids.slice(i, i + 100).join(','), fields: 'Stage,Deal_Lost_Date,Deposit_Information_Received,Modified_Time' },
+      });
+      out.push(...(response.data?.data || []));
+    }
+    return out;
+  }
+
   async getAccount(accountId) {
     if (!accountId) return null;
     try {

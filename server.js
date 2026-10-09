@@ -2765,6 +2765,16 @@ async function initializeDatabase() {
       );
     `);
 
+    // Deals an admin put BACK after the Closed Lost rule excluded them (see applyClosedLostRule).
+    // Without this the next CRM sync would exclude them again, an hour later, silently.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS deal_auto_exclusion_waivers (
+        deal_id   VARCHAR(255) PRIMARY KEY,
+        waived_by VARCHAR(255),
+        waived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
     // Copie locale des billets Zoho Desk. Voir le bloc « SOUTIEN TECHNIQUE » plus bas pour
     // le pourquoi : ~156 000 billets et une API qui ne sait pas agreger.
     await pool.query(`
@@ -14295,7 +14305,14 @@ app.post('/api/crm/deals/:dealId/exclude', authenticateToken, async (req, res) =
         [dealId, deal.deal_name, reason, actor]
       );
     } else {
-      await pool.query(`DELETE FROM excluded_deals WHERE deal_id = $1`, [dealId]);
+      const gone = (await pool.query(
+        `DELETE FROM excluded_deals WHERE deal_id = $1 RETURNING excluded_by`, [dealId])).rows[0];
+      if (gone?.excluded_by === AUTO_LOST_ACTOR) {
+        await pool.query(
+          `INSERT INTO deal_auto_exclusion_waivers (deal_id, waived_by) VALUES ($1, $2)
+           ON CONFLICT (deal_id) DO UPDATE SET waived_by = EXCLUDED.waived_by, waived_at = CURRENT_TIMESTAMP`,
+          [dealId, actor]);
+      }
     }
     logActivity('crm_deal', dealId,
       excluded ? 'deal_excluded_from_tracker' : 'deal_restored_to_tracker',
@@ -15332,8 +15349,88 @@ async function syncCrmSoldDeals(crm) {
   }
   console.log(`👥 Upserted ${uniqueReps.length} CRM reps into salespeople table`);
 
+  // Its own try: a failure here must not fail the sync that just stored every deal.
+  let closedLost = null;
+  try { closedLost = await applyClosedLostRule(crm, deals); }
+  catch (e) { console.warn('[closed-lost] rule skipped:', e.message); }
+
   console.log(`✅ CRM sync: ${deals.length} deals processed, ${newCount} new, ${additionalLocationResolved} 'Additional Location' resolved via Account`);
-  return { total: deals.length, newCount, additionalLocationResolved };
+  return { total: deals.length, newCount, additionalLocationResolved, closedLost };
+}
+
+// Rule decided by David 2026-10-09: a counted deal that Zoho marks Closed Lost within 90 days of
+// its deposit loses its point; if it comes back to Closed Won, the point comes back. Lost later
+// than that is churn, not a lost sale, and keeps its point.
+//
+// Done through excluded_deals, stamped AUTO_LOST_ACTOR, so it is visible and reversible in
+// Admin → Commissions → Deals like any exclusion. The rule only ever touches its OWN stamp: an
+// exclusion an admin made is never lifted, and an admin who restores an auto-excluded deal is
+// recorded in deal_auto_exclusion_waivers so the rule leaves it alone. Paid commissions are
+// frozen anyway; this moves points, quotas and bonuses still to come.
+//
+// Acts only on a stage Zoho actually returned. A deal missing from the answer is unknown, not
+// lost — the 2026-08-18 incident was exactly a partial fetch read as a deletion.
+const AUTO_LOST_ACTOR = 'auto:closed-lost';
+const CLOSED_LOST_WINDOW_DAYS = 90;
+
+async function applyClosedLostRule(crm, deals) {
+  const byId = new Map(deals.map(d => [String(d.id), d]));
+  const stored = (await pool.query(`
+    SELECT d.deal_id, d.deal_name, d.owner_name, d.points,
+           to_char(d.sold_date, 'YYYY-MM-DD') AS sold_date,
+           x.excluded_by, (w.deal_id IS NOT NULL) AS waived
+      FROM crm_sold_deals d
+      LEFT JOIN excluded_deals x ON x.deal_id = d.deal_id
+      LEFT JOIN deal_auto_exclusion_waivers w ON w.deal_id = d.deal_id
+     WHERE d.is_manual IS NOT TRUE`)).rows;
+
+  // Deals we count but that no sync query returns any more (a no-deposit deal whose closing
+  // date left the 6-month window, then got lost): ask Zoho for those few directly.
+  const missing = stored.filter(r => !byId.has(r.deal_id)).map(r => r.deal_id);
+  if (missing.length) {
+    for (const d of await crm.getDealsByIds(missing)) byId.set(String(d.id), d);
+  }
+
+  let excluded = 0, restored = 0;
+  for (const r of stored) {
+    const z = byId.get(r.deal_id);
+    if (!z) continue;
+    if (z.Stage === 'Closed Lost') {
+      if (r.excluded_by || r.waived) continue;
+      const deposit = z.Deposit_Information_Received || r.sold_date;
+      const lost = z.Deal_Lost_Date || String(z.Modified_Time || '').slice(0, 10);
+      if (!deposit || !lost) continue;
+      const days = Math.round((Date.parse(lost) - Date.parse(deposit)) / 86400000);
+      if (!(days <= CLOSED_LOST_WINDOW_DAYS)) continue;
+      const reason = `Auto : Closed Lost dans Zoho le ${lost}, ${days} j après le dépôt du ${deposit}`;
+      const ins = await pool.query(
+        `INSERT INTO excluded_deals (deal_id, deal_name, reason, excluded_by)
+         VALUES ($1, $2, $3, $4) ON CONFLICT (deal_id) DO NOTHING`,
+        [r.deal_id, r.deal_name, reason, AUTO_LOST_ACTOR]);
+      if (!ins.rowCount) continue;
+      excluded++;
+      logActivity('crm_deal', r.deal_id, 'deal_excluded_from_tracker',
+        `Deal "${r.deal_name}" (${r.owner_name || '—'}, ${r.points} pt) excluded from the Commission Tracker — ${reason}`,
+        AUTO_LOST_ACTOR, { metadata: { points: r.points, owner: r.owner_name, reason } });
+    } else if (z.Stage === 'Closed Won' && (r.excluded_by === AUTO_LOST_ACTOR || r.waived)) {
+      // Won again: the point is back, and a later loss is judged afresh.
+      await pool.query(`DELETE FROM deal_auto_exclusion_waivers WHERE deal_id = $1`, [r.deal_id]);
+      if (r.excluded_by !== AUTO_LOST_ACTOR) continue;
+      const del = await pool.query(
+        `DELETE FROM excluded_deals WHERE deal_id = $1 AND excluded_by = $2`, [r.deal_id, AUTO_LOST_ACTOR]);
+      if (!del.rowCount) continue;
+      restored++;
+      logActivity('crm_deal', r.deal_id, 'deal_restored_to_tracker',
+        `Deal "${r.deal_name}" (${r.owner_name || '—'}, ${r.points} pt) restored to the Commission Tracker — Closed Won again in Zoho`,
+        AUTO_LOST_ACTOR, { metadata: { points: r.points, owner: r.owner_name } });
+    }
+  }
+  if (excluded || restored) {
+    _monthlyPointsCache.clear();
+    _dataHealthCache = { at: 0, data: null };
+  }
+  console.log(`[closed-lost] ${excluded} excluded, ${restored} restored (${missing.length} deals checked by id)`);
+  return { excluded, restored, checkedById: missing.length };
 }
 
 // ============================================================================
