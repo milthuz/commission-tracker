@@ -263,6 +263,10 @@ function registerLeadBookingRoutes(app, deps) {
       const got = await loadByToken(req, res);
       if (!got) return;
       const { lead } = got;
+      // Le client a OUVERT son lien de réservation — signal fiable, contrairement au pixel.
+      // Colonnes créées par services/leadImport ; tant qu'elles n'existent pas, on ignore l'échec.
+      pool.query(`UPDATE leads SET booking_link_opened_at = COALESCE(booking_link_opened_at, NOW()),
+                         booking_link_open_count = COALESCE(booking_link_open_count, 0) + 1 WHERE id = $1`, [lead.id]).catch(() => {});
       const settings = await h().leadSettings();
       const cur = current(lead);
       const past = !!cur && cur.getTime() < Date.now() && lead.booking_status !== 'callback';

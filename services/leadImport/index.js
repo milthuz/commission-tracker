@@ -64,6 +64,15 @@ function registerLeadImportRoutes(app, deps) {
         await pool.query(`ALTER TABLE lead_import_batches ADD COLUMN IF NOT EXISTS photo_type VARCHAR(40)`);
         await pool.query(`ALTER TABLE lead_import_batches ADD COLUMN IF NOT EXISTS photo_token VARCHAR(64)`);
         await pool.query(`ALTER TABLE lead_import_batches ADD COLUMN IF NOT EXISTS photo_caption VARCHAR(200)`);
+        // Suivi du remerciement (2026-10-09, « comme ailleurs » = le pixel des propositions). Le pixel
+        // SOUS-COMPTE (Gmail/Outlook mettent les images en cache, d'autres les bloquent) : on mesure
+        // aussi l'ouverture du LIEN de réservation et le rendez-vous pris, qui eux sont fiables.
+        await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS event_track_token VARCHAR(64)`);
+        await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS event_opened_at TIMESTAMPTZ`);
+        await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS event_open_count INT DEFAULT 0`);
+        await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS booking_link_opened_at TIMESTAMPTZ`);
+        await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS booking_link_open_count INT DEFAULT 0`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_leads_event_track_token ON leads(event_track_token) WHERE event_track_token IS NOT NULL`);
         await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS external_ref VARCHAR(160)`);
         await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_external_ref ON leads(external_ref) WHERE external_ref IS NOT NULL`);
       })().catch((e) => { schemaReady = null; throw e; });
@@ -84,7 +93,8 @@ function registerLeadImportRoutes(app, deps) {
     delete b.photo_token;
     const leads = (await pool.query(
       `SELECT id, ref_code, external_ref, status, assigned_rep_name, crm_lead_id, crm_lead_error,
-              merchant_notified_at, contact_email, automation
+              merchant_notified_at, contact_email, automation, event_opened_at, event_open_count,
+              booking_link_opened_at, booking_link_open_count, booking_status, callback_at
          FROM leads WHERE import_batch_id = $1`, [id])).rows;
     const byKey = new Map(leads.map((l) => [String(l.external_ref || '').replace(`import:${id}:`, ''), l]));
     const rows = (b.rows || []).map((r) => {
@@ -92,6 +102,9 @@ function registerLeadImportRoutes(app, deps) {
       return { ...r, lead: l ? {
         id: l.id, refCode: l.ref_code, status: l.status, rep: l.assigned_rep_name,
         crmLeadId: l.crm_lead_id, crmError: l.crm_lead_error,
+        openedAt: l.event_opened_at, openCount: Number(l.event_open_count) || 0,
+        linkOpenedAt: l.booking_link_opened_at, linkOpenCount: Number(l.booking_link_open_count) || 0,
+        booked: l.booking_status === 'confirmed' ? l.callback_at : null,
         emailedAt: l.merchant_notified_at, resendCount: Number(l.automation?.eventThanks?.resendCount) || 0, emailError: l.automation?.eventThanks?.ok === false ? l.automation.eventThanks.error : null,
       } : null };
     });
@@ -331,7 +344,33 @@ function registerLeadImportRoutes(app, deps) {
     } catch { res.status(500).end(); }
   });
 
+  // PUBLIQUE : le pixel d'ouverture. Ne lève jamais, rend toujours l'image.
+  const PIXEL = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+  app.get('/api/public/lead-import-open/:token', (req, res) => {
+    const token = String(req.params.token || '').replace(/\.gif$/i, '');
+    if (/^[A-Za-z0-9_-]{16,64}$/.test(token)) {
+      pool.query(`UPDATE leads SET event_opened_at = COALESCE(event_opened_at, NOW()), event_open_count = COALESCE(event_open_count, 0) + 1
+                   WHERE event_track_token = $1`, [token]).catch(() => {});
+    }
+    res.set('Content-Type', 'image/gif');
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    res.end(PIXEL);
+  });
+
   // ── 3. Le courriel de remerciement ────────────────────────────────────────
+  // Le jeton du pixel, UN par piste et gardé d'un renvoi à l'autre : les ouvertures s'additionnent.
+  async function trackTokenFor(lead) {
+    if (lead.event_track_token) return lead.event_track_token;
+    const t = crypto.randomBytes(18).toString('base64url');
+    await pool.query(`UPDATE leads SET event_track_token = COALESCE(event_track_token, $2) WHERE id = $1`, [lead.id, t]);
+    return (await pool.query(`SELECT event_track_token FROM leads WHERE id = $1`, [lead.id])).rows[0].event_track_token;
+  }
+  const pixelFor = (token) => `<img src="${apiBase()}/api/public/lead-import-open/${token}.gif" width="1" height="1" alt="" style="display:none;width:1px;height:1px;border:0;max-height:0;overflow:hidden">`;
+  // Glissé juste avant </body> : le pixel n'appartient pas au gabarit (l'aperçu et le test n'en ont pas).
+  const withPixel = (html, token) => (html.includes('</body>') ? html.replace('</body>', `${pixelFor(token)}</body>`) : html + pixelFor(token));
+
   async function renderFor(batch, lead, bookingUrl) {
     const lang = lead.language === 'fr' ? 'fr' : 'en';
     const rep = await h().leadRepContact(lead.assigned_rep_name || batch.default_rep, { lang });
@@ -403,7 +442,7 @@ function registerLeadImportRoutes(app, deps) {
           const bookingUrl = await h().issueLink(lead.id);
           const { mail, rep, settings } = await renderFor(batch, lead, bookingUrl);
           const sender = h().senderFor(rep, settings);
-          const m = await h().sendMail(lead.contact_email, mail.subject, mail.html, sender);
+          const m = await h().sendMail(lead.contact_email, mail.subject, withPixel(mail.html, await trackTokenFor(lead)), sender);
           step = m.sent ? { ok: true, at: new Date().toISOString(), to: lead.contact_email, from: sender.from || null, by: actor }
                         : { ok: false, at: new Date().toISOString(), error: m.reason };
         } catch (e) { step = { ok: false, at: new Date().toISOString(), error: e.message.slice(0, 300) }; }
@@ -443,7 +482,7 @@ function registerLeadImportRoutes(app, deps) {
       const bookingUrl = await h().issueLink(lead.id);
       const { mail, rep, settings } = await renderFor(batch, lead, bookingUrl);
       const sender = h().senderFor(rep, settings);
-      const m = await h().sendMail(lead.contact_email, mail.subject, mail.html, sender);
+      const m = await h().sendMail(lead.contact_email, mail.subject, withPixel(mail.html, await trackTokenFor(lead)), sender);
       if (!m.sent) return res.status(502).json({ error: 'send_failed', detail: m.reason || null });
       const step = { ...prev, ok: true, resentAt: new Date().toISOString(), resentBy: actor,
                      resendCount: (Number(prev.resendCount) || 0) + 1, to: lead.contact_email, from: sender.from || null };
