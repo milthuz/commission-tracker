@@ -37825,13 +37825,18 @@ async function leadRepContact(repName, { lang = null } = {}) {
   const hit = dir.find((u) => String(u.name || '').trim().toLowerCase() === name.trim().toLowerCase())
     || (email ? dir.find((u) => String(u.email || '').trim().toLowerCase() === email.toLowerCase()) : null);
   const finalEmail = email || hit?.email || null;
-  const role = (lang === 'en' && row?.signature_role_en) ? row.signature_role_en : (row?.signature_role || null);
+  const useEn = lang === 'en' && !!row?.signature_role_en;
+  const role = useEn ? row.signature_role_en : (row?.signature_role || null);
+  // Plusieurs reps ont mis leur titre ANGLAIS en ligne 2 (signature bilingue). En anglais, cette
+  // ligne répéterait le titre : on la retire quand elle dit la même chose (casse et ponctuation ignorées).
+  const sameText = (a, b) => String(a || '').toLowerCase().replace(/[^a-z0-9]/g, '') === String(b || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const role2 = useEn && sameText(row?.signature_role2, row.signature_role_en) ? null : (row?.signature_role2 || null);
   // Signature de profil (Profil → Signature courriel) : titre et téléphone pour le courriel de
   // bienvenue au marchand. Vide tant que le représentant ne l'a pas configurée.
   return {
     name, email: finalEmail, crmUserId: hit?.id || null,
     signatureRole: role, signaturePhone: row?.signature_phone || null,
-    signatureHtml: buildSignatureHtml({ name, role, role2: row?.signature_role2, phone: row?.signature_phone, email: finalEmail }),
+    signatureHtml: buildSignatureHtml({ name, role, role2, phone: row?.signature_phone, email: finalEmail }),
   };
 }
 
