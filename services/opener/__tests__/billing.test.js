@@ -32,6 +32,22 @@ const ACTIVE = new Set(['live', 'non_renewing', 'dunning', 'unpaid', 'paused']);
     assert.strictEqual(m.get('O:C').name, 'Resto C');
   });
 
+  await t('règle des emplacements : payants + en pause (« Saisonnier ») ; impayés et retards de paiement = pas clients', async () => {
+    const CLIENT = new Set(['live', 'non_renewing', 'paused']);
+    const m = B.groupCustomers('O', [
+      { customer_id: 'P', status: 'paused' },                       // saisonnier
+      { customer_id: 'M', status: 'paused' }, { customer_id: 'M', status: 'live' },  // payant (pas saisonnier)
+      { customer_id: 'U', status: 'unpaid' },                       // impayé → ancien client
+      { customer_id: 'D', status: 'dunning' },                      // retard de paiement → ancien client
+      { customer_id: 'N', status: 'non_renewing' },                 // payant jusqu'à la fin du terme
+    ], CLIENT);
+    assert.deepStrictEqual([m.get('O:P').active, m.get('O:P').seasonal], [true, true]);
+    assert.deepStrictEqual([m.get('O:M').active, m.get('O:M').seasonal], [true, false]);
+    assert.strictEqual(m.get('O:U').active, false);
+    assert.strictEqual(m.get('O:D').active, false);
+    assert.deepStrictEqual([m.get('O:N').active, m.get('O:N').seasonal], [true, false]);
+  });
+
   await t('adresse : livraison si elle a une rue, sinon facturation', async () => {
     const both = B.pickAddress({ shipping_address: { address: '1 Resto', zip: 'H1A 1A1', city: 'Mtl' }, billing_address: { address: '9 Siège', zip: 'H9Z 9Z9' } });
     assert.strictEqual(both.street, '1 Resto');

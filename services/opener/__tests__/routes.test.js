@@ -394,6 +394,20 @@ const addr = (address, zip, extra = {}) => ({ address, street2: '', city: 'Montr
       zohoLockBusy = false;
     });
 
+    await t('synchro : un abonnement impayé n\'est plus client ; en pause = client « Saisonnier »', async () => {
+      const saved = subs;
+      subs = subs.map((s) => (s.customer_id === 'C4' ? { ...s, status: 'unpaid' } : s.customer_id === 'X1' ? { ...s, status: 'paused' } : s));
+      await mod.runAll({ source: 'statuts' });
+      const rows = (await pool.query(`SELECT source_key, active, extra->>'seasonal' AS seasonal FROM cluster_locations WHERE source = 'billing'`)).rows;
+      const byKey = Object.fromEntries(rows.map((r) => [r.source_key, r]));
+      assert.strictEqual(byKey[`${CA}:C4`].active, false, 'impayé → ancien client');
+      assert.deepStrictEqual([byKey[`${XP}:X1`].active, byKey[`${XP}:X1`].seasonal], [true, 'true'], 'en pause → client saisonnier');
+      const list = (await call('GET', '/api/opener/locations?q=xperio')).body.locations;
+      assert.ok(list.some((l) => l.seasonal === true), 'la liste expose « seasonal »');
+      subs = saved;
+      await mod.runAll({ source: 'statuts-retour' });
+    });
+
     await t('client Billing résilié de partout → missing, jamais supprimé', async () => {
       subs = subs.filter((s) => s.customer_id !== 'C4');
       out = await mod.runAll({ source: 'missing-billing' });

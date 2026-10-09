@@ -21,9 +21,9 @@ const DEFAULT_ORGS = ['697704869', '905113716'];
 const billingOrgs = (env = process.env) =>
   String(env.OPENER_BILLING_ORG_IDS || DEFAULT_ORGS.join(',')).split(',').map((s) => s.trim()).filter(Boolean);
 
-// Abonnements → clients. `activeStatuses` = les statuts « client actif » du tableau de bord
-// (live, non_renewing, dunning, unpaid, paused) : un client sans aucun abonnement actif est un
-// ANCIEN client, gardé (utile aux openers : reconquête), marqué inactif.
+// Abonnements → clients. `activeStatuses` = les statuts qui font un « client » (pour les
+// emplacements : CLIENT_STATUSES de routes.js — payants + en pause). Un client sans aucun abonnement
+// actif est un ANCIEN client, gardé (utile aux openers : reconquête), marqué inactif.
 function groupCustomers(orgId, subs, activeStatuses) {
   const out = new Map();
   for (const s of subs || []) {
@@ -32,17 +32,19 @@ function groupCustomers(orgId, subs, activeStatuses) {
     const key = `${orgId}:${cid}`;
     let c = out.get(key);
     if (!c) {
-      c = { key, orgId, customerId: cid, name: '', active: false, plans: new Set(), subs: 0, activeSubs: 0, subNumbers: [] };
+      c = { key, orgId, customerId: cid, name: '', active: false, plans: new Set(), subs: 0, activeSubs: 0, pausedSubs: 0, subNumbers: [] };
       out.set(key, c);
     }
     const name = String(s.customer_name || s.company_name || '').trim();
     if (name && !c.name) c.name = name;
     const st = String(s.status || '').toLowerCase();
     c.subs++;
-    if (activeStatuses.has(st)) { c.active = true; c.activeSubs++; }
+    if (activeStatuses.has(st)) { c.active = true; c.activeSubs++; if (st === 'paused') c.pausedSubs++; }
     if (s.plan_name) c.plans.add(String(s.plan_name).trim());
     if (s.subscription_number && c.subNumbers.length < 10) c.subNumbers.push(String(s.subscription_number));
   }
+  // Saisonnier : client dont TOUS les abonnements actifs sont en pause (restaurant fermé l'hiver…).
+  for (const c of out.values()) c.seasonal = c.activeSubs > 0 && c.pausedSubs === c.activeSubs;
   return out;
 }
 

@@ -34,6 +34,11 @@ const M = require('./matching');
 const PERM_MATCH = 'opener:match';
 const STATUSES = ['pending', 'auto', 'review', 'none', 'no_address', 'manual', 'ignored'];
 const SOURCES = ['kaizen', 'billing'];
+// Qui est « client » pour les emplacements (David, 2026-10-09) : seulement les abonnements PAYANTS
+// (live, non_renewing) et ceux EN PAUSE, gardés comme « Saisonnier ». Les impayés et en retard de
+// paiement (dunning, unpaid) ne comptent plus. ≠ ACTIVE_STATUSES du tableau de bord (server.js),
+// qui reste aligné sur Zoho Billing pour le MRR.
+const CLIENT_STATUSES = new Set(['live', 'non_renewing', 'paused']);
 const PLACE_RE = /^[A-Za-z0-9_-]{10,300}$/;
 const DEFAULT_MATCH_BUDGET = 300;     // recherches Text Search par passage ; ~0,03 $US l'une
 const DEFAULT_ADDRESS_BUDGET = 400;   // contacts Books lus par passage manuel (~5 min)
@@ -307,7 +312,7 @@ function registerOpenerRoutes(app, deps) {
       for (const [i, orgId] of orgs.entries()) {
         await progress('billing_subs', i, orgs.length, true);
         const subs = await L.fetchBillingSubs(apiDomain, accessToken, orgId, 'SubscriptionStatus.All');
-        for (const [k, c] of B.groupCustomers(orgId, subs, L.ACTIVE_STATUSES)) customers.set(k, c);
+        for (const [k, c] of B.groupCustomers(orgId, subs, CLIENT_STATUSES)) customers.set(k, c);
       }
       if (await L.saasScanShouldStop(owner)) throw new Error('arrêt demandé par un autre scan Zoho');
 
@@ -339,7 +344,7 @@ function registerOpenerRoutes(app, deps) {
             name: (c.name || '(sans nom)').slice(0, 255),
             street: a.street, unit: a.unit, city: a.city, region: a.region, postalCode: a.postal_code, country: a.country,
             active: c.active,
-            extra: { org: ORG_NAMES[c.orgId] || c.orgId, plans: [...c.plans].slice(0, 8), subs: c.subs, activeSubs: c.activeSubs,
+            extra: { org: ORG_NAMES[c.orgId] || c.orgId, plans: [...c.plans].slice(0, 8), subs: c.subs, activeSubs: c.activeSubs, seasonal: c.seasonal || undefined,
               subNumbers: c.subNumbers, addressFrom: a.which, addressError: a.error || undefined },
           });
         }
@@ -628,6 +633,7 @@ function registerOpenerRoutes(app, deps) {
       twin: r.twin_of ? { id: r.twin_of, storeName: r.twin_name || null } : null,
       plans: Array.isArray(x.plans) ? x.plans : [],
       activeSubs: x.activeSubs ?? null,
+      seasonal: !!x.seasonal,
       addressFrom: x.addressFrom || null,
       missingSince: r.missing_since,
       status: r.match_status,

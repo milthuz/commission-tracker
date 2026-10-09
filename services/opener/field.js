@@ -233,7 +233,7 @@ function registerOpenerFieldRoutes(app, deps) {
     if (!ids.length) return out;
     const { rows } = await pool.query(
       `SELECT p.pid,
-         (SELECT json_build_object('id', l.id, 'active', l.active, 'source', l.source, 'name', l.name,
+         (SELECT json_build_object('id', l.id, 'active', l.active, 'source', l.source, 'name', l.name, 'seasonal', l.extra->>'seasonal' = 'true',
                                    'version', COALESCE(l.version_override, l.software_version))
             FROM cluster_locations l
            WHERE l.place_id = p.pid AND l.missing_since IS NULL AND l.match_status <> 'ignored'
@@ -251,6 +251,8 @@ function registerOpenerFieldRoutes(app, deps) {
       const status = loc && loc.active ? 'client' : loc ? 'former' : (r.lead || r.last) ? 'prospect' : 'new';
       out.set(r.pid, {
         status, version: loc?.version || null, clusterName: loc?.name || null, source: loc?.source || null,
+        // Client dont tous les abonnements sont en pause (2026-10-09) : « Saisonnier ».
+        seasonal: status === 'client' && loc?.seasonal === true,
         lastVisitAt: r.last?.at || null, lastVisitBy: r.last?.by || null, competitorPos: r.last?.currentPos || null,
         serviceTypeSeen: r.last?.serviceType || null, lastInterest: r.last?.interest ?? null,
         lastSatisfaction: r.last?.satisfaction ?? null, lastPaymentsBy: r.last?.paymentsBy || null,
