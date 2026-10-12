@@ -32,7 +32,9 @@ const IN = (i) => [45.521 + i * 0.0003, -73.589 + i * 0.0004];   // points dans 
     CREATE TABLE local_users (email TEXT, display_name TEXT);
     CREATE TABLE leads (id SERIAL PRIMARY KEY, ref_code TEXT, business_name TEXT, status TEXT DEFAULT 'new', interest JSONB,
       source TEXT, source_detail TEXT, notes TEXT, city TEXT, province TEXT, postal_code TEXT, created_by TEXT, raw JSONB,
-      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, business_type TEXT, website TEXT, contact_first_name TEXT,
+      contact_last_name TEXT, contact_title TEXT, contact_email TEXT, contact_phone TEXT, contact_phone_digits TEXT, language TEXT,
+      locations_count INT, current_pos TEXT, timeline TEXT);
     INSERT INTO roles (name, permissions) VALUES ('Opener', '["opener:field"]'), ('Manager', '["opener:routes"]');
     INSERT INTO user_roles VALUES ('jo@x.com', 1), ('autre@x.com', 1), ('mgr@x.com', 2);
     INSERT INTO user_tokens VALUES ('jo@x.com', 'Jonathan Opener', false), ('mgr@x.com', 'Marie Manager', false);
@@ -72,7 +74,11 @@ const IN = (i) => [45.521 + i * 0.0003, -73.589 + i * 0.0004];   // points dans 
   let refN = 1000;
   const late = () => ({
     normalizeLeadInput: (b, d) => ({ businessName: b.businessName || null, source: d.source, interest: b.interest || [],
-      notes: b.notes || null, city: b.city || null, province: b.province || null, postalCode: b.postalCode || null }),
+      notes: b.notes || null, city: b.city || null, province: b.province || null, postalCode: b.postalCode || null,
+      businessType: b.businessType || null, website: b.website || null, firstName: b.firstName || null, lastName: b.lastName || null,
+      title: b.title || null, email: b.email || null, phone: b.phone || null, phoneDigits: (b.phone || '').replace(/\D/g, '') || null,
+      language: b.language || null, locationsCount: b.locationsCount ? Number(b.locationsCount) : null, currentPos: b.currentPos || null,
+      timeline: b.timeline || null }),
     createLeadRow: async (input, { createdBy, raw }) => {
       const r = await pool.query(
         `INSERT INTO leads (ref_code, business_name, interest, source, source_detail, notes, city, province, postal_code, created_by, raw)
@@ -443,6 +449,85 @@ const IN = (i) => [45.521 + i * 0.0003, -73.589 + i * 0.0004];   // points dans 
       const r = await call('GET', '/api/opener/routes');
       const mine = r.body.routes.find((x) => x.id === route.id);
       assert.deepStrictEqual([mine.stops, mine.done, mine.status], [3, 1, 'closed']);
+    });
+
+    // ------------------------------------------------ demandes de Hao (2026-10-12)
+    const R2 = (await pool.query(
+      `INSERT INTO opener_routes (name, route_date, opener_email, status, created_by) VALUES ('Hao test', '2030-01-07', 'jo@x.com', 'published', 'mgr@x.com') RETURNING id`)).rows[0].id;
+    for (const [i, pid] of ['PLACE_H_00000001', 'PLACE_H_00000002', 'PLACE_H_00000003'].entries()) {
+      await pool.query(`INSERT INTO opener_route_stops (route_id, place_id, position, label, lat, lng) VALUES ($1, $2, $3, $4, 45.52, -73.58)`, [R2, pid, i + 1, `Resto ${i + 1}`]);
+    }
+    const h = async () => (await pool.query(`SELECT id, place_id, position, outcome, skip_reason FROM opener_route_stops WHERE route_id = $1 ORDER BY position`, [R2])).rows;
+
+    await t('revenir plus tard : l\'arrêt reste à faire et passe en fin de route ; rien à remplir', async () => {
+      const [a] = await h();
+      assert.strictEqual((await call('POST', `/api/opener/stops/${a.id}/later`, {}, 'autre@x.com')).status, 404);
+      assert.strictEqual((await call('POST', `/api/opener/stops/${a.id}/later`, {}, 'jo@x.com')).status, 200);
+      const after = await h();
+      assert.deepStrictEqual(after.map((x) => x.place_id), ['PLACE_H_00000002', 'PLACE_H_00000003', 'PLACE_H_00000001']);
+      assert.strictEqual(after[2].outcome, 'planned');
+    });
+
+    const ck2 = { id: crypto.randomUUID(), placeId: 'PLACE_H_00000002', at: new Date().toISOString(), currentPos: 'Square', serviceType: 'quick', interest: 2, notes: 'Fermé, reviens' };
+    await t('corriger un check-in : réponses modifiées, heure et position intactes ; seulement le sien', async () => {
+      const stop = (await h()).find((x) => x.place_id === 'PLACE_H_00000002');
+      assert.strictEqual((await call('POST', '/api/opener/checkins', { ...ck2, stopId: stop.id, lat: 45.52, lng: -73.58 }, 'jo@x.com')).status, 200);
+      const g = (await call('GET', `/api/opener/checkins/${ck2.id}`, undefined, 'jo@x.com')).body.checkin;
+      assert.deepStrictEqual([g.currentPos, g.interest, g.editable], ['Square', 2, true]);
+      assert.strictEqual((await call('GET', `/api/opener/checkins/${ck2.id}`, undefined, 'autre@x.com')).status, 404);
+      assert.strictEqual((await call('PUT', `/api/opener/checkins/${ck2.id}`, { currentPos: 'Clover', serviceType: 'both', interest: 4 }, 'autre@x.com')).status, 404);
+      assert.strictEqual((await call('PUT', `/api/opener/checkins/${ck2.id}`, { currentPos: '', serviceType: 'both', interest: 4 }, 'jo@x.com')).body.error, 'current_pos_required');
+      const before = (await pool.query(`SELECT at, lat FROM opener_checkins WHERE id = $1`, [ck2.id])).rows[0];
+      assert.strictEqual((await call('PUT', `/api/opener/checkins/${ck2.id}`, { currentPos: 'Clover', serviceType: 'both', interest: 4, notes: 'Oublié : 2 terminaux', at: '2020-01-01', lat: 1 }, 'jo@x.com')).status, 200);
+      const row = (await pool.query(`SELECT at, lat, current_pos, interest_level, notes, updated_at FROM opener_checkins WHERE id = $1`, [ck2.id])).rows[0];
+      assert.deepStrictEqual([row.current_pos, row.interest_level, row.notes], ['Clover', 4, 'Oublié : 2 terminaux']);
+      assert.strictEqual(String(row.at), String(before.at), 'heure inchangée');
+      assert.strictEqual(row.lat, before.lat, 'position inchangée');
+      assert.ok(row.updated_at);
+      // Au-delà de 7 jours : plus modifiable.
+      await pool.query(`UPDATE opener_checkins SET at = CURRENT_TIMESTAMP - INTERVAL '8 days' WHERE id = $1`, [ck2.id]);
+      assert.strictEqual((await call('PUT', `/api/opener/checkins/${ck2.id}`, { currentPos: 'Toast', serviceType: 'both', interest: 4 }, 'jo@x.com')).body.error, 'too_old');
+      await pool.query(`UPDATE opener_checkins SET at = CURRENT_TIMESTAMP WHERE id = $1`, [ck2.id]);
+    });
+
+    await t('annuler un check-in (« ce n\'était pas une visite ») : fermé → non visité ; plus tard → fin de route ; n\'existe pas → exclu', async () => {
+      assert.strictEqual((await call('POST', `/api/opener/checkins/${ck2.id}/void`, { reason: 'x' }, 'jo@x.com')).body.error, 'invalid_reason');
+      assert.strictEqual((await call('POST', `/api/opener/checkins/${ck2.id}/void`, { reason: 'later' }, 'autre@x.com')).status, 404);
+      assert.strictEqual((await call('POST', `/api/opener/checkins/${ck2.id}/void`, { reason: 'later' }, 'jo@x.com')).status, 200);
+      assert.strictEqual((await pool.query(`SELECT COUNT(*)::int n FROM opener_checkins WHERE id = $1`, [ck2.id])).rows[0].n, 0);
+      let st = await h();
+      assert.strictEqual(st[st.length - 1].place_id, 'PLACE_H_00000002', 'plus tard → en fin de route');
+      assert.strictEqual(st[st.length - 1].outcome, 'planned');
+      // Fermé.
+      const ck3 = { ...ck2, id: crypto.randomUUID(), placeId: 'PLACE_H_00000003' };
+      await call('POST', '/api/opener/checkins', { ...ck3, stopId: st.find((x) => x.place_id === 'PLACE_H_00000003').id }, 'jo@x.com');
+      assert.strictEqual((await call('POST', `/api/opener/checkins/${ck3.id}/void`, { reason: 'closed' }, 'jo@x.com')).status, 200);
+      st = await h();
+      const c3 = st.find((x) => x.place_id === 'PLACE_H_00000003');
+      assert.deepStrictEqual([c3.outcome, c3.skip_reason], ['skipped', 'closed']);
+      // N'existe pas.
+      const ck4 = { ...ck2, id: crypto.randomUUID(), placeId: 'PLACE_H_00000001' };
+      await call('POST', '/api/opener/checkins', { ...ck4, stopId: st.find((x) => x.place_id === 'PLACE_H_00000001').id }, 'jo@x.com');
+      assert.strictEqual((await call('POST', `/api/opener/checkins/${ck4.id}/void`, { reason: 'not_found' }, 'jo@x.com')).status, 200);
+      const ex = (await pool.query(`SELECT excluded_reason FROM opener_places WHERE place_id = 'PLACE_H_00000001'`)).rows[0];
+      assert.strictEqual(ex.excluded_reason, 'not_found');
+      assert.strictEqual((await h()).find((x) => x.place_id === 'PLACE_H_00000001').skip_reason, 'excluded');
+      // Un check-in lié à une piste ne s'annule pas.
+      assert.strictEqual((await call('POST', `/api/opener/checkins/${ck.id}/void`, { reason: 'closed' }, 'jo@x.com')).body.error, 'has_lead');
+    });
+
+    await t('corriger sa piste : avant la révision seulement, et seulement la sienne', async () => {
+      const g = (await call('GET', `/api/opener/leads/${lead.id}`, undefined, 'jo@x.com')).body.lead;
+      assert.deepStrictEqual([g.address, g.notes, g.editable], ['123 Rue Neuve', 'Rappeler lundi', true]);
+      assert.strictEqual((await call('GET', `/api/opener/leads/${lead.id}`, undefined, 'autre@x.com')).status, 404);
+      const body = { ...g, firstName: 'Marie', email: 'marie@resto.ca', notes: 'Rappeler mardi', address: '125 Rue Neuve' };
+      assert.strictEqual((await call('PUT', `/api/opener/leads/${lead.id}`, body, 'autre@x.com')).status, 404);
+      assert.strictEqual((await call('PUT', `/api/opener/leads/${lead.id}`, body, 'jo@x.com')).status, 200);
+      const row = (await pool.query(`SELECT contact_first_name, contact_email, notes, source FROM leads WHERE id = $1`, [lead.id])).rows[0];
+      assert.deepStrictEqual([row.contact_first_name, row.contact_email, row.notes, row.source], ['Marie', 'marie@resto.ca', 'Adresse : 125 Rue Neuve\n\nRappeler mardi', 'opener']);
+      await pool.query(`UPDATE leads SET status = 'accepted' WHERE id = $1`, [lead.id]);
+      assert.strictEqual((await call('PUT', `/api/opener/leads/${lead.id}`, body, 'jo@x.com')).body.error, 'lead_locked');
+      assert.strictEqual((await call('GET', `/api/opener/leads/${lead.id}`, undefined, 'jo@x.com')).body.lead.editable, false);
     });
 
     console.log(`field : ${n} tests OK (${nearbyCalls.length} appels Nearby simulés dans le dernier lot)`);

@@ -128,6 +128,8 @@ const SCHEMA = [
   // paiements (cluster | other | unknown) — la porte d'entrée pour proposer les paiements.
   `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS satisfaction SMALLINT`,
   `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS payments_by VARCHAR(10)`,
+  // Check-in corrigé par l'opener après l'envoi (2026-10-12).
+  `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP`,
 ];
 
 // AAAA-MM-JJ à Montréal. Jamais `new Date().toISOString()` : à 20 h à Montréal, c'est déjà demain en UTC.
@@ -792,9 +794,10 @@ function registerOpenerFieldRoutes(app, deps) {
       const history = (await pool.query(
         `SELECT c.id, c.at, ${V_LAT} AS lat, ${V_DIST} AS distance_m, ${V_ACC} AS accuracy_m, ${DUR_MIN} AS duration_min,
                 COALESCE(c.user_name, c.user_email) AS by, c.current_pos, c.service_type, c.terminals,
-                c.decision_maker, c.interest_level, c.services, c.notes, c.satisfaction, c.payments_by, ld.ref_code
+                c.decision_maker, c.interest_level, c.services, c.notes, c.satisfaction, c.payments_by, ld.ref_code,
+                (LOWER(c.user_email) = $2 AND c.at > CURRENT_TIMESTAMP - INTERVAL '7 days') AS editable
            FROM opener_checkins c LEFT JOIN leads ld ON ld.id = c.lead_id
-          WHERE c.place_id = $1 ORDER BY c.at DESC LIMIT 15`, [pid])).rows;
+          WHERE c.place_id = $1 ORDER BY c.at DESC LIMIT 15`, [pid, me(req)])).rows;
       res.json({
         placeId: pid,
         google: g ? {
@@ -816,7 +819,7 @@ function registerOpenerFieldRoutes(app, deps) {
         history: history.map((h) => ({
           id: h.id, at: h.at, by: h.by, distanceM: h.distance_m, durationMin: h.duration_min, verdict: verdict(h.distance_m, h.accuracy_m, h.lat), currentPos: h.current_pos, serviceType: h.service_type, terminals: h.terminals,
           decisionMaker: h.decision_maker, interest: h.interest_level, services: h.services || [], notes: h.notes, leadRef: h.ref_code,
-          satisfaction: h.satisfaction ?? null, paymentsBy: h.payments_by || null,
+          satisfaction: h.satisfaction ?? null, paymentsBy: h.payments_by || null, editable: h.editable === true, hasLead: !!h.ref_code,
         })),
       });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -981,6 +984,175 @@ function registerOpenerFieldRoutes(app, deps) {
       if (!stop) return res.status(404).json({ error: 'not_found' });
       if (stop.outcome !== 'skipped') return res.status(409).json({ error: 'not_skipped' });
       await pool.query(`UPDATE opener_route_stops SET outcome = 'planned', skip_reason = NULL, done_at = NULL WHERE id = $1`, [stop.id]);
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // ==========================================================================
+  // Demandes de Hao (2026-10-12) : revenir plus tard sans rien remplir, corriger un check-in
+  // envoyé (ou l'annuler si ce n'était pas une visite), corriger sa piste avant la révision.
+  // ==========================================================================
+  // Fenêtre de correction : 7 jours, comme l'heure acceptée d'un check-in hors ligne.
+  const EDIT_DAYS = 7;
+  const moveToEnd = (stop) => pool.query(
+    `UPDATE opener_route_stops SET outcome = 'planned', skip_reason = NULL, done_at = NULL,
+            position = (SELECT COALESCE(MAX(position), 0) + 1 FROM opener_route_stops WHERE route_id = $2)
+      WHERE id = $1`, [stop.id, stop.route_id]);
+
+  // « Revenir plus tard » : l'arrêt reste à faire et passe en fin de route. Rien à remplir.
+  app.post('/api/opener/stops/:id/later', authenticateToken, async (req, res) => {
+    if (!(await guard(req, res, PERM_FIELD))) return;
+    try {
+      const stop = await myStop(req, parseInt(req.params.id, 10) || 0);
+      if (!stop) return res.status(404).json({ error: 'not_found' });
+      if (stop.outcome === 'done') return res.status(409).json({ error: 'already_done' });
+      if (stop.route_status !== 'published') return res.status(409).json({ error: 'route_closed' });
+      await moveToEnd(stop);
+      log('opener_route', stop.route_id, 'stop_later', `${stop.label} : revenir plus tard (fin de route)`, actorOf(req));
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  async function myCheckin(req, id) {
+    if (!UUID_RE.test(String(id || ''))) return null;
+    return (await pool.query(
+      `SELECT c.*, s.label AS stop_label, s.route_id, r.status AS route_status,
+              (c.at > CURRENT_TIMESTAMP - INTERVAL '${EDIT_DAYS} days') AS editable
+         FROM opener_checkins c LEFT JOIN opener_route_stops s ON s.id = c.route_stop_id
+         LEFT JOIN opener_routes r ON r.id = s.route_id
+        WHERE c.id = $1 AND LOWER(c.user_email) = $2`, [String(id).toLowerCase(), me(req)])).rows[0] || null;
+  }
+
+  app.get('/api/opener/checkins/:id', authenticateToken, async (req, res) => {
+    if (!(await guard(req, res, PERM_FIELD))) return;
+    try {
+      const c = await myCheckin(req, req.params.id);
+      if (!c) return res.status(404).json({ error: 'not_found' });
+      const st = (await statusOf([c.place_id])).get(c.place_id) || { status: 'new' };
+      res.json({ checkin: {
+        id: c.id, placeId: c.place_id, stopId: c.route_stop_id, name: c.stop_label || null, at: c.at, startedAt: c.started_at,
+        currentPos: c.current_pos, serviceType: c.service_type, terminals: c.terminals, onlineDelivery: c.online_delivery,
+        decisionMaker: c.decision_maker, interest: c.interest_level, services: c.services || [], notes: c.notes || '',
+        satisfaction: c.satisfaction, paymentsBy: c.payments_by, leadId: c.lead_id, editable: c.editable,
+        isClient: st.status === 'client', updatedAt: c.updated_at || null,
+      } });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Corriger un check-in envoyé : les RÉPONSES seulement. L'heure et la position (la preuve de
+  // la visite) ne changent jamais.
+  app.put('/api/opener/checkins/:id', authenticateToken, async (req, res) => {
+    if (!(await guard(req, res, PERM_FIELD))) return;
+    try {
+      const c = await myCheckin(req, req.params.id);
+      if (!c) return res.status(404).json({ error: 'not_found' });
+      if (!c.editable) return res.status(409).json({ error: 'too_old', days: EDIT_DAYS });
+      const p = parseCheckin({ ...(req.body || {}), id: c.id, placeId: c.place_id });
+      if (p.error) return res.status(400).json(p);
+      const v = p.value;
+      await pool.query(
+        `UPDATE opener_checkins SET current_pos = $2, service_type = $3, terminals = $4, online_delivery = $5, decision_maker = $6,
+                interest_level = $7, services = $8::jsonb, notes = $9, satisfaction = $10, payments_by = $11, updated_at = CURRENT_TIMESTAMP
+          WHERE id = $1`,
+        [c.id, v.currentPos, v.serviceType, v.terminals, v.onlineDelivery, v.decisionMaker, v.interest,
+         JSON.stringify(v.services), v.notes, v.satisfaction, v.paymentsBy]);
+      log('opener_checkin', c.id, 'edited', `Check-in corrigé par l'opener (${c.stop_label || c.place_id})`, actorOf(req),
+        { metadata: { before: { currentPos: c.current_pos, serviceType: c.service_type, interest: c.interest_level, notes: c.notes, satisfaction: c.satisfaction, paymentsBy: c.payments_by } } });
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // « Ce n'était pas une visite » : le check-in est retiré et l'arrêt prend son vrai sort —
+  // fermé (revient dans une prochaine route), plus tard (fin de la route du jour) ou n'existe pas
+  // (lieu exclu). Le contenu retiré est gardé dans le journal d'activité.
+  const VOID_REASONS = ['closed', 'later', 'not_found'];
+  app.post('/api/opener/checkins/:id/void', authenticateToken, async (req, res) => {
+    if (!(await guard(req, res, PERM_FIELD))) return;
+    const reason = String(req.body?.reason || '');
+    if (!VOID_REASONS.includes(reason)) return res.status(400).json({ error: 'invalid_reason' });
+    try {
+      const c = await myCheckin(req, req.params.id);
+      if (!c) return res.status(404).json({ error: 'not_found' });
+      if (!c.editable) return res.status(409).json({ error: 'too_old', days: EDIT_DAYS });
+      if (c.lead_id) return res.status(409).json({ error: 'has_lead' });
+      await pool.query(`DELETE FROM opener_checkins WHERE id = $1`, [c.id]);
+      const stop = c.route_stop_id ? await myStop(req, c.route_stop_id) : null;
+      const other = stop ? (await pool.query(`SELECT 1 FROM opener_checkins WHERE route_stop_id = $1 LIMIT 1`, [stop.id])).rows.length > 0 : false;
+      if (stop && !other) {
+        if (reason === 'later' && stop.route_status === 'published' && stop.route_date >= ymdMtl()) await moveToEnd(stop);
+        else await pool.query(`UPDATE opener_route_stops SET outcome = 'skipped', skip_reason = $2, done_at = CURRENT_TIMESTAMP WHERE id = $1`,
+          [stop.id, reason === 'not_found' ? 'excluded' : 'closed']);
+      }
+      if (reason === 'not_found') {
+        await pool.query(
+          `INSERT INTO opener_places (place_id, excluded_at, excluded_by, excluded_reason, source) VALUES ($1, CURRENT_TIMESTAMP, $2, 'not_found', 'exclude')
+           ON CONFLICT (place_id) DO UPDATE SET excluded_at = CURRENT_TIMESTAMP, excluded_by = $2, excluded_reason = 'not_found'`, [c.place_id, actorOf(req)]);
+      }
+      const what = { closed: 'fermé', later: 'revenir plus tard', not_found: "n'existe pas (exclu)" }[reason];
+      log('opener_checkin', c.id, 'voided', `Check-in annulé par l'opener : ${what} (${c.stop_label || c.place_id})`, actorOf(req),
+        { metadata: { reason, checkin: { at: c.at, placeId: c.place_id, currentPos: c.current_pos, interest: c.interest_level, notes: c.notes } } });
+      res.json({ ok: true, stopOutcome: stop && !other ? (reason === 'later' && stop.route_date >= ymdMtl() ? 'planned' : 'skipped') : null });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Corriger SA piste tant que personne ne l'a révisée (nouvelle ou en révision). Après
+  // l'acceptation, elle vit dans Zoho : on ne la touche plus d'ici.
+  const LEAD_EDITABLE = ['new', 'in_review'];
+  async function myLead(req, id) {
+    return (await pool.query(
+      `SELECT * FROM leads WHERE id = $1 AND raw->>'via' = 'opener' AND LOWER(created_by) = $2`, [parseInt(id, 10) || 0, me(req)])).rows[0] || null;
+  }
+  const splitNotes = (n) => {
+    const m = /^Adresse : ([^\n]*)(?:\n\n([\s\S]*))?$/.exec(n || '');
+    return m ? { address: m[1], notes: m[2] || '' } : { address: '', notes: n || '' };
+  };
+  app.get('/api/opener/leads/:id', authenticateToken, async (req, res) => {
+    if (!(await guard(req, res, PERM_FIELD))) return;
+    try {
+      const l = await myLead(req, req.params.id);
+      if (!l) return res.status(404).json({ error: 'not_found' });
+      const n = splitNotes(l.notes);
+      res.json({ lead: {
+        id: l.id, refCode: l.ref_code, status: l.status, editable: LEAD_EDITABLE.includes(l.status), placeId: l.raw?.placeId || null,
+        businessName: l.business_name || '', businessType: l.business_type || '', phone: l.contact_phone || '', address: n.address,
+        city: l.city || '', province: l.province || 'QC', postalCode: l.postal_code || '', website: l.website || null,
+        firstName: l.contact_first_name || '', lastName: l.contact_last_name || '', title: l.contact_title || '',
+        language: l.language === 'en' ? 'en' : 'fr', email: l.contact_email || '', interest: Array.isArray(l.interest) ? l.interest : [],
+        currentPos: l.current_pos || '', locationsCount: l.locations_count ?? '', timeline: l.timeline || null, notes: n.notes,
+      } });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+  app.put('/api/opener/leads/:id', authenticateToken, async (req, res) => {
+    if (!(await guard(req, res, PERM_FIELD))) return;
+    const L = late();
+    if (!L.normalizeLeadInput) return res.status(503).json({ error: 'leads_unavailable' });
+    try {
+      const l = await myLead(req, req.params.id);
+      if (!l) return res.status(404).json({ error: 'not_found' });
+      if (!LEAD_EDITABLE.includes(l.status)) return res.status(409).json({ error: 'lead_locked', status: l.status });
+      const b = req.body || {};
+      const street = clean(b.address, 300);
+      const notes = [street ? `Adresse : ${street}` : null, clean(b.notes, 6000)].filter(Boolean).join('\n\n') || null;
+      const input = L.normalizeLeadInput({
+        businessName: b.businessName, businessType: b.businessType, website: b.website ?? l.website,
+        firstName: b.firstName, lastName: b.lastName, title: b.title, email: b.email, phone: b.phone,
+        city: b.city, province: b.province, postalCode: b.postalCode, language: b.language,
+        interest: Array.isArray(b.interest) ? b.interest.filter((x) => SERVICES.includes(x)) : [],
+        locationsCount: b.locationsCount, currentPos: b.currentPos, timeline: b.timeline, notes,
+      }, { source: 'opener' });
+      if (!input.businessName) return res.status(400).json({ error: 'businessName is required' });
+      await pool.query(
+        `UPDATE leads SET business_name = $2, business_type = $3, website = $4,
+                contact_first_name = $5, contact_last_name = $6, contact_title = $7,
+                contact_email = $8, contact_phone = $9, contact_phone_digits = $10,
+                city = $11, province = $12, postal_code = $13, language = $14,
+                interest = $15::jsonb, locations_count = $16, current_pos = $17, timeline = $18, notes = $19
+          WHERE id = $1 AND status = ANY($20::text[])`,
+        [l.id, input.businessName, input.businessType, input.website,
+         input.firstName, input.lastName, input.title, input.email, input.phone, input.phoneDigits,
+         input.city, input.province, input.postalCode, input.language, JSON.stringify(input.interest),
+         input.locationsCount, input.currentPos, input.timeline, input.notes, LEAD_EDITABLE]);
+      log('lead', l.id, 'edited', 'Piste corrigée par l\'opener avant la révision', actorOf(req));
       res.json({ ok: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
