@@ -38871,23 +38871,37 @@ app.get('/api/leads/stats', authenticateToken, async (req, res) => {
   const months = Math.min(24, Math.max(1, parseInt(req.query.months, 10) || 6));
   try {
     const since = `${months} months`;
+    // Les pistes des PARTENAIRES (partner_opportunities) sont des pistes assignées comme les autres :
+    // un représentant (crm_owner_name, fixé à l'approbation), un Deal Zoho, une date de dépôt. David
+    // a constaté le 2026-10-13 qu'elles manquaient au rapport — plus des deux tiers des pistes
+    // assignées sur six mois. Réunies ici sous une forme commune ; la file d'examen et le délai
+    // d'examen restent ceux des pistes directes (l'approbation partenaire vit ailleurs).
+    const ALL = `(
+      SELECT created_at, status, source, assigned_rep_name AS rep, crm_deal_id, crm_deposit_date, false AS partner FROM leads
+      UNION ALL
+      SELECT created_at,
+             CASE status WHEN 'approved' THEN 'accepted' WHEN 'pending' THEN 'new' ELSE status END,
+             'partner', crm_owner_name, crm_deal_id, crm_deposit_date, true
+        FROM partner_opportunities
+    ) p`;
     const [byStatus, bySource, byMonth, byRep, funnel, queue, speed] = await Promise.all([
       pool.query(`SELECT status, COUNT(*)::int AS n FROM leads GROUP BY status`),
       pool.query(`SELECT source, COUNT(*)::int AS n,
                          COUNT(*) FILTER (WHERE status = 'accepted')::int AS accepted
-                    FROM leads WHERE created_at >= NOW() - INTERVAL '${since}'
+                    FROM ${ALL} WHERE created_at >= NOW() - INTERVAL '${since}'
                    GROUP BY source ORDER BY n DESC`),
       pool.query(`SELECT to_char(date_trunc('month', created_at), 'YYYY-MM') AS month,
                          COUNT(*)::int AS n,
                          COUNT(*) FILTER (WHERE status = 'accepted')::int AS accepted,
                          COUNT(*) FILTER (WHERE status IN ('rejected','duplicate'))::int AS rejected
-                    FROM leads WHERE created_at >= NOW() - INTERVAL '${since}'
+                    FROM ${ALL} WHERE created_at >= NOW() - INTERVAL '${since}'
                    GROUP BY 1 ORDER BY 1`),
-      pool.query(`SELECT assigned_rep_name AS rep, COUNT(*)::int AS n,
+      pool.query(`SELECT rep, COUNT(*)::int AS n,
+                         COUNT(*) FILTER (WHERE partner)::int AS partner,
                          COUNT(*) FILTER (WHERE crm_deal_id IS NOT NULL)::int AS converted,
                          COUNT(*) FILTER (WHERE crm_deposit_date IS NOT NULL)::int AS won
-                    FROM leads
-                   WHERE assigned_rep_name IS NOT NULL AND created_at >= NOW() - INTERVAL '${since}'
+                    FROM ${ALL}
+                   WHERE rep IS NOT NULL AND created_at >= NOW() - INTERVAL '${since}'
                    GROUP BY 1 ORDER BY n DESC`),
       // L'entonnoir complet — c'est la seule vue qui relie une piste a de l'argent reel, via
       // l'etat du Deal Zoho rafraichi par le travail horaire.
@@ -38895,7 +38909,7 @@ app.get('/api/leads/stats', authenticateToken, async (req, res) => {
                          COUNT(*) FILTER (WHERE status = 'accepted')::int AS accepted,
                          COUNT(*) FILTER (WHERE crm_deal_id IS NOT NULL)::int AS converted,
                          COUNT(*) FILTER (WHERE crm_deposit_date IS NOT NULL)::int AS won
-                    FROM leads WHERE created_at >= NOW() - INTERVAL '${since}'`),
+                    FROM ${ALL} WHERE created_at >= NOW() - INTERVAL '${since}'`),
       // L'age de la file : une piste de trois jours qui attend est un client perdu, et c'est
       // exactement ce qu'un compteur global ne montre pas.
       pool.query(`SELECT COUNT(*)::int AS waiting,
