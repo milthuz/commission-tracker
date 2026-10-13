@@ -39135,7 +39135,7 @@ app.get('/api/leads/stats/export', authenticateToken, async (req, res) => {
       aoa.push([], []);
       if (pv.sources.length && pv.cats.length) {
         chartSpecs.push({
-          title, headerRow, firstRow, lastRow, catCol: 0,
+          unit, title, headerRow, firstRow, lastRow, catCol: 0,
           categories: pv.cats.map((c) => periodLabel(unit, c)),
           series: pv.sources.map((k, i) => ({ col: i + 1, name: src(k), values: pv.values[i],
             color: SRC_COLOR[Math.max(0, SRC_ORDER.indexOf(k)) % SRC_COLOR.length] })),
@@ -39184,7 +39184,16 @@ app.get('/api/leads/stats/export', authenticateToken, async (req, res) => {
 
     let buf = xlsx.write(wb, { type: 'buffer', bookType: 'xlsx' });
     try {
-      buf = require('./services/xlsxCharts').addColumnCharts(buf, chartSheetName, chartSpecs);
+      const { addColumnCharts } = require('./services/xlsxCharts');
+      buf = addColumnCharts(buf, chartSheetName, chartSpecs);
+      // Le graphique par SEMAINE aussi dans le Résumé, sous l'entonnoir (demande de David) : il lit
+      // les MÊMES cellules de la feuille Graphique — un seul jeu de chiffres pour les deux.
+      const weekly = chartSpecs.find((c) => c.unit === 'week');
+      if (weekly) {
+        buf = addColumnCharts(buf, L('Résumé', 'Summary'), [{
+          ...weekly, dataSheet: chartSheetName, anchor: { col: 0, row: 15, cols: 9, rows: 22 },
+        }]);
+      }
     } catch (e) {
       // Le graphique est un plus : un échec ne doit jamais priver l'admin de ses chiffres.
       console.warn('[leads/export] graphique non ajouté :', e.message);

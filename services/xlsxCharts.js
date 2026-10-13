@@ -18,7 +18,7 @@ const x = (s) => String(s == null ? '' : s)
 const colName = (i) => { let s = ''; i += 1; while (i > 0) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; };
 const ref = (sheet, c, r1, r2) => `'${String(sheet).replace(/'/g, "''")}'!$${colName(c)}$${r1 + 1}${r2 != null ? `:$${colName(c)}$${r2 + 1}` : ''}`;
 
-// spec : { title, sheet, headerRow, firstRow, lastRow, catCol, series:[{ col, name, color, values:[] }],
+// spec : { title, sheet, dataSheet?, headerRow, firstRow, lastRow, catCol, series:[{ col, name, color, values:[] }],
 //          categories:[], anchor:{ col, row, cols, rows } }   (indices 0-based)
 function chartXml(spec) {
   const { sheet, headerRow, firstRow, lastRow, catCol } = spec;
@@ -112,7 +112,8 @@ function addColumnCharts(buffer, sheetName, specs) {
   const drawingRels = [];
   specs.forEach((spec, i) => {
     const no = nextChart + i;
-    write(`xl/charts/chart${no}.xml`, chartXml({ ...spec, sheet: sheetName }));
+    // `dataSheet` : le graphique peut lire ses chiffres sur une AUTRE feuille que celle où il est posé.
+    write(`xl/charts/chart${no}.xml`, chartXml({ ...spec, sheet: spec.dataSheet || sheetName }));
     drawingRels.push(`<Relationship Id="rIdC${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart${no}.xml"/>`);
     anchors.push(anchorXml(spec.anchor, `rIdC${i + 1}`, i + 2, spec.title));
   });
