@@ -214,6 +214,8 @@ const PERMISSION_CATALOG = [
   { key: 'leads:attach_existing',      label: 'Attach a lead to a merchant that already exists in Zoho (creates a deal, not a second lead)', category: 'Leads' },
   // Liste de salon (XLSX) : l'écran du lot EST l'examen — la clé fait donc entrer des pistes dans
   // Zoho et partir un courriel aux visiteurs, comme `leads:review`, mais en lot (2026-10-09).
+  // Export Excel du rapport des pistes : le détail contient les coordonnées des prospects (2026-10-13).
+  { key: 'leads:export',               label: 'Export the lead report to Excel (includes prospect contact details)', category: 'Leads' },
   { key: 'leads:import',               label: 'Import a trade-show lead list (XLSX), accept it in bulk into Zoho and email the visitors', category: 'Leads' },
 
   // Module Opener (porte-à-porte). Lot 0 : l'appariement des magasins Cluster (Kaizen) à leur
@@ -38848,6 +38850,7 @@ async function leadAccess(req) {
     toTicket: has('leads:to_ticket'),
     attachExisting: has('leads:attach_existing'),
     import: has('leads:import'),
+    export: has('leads:export'),
   };
 }
 
@@ -38865,32 +38868,13 @@ function leadCan(acc) {
 
 // ⚠️ Ces deux routes doivent rester AVANT `/api/leads/:id` : Express prend la premiere qui
 // correspond, et `:id` avalerait « stats » comme un identifiant.
-app.get('/api/leads/stats', authenticateToken, async (req, res) => {
-  const acc = await leadAccess(req);
-  if (!acc.viewAll && !acc.review) return res.status(403).json({ error: 'Permission required: leads:view_all' });
-  // Période : `from`/`to` (AAAA-MM-JJ, bornes INCLUSES, journées à l'heure de Montréal) — c'est ce
-  // que l'écran envoie pour une semaine, un mois, une année ou une plage libre (2026-10-13). Sans
-  // dates, l'ancien `months` (6 par défaut) reste valable. `source` restreint tout le rapport.
-  const ymdOk = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) && !Number.isNaN(Date.parse(v)) ? String(v) : null);
-  const from = ymdOk(req.query.from);
-  const to = ymdOk(req.query.to);
-  const months = Math.min(60, Math.max(1, parseInt(req.query.months, 10) || 6));
-  const source = /^[a-z_]{2,30}$/.test(String(req.query.source || '')) ? String(req.query.source) : null;
-  try {
-    // created_at est un TIMESTAMP sans fuseau, écrit en UTC : minuit à Montréal → instant UTC.
-    const params = [];
-    const conds = [];
-    if (from) { params.push(from); conds.push(`created_at >= (($${params.length}::date)::timestamp AT TIME ZONE 'America/Toronto') AT TIME ZONE 'UTC'`); }
-    if (to)   { params.push(to);   conds.push(`created_at <  ((($${params.length}::date) + 1)::timestamp AT TIME ZONE 'America/Toronto') AT TIME ZONE 'UTC'`); }
-    if (!from && !to) conds.push(`created_at >= NOW() - INTERVAL '${months} months'`);
-    if (source) { params.push(source); conds.push(`source = $${params.length}`); }
-    const W = conds.join(' AND ');
-    // Les pistes des PARTENAIRES (partner_opportunities) sont des pistes assignées comme les autres :
-    // un représentant (crm_owner_name, fixé à l'approbation), un Deal Zoho, une date de dépôt. David
-    // a constaté le 2026-10-13 qu'elles manquaient au rapport — plus des deux tiers des pistes
-    // assignées sur six mois. Réunies ici sous une forme commune ; la file d'examen et le délai
-    // d'examen restent ceux des pistes directes (l'approbation partenaire vit ailleurs).
-    const ALL = `(
+// ── Le rapport des pistes : filtre et union, partagés par /api/leads/stats et son export Excel ──
+// Les pistes des PARTENAIRES (partner_opportunities) sont des pistes assignées comme les autres :
+// un représentant (crm_owner_name, fixé à l'approbation), un Deal Zoho, une date de dépôt. David
+// a constaté le 2026-10-13 qu'elles manquaient au rapport — plus des deux tiers des pistes
+// assignées sur six mois. Réunies ici sous une forme commune ; la file d'examen et le délai
+// d'examen restent ceux des pistes directes (l'approbation partenaire vit ailleurs).
+const LEAD_STATS_ALL = `(
       SELECT created_at, status, source, assigned_rep_name AS rep, crm_deal_id, crm_deposit_date, false AS partner FROM leads
       UNION ALL
       SELECT created_at,
@@ -38898,6 +38882,33 @@ app.get('/api/leads/stats', authenticateToken, async (req, res) => {
              'partner', crm_owner_name, crm_deal_id, crm_deposit_date, true
         FROM partner_opportunities
     ) p`;
+
+// Période : `from`/`to` (AAAA-MM-JJ, bornes INCLUSES, journées à l'heure de Montréal) — c'est ce
+// que l'écran envoie pour une semaine, un mois, une année ou une plage libre (2026-10-13). Sans
+// dates, l'ancien `months` (6 par défaut) reste valable. `source` restreint tout le rapport.
+// Rend une condition SQL `W` sur `created_at`/`source` et ses paramètres liés.
+function leadStatsFilter(q) {
+  const ymdOk = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) && !Number.isNaN(Date.parse(v)) ? String(v) : null);
+  const from = ymdOk(q.from);
+  const to = ymdOk(q.to);
+  const months = Math.min(60, Math.max(1, parseInt(q.months, 10) || 6));
+  const source = /^[a-z_]{2,30}$/.test(String(q.source || '')) ? String(q.source) : null;
+  // created_at est un TIMESTAMP sans fuseau, écrit en UTC : minuit à Montréal → instant UTC.
+  const params = [];
+  const conds = [];
+  if (from) { params.push(from); conds.push(`created_at >= (($${params.length}::date)::timestamp AT TIME ZONE 'America/Toronto') AT TIME ZONE 'UTC'`); }
+  if (to)   { params.push(to);   conds.push(`created_at <  ((($${params.length}::date) + 1)::timestamp AT TIME ZONE 'America/Toronto') AT TIME ZONE 'UTC'`); }
+  if (!from && !to) conds.push(`created_at >= NOW() - INTERVAL '${months} months'`);
+  if (source) { params.push(source); conds.push(`source = $${params.length}`); }
+  return { W: conds.join(' AND '), params, from, to, months, source };
+}
+
+app.get('/api/leads/stats', authenticateToken, async (req, res) => {
+  const acc = await leadAccess(req);
+  if (!acc.viewAll && !acc.review) return res.status(403).json({ error: 'Permission required: leads:view_all' });
+  try {
+    const { W, params } = leadStatsFilter(req.query);
+    const ALL = LEAD_STATS_ALL;
     const [byStatus, bySource, byMonth, byRep, funnel, queue, speed] = await Promise.all([
       pool.query(`SELECT status, COUNT(*)::int AS n FROM leads GROUP BY status`),
       pool.query(`SELECT source, COUNT(*)::int AS n,
@@ -38946,6 +38957,142 @@ app.get('/api/leads/stats', authenticateToken, async (req, res) => {
       queue:    queue.rows[0],
       speed:    speed.rows[0],
     });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/leads/stats/export — le MÊME rapport en classeur Excel (demande de David, 2026-10-13) :
+// mêmes filtres, mêmes chiffres (mêmes requêtes sur LEAD_STATS_ALL), plus le DÉTAIL piste par piste
+// que l'écran n'affiche pas. Permission `leads:export` en plus de l'accès au rapport : le détail
+// contient les coordonnées des prospects. Refusé en mode démo — le brouillage des noms se fait sur
+// les réponses JSON, un fichier Excel y échapperait.
+app.get('/api/leads/stats/export', authenticateToken, async (req, res) => {
+  const acc = await leadAccess(req);
+  if (!acc.viewAll && !acc.review) return res.status(403).json({ error: 'Permission required: leads:view_all' });
+  if (!acc.export) return res.status(403).json({ error: 'Permission required: leads:export' });
+  if (req.user.isDemo) return res.status(403).json({ error: 'demo_mode' });
+  const en = String(req.query.lang || '').toLowerCase().startsWith('en');
+  const L = (fr, eng) => (en ? eng : fr);
+  try {
+    const f = leadStatsFilter(req.query);
+    const { W, params } = f;
+    const ALL = LEAD_STATS_ALL;
+    const [byRep, bySource, byMonth, funnel, detail] = await Promise.all([
+      pool.query(`SELECT rep, COUNT(*)::int AS n, COUNT(*) FILTER (WHERE partner)::int AS partner,
+                         COUNT(*) FILTER (WHERE crm_deal_id IS NOT NULL)::int AS converted,
+                         COUNT(*) FILTER (WHERE crm_deposit_date IS NOT NULL)::int AS won
+                    FROM ${ALL} WHERE rep IS NOT NULL AND ${W} GROUP BY 1 ORDER BY n DESC`, params),
+      pool.query(`SELECT source, COUNT(*)::int AS n, COUNT(*) FILTER (WHERE status = 'accepted')::int AS accepted,
+                         COUNT(*) FILTER (WHERE crm_deal_id IS NOT NULL)::int AS converted,
+                         COUNT(*) FILTER (WHERE crm_deposit_date IS NOT NULL)::int AS won
+                    FROM ${ALL} WHERE ${W} GROUP BY source ORDER BY n DESC`, params),
+      pool.query(`SELECT to_char(date_trunc('month', created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Toronto'), 'YYYY-MM') AS month,
+                         COUNT(*)::int AS n, COUNT(*) FILTER (WHERE status = 'accepted')::int AS accepted,
+                         COUNT(*) FILTER (WHERE crm_deal_id IS NOT NULL)::int AS converted,
+                         COUNT(*) FILTER (WHERE crm_deposit_date IS NOT NULL)::int AS won
+                    FROM ${ALL} WHERE ${W} GROUP BY 1 ORDER BY 1`, params),
+      pool.query(`SELECT COUNT(*)::int AS received, COUNT(*) FILTER (WHERE status = 'accepted')::int AS accepted,
+                         COUNT(*) FILTER (WHERE crm_deal_id IS NOT NULL)::int AS converted,
+                         COUNT(*) FILTER (WHERE crm_deposit_date IS NOT NULL)::int AS won
+                    FROM ${ALL} WHERE ${W}`, params),
+      // Le détail : une ligne par piste, directe ou partenaire. Même filtre W (mêmes colonnes
+      // created_at/source dans la sous-requête).
+      pool.query(`SELECT * FROM (
+          SELECT l.created_at, l.ref_code AS ref, l.source, l.source_detail AS detail, l.business_name AS business,
+                 NULLIF(TRIM(CONCAT_WS(' ', l.contact_first_name, l.contact_last_name)), '') AS contact,
+                 l.contact_email AS email, l.contact_phone AS phone, l.city, l.province,
+                 l.assigned_rep_name AS rep, l.status, l.crm_lead_id, l.crm_deal_id, l.crm_deposit_date
+            FROM leads l
+          UNION ALL
+          SELECT o.created_at, CONCAT('P-', o.id), 'partner', pa.name, o.business_name,
+                 NULLIF(TRIM(CONCAT_WS(' ', o.contact_first_name, o.contact_last_name)), ''),
+                 o.contact_email, o.contact_phone, NULL, NULL,
+                 o.crm_owner_name,
+                 CASE o.status WHEN 'approved' THEN 'accepted' WHEN 'pending' THEN 'new' ELSE o.status END,
+                 o.crm_lead_id, o.crm_deal_id, o.crm_deposit_date
+            FROM partner_opportunities o LEFT JOIN partners pa ON pa.id = o.partner_id
+        ) d WHERE ${W} ORDER BY created_at DESC`, params),
+    ]);
+
+    const SRC = {
+      website: L('Site web', 'Website'), phone: L('Téléphone', 'Phone'), walk_in: L('Sans rendez-vous', 'Walk-in'),
+      referral: L('Recommandation', 'Referral'), event: L('Salon', 'Event'), other: L('Autre', 'Other'),
+      opener: 'Opener', partner: L('Portail partenaire', 'Partner portal'),
+    };
+    const ST = {
+      new: L('Nouvelle', 'New'), in_review: L('En examen', 'In review'), accepted: L('Acceptée', 'Accepted'),
+      rejected: L('Rejetée', 'Rejected'), duplicate: L('Doublon', 'Duplicate'), support_ticket: L('Billet de soutien', 'Support ticket'),
+    };
+    const src = (k) => SRC[k] || k;
+    const pct = (a, b) => (b ? Math.round((a / b) * 1000) / 10 : 0);
+    const day = (d) => (d ? new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/Toronto' }) : '');
+    const ymd = (d) => (d ? (d instanceof Date ? d.toISOString().slice(0, 10) : String(d).slice(0, 10)) : '');
+
+    const wb = xlsx.utils.book_new();
+    const sheet = (name, rows, cols) => {
+      const ws = xlsx.utils.aoa_to_sheet(rows);
+      ws['!cols'] = cols.map((w) => ({ wch: w }));
+      xlsx.utils.book_append_sheet(wb, ws, name.slice(0, 31));
+      return ws;
+    };
+    const table = (name, header, data, cols) => {
+      const ws = sheet(name, [header, ...data], cols);
+      ws['!autofilter'] = { ref: xlsx.utils.encode_range({ s: { c: 0, r: 0 }, e: { c: header.length - 1, r: Math.max(data.length, 1) } }) };
+    };
+
+    const fu = funnel.rows[0];
+    const period = f.from || f.to
+      ? `${f.from || '…'} → ${f.to || '…'}`
+      : L(`${f.months} derniers mois`, `Last ${f.months} months`);
+    sheet(L('Résumé', 'Summary'), [
+      [L('Rapport des pistes — Sales Hub', 'Lead report — Sales Hub')],
+      [],
+      [L('Période', 'Period'), period],
+      [L('Source', 'Source'), f.source ? src(f.source) : L('Toutes', 'All')],
+      [L('Généré le', 'Generated'), new Date().toLocaleString(en ? 'en-CA' : 'fr-CA', { timeZone: 'America/Toronto' })],
+      [L('Par', 'By'), req.user.realAdminEmail || req.user.email || ''],
+      [],
+      [L('Étape', 'Stage'), L('Pistes', 'Leads'), L('% des reçues', '% of received')],
+      [L('Reçues', 'Received'), fu.received, 100],
+      [L('Acceptées', 'Accepted'), fu.accepted, pct(fu.accepted, fu.received)],
+      [L('Converties (deal Zoho)', 'Converted (Zoho deal)'), fu.converted, pct(fu.converted, fu.received)],
+      [L('Gagnées (dépôt reçu)', 'Won (deposit received)'), fu.won, pct(fu.won, fu.received)],
+      [],
+      [L('Les pistes des partenaires sont incluses. « Gagnée » = date de dépôt du deal Zoho.',
+         'Partner-portal leads are included. "Won" = the Zoho deal\'s deposit date.')],
+    ], [30, 22, 16]);
+    table(L('Par représentant', 'By rep'),
+      [L('Représentant', 'Rep'), L('Assignées', 'Assigned'), L('Dont partenaires', 'Of which partners'),
+       L('Converties', 'Converted'), L('Gagnées', 'Won'), L('% gagnées', 'Win rate %')],
+      byRep.rows.map((r) => [r.rep, r.n, r.partner, r.converted, r.won, pct(r.won, r.n)]),
+      [26, 12, 16, 12, 10, 12]);
+    table(L('Par source', 'By source'),
+      [L('Source', 'Source'), L('Reçues', 'Received'), L('Acceptées', 'Accepted'), L('Converties', 'Converted'), L('Gagnées', 'Won')],
+      bySource.rows.map((r) => [src(r.source), r.n, r.accepted, r.converted, r.won]),
+      [22, 10, 11, 11, 10]);
+    table(L('Par mois', 'By month'),
+      [L('Mois', 'Month'), L('Reçues', 'Received'), L('Acceptées', 'Accepted'), L('Converties', 'Converted'), L('Gagnées', 'Won')],
+      byMonth.rows.map((r) => [r.month, r.n, r.accepted, r.converted, r.won]),
+      [10, 10, 11, 11, 10]);
+    table(L('Détail', 'Detail'),
+      [L('Date', 'Date'), L('Référence', 'Reference'), L('Source', 'Source'), L('Détail / partenaire', 'Detail / partner'),
+       L('Commerce', 'Business'), L('Contact', 'Contact'), L('Courriel', 'Email'), L('Téléphone', 'Phone'),
+       L('Ville', 'City'), L('Province', 'Province'), L('Représentant', 'Rep'), L('Statut', 'Status'),
+       L('Lead Zoho', 'Zoho lead'), L('Deal Zoho', 'Zoho deal'), L('Date de dépôt', 'Deposit date')],
+      detail.rows.map((r) => [day(r.created_at), r.ref, src(r.source), r.detail || '', r.business || '', r.contact || '',
+        r.email || '', r.phone || '', r.city || '', r.province || '', r.rep || '', ST[r.status] || r.status || '',
+        r.crm_lead_id || '', r.crm_deal_id || '', ymd(r.crm_deposit_date)]),
+      [11, 11, 16, 30, 32, 22, 30, 15, 14, 8, 22, 12, 21, 21, 12]);
+
+    const buf = xlsx.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    const tag = f.from || f.to ? `${f.from || ''}_${f.to || ''}` : `${f.months}m`;
+    const nom = `${en ? 'leads-report' : 'rapport-pistes'}${f.source ? `-${f.source}` : ''}-${tag}.xlsx`;
+    logActivity('lead_report', 'export', 'exported', `Export Excel du rapport des pistes (${period}${f.source ? `, ${f.source}` : ''}, ${detail.rows.length} lignes)`,
+      req.user.realAdminEmail || req.user.email || 'unknown');
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${nom}"`);
+    res.send(buf);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
