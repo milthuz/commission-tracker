@@ -38915,7 +38915,7 @@ app.get('/api/leads/stats', authenticateToken, async (req, res) => {
       `SELECT to_char(date_trunc('${unit}', created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Toronto'), 'YYYY-MM-DD') AS period,
               source, COUNT(*)::int AS n
          FROM ${ALL} WHERE ${W} GROUP BY 1, 2 ORDER BY 1`, params);
-    const [byStatus, bySource, byMonth, byRep, funnel, queue, speed, chartWeek, chartMonth] = await Promise.all([
+    const [byStatus, bySource, byMonth, byRep, funnel, queue, speed, chartWeek, chartMonth, repSource] = await Promise.all([
       pool.query(`SELECT status, COUNT(*)::int AS n FROM leads GROUP BY status`),
       pool.query(`SELECT source, COUNT(*)::int AS n,
                          COUNT(*) FILTER (WHERE status = 'accepted')::int AS accepted
@@ -38955,12 +38955,18 @@ app.get('/api/leads/stats', authenticateToken, async (req, res) => {
                    WHERE reviewed_at IS NOT NULL AND ${W}`, params),
       perPeriod('week'),
       perPeriod('month'),
+      // Le détail par SOURCE de chaque représentant (David, 2026-10-13).
+      pool.query(`SELECT rep, source, COUNT(*)::int AS n FROM ${ALL}
+                   WHERE rep IS NOT NULL AND ${W} GROUP BY 1, 2`, params),
     ]);
     res.json({
       byStatus: Object.fromEntries(byStatus.rows.map((r) => [r.status, r.n])),
       bySource: bySource.rows,
       byMonth:  byMonth.rows,
-      byRep:    byRep.rows,
+      byRep:    byRep.rows.map((r) => ({
+        ...r,
+        sources: Object.fromEntries(repSource.rows.filter((x) => x.rep === r.rep).map((x) => [x.source, x.n])),
+      })),
       funnel:   funnel.rows[0],
       queue:    queue.rows[0],
       speed:    speed.rows[0],
@@ -38987,7 +38993,7 @@ app.get('/api/leads/stats/export', authenticateToken, async (req, res) => {
     const f = leadStatsFilter(req.query);
     const { W, params } = f;
     const ALL = LEAD_STATS_ALL;
-    const [byRep, bySource, byMonth, funnel, detail, byWeek, chartMonth, chartWeek] = await Promise.all([
+    const [byRep, bySource, byMonth, funnel, detail, byWeek, chartMonth, chartWeek, repSource] = await Promise.all([
       pool.query(`SELECT rep, COUNT(*)::int AS n, COUNT(*) FILTER (WHERE partner)::int AS partner,
                          COUNT(*) FILTER (WHERE crm_deal_id IS NOT NULL)::int AS converted,
                          COUNT(*) FILTER (WHERE crm_deposit_date IS NOT NULL)::int AS won
@@ -39033,6 +39039,8 @@ app.get('/api/leads/stats/export', authenticateToken, async (req, res) => {
         `SELECT to_char(date_trunc('${unit}', created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Toronto'), 'YYYY-MM-DD') AS period,
                 source, COUNT(*)::int AS n
            FROM ${ALL} WHERE ${W} GROUP BY 1, 2 ORDER BY 1`, params)),
+      pool.query(`SELECT rep, source, COUNT(*)::int AS n FROM ${ALL}
+                   WHERE rep IS NOT NULL AND ${W} GROUP BY 1, 2`, params),
     ]);
 
     const SRC = {
@@ -39155,11 +39163,16 @@ app.get('/api/leads/stats/export', authenticateToken, async (req, res) => {
     }
     sheet(chartSheetName, aoa, [22, ...Array(10).fill(14)]);
 
+    // Une colonne par source présente, même ordre que l'écran et le graphique.
+    const repSrcKeys = [...SRC_ORDER.filter((k) => repSource.rows.some((x) => x.source === k)),
+      ...[...new Set(repSource.rows.map((x) => x.source))].filter((k) => !SRC_ORDER.includes(k))];
+    const repSrcAt = new Map(repSource.rows.map((x) => [`${x.rep}|${x.source}`, x.n]));
     table(L('Par représentant', 'By rep'),
-      [L('Représentant', 'Rep'), L('Assignées', 'Assigned'), L('Dont partenaires', 'Of which partners'),
+      [L('Représentant', 'Rep'), L('Assignées', 'Assigned'), ...repSrcKeys.map(src),
        L('Converties', 'Converted'), L('Gagnées', 'Won'), L('% gagnées', 'Win rate %')],
-      byRep.rows.map((r) => [r.rep, r.n, r.partner, r.converted, r.won, pct(r.won, r.n)]),
-      [26, 12, 16, 12, 10, 12]);
+      byRep.rows.map((r) => [r.rep, r.n, ...repSrcKeys.map((k) => repSrcAt.get(`${r.rep}|${k}`) || 0),
+        r.converted, r.won, pct(r.won, r.n)]),
+      [26, 12, ...repSrcKeys.map(() => 15), 12, 10, 12]);
     table(L('Par source', 'By source'),
       [L('Source', 'Source'), L('Reçues', 'Received'), L('Acceptées', 'Accepted'), L('Converties', 'Converted'), L('Gagnées', 'Won')],
       bySource.rows.map((r) => [src(r.source), r.n, r.accepted, r.converted, r.won]),
