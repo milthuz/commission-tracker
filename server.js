@@ -39053,6 +39053,7 @@ app.get('/api/leads/stats/export', authenticateToken, async (req, res) => {
       rejected: L('Rejetée', 'Rejected'), duplicate: L('Doublon', 'Duplicate'), support_ticket: L('Billet de soutien', 'Support ticket'),
     };
     const src = (k) => SRC[k] || k;
+    const chartHide = new Set(String(req.query.chartHide || '').split(',').map((v) => v.trim()).filter((v) => /^[a-z_]{2,30}$/.test(v)));
     const pct = (a, b) => (b ? Math.round((a / b) * 1000) / 10 : 0);
     const day = (d) => (d ? new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/Toronto' }) : '');
     const ymd = (d) => (d ? (d instanceof Date ? d.toISOString().slice(0, 10) : String(d).slice(0, 10)) : '');
@@ -39089,6 +39090,8 @@ app.get('/api/leads/stats/export', authenticateToken, async (req, res) => {
       [],
       [L('Les pistes des partenaires sont incluses. « Gagnée » = date de dépôt du deal Zoho.',
          'Partner-portal leads are included. "Won" = the Zoho deal\'s deposit date.')],
+      chartHide.size ? [L(`Graphique ci-dessous sans : ${[...chartHide].map(src).join(', ')}`,
+                          `Chart below excludes: ${[...chartHide].map(src).join(', ')}`)] : [],
     ], [30, 22, 16]);
     // ── Feuille « Graphique » : deux tableaux croisés (mois, semaine) × source, périodes vides
     // comprises, et un VRAI graphique Excel à côté de chacun (services/xlsxCharts) — mêmes couleurs
@@ -39117,7 +39120,11 @@ app.get('/api/leads/stats/export', authenticateToken, async (req, res) => {
     const periodLabel = (unit, iso) => (unit === 'month'
       ? new Date(`${iso}T12:00:00Z`).toLocaleDateString(locale, { month: 'short', year: 'numeric', timeZone: 'UTC' })
       : new Date(`${iso}T12:00:00Z`).toLocaleDateString(locale, { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' }));
+    // Les sources décochées dans le graphique de l'écran (`chartHide`, liste séparée par des
+    // virgules) sortent AUSSI des graphiques du classeur — et de leurs tableaux, que les graphiques
+    // lisent. Le reste du classeur garde tous les chiffres, comme le rapport à l'écran.
     const pivot = (unit, rows) => {
+      rows = rows.filter((r) => !chartHide.has(r.source));
       const cats = allPeriods(unit);
       const present = SRC_ORDER.filter((k) => rows.some((r) => r.source === k && r.n > 0));
       const extra = [...new Set(rows.map((r) => r.source))].filter((k) => !SRC_ORDER.includes(k));
@@ -39151,6 +39158,10 @@ app.get('/api/leads/stats/export', authenticateToken, async (req, res) => {
         });
       }
     };
+    if (chartHide.size) {
+      aoa.push([L(`Sources masquées dans ces graphiques : ${[...chartHide].map(src).join(', ')}`,
+                  `Sources hidden from these charts: ${[...chartHide].map(src).join(', ')}`)], []);
+    }
     block('month', chartMonth.rows, L('Pistes reçues par mois', 'Leads received by month'), L('Mois', 'Month'));
     block('week', chartWeek.rows, L('Pistes reçues par semaine (lundi → dimanche)', 'Leads received by week (Mon → Sun)'), L('Semaine du', 'Week of'));
     // Le second bloc commence assez bas pour que les deux graphiques ne se chevauchent pas.
