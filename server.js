@@ -38909,7 +38909,13 @@ app.get('/api/leads/stats', authenticateToken, async (req, res) => {
   try {
     const { W, params } = leadStatsFilter(req.query);
     const ALL = LEAD_STATS_ALL;
-    const [byStatus, bySource, byMonth, byRep, funnel, queue, speed] = await Promise.all([
+    // Le graphique (2026-10-13) : pistes reçues par PÉRIODE et par source, mois (vue par défaut) ou
+    // semaine du lundi. Périodes en heure de Montréal ; l'écran comble les périodes vides.
+    const perPeriod = (unit) => pool.query(
+      `SELECT to_char(date_trunc('${unit}', created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Toronto'), 'YYYY-MM-DD') AS period,
+              source, COUNT(*)::int AS n
+         FROM ${ALL} WHERE ${W} GROUP BY 1, 2 ORDER BY 1`, params);
+    const [byStatus, bySource, byMonth, byRep, funnel, queue, speed, chartWeek, chartMonth] = await Promise.all([
       pool.query(`SELECT status, COUNT(*)::int AS n FROM leads GROUP BY status`),
       pool.query(`SELECT source, COUNT(*)::int AS n,
                          COUNT(*) FILTER (WHERE status = 'accepted')::int AS accepted
@@ -38947,6 +38953,8 @@ app.get('/api/leads/stats', authenticateToken, async (req, res) => {
                            ORDER BY EXTRACT(EPOCH FROM (reviewed_at - created_at)) / 3600))::numeric, 1)::float AS median_hours
                     FROM leads
                    WHERE reviewed_at IS NOT NULL AND ${W}`, params),
+      perPeriod('week'),
+      perPeriod('month'),
     ]);
     res.json({
       byStatus: Object.fromEntries(byStatus.rows.map((r) => [r.status, r.n])),
@@ -38956,6 +38964,7 @@ app.get('/api/leads/stats', authenticateToken, async (req, res) => {
       funnel:   funnel.rows[0],
       queue:    queue.rows[0],
       speed:    speed.rows[0],
+      chart:    { week: chartWeek.rows, month: chartMonth.rows },
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -38978,7 +38987,7 @@ app.get('/api/leads/stats/export', authenticateToken, async (req, res) => {
     const f = leadStatsFilter(req.query);
     const { W, params } = f;
     const ALL = LEAD_STATS_ALL;
-    const [byRep, bySource, byMonth, funnel, detail] = await Promise.all([
+    const [byRep, bySource, byMonth, funnel, detail, byWeek] = await Promise.all([
       pool.query(`SELECT rep, COUNT(*)::int AS n, COUNT(*) FILTER (WHERE partner)::int AS partner,
                          COUNT(*) FILTER (WHERE crm_deal_id IS NOT NULL)::int AS converted,
                          COUNT(*) FILTER (WHERE crm_deposit_date IS NOT NULL)::int AS won
@@ -39013,6 +39022,12 @@ app.get('/api/leads/stats/export', authenticateToken, async (req, res) => {
                  o.crm_lead_id, o.crm_deal_id, o.crm_deposit_date
             FROM partner_opportunities o LEFT JOIN partners pa ON pa.id = o.partner_id
         ) d WHERE ${W} ORDER BY created_at DESC`, params),
+      // Semaine du LUNDI (date_trunc ISO), en heure de Montréal — les mêmes semaines que le graphique.
+      pool.query(`SELECT to_char(date_trunc('week', created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Toronto'), 'YYYY-MM-DD') AS week,
+                         COUNT(*)::int AS n, COUNT(*) FILTER (WHERE status = 'accepted')::int AS accepted,
+                         COUNT(*) FILTER (WHERE crm_deal_id IS NOT NULL)::int AS converted,
+                         COUNT(*) FILTER (WHERE crm_deposit_date IS NOT NULL)::int AS won
+                    FROM ${ALL} WHERE ${W} GROUP BY 1 ORDER BY 1`, params),
     ]);
 
     const SRC = {
@@ -39075,6 +39090,10 @@ app.get('/api/leads/stats/export', authenticateToken, async (req, res) => {
       [L('Mois', 'Month'), L('Reçues', 'Received'), L('Acceptées', 'Accepted'), L('Converties', 'Converted'), L('Gagnées', 'Won')],
       byMonth.rows.map((r) => [r.month, r.n, r.accepted, r.converted, r.won]),
       [10, 10, 11, 11, 10]);
+    table(L('Par semaine', 'By week'),
+      [L('Semaine du (lundi)', 'Week of (Monday)'), L('Reçues', 'Received'), L('Acceptées', 'Accepted'), L('Converties', 'Converted'), L('Gagnées', 'Won')],
+      byWeek.rows.map((r) => [r.week, r.n, r.accepted, r.converted, r.won]),
+      [18, 10, 11, 11, 10]);
     table(L('Détail', 'Detail'),
       [L('Date', 'Date'), L('Référence', 'Reference'), L('Source', 'Source'), L('Détail / partenaire', 'Detail / partner'),
        L('Commerce', 'Business'), L('Contact', 'Contact'), L('Courriel', 'Email'), L('Téléphone', 'Phone'),
