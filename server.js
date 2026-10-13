@@ -38987,7 +38987,7 @@ app.get('/api/leads/stats/export', authenticateToken, async (req, res) => {
     const f = leadStatsFilter(req.query);
     const { W, params } = f;
     const ALL = LEAD_STATS_ALL;
-    const [byRep, bySource, byMonth, funnel, detail, byWeek] = await Promise.all([
+    const [byRep, bySource, byMonth, funnel, detail, byWeek, chartMonth, chartWeek] = await Promise.all([
       pool.query(`SELECT rep, COUNT(*)::int AS n, COUNT(*) FILTER (WHERE partner)::int AS partner,
                          COUNT(*) FILTER (WHERE crm_deal_id IS NOT NULL)::int AS converted,
                          COUNT(*) FILTER (WHERE crm_deposit_date IS NOT NULL)::int AS won
@@ -39028,6 +39028,11 @@ app.get('/api/leads/stats/export', authenticateToken, async (req, res) => {
                          COUNT(*) FILTER (WHERE crm_deal_id IS NOT NULL)::int AS converted,
                          COUNT(*) FILTER (WHERE crm_deposit_date IS NOT NULL)::int AS won
                     FROM ${ALL} WHERE ${W} GROUP BY 1 ORDER BY 1`, params),
+      // Les séries du graphique, par source — exactement celles de l'écran.
+      ...['month', 'week'].map((unit) => pool.query(
+        `SELECT to_char(date_trunc('${unit}', created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Toronto'), 'YYYY-MM-DD') AS period,
+                source, COUNT(*)::int AS n
+           FROM ${ALL} WHERE ${W} GROUP BY 1, 2 ORDER BY 1`, params)),
     ]);
 
     const SRC = {
@@ -39077,6 +39082,79 @@ app.get('/api/leads/stats/export', authenticateToken, async (req, res) => {
       [L('Les pistes des partenaires sont incluses. « Gagnée » = date de dépôt du deal Zoho.',
          'Partner-portal leads are included. "Won" = the Zoho deal\'s deposit date.')],
     ], [30, 22, 16]);
+    // ── Feuille « Graphique » : deux tableaux croisés (mois, semaine) × source, périodes vides
+    // comprises, et un VRAI graphique Excel à côté de chacun (services/xlsxCharts) — mêmes couleurs
+    // par source qu'à l'écran (LeadsChart.tsx), même ordre fixe.
+    const SRC_ORDER = ['partner', 'website', 'event', 'phone', 'opener', 'referral', 'walk_in', 'other'];
+    const SRC_COLOR = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#4a3aa7', '#e34948'];
+    const pad2 = (n) => String(n).padStart(2, '0');
+    const isoOf = (d) => `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+    const todayIso = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Toronto' });
+    const rangeFrom = f.from || (() => { const d = new Date(`${todayIso}T00:00:00Z`); d.setUTCMonth(d.getUTCMonth() - f.months); return isoOf(d); })();
+    const rangeTo = f.to || todayIso;
+    const allPeriods = (unit) => {
+      const out = [];
+      let d = new Date(`${rangeFrom}T00:00:00Z`);
+      const end = new Date(`${rangeTo}T00:00:00Z`);
+      d = unit === 'month' ? new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1))
+        : new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - ((d.getUTCDay() + 6) % 7)));
+      while (d <= end && out.length < 400) {
+        out.push(isoOf(d));
+        d = unit === 'month' ? new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1))
+          : new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 7));
+      }
+      return out;
+    };
+    const locale = en ? 'en-CA' : 'fr-CA';
+    const periodLabel = (unit, iso) => (unit === 'month'
+      ? new Date(`${iso}T12:00:00Z`).toLocaleDateString(locale, { month: 'short', year: 'numeric', timeZone: 'UTC' })
+      : new Date(`${iso}T12:00:00Z`).toLocaleDateString(locale, { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' }));
+    const pivot = (unit, rows) => {
+      const cats = allPeriods(unit);
+      const present = SRC_ORDER.filter((k) => rows.some((r) => r.source === k && r.n > 0));
+      const extra = [...new Set(rows.map((r) => r.source))].filter((k) => !SRC_ORDER.includes(k));
+      const sources = [...present, ...extra];
+      const at = new Map(rows.map((r) => [`${r.period}|${r.source}`, r.n]));
+      return { cats, sources, values: sources.map((k) => cats.map((c) => at.get(`${c}|${k}`) || 0)) };
+    };
+    const chartSheetName = L('Graphique', 'Chart');
+    const aoa = [];
+    const chartSpecs = [];
+    const block = (unit, rows, title, periodHead) => {
+      const pv = pivot(unit, rows);
+      const titleRow = aoa.length;
+      aoa.push([title]);
+      const headerRow = aoa.length;
+      aoa.push([periodHead, ...pv.sources.map(src), L('Total', 'Total')]);
+      const firstRow = aoa.length;
+      pv.cats.forEach((c, i) => {
+        const vals = pv.values.map((v) => v[i]);
+        aoa.push([periodLabel(unit, c), ...vals, vals.reduce((x, y) => x + y, 0)]);
+      });
+      const lastRow = aoa.length - 1;
+      aoa.push([], []);
+      if (pv.sources.length && pv.cats.length) {
+        chartSpecs.push({
+          title, headerRow, firstRow, lastRow, catCol: 0,
+          categories: pv.cats.map((c) => periodLabel(unit, c)),
+          series: pv.sources.map((k, i) => ({ col: i + 1, name: src(k), values: pv.values[i],
+            color: SRC_COLOR[Math.max(0, SRC_ORDER.indexOf(k)) % SRC_COLOR.length] })),
+          anchor: { col: pv.sources.length + 3, row: titleRow, cols: 11, rows: 20 },
+        });
+      }
+    };
+    block('month', chartMonth.rows, L('Pistes reçues par mois', 'Leads received by month'), L('Mois', 'Month'));
+    block('week', chartWeek.rows, L('Pistes reçues par semaine (lundi → dimanche)', 'Leads received by week (Mon → Sun)'), L('Semaine du', 'Week of'));
+    // Le second bloc commence assez bas pour que les deux graphiques ne se chevauchent pas.
+    if (chartSpecs.length === 2 && chartSpecs[1].anchor.row < chartSpecs[0].anchor.row + 22) {
+      const shift = chartSpecs[0].anchor.row + 22 - chartSpecs[1].anchor.row;
+      const at = chartSpecs[1].anchor.row;
+      aoa.splice(at, 0, ...Array.from({ length: shift }, () => []));
+      for (const k of ['headerRow', 'firstRow', 'lastRow']) chartSpecs[1][k] += shift;
+      chartSpecs[1].anchor.row += shift;
+    }
+    sheet(chartSheetName, aoa, [22, ...Array(10).fill(14)]);
+
     table(L('Par représentant', 'By rep'),
       [L('Représentant', 'Rep'), L('Assignées', 'Assigned'), L('Dont partenaires', 'Of which partners'),
        L('Converties', 'Converted'), L('Gagnées', 'Won'), L('% gagnées', 'Win rate %')],
@@ -39104,7 +39182,13 @@ app.get('/api/leads/stats/export', authenticateToken, async (req, res) => {
         r.crm_lead_id || '', r.crm_deal_id || '', ymd(r.crm_deposit_date)]),
       [11, 11, 16, 30, 32, 22, 30, 15, 14, 8, 22, 12, 21, 21, 12]);
 
-    const buf = xlsx.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    let buf = xlsx.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    try {
+      buf = require('./services/xlsxCharts').addColumnCharts(buf, chartSheetName, chartSpecs);
+    } catch (e) {
+      // Le graphique est un plus : un échec ne doit jamais priver l'admin de ses chiffres.
+      console.warn('[leads/export] graphique non ajouté :', e.message);
+    }
     const tag = f.from || f.to ? `${f.from || ''}_${f.to || ''}` : `${f.months}m`;
     const nom = `${en ? 'leads-report' : 'rapport-pistes'}${f.source ? `-${f.source}` : ''}-${tag}.xlsx`;
     logActivity('lead_report', 'export', 'exported', `Export Excel du rapport des pistes (${period}${f.source ? `, ${f.source}` : ''}, ${detail.rows.length} lignes)`,
