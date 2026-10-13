@@ -38868,9 +38868,23 @@ function leadCan(acc) {
 app.get('/api/leads/stats', authenticateToken, async (req, res) => {
   const acc = await leadAccess(req);
   if (!acc.viewAll && !acc.review) return res.status(403).json({ error: 'Permission required: leads:view_all' });
-  const months = Math.min(24, Math.max(1, parseInt(req.query.months, 10) || 6));
+  // Période : `from`/`to` (AAAA-MM-JJ, bornes INCLUSES, journées à l'heure de Montréal) — c'est ce
+  // que l'écran envoie pour une semaine, un mois, une année ou une plage libre (2026-10-13). Sans
+  // dates, l'ancien `months` (6 par défaut) reste valable. `source` restreint tout le rapport.
+  const ymdOk = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) && !Number.isNaN(Date.parse(v)) ? String(v) : null);
+  const from = ymdOk(req.query.from);
+  const to = ymdOk(req.query.to);
+  const months = Math.min(60, Math.max(1, parseInt(req.query.months, 10) || 6));
+  const source = /^[a-z_]{2,30}$/.test(String(req.query.source || '')) ? String(req.query.source) : null;
   try {
-    const since = `${months} months`;
+    // created_at est un TIMESTAMP sans fuseau, écrit en UTC : minuit à Montréal → instant UTC.
+    const params = [];
+    const conds = [];
+    if (from) { params.push(from); conds.push(`created_at >= (($${params.length}::date)::timestamp AT TIME ZONE 'America/Toronto') AT TIME ZONE 'UTC'`); }
+    if (to)   { params.push(to);   conds.push(`created_at <  ((($${params.length}::date) + 1)::timestamp AT TIME ZONE 'America/Toronto') AT TIME ZONE 'UTC'`); }
+    if (!from && !to) conds.push(`created_at >= NOW() - INTERVAL '${months} months'`);
+    if (source) { params.push(source); conds.push(`source = $${params.length}`); }
+    const W = conds.join(' AND ');
     // Les pistes des PARTENAIRES (partner_opportunities) sont des pistes assignées comme les autres :
     // un représentant (crm_owner_name, fixé à l'approbation), un Deal Zoho, une date de dépôt. David
     // a constaté le 2026-10-13 qu'elles manquaient au rapport — plus des deux tiers des pistes
@@ -38888,28 +38902,28 @@ app.get('/api/leads/stats', authenticateToken, async (req, res) => {
       pool.query(`SELECT status, COUNT(*)::int AS n FROM leads GROUP BY status`),
       pool.query(`SELECT source, COUNT(*)::int AS n,
                          COUNT(*) FILTER (WHERE status = 'accepted')::int AS accepted
-                    FROM ${ALL} WHERE created_at >= NOW() - INTERVAL '${since}'
-                   GROUP BY source ORDER BY n DESC`),
+                    FROM ${ALL} WHERE ${W}
+                   GROUP BY source ORDER BY n DESC`, params),
       pool.query(`SELECT to_char(date_trunc('month', created_at), 'YYYY-MM') AS month,
                          COUNT(*)::int AS n,
                          COUNT(*) FILTER (WHERE status = 'accepted')::int AS accepted,
                          COUNT(*) FILTER (WHERE status IN ('rejected','duplicate'))::int AS rejected
-                    FROM ${ALL} WHERE created_at >= NOW() - INTERVAL '${since}'
-                   GROUP BY 1 ORDER BY 1`),
+                    FROM ${ALL} WHERE ${W}
+                   GROUP BY 1 ORDER BY 1`, params),
       pool.query(`SELECT rep, COUNT(*)::int AS n,
                          COUNT(*) FILTER (WHERE partner)::int AS partner,
                          COUNT(*) FILTER (WHERE crm_deal_id IS NOT NULL)::int AS converted,
                          COUNT(*) FILTER (WHERE crm_deposit_date IS NOT NULL)::int AS won
                     FROM ${ALL}
-                   WHERE rep IS NOT NULL AND created_at >= NOW() - INTERVAL '${since}'
-                   GROUP BY 1 ORDER BY n DESC`),
+                   WHERE rep IS NOT NULL AND ${W}
+                   GROUP BY 1 ORDER BY n DESC`, params),
       // L'entonnoir complet — c'est la seule vue qui relie une piste a de l'argent reel, via
       // l'etat du Deal Zoho rafraichi par le travail horaire.
       pool.query(`SELECT COUNT(*)::int AS received,
                          COUNT(*) FILTER (WHERE status = 'accepted')::int AS accepted,
                          COUNT(*) FILTER (WHERE crm_deal_id IS NOT NULL)::int AS converted,
                          COUNT(*) FILTER (WHERE crm_deposit_date IS NOT NULL)::int AS won
-                    FROM ${ALL} WHERE created_at >= NOW() - INTERVAL '${since}'`),
+                    FROM ${ALL} WHERE ${W}`, params),
       // L'age de la file : une piste de trois jours qui attend est un client perdu, et c'est
       // exactement ce qu'un compteur global ne montre pas.
       pool.query(`SELECT COUNT(*)::int AS waiting,
@@ -38921,7 +38935,7 @@ app.get('/api/leads/stats', authenticateToken, async (req, res) => {
                          ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (
                            ORDER BY EXTRACT(EPOCH FROM (reviewed_at - created_at)) / 3600))::numeric, 1)::float AS median_hours
                     FROM leads
-                   WHERE reviewed_at IS NOT NULL AND created_at >= NOW() - INTERVAL '${since}'`),
+                   WHERE reviewed_at IS NOT NULL AND ${W}`, params),
     ]);
     res.json({
       byStatus: Object.fromEntries(byStatus.rows.map((r) => [r.status, r.n])),
