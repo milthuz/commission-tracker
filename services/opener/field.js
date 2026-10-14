@@ -589,20 +589,28 @@ function registerOpenerFieldRoutes(app, deps) {
         `SELECT ${ROUTE_COLS} FROM opener_routes r WHERE r.route_date BETWEEN $1 AND $2 ORDER BY r.route_date, r.id`, [from, to])).rows;
       const ids = routes.map((r) => r.id);
       const stops = ids.length ? (await pool.query(
-        `SELECT s.id, s.route_id, s.place_id, s.position, s.label, s.lat, s.lng, s.outcome, s.skip_reason, s.done_at,
-                c.at AS c_at, c.lat AS c_lat, c.lng AS c_lng, c.distance_m AS c_dist, c.accuracy_m AS c_acc,
-                c.started_at AS c_start, c.duration_min AS c_dur, c.end_distance_m AS c_end_dist
+        `SELECT s.id, s.route_id, s.place_id, s.position, s.label, s.address, s.lat, s.lng, s.outcome, s.skip_reason, s.done_at,
+                c.id AS c_id, c.at AS c_at, c.lat AS c_lat, c.lng AS c_lng, c.distance_m AS c_dist, c.accuracy_m AS c_acc,
+                c.started_at AS c_start, c.duration_min AS c_dur, c.end_distance_m AS c_end_dist,
+                c.current_pos, c.service_type, c.interest_level, c.decision_maker, c.satisfaction, c.payments_by,
+                c.services, c.notes, c.terminals, c.online_delivery, c.lead_id, ld.ref_code AS lead_ref, ld.status AS lead_status
            FROM opener_route_stops s
-           LEFT JOIN LATERAL (SELECT c.at, ${V_LAT} AS lat, COALESCE(c.start_lng, c.lng) AS lng, ${V_DIST} AS distance_m,
-                                     ${V_ACC} AS accuracy_m, c.started_at, ${DUR_MIN} AS duration_min, c.distance_m AS end_distance_m
+           LEFT JOIN LATERAL (SELECT c.id, c.at, ${V_LAT} AS lat, COALESCE(c.start_lng, c.lng) AS lng, ${V_DIST} AS distance_m,
+                                     ${V_ACC} AS accuracy_m, c.started_at, ${DUR_MIN} AS duration_min, c.distance_m AS end_distance_m,
+                                     c.current_pos, c.service_type, c.interest_level, c.decision_maker, c.satisfaction, c.payments_by,
+                                     c.services, c.notes, c.terminals, c.online_delivery, c.lead_id
                                 FROM opener_checkins c
                                WHERE c.route_stop_id = s.id ORDER BY c.at DESC LIMIT 1) c ON true
+           LEFT JOIN leads ld ON ld.id = c.lead_id
           WHERE s.route_id = ANY($1::int[]) ORDER BY s.route_id, s.position`, [ids])).rows : [];
       const last = ids.length ? (await pool.query(
         `SELECT DISTINCT ON (s.route_id) s.route_id, c.at, c.lat, c.lng, c.distance_m, s.label
            FROM opener_checkins c JOIN opener_route_stops s ON s.id = c.route_stop_id
           WHERE s.route_id = ANY($1::int[]) ORDER BY s.route_id, c.at DESC`, [ids])).rows : [];
       const lastBy = new Map(last.map((l) => [l.route_id, l]));
+      // Ce qu'on sait du restaurant (client ? quel système ? franchise ?) — vue gestionnaire,
+      // demande de David (2026-10-14) : voir d'un coup d'œil le résultat de chaque visite.
+      const st0 = await statusOf(stops.map((s) => s.place_id));
       const out = [];
       for (const r of routes) {
         const st = stops.filter((s) => s.route_id === r.id);
@@ -612,7 +620,14 @@ function registerOpenerFieldRoutes(app, deps) {
           openerName: await displayName(r.opener_email), zone: r.zone,
           total: st.length, done: st.filter((s) => s.outcome === 'done').length, skipped: st.filter((s) => s.outcome === 'skipped').length,
           stops: st.map((s) => ({
-            id: s.id, name: s.label, lat: s.lat, lng: s.lng, outcome: s.outcome, skipReason: s.skip_reason, doneAt: s.done_at,
+            id: s.id, placeId: s.place_id, name: s.label, address: s.address, lat: s.lat, lng: s.lng, outcome: s.outcome, skipReason: s.skip_reason, doneAt: s.done_at,
+            place: (({ status, version, competitorPos, franchise, brand, seasonal, lastSatisfaction, visits }) =>
+              ({ status, version, competitorPos, franchise, brand, seasonal, lastSatisfaction, visits }))(st0.get(s.place_id) || { status: 'new' }),
+            result: s.c_at ? {
+              checkinId: s.c_id, currentPos: s.current_pos, serviceType: s.service_type, interest: s.interest_level, decisionMaker: s.decision_maker,
+              satisfaction: s.satisfaction, paymentsBy: s.payments_by, services: s.services || [], notes: s.notes, terminals: s.terminals,
+              onlineDelivery: s.online_delivery, lead: s.lead_id ? { id: s.lead_id, refCode: s.lead_ref, status: s.lead_status } : null,
+            } : null,
             // La visite : où était le téléphone au check-in, et le verdict qui en découle.
             checkin: s.c_at ? { at: s.c_at, lat: s.c_lat, lng: s.c_lng, distanceM: s.c_dist, accuracyM: s.c_acc,
               startedAt: s.c_start, durationMin: s.c_dur, endDistanceM: s.c_end_dist,

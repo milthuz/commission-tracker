@@ -389,6 +389,11 @@ const IN = (i) => [45.521 + i * 0.0003, -73.589 + i * 0.0004];   // points dans 
       assert.strictEqual(visited.checkin.verdict, 'onsite', 'check-in à ~55 m, précision 12 m');
       assert.ok(visited.checkin.distanceM > 40 && visited.checkin.distanceM < 70);
       assert.deepStrictEqual(mine.verdicts, { onsite: 1 });
+      // Le RÉSULTAT de la visite, pour le gestionnaire (2026-10-14) : réponses du check-in, lead, statut du lieu.
+      assert.deepStrictEqual([visited.result.currentPos, visited.result.interest, visited.result.lead?.refCode],
+        [ck.currentPos, ck.interest, lead.refCode]);
+      assert.ok(visited.place && visited.place.status, 'statut Cluster du lieu');
+      assert.strictEqual(mine.stops.find((s) => s.outcome !== 'done').result, null, 'pas de résultat sans visite');
       assert.ok(r.body.routes.some((x) => x.date === addDays(today, 1)), 'la route du lendemain (reportée) est dans la période');
       assert.strictEqual((await call('GET', '/api/opener/routes-overview', undefined, 'jo@x.com')).status, 403);
     });
