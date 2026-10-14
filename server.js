@@ -216,6 +216,8 @@ const PERMISSION_CATALOG = [
   // Zoho et partir un courriel aux visiteurs, comme `leads:review`, mais en lot (2026-10-09).
   // Export Excel du rapport des pistes : le détail contient les coordonnées des prospects (2026-10-13).
   { key: 'leads:export',               label: 'Export the lead report to Excel (includes prospect contact details)', category: 'Leads' },
+  // Fusionner deux demandes du même marchand (site + téléphone le même jour, 2026-10-14).
+  { key: 'leads:merge',                label: 'Merge two incoming leads from the same merchant (e.g. website form + phone call)', category: 'Leads' },
   { key: 'leads:import',               label: 'Import a trade-show lead list (XLSX), accept it in bulk into Zoho and email the visitors', category: 'Leads' },
 
   // Module Opener (porte-à-porte). Lot 0 : l'appariement des magasins Cluster (Kaizen) à leur
@@ -2370,6 +2372,10 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS desk_ticket_id TEXT`);
     await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS desk_ticket_number TEXT`);
     await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS desk_ticket_url TEXT`);
+    // Fusion de deux demandes du même marchand (2026-10-14) : l'absorbée garde un lien vers la gardée.
+    await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS merged_into INTEGER`);
+    await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS merged_at TIMESTAMP`);
+    await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS merged_by VARCHAR(255)`);
     // Rattachement a un marchand existant (2026-10-05) : le compte Zoho auquel l'opportunite
     // a ete accrochee. Le nom est copie a cote de l'identifiant — l'ecran doit pouvoir dire
     // « rattachee a Le Cambo » sans rappeler Zoho a chaque affichage.
@@ -38851,6 +38857,7 @@ async function leadAccess(req) {
     attachExisting: has('leads:attach_existing'),
     import: has('leads:import'),
     export: has('leads:export'),
+    merge: has('leads:merge'),
   };
 }
 
@@ -39320,9 +39327,18 @@ app.get('/api/leads', authenticateToken, async (req, res) => {
       `SELECT status, COUNT(*)::int AS n FROM leads ${scope ? `WHERE ${scope}` : ''} GROUP BY status`,
       scope ? params.slice(0, 2) : []
     )).rows;
+    // « Même demande probable » : une piste en attente qui ressemble à une autre (même courriel,
+    // téléphone ou commerce, à 3 jours près). Seulement pour qui peut fusionner.
+    let possible = new Set();
+    const queueIds = rows.filter((r) => r.status === 'new' || r.status === 'in_review').map((r) => r.id);
+    if (acc.merge && queueIds.length) {
+      possible = new Set((await pool.query(
+        `SELECT DISTINCT a.id FROM leads a JOIN leads b ON ${LEAD_MERGE_MATCH('a', 'b')}
+          WHERE a.id = ANY($1)`, [queueIds])).rows.map((x) => x.id));
+    }
     res.json({
       // Doublon masque a qui ne distribue pas (voir POST /api/leads).
-      leads: rows.map((r) => withoutDuplicateUnlessReviewer(publicLead(r), acc)),
+      leads: rows.map((r) => ({ ...withoutDuplicateUnlessReviewer(publicLead(r), acc), possibleMerge: possible.has(r.id) })),
       counts: Object.fromEntries(counts.map((r) => [r.status, r.n])),
       can: leadCan(acc),
     });
@@ -39386,6 +39402,7 @@ function publicLead(r) {
     booking: { status: r.booking_status || null, updatedAt: r.booking_updated_at || null, changes: r.booking_changes || 0,
                inGoogleCalendar: !!r.gcal_event_id, meetUrl: r.gcal_meet_url || null },
     automation: r.automation || {},
+    mergedInto: r.merged_into || null,
     // Remerciement de salon (services/leadImport) : pixel d'ouverture (sous-compte) et ouverture du
     // lien de réservation (fiable). Colonnes créées par le module : absentes = undefined → null.
     eventThanks: r.event_open_count != null || r.booking_link_open_count != null
@@ -39419,7 +39436,14 @@ app.get('/api/leads/:id', authenticateToken, async (req, res) => {
         WHERE entity_type = 'lead' AND entity_id = $1 ORDER BY created_at DESC LIMIT 50`,
       [String(r.id)]
     )).rows;
-    res.json({ lead: withoutDuplicateUnlessReviewer(publicLead(r), acc), history,
+    // Les liens de fusion, avec leur numéro de dossier (pas seulement un identifiant interne).
+    const mergedInto = r.merged_into
+      ? (await pool.query(`SELECT id, ref_code AS "refCode", source, status FROM leads WHERE id = $1`, [r.merged_into])).rows[0] || null
+      : null;
+    const mergedFrom = (await pool.query(
+      `SELECT id, ref_code AS "refCode", source, created_at AS "createdAt", merged_at AS "mergedAt", merged_by AS "mergedBy"
+         FROM leads WHERE merged_into = $1 ORDER BY merged_at`, [r.id])).rows;
+    res.json({ lead: { ...withoutDuplicateUnlessReviewer(publicLead(r), acc), mergedIntoLead: mergedInto, mergedFrom }, history,
                can: leadCan(acc) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -39606,6 +39630,161 @@ app.post('/api/leads/:id/reject', authenticateToken, async (req, res) => {
       req.user.realAdminEmail || req.user.email);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Fusion de deux demandes (2026-10-14, demande de David) ──────────────────────────────────
+// Le même marchand remplit le formulaire du site PUIS appelle, le même jour : deux pistes. Les
+// fusionner garde UNE piste et y verse tout ce que l'autre savait — champs manquants, coordonnées
+// qui diffèrent, message —, rien n'est perdu. L'absorbée passe en « doublon » avec un lien.
+//   • l'absorbée doit être EN ATTENTE (new / in_review) : rien n'est encore parti pour elle ;
+//   • la gardée peut être en attente OU déjà acceptée — dans ce cas, les nouvelles informations
+//     vont aussi dans une NOTE sur sa fiche Zoho (Lead, ou l'opportunité d'une piste rattachée).
+// Correspondance : même courriel, même téléphone (7 chiffres et plus) ou même nom de commerce
+// normalisé (sh_norm_name : accents, ponctuation, « inc / ltée »), reçues à 3 jours près. Un SQL partagé par la liste (pastille) et la fiche (bandeau).
+const LEAD_MERGE_MATCH = (a, b) => `${b}.id <> ${a}.id
+  AND ${b}.merged_into IS NULL AND ${a}.merged_into IS NULL
+  AND ${b}.status IN ('new', 'in_review', 'accepted')
+  AND ABS(EXTRACT(EPOCH FROM (${a}.created_at - ${b}.created_at))) < 3 * 86400
+  AND (
+    (${a}.contact_email IS NOT NULL AND ${a}.contact_email <> '' AND LOWER(${a}.contact_email) = LOWER(${b}.contact_email))
+    OR (LENGTH(COALESCE(${a}.contact_phone_digits, '')) >= 7 AND ${a}.contact_phone_digits = ${b}.contact_phone_digits)
+    OR (LENGTH(sh_norm_name(${a}.business_name)) >= 3 AND sh_norm_name(${a}.business_name) = sh_norm_name(${b}.business_name))
+  )`;
+
+// Les champs qu'une fusion complète (la gardée prend la valeur de l'absorbée si elle n'en a pas).
+const LEAD_MERGE_FIELDS = [
+  ['business_type', 'Type de commerce'], ['website', 'Site web'],
+  ['contact_first_name', 'Prénom'], ['contact_last_name', 'Nom'], ['contact_title', 'Titre'],
+  ['contact_email', 'Courriel'], ['contact_phone', 'Téléphone'],
+  ['city', 'Ville'], ['province', 'Province'], ['postal_code', 'Code postal'],
+  ['locations_count', 'Succursales'], ['current_pos', 'Système actuel'], ['timeline', 'Échéance'],
+];
+
+// Le nom de la source dans les notes (en français : les notes Zoho de Sales Hub le sont).
+const LEAD_SOURCE_FR = { website: 'formulaire du site', phone: 'téléphone', walk_in: 'visite', referral: 'recommandation',
+  event: 'salon', other: 'autre', opener: 'opener' };
+const leadSourceFr = (k) => LEAD_SOURCE_FR[k] || k;
+
+// GET /api/leads/:id/merge-candidates[?q=] — les pistes qui ressemblent à celle-ci ; avec `q`,
+// une recherche libre (numéro de dossier ou commerce) pour fusionner à la main.
+app.get('/api/leads/:id/merge-candidates', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:merge'))) return;
+  const id = parseInt(req.params.id, 10);
+  const q = String(req.query.q || '').trim().slice(0, 80);
+  try {
+    const self = (await pool.query(`SELECT id, created_at FROM leads WHERE id = $1`, [id])).rows[0];
+    if (!self) return res.status(404).json({ error: 'not_found' });
+    const cols = `b.id, b.ref_code AS "refCode", b.source, b.source_detail AS "sourceDetail", b.status,
+                  b.business_name AS "businessName", b.contact_first_name AS "contactFirstName",
+                  b.contact_last_name AS "contactLastName", b.contact_email AS "contactEmail",
+                  b.contact_phone AS "contactPhone", b.created_at AS "createdAt", b.assigned_rep_name AS "repName",
+                  (b.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Toronto')::date
+                    = (a.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Toronto')::date AS "sameDay",
+                  ARRAY_REMOVE(ARRAY[
+                    CASE WHEN a.contact_email <> '' AND LOWER(a.contact_email) = LOWER(b.contact_email) THEN 'email' END,
+                    CASE WHEN LENGTH(COALESCE(a.contact_phone_digits, '')) >= 7 AND a.contact_phone_digits = b.contact_phone_digits THEN 'phone' END,
+                    CASE WHEN LENGTH(sh_norm_name(a.business_name)) >= 3 AND sh_norm_name(a.business_name) = sh_norm_name(b.business_name) THEN 'business' END
+                  ], NULL) AS "matchedOn"`;
+    const rows = q
+      ? (await pool.query(
+          `SELECT ${cols} FROM leads a JOIN leads b ON b.id <> a.id AND b.merged_into IS NULL
+                AND b.status IN ('new', 'in_review', 'accepted')
+                AND (b.ref_code ILIKE $2 OR b.business_name ILIKE $3 OR b.contact_email ILIKE $3)
+            WHERE a.id = $1 ORDER BY b.created_at DESC LIMIT 15`, [id, q, `%${q}%`])).rows
+      : (await pool.query(
+          `SELECT ${cols} FROM leads a JOIN leads b ON ${LEAD_MERGE_MATCH('a', 'b')}
+            WHERE a.id = $1 ORDER BY ABS(EXTRACT(EPOCH FROM (a.created_at - b.created_at))) LIMIT 10`, [id])).rows;
+    res.json({ candidates: rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/leads/:id/merge { keepId } — :id est ABSORBÉE dans keepId.
+app.post('/api/leads/:id/merge', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'leads:merge'))) return;
+  const goneId = parseInt(req.params.id, 10);
+  const keepId = parseInt(req.body?.keepId, 10);
+  const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+  if (!keepId || keepId === goneId) return res.status(400).json({ error: 'bad_target' });
+  const client = await pool.connect();
+  let keep, gone, added = [], extra = [], sets = {};
+  try {
+    await client.query('BEGIN');
+    // Verrou des deux lignes, dans un ordre fixe : deux fusions croisées ne s'interbloquent pas.
+    const both = (await client.query(`SELECT * FROM leads WHERE id = ANY($1) ORDER BY id FOR UPDATE`, [[goneId, keepId]])).rows;
+    keep = both.find((r) => r.id === keepId);
+    gone = both.find((r) => r.id === goneId);
+    if (!keep || !gone) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'not_found' }); }
+    if (gone.merged_into || keep.merged_into) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'already_merged' }); }
+    if (!['new', 'in_review'].includes(gone.status)) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'absorbed_not_pending' }); }
+    if (!['new', 'in_review', 'accepted'].includes(keep.status)) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'keep_closed' }); }
+
+    // Ce que la gardée n'avait pas → on le lui donne. Ce qui DIFFÈRE → dans la note, jamais perdu.
+    for (const [col, label] of LEAD_MERGE_FIELDS) {
+      const g = gone[col];
+      if (g == null || String(g).trim() === '') continue;
+      const k = keep[col];
+      if (k == null || String(k).trim() === '') { sets[col] = g; added.push(`${label} : ${g}`); }
+      else if (String(k).trim().toLowerCase() !== String(g).trim().toLowerCase()) extra.push(`${label} : ${g}`);
+    }
+    if (sets.contact_phone) sets.contact_phone_digits = gone.contact_phone_digits;
+    const interest = [...new Set([...(Array.isArray(keep.interest) ? keep.interest : []), ...(Array.isArray(gone.interest) ? gone.interest : [])])];
+    const when = new Date(gone.created_at).toLocaleString('fr-CA', { timeZone: LEAD_TZ, dateStyle: 'medium', timeStyle: 'short' });
+    const block = [
+      `— Fusionnée avec ${gone.ref_code} (${leadSourceFr(gone.source)}${gone.source_detail ? ` — ${gone.source_detail}` : ''}, reçue le ${when}) par ${actor}`,
+      ...extra.map((x) => `Autre ${x.charAt(0).toLowerCase()}${x.slice(1)}`),
+      gone.notes ? `Message de ${gone.ref_code} :\n${gone.notes}` : null,
+    ].filter(Boolean).join('\n');
+    const notes = [keep.notes, block].filter(Boolean).join('\n\n').slice(0, 8000);
+
+    const cols = Object.keys(sets);
+    await client.query(
+      `UPDATE leads SET ${cols.map((c, i) => `${c} = $${i + 4}`).join(', ')}${cols.length ? ',' : ''}
+              notes = $2, interest = $3::jsonb WHERE id = $1`,
+      [keep.id, notes, JSON.stringify(interest), ...cols.map((c) => sets[c])]);
+    await client.query(
+      `UPDATE leads SET status = 'duplicate', merged_into = $2, merged_at = CURRENT_TIMESTAMP, merged_by = $3,
+              reviewed_by = $3, reviewed_at = CURRENT_TIMESTAMP, rejection_reason = $4 WHERE id = $1`,
+      [gone.id, keep.id, actor, `Fusionnée dans ${keep.ref_code}`]);
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    client.release();
+    return res.status(500).json({ error: e.message });
+  }
+  client.release();
+
+  logActivity('lead', gone.id, 'merged_into', `${gone.ref_code} fusionnée dans ${keep.ref_code}`, actor, { metadata: { keepId: keep.id } });
+  logActivity('lead', keep.id, 'merged_from',
+    `${gone.ref_code} (${leadSourceFr(gone.source)}) fusionnée ici${added.length ? ` — ajouté : ${added.join(' · ')}` : ''}`, actor, { metadata: { goneId: gone.id } });
+
+  // Gardée déjà dans Zoho : les nouvelles informations y vont aussi. N'échoue jamais la fusion.
+  let zohoNote = null;
+  if (keep.status === 'accepted' && (keep.crm_lead_id || keep.crm_deal_id)) {
+    const mod = keep.crm_lead_id ? 'Leads' : 'Deals';
+    const recId = keep.crm_lead_id || keep.crm_deal_id;
+    try {
+      const body = [
+        `La même demande est aussi arrivée par ${leadSourceFr(gone.source)} (${gone.ref_code}) et a été fusionnée dans Sales Hub par ${actor}.`,
+        added.length ? `\nNouvelles informations :\n- ${added.join('\n- ')}` : null,
+        extra.length ? `\nAutres coordonnées données :\n- ${extra.join('\n- ')}` : null,
+        gone.notes ? `\nMessage :\n${gone.notes}` : null,
+      ].filter(Boolean).join('\n');
+      const r = await crmPost('/Notes', { data: [{
+        Note_Title: `Demande fusionnée — ${gone.ref_code}`.slice(0, 120),
+        Note_Content: body.slice(0, 32000), Parent_Id: { id: String(recId) }, se_module: mod,
+      }] });
+      zohoNote = r.ok ? { ok: true, id: r.id } : { ok: false, error: r.error };
+    } catch (e) { zohoNote = { ok: false, error: e.message }; }
+  } else {
+    // Gardée encore en attente : ses coordonnées ont pu s'enrichir → reposer la question à Zoho.
+    checkCrmDuplicate({ businessName: keep.business_name, contactEmail: sets.contact_email || keep.contact_email,
+                        contactPhone: sets.contact_phone || keep.contact_phone })
+      .then((result) => pool.query(
+        `UPDATE leads SET crm_match_status = $2, crm_match_summary = $3, crm_match_records = $4::jsonb WHERE id = $1`,
+        [keep.id, result.status, result.summary, JSON.stringify(result.matches || [])]))
+      .catch(() => {});
+  }
+  res.json({ success: true, keepId: keep.id, keepRef: keep.ref_code, added, extra, zohoNote });
 });
 
 // Relancer la detection de doublon a la demande — les donnees bougent, et un examen fait trois
