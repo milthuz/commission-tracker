@@ -12690,6 +12690,10 @@ app.get('/api/crm/points/annual', authenticateToken, async (req, res) => {
       };
     }
 
+    // The rep's own monthly quota (NULL = default), same rule as the pay-stub gate.
+    const spQuota = (await pool.query(`SELECT monthly_quota FROM salespeople WHERE LOWER(name) = LOWER($1)`, [repName])).rows[0];
+    const quota   = spQuota?.monthly_quota == null ? MONTHLY_QUOTA : parseInt(spQuota.monthly_quota);
+
     const months = [];
     for (let m = 1; m <= 12; m++) {
       const crmPts  = crmByMonth[m]    || 0;
@@ -12702,7 +12706,8 @@ app.get('/api/crm/points/annual', authenticateToken, async (req, res) => {
         zentactActivations: zentact.activations,
         zentactBonus:      zentact.bonus,
         totalPoints:       total,
-        quotaMet:          total >= MONTHLY_QUOTA,
+        quota,
+        quotaMet:          total >= quota,
         monthlyBonus:      ZohoCRMService.calculateMonthlyBonus(total),
       });
     }
