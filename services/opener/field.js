@@ -130,6 +130,8 @@ const SCHEMA = [
   `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS payments_by VARCHAR(10)`,
   // Check-in corrigé par l'opener après l'envoi (2026-10-12).
   `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP`,
+  // Client qui a DÉJÀ les paiements Cluster (demande de Hao, 2026-10-14) : pas d'intérêt à noter.
+  `ALTER TABLE opener_checkins ALTER COLUMN interest_level DROP NOT NULL`,
 ];
 
 // AAAA-MM-JJ à Montréal. Jamais `new Date().toISOString()` : à 20 h à Montréal, c'est déjà demain en UTC.
@@ -831,8 +833,15 @@ function registerOpenerFieldRoutes(app, deps) {
     const currentPos = clean(b.currentPos, 40);
     if (!currentPos) return { error: 'current_pos_required' };
     if (!['tables', 'quick', 'both'].includes(b.serviceType)) return { error: 'service_type_required' };
-    const interest = parseInt(b.interest, 10);
-    if (!(interest >= 1 && interest <= 5)) return { error: 'interest_required' };
+    // L'intérêt porte, chez un client, sur les paiements Cluster : s'il les a déjà (paymentsBy =
+    // cluster), il n'y a rien à demander (demande de Hao, 2026-10-14) et l'intérêt reste vide.
+    const sat = parseInt(b.satisfaction, 10);
+    const alreadyPays = b.paymentsBy === 'cluster' && sat >= 1 && sat <= 5;
+    let interest = parseInt(b.interest, 10);
+    if (!(interest >= 1 && interest <= 5)) {
+      if (!alreadyPays) return { error: 'interest_required' };
+      interest = null;
+    }
     // Heure du TÉLÉPHONE (un check-in hors ligne part plus tard), bornée : pas dans le futur,
     // pas plus de 7 jours en arrière.
     let at = new Date(b.at || Date.now());

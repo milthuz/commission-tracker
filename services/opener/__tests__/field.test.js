@@ -443,6 +443,17 @@ const IN = (i) => [45.521 + i * 0.0003, -73.589 + i * 0.0004];   // points dans 
       assert.strictEqual(bad.status, 200);
       const h = (await call('GET', `/api/opener/place/${client.placeId}`, undefined, 'autre@x.com')).body.history[0];
       assert.deepStrictEqual([h.satisfaction, h.paymentsBy], [null, null]);
+      // Déjà aux paiements Cluster : l'intérêt (pour les paiements) n'est plus demandé.
+      const paid = await call('POST', '/api/opener/checkins', { ...ck, id: crypto.randomUUID(), placeId: client.placeId,
+        currentPos: 'Cluster', satisfaction: 5, paymentsBy: 'cluster', interest: undefined }, 'autre@x.com');
+      assert.strictEqual(paid.status, 200, JSON.stringify(paid.body));
+      const hp = (await call('GET', `/api/opener/place/${client.placeId}`, undefined, 'autre@x.com')).body.history[0];
+      assert.deepStrictEqual([hp.paymentsBy, hp.interest], ['cluster', null]);
+      // Sans satisfaction ou sans « Cluster », l'intérêt reste obligatoire.
+      assert.strictEqual((await call('POST', '/api/opener/checkins', { ...ck, id: crypto.randomUUID(), placeId: client.placeId,
+        paymentsBy: 'other', satisfaction: 4, interest: undefined }, 'autre@x.com')).body.error, 'interest_required');
+      assert.strictEqual((await call('POST', '/api/opener/checkins', { ...ck, id: crypto.randomUUID(), placeId: client.placeId,
+        paymentsBy: 'cluster', interest: undefined }, 'autre@x.com')).body.error, 'interest_required');
     });
 
     await t('liste des routes du manager : comptes d\'arrêts et de visites', async () => {
