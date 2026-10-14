@@ -222,7 +222,14 @@ const addr = (address, zip, extra = {}) => ({ address, street2: '', city: 'Montr
     });
 
     await t('statut : compteurs par source et par version', async () => {
-      const r = await call('GET', '/api/opener/locations/status');
+      // Par défaut : les clients PAYANTS seulement (2026-10-14) ; ?active=all : tout le parc.
+      const def = (await call('GET', '/api/opener/locations/status')).body;
+      const act = (await pool.query(`SELECT COUNT(*) FILTER (WHERE source = 'kaizen')::int k, COUNT(*) FILTER (WHERE source = 'billing')::int b
+        FROM cluster_locations WHERE missing_since IS NULL AND active`)).rows[0];
+      assert.deepStrictEqual([def.totals.kaizen, def.totals.billing], [act.k, act.b]);
+      assert.ok(def.totals.inactive > 0 && act.k + act.b < 11, 'des anciens clients existent et ne sont pas comptés');
+      assert.strictEqual(Object.values(def.counts).reduce((x, y) => x + y, 0), act.k + act.b, 'compteurs d\'appariement : actifs seulement');
+      const r = await call('GET', '/api/opener/locations/status?active=all');
       assert.strictEqual(r.status, 200);
       const tt = r.body.totals;
       assert.strictEqual(tt.kaizen, 6);

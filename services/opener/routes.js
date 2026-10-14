@@ -657,19 +657,25 @@ function registerOpenerRoutes(app, deps) {
   app.get('/api/opener/locations/status', authenticateToken, async (req, res) => {
     if (!(await guard(req, res))) return;
     try {
+      // Les tuiles comptent les clients PAYANTS par défaut (David, 2026-10-14 : « beaucoup trop
+      // d'emplacements versus ceux qui paient » — 1 638 anciens clients gonflaient le V1).
+      // ?active=false : les anciens clients ; ?active=all : tout.
+      const a = String(req.query.active ?? 'true');
+      const act = a === 'false' ? 'AND NOT active' : a === 'all' || a === '' ? '' : 'AND active';
       const counts = Object.fromEntries(STATUSES.map((s) => [s, 0]));
       const { rows } = await pool.query(
-        `SELECT match_status, COUNT(*)::int AS n FROM cluster_locations WHERE missing_since IS NULL GROUP BY match_status`);
+        `SELECT match_status, COUNT(*)::int AS n FROM cluster_locations WHERE missing_since IS NULL ${act} GROUP BY match_status`);
       for (const r of rows) counts[r.match_status] = r.n;
       const tot = (await pool.query(
         `SELECT COUNT(*) FILTER (WHERE missing_since IS NULL AND active)::int AS active,
                 COUNT(*) FILTER (WHERE missing_since IS NULL AND NOT active)::int AS inactive,
                 COUNT(*) FILTER (WHERE missing_since IS NOT NULL)::int AS missing,
-                COUNT(*) FILTER (WHERE missing_since IS NULL AND source = 'kaizen')::int AS kaizen,
-                COUNT(*) FILTER (WHERE missing_since IS NULL AND source = 'billing')::int AS billing,
-                COUNT(*) FILTER (WHERE missing_since IS NULL AND COALESCE(version_override, software_version) = 'v2')::int AS v2,
-                COUNT(*) FILTER (WHERE missing_since IS NULL AND COALESCE(version_override, software_version) = 'v1')::int AS v1,
-                COUNT(*) FILTER (WHERE missing_since IS NULL AND source = 'billing' AND twin_of IS NOT NULL)::int AS twins
+                COUNT(*) FILTER (WHERE missing_since IS NULL AND active AND extra->>'seasonal' = 'true')::int AS seasonal,
+                COUNT(*) FILTER (WHERE missing_since IS NULL ${act} AND source = 'kaizen')::int AS kaizen,
+                COUNT(*) FILTER (WHERE missing_since IS NULL ${act} AND source = 'billing')::int AS billing,
+                COUNT(*) FILTER (WHERE missing_since IS NULL ${act} AND COALESCE(version_override, software_version) = 'v2')::int AS v2,
+                COUNT(*) FILTER (WHERE missing_since IS NULL ${act} AND COALESCE(version_override, software_version) = 'v1')::int AS v1,
+                COUNT(*) FILTER (WHERE missing_since IS NULL ${act} AND source = 'billing' AND twin_of IS NOT NULL)::int AS twins
            FROM cluster_locations`)).rows[0];
       res.json({
         configured: { kaizen: kaizenReady(), google: google.configured(), billing: !!deps.late },
