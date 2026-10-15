@@ -72,6 +72,10 @@ if (!JWT_SECRET) {
 }
 
 const app = express();
+// SECURITY (audit 2026-10-14): one proxy hop (Railway's edge) appends the real client IP to
+// X-Forwarded-For. Without this, req.ip was the proxy for EVERY request — the per-IP login /
+// reset / signup limits were shared by all users, so one attacker could lock everyone out.
+app.set('trust proxy', 1);
 
 // ============================================================================
 // PERMISSION CATALOG — all features that can be gated via roles
@@ -3481,8 +3485,8 @@ async function partnerRecordCount(partnerId) {
 // divergent, c'est une origine ajoutée d'un côté et pas de l'autre.
 const ALLOWED_ORIGINS = [
   process.env.FRONTEND_URL,
-  'http://localhost:3000',
-  'http://localhost:3001',
+  // Local dev only — never on Railway (audit 2026-10-14).
+  ...(process.env.RAILWAY_ENVIRONMENT ? [] : ['http://localhost:3000', 'http://localhost:3001']),
   'https://sparkly-kulfi-c7641a.netlify.app', // Netlify (default)
   'https://saleshub.clusterpos.com',          // custom domain
   // Portes d'entrée dédiées (le même site Netlify, servi sous un autre nom). Sans ces
@@ -4074,6 +4078,7 @@ const ZOHO_CONFIG = {
 // appels Books AVEC de vrais jetons.
 const ZOHO_ACCOUNTS_HOST_RE = /^https:\/\/accounts\.zoho\.(com|eu|in|com\.au|jp|ca|sa|uk|com\.cn)$/;
 const ZOHO_API_DOMAIN_RE = /^https:\/\/(www\.)?zohoapis\.(com|eu|in|com\.au|jp|ca|sa|uk|com\.cn)$/;
+const ZOHO_LOGIN_DOMAINS = ['clustersystems.com', 'clusterpos.com'];
 function zohoAccountsUrlFrom(value) {
   if (value == null || value === '') return ZOHO_CONFIG.accounts_url;
   const v = String(value).trim().replace(/\/+$/, '');
@@ -4194,7 +4199,48 @@ app.get('/api/auth/callback', async (req, res) => {
     console.log('✅ Zoho user info received for', userInfo.Email);
 
     const userEmail = userInfo.Email;
-    const userName = `${userInfo.First_Name || ''} ${userInfo.Last_Name || ''}`.trim() || userEmail;
+    let userName = `${userInfo.First_Name || ''} ${userInfo.Last_Name || ''}`.trim() || userEmail;
+
+    // SECURITY (audit 2026-10-14, décision de David) — n'importe quel compte Zoho au monde pouvait
+    // entrer. Admis : les domaines de Cluster, ou une adresse DÉJÀ connue de Sales Hub (usager
+    // existant, rôle pré-assigné, courriel de connexion d'un représentant). Jerome
+    // (onesolutionpayments.com) entre par user_tokens. Les autres : refus, journal, retour à la
+    // page de connexion avec un message.
+    const loginEmail = String(userEmail || '').trim().toLowerCase();
+    const frontBase = process.env.FRONTEND_URL || 'http://localhost:3000';
+    const loginDomain = loginEmail.split('@')[1] || '';
+    let knownAddress = ZOHO_LOGIN_DOMAINS.includes(loginDomain);
+    if (!knownAddress && loginEmail) {
+      const k = await pool.query(
+        `SELECT 1 FROM user_tokens  WHERE LOWER(email) = $1
+         UNION ALL SELECT 1 FROM user_roles WHERE LOWER(user_email) = $1
+         UNION ALL SELECT 1 FROM salespeople WHERE LOWER(email) = $1
+         LIMIT 1`, [loginEmail]);
+      knownAddress = k.rows.length > 0;
+    }
+    if (!loginEmail || !knownAddress) {
+      console.warn('[SECURITY] connexion Zoho refusée — adresse inconnue :', loginEmail || '(aucune)');
+      return res.redirect(`${frontBase}/auth/zoho-login?error=not_authorized`);
+    }
+
+    // SECURITY (audit 2026-10-14) — le nom du profil Zoho est choisi par l'usager, et il servait à
+    // trouver « son » représentant (display_name). Se renommer comme un collègue donnait ses
+    // commissions. Un nom qui est celui d'un représentant DÉJÀ rattaché à quelqu'un d'autre (son
+    // courriel de connexion, ou un autre compte qui porte ce nom) n'est donc pas pris : on garde
+    // le nom connu, sinon l'adresse.
+    try {
+      const clash = await pool.query(
+        `SELECT 1 FROM salespeople s
+          WHERE LOWER(s.name) = LOWER($1)
+            AND ((s.email IS NOT NULL AND s.email <> '' AND LOWER(s.email) <> $2)
+                 OR EXISTS (SELECT 1 FROM user_tokens u WHERE LOWER(u.display_name) = LOWER($1) AND LOWER(u.email) <> $2))
+          LIMIT 1`, [userName, loginEmail]);
+      if (clash.rows.length) {
+        const prev = await pool.query(`SELECT display_name FROM user_tokens WHERE LOWER(email) = $1`, [loginEmail]);
+        console.warn('[SECURITY] nom Zoho refusé (représentant déjà rattaché ailleurs) pour', loginEmail);
+        userName = prev.rows[0]?.display_name || loginEmail;
+      }
+    } catch (_e) { /* en cas de doute, on garde le nom tel quel : le rattachement par courriel prime de toute façon */ }
 
     console.log('User Email:', userEmail);
     console.log('User Name:', userName);
@@ -4251,11 +4297,12 @@ app.get('/api/auth/callback', async (req, res) => {
         `INSERT INTO user_roles (user_email, role_id)
          SELECT $1, r.id FROM roles r
          WHERE r.name = 'Sales Rep'
+           -- Par COURRIEL seulement (audit 2026-10-14) : le nom du profil Zoho est choisi par l'usager.
            AND EXISTS (SELECT 1 FROM salespeople s WHERE s.is_active = true
-                       AND (LOWER(s.name) = LOWER($2) OR LOWER(s.email) = LOWER($1)))
+                       AND LOWER(s.email) = LOWER($1))
            AND NOT EXISTS (SELECT 1 FROM user_roles ur WHERE LOWER(ur.user_email) = LOWER($1))
          ON CONFLICT DO NOTHING`,
-        [userEmail, userName]
+        [userEmail]
       );
     } catch (_e) { /* non-fatal — role can be assigned manually */ }
 
@@ -4614,6 +4661,9 @@ function mailShell(title, intro, ctaLabel, ctaUrl, lang, brand) {
 
 // Simple in-memory rate limiter for credential endpoints (per dyno — good enough).
 const authAttempts = new Map();
+// Hash of a random string, computed once: compared against when the account doesn't exist so the
+// failure takes as long as a real wrong password (audit 2026-10-14 — timing enumeration).
+const DUMMY_BCRYPT_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex'), 10);
 function rateLimited(key, max = 8, windowMs = 15 * 60 * 1000) {
   const now = Date.now();
   const e = authAttempts.get(key);
@@ -4631,7 +4681,7 @@ const signMfaJwt = (email, purpose) => jwt.sign(
 );
 function verifyMfaJwt(token, purpose) {
   try {
-    const p = jwt.verify(token, JWT_SECRET);
+    const p = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
     return p.purpose === purpose ? p : null;
   } catch { return null; }
 }
@@ -4641,8 +4691,13 @@ function verifyMfaJwt(token, purpose) {
 async function resolveOwnRepName(email, fallbackName) {
   if (!email) return fallbackName || null;
   try {
-    const r = await pool.query(`SELECT display_name FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1`, [email]);
-    return r.rows[0]?.display_name || fallbackName || null;
+    // Le lien explicite « courriel de connexion » du représentant prime (audit 2026-10-14) ;
+    // le nom affiché, venu du profil Zoho, n'est qu'un repli pour les fiches sans courriel.
+    const r = await pool.query(
+      `SELECT COALESCE(
+         (SELECT name FROM salespeople WHERE LOWER(email) = LOWER($1) ORDER BY is_active DESC LIMIT 1),
+         (SELECT display_name FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1)) AS rep`, [email]);
+    return r.rows[0]?.rep || fallbackName || null;
   } catch { return fallbackName || null; }
 }
 
@@ -4653,19 +4708,37 @@ async function resolveOwnRepName(email, fallbackName) {
 // so a transient DB error skipped the 403 entirely and served the raw Zoho PDF. Given the
 // cross-cloud Postgres latency that's a reachable state, not a theoretical one — an authorization
 // check must deny when it cannot decide. Callers must treat a throw as a denial.
-async function canViewInvoiceDocs(email) {
+async function canViewInvoiceDocs(email, invoiceNumber, userType) {
   if (!email) return { ok: false, reason: 'permission' };
   const d = await pool.query(
     `SELECT COALESCE((SELECT is_admin  FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1), false) AS is_admin,
             COALESCE((SELECT demo_mode FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1),
                      (SELECT demo_mode FROM local_users WHERE LOWER(email) = LOWER($1) LIMIT 1),
-                     false) AS demo_mode`, [email]);
+                     false) AS demo_mode,
+            (SELECT status FROM local_users WHERE LOWER(email) = LOWER($1) LIMIT 1) AS local_status`, [email]);
+  // A disabled / deleted external account: its 7-day token must not open documents either
+  // (authenticateToken checks this; the ?token= iframe routes did not).
+  if (userType === 'local' && d.rows[0]?.local_status !== 'active') return { ok: false, reason: 'permission' };
   if (d.rows[0]?.demo_mode === true) return { ok: false, reason: 'demo' };
-  if (d.rows[0]?.is_admin === true) return { ok: true };
+  // Admin only from the Zoho account (same rule as authenticateToken).
+  if (userType !== 'local' && d.rows[0]?.is_admin === true) return { ok: true };
   const perms = await getUserPermissions(email);
   const viewPerms = ['invoices:view_own', 'invoices:view_all', 'report:view_own', 'report:view_others', 'report:view_paystub'];
   if (!viewPerms.some(p => userHasPermission(perms, p))) return { ok: false, reason: 'permission' };
-  return { ok: true };
+  if (userHasPermission(perms, 'invoices:view_all')) return { ok: true };
+  // SECURITY (audit 2026-10-14): holding a view permission used to open ANY customer's invoice by
+  // number. Now the invoice must be the caller's own sale, or one of the reps they manage.
+  if (!invoiceNumber) return { ok: false, reason: 'permission' };
+  const inv = await pool.query(`SELECT salesperson_name FROM invoices WHERE invoice_number = $1 LIMIT 1`, [String(invoiceNumber)]);
+  const owner = String(inv.rows[0]?.salesperson_name || '').trim().toLowerCase();
+  if (!owner) return { ok: false, reason: 'permission' };
+  const me = String((await resolveOwnRepName(email, null)) || '').trim().toLowerCase();
+  if (me && me === owner) return { ok: true };
+  if (userHasPermission(perms, 'report:view_others')) {
+    const managed = await getManagedRepNames(email);
+    if (managed.some((n) => String(n).trim().toLowerCase() === owner)) return { ok: true };
+  }
+  return { ok: false, reason: 'permission' };
 }
 const DOC_DENY_HTML = (msg) =>
   `<html><body style="font-family:sans-serif;padding:2rem;color:#333"><h3>${msg}</h3></body></html>`;
@@ -4682,7 +4755,8 @@ const escHtml = (s) => String(s == null ? '' : s)
 function sessionEmailFromToken(token) {
   const p = jwt.verify(String(token), JWT_SECRET, { algorithms: ['HS256'] });
   if (p.purpose) throw new Error('not a session token');
-  if (p.userType === 'partner') throw new Error('partner token rejected on internal route');
+  // Same ALLOWLIST as authenticateToken (was a partner-only deny-list: a Pass token got through).
+  if (p.userType && p.userType !== 'local') throw new Error('non-internal token rejected');
   return p.email || null;
 }
 
@@ -4705,7 +4779,7 @@ const authenticatePartnerToken = async (req, res, next) => {
   const token = req.headers['authorization']?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token provided' });
   try {
-    const claims = jwt.verify(token, JWT_SECRET);
+    const claims = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
     if (claims.userType !== 'partner') return res.status(401).json({ error: 'Invalid token' });
     // Never trust the JWT's role/partnerId alone — re-resolve the live row every request (same
     // reasoning as isAdmin/isDemo re-resolution in authenticateToken) so a disabled partner user
@@ -5221,7 +5295,7 @@ app.post('/api/auth/login', async (req, res) => {
     const u = (await pool.query(`SELECT * FROM local_users WHERE email = $1`, [email])).rows[0];
     // Uniform error → no user enumeration
     const fail = () => res.status(401).json({ error: 'Invalid email or password' });
-    if (!u || !u.password_hash || u.status === 'disabled') return fail();
+    if (!u || !u.password_hash || u.status === 'disabled') { await bcrypt.compare(password, DUMMY_BCRYPT_HASH); return fail(); }
     if (!(await bcrypt.compare(password, u.password_hash))) return fail();
     if (u.status !== 'active' || !u.totp_enabled) {
       return res.status(403).json({ error: 'Account setup incomplete — use your invitation link' });
@@ -5386,8 +5460,11 @@ app.post('/api/partner-auth/signup', async (req, res) => {
     // la premiere : lien peri d'un cote, « un compte existe deja » de l'autre, et plus aucun
     // moyen d'entrer. Elle vient de prouver qu'elle connait le code de son organisation et son
     // adresse est dans un domaine autorise ; c'est au moins aussi solide qu'un lien par courriel.
+    // SECURITY (audit 2026-10-14): never for an ADMIN invitation — the org code circulates among
+    // all the partner's staff, so anyone holding it could take the pending admin seat. Admins use
+    // their emailed link (Cluster can resend it).
     const reprenable = existant && existant.status === 'invited' && !existant.password_hash
-      && existant.partner_id === p.id;
+      && existant.partner_id === p.id && existant.role !== 'admin';
     if (existant && !reprenable) return res.status(409).json({ error: 'account_exists' });
     if (reprenable) {
       const repris = (await pool.query(
@@ -5501,7 +5578,7 @@ app.post('/api/partner-auth/login', async (req, res) => {
   try {
     const pu = (await pool.query(`SELECT * FROM partner_users WHERE email = $1`, [email])).rows[0];
     const fail = () => res.status(401).json({ error: 'Invalid email or password' });
-    if (!pu || !pu.password_hash || pu.status === 'disabled') return fail();
+    if (!pu || !pu.password_hash || pu.status === 'disabled') { await bcrypt.compare(password, DUMMY_BCRYPT_HASH); return fail(); }
     if (!(await bcrypt.compare(password, pu.password_hash))) return fail();
     // La 2FA n'est plus exigee pour entrer : un compte actif avec un mot de passe suffit.
     // On garde le refus pour un compte dont le mot de passe n'a jamais ete pose.
@@ -6222,7 +6299,7 @@ app.post('/api/partner-portal/organization/logo', authenticatePartnerToken, uplo
   if (req.partnerUser.role !== 'admin') return res.status(403).json({ error: 'Partner Admin only' });
   const file = req.file;
   if (!file) return res.status(400).json({ error: 'file required (multipart field "file")' });
-  if (!/^image\//.test(file.mimetype)) return res.status(400).json({ error: 'logo must be an image' });
+  if (!/^image\//.test(file.mimetype) || /svg/i.test(file.mimetype)) return res.status(400).json({ error: 'logo must be a PNG, JPEG or WebP image' });
   try {
     await pool.query(
       `UPDATE partners SET logo_data = $2, logo_mime_type = $3, logo_file_name = $4, updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
@@ -6368,6 +6445,9 @@ app.get('/api/partner-portal/payout-runs', authenticatePartnerToken, async (req,
 app.post('/api/partner-portal/invoices', authenticatePartnerToken, uploadPartnerInvoice.single('file'), async (req, res) => {
   if (req.partnerUser.role !== 'admin') return res.status(403).json({ error: 'Partner Admin only' });
   if (!req.file) return res.status(400).json({ error: 'file is required' });
+  // SECURITY (audit 2026-10-14): any file type was accepted, then emailed to accounting from our own
+  // sender and served back inline. PDF only, checked on its content, not on the declared type.
+  if (!req.file.buffer || req.file.buffer.slice(0, 5).toString('latin1') !== '%PDF-') return res.status(400).json({ error: 'The invoice must be a PDF file.' });
   const payoutRunId = req.body.payoutRunId ? parseInt(req.body.payoutRunId, 10) : null;
   try {
     if (payoutRunId) {
@@ -6379,7 +6459,7 @@ app.post('/api/partner-portal/invoices', authenticatePartnerToken, uploadPartner
     const r = await pool.query(
       `INSERT INTO partner_invoices (partner_id, payout_run_id, uploaded_by, file_name, mime_type, file_data)
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-      [req.partnerUser.partnerId, payoutRunId, req.partnerUser.id, req.file.originalname, req.file.mimetype, req.file.buffer]
+      [req.partnerUser.partnerId, payoutRunId, req.partnerUser.id, req.file.originalname, 'application/pdf', req.file.buffer]
     );
     notifyPartnerInvoiceUploaded(r.rows[0].id).catch(() => {});
     res.json({ success: true, id: r.rows[0].id });
@@ -6569,7 +6649,7 @@ app.post('/api/admin/partners/:id/logo', authenticateToken, uploadPartnerLogo.si
   if (!(await requirePerm(req, res, 'partners:manage'))) return;
   const file = req.file;
   if (!file) return res.status(400).json({ error: 'file required (multipart field "file")' });
-  if (!/^image\//.test(file.mimetype)) return res.status(400).json({ error: 'logo must be an image' });
+  if (!/^image\//.test(file.mimetype) || /svg/i.test(file.mimetype)) return res.status(400).json({ error: 'logo must be a PNG, JPEG or WebP image' });
   try {
     const id = parseInt(req.params.id, 10);
     const r = await pool.query(
@@ -10098,7 +10178,7 @@ async function toolCrmExport(scope, input) {
     rowCount: preview.rows.length,
     format,
     filename: `${title}.${format}`,
-    downloadToken: jwt.sign({ x: { source, input, title, format } }, JWT_SECRET, { expiresIn: '30m' }),
+    downloadToken: jwt.sign({ x: { source, input, title, format }, purpose: 'sofia-download' }, JWT_SECRET, { expiresIn: '30m' }),
   };
 }
 
@@ -10156,7 +10236,7 @@ function sofiaExportPdf(res, title, rows) {
 app.get('/api/assistant/export', authenticateToken, async (req, res) => {
   let spec;
   try {
-    spec = jwt.verify(String(req.query.token || ''), JWT_SECRET).x;
+    spec = jwt.verify(String(req.query.token || ''), JWT_SECRET, { algorithms: ['HS256'] }).x;
   } catch {
     return res.status(400).json({ error: 'expired_or_invalid_export' });
   }
@@ -11213,7 +11293,7 @@ app.post('/api/assistant/chat', authenticateToken, async (req, res) => {
         return res.json({
           reply: text,
           pendingAction: {
-            token: signPendingAction({ call: pending }),
+            token: signPendingAction({ call: pending }, req.user.email),
             tool: pending.name,
             summary: await describePendingAction(scope, pending),
             input: pending.input,
@@ -11393,8 +11473,17 @@ function actionLog(convo) {
 // Only the tool call goes in — NOT the conversation. The token lives in the
 // browser, and there is no reason to hand a user's whole chat history back to
 // them in a signed blob just to write one note.
-function signPendingAction(payload) {
-  return jwt.sign({ p: payload }, JWT_SECRET, { expiresIn: '15m' });
+// purpose: never a session · sub: only its author may confirm · jti: confirmed once (audit 2026-10-14).
+function signPendingAction(payload, email) {
+  return jwt.sign({ p: payload, purpose: 'sofia-action', sub: email || null, jti: crypto.randomBytes(12).toString('hex') }, JWT_SECRET, { expiresIn: '15m' });
+}
+const usedSofiaActions = new Map(); // jti → expiry (ms); the token itself lives 15 min
+function consumeSofiaAction(jti) {
+  const now = Date.now();
+  for (const [k, exp] of usedSofiaActions) if (exp < now) usedSofiaActions.delete(k);
+  if (!jti || usedSofiaActions.has(jti)) return false;
+  usedSofiaActions.set(jti, now + 16 * 60 * 1000);
+  return true;
 }
 
 const SOFIA_CRM_GUIDANCE_BASE = `
@@ -11454,7 +11543,11 @@ app.post('/api/assistant/confirm-action', authenticateToken, async (req, res) =>
   if (!client) return res.status(503).json({ error: 'assistant_not_configured' });
   let payload;
   try {
-    payload = jwt.verify(String(req.body.token || ''), JWT_SECRET).p;
+    const t = jwt.verify(String(req.body.token || ''), JWT_SECRET, { algorithms: ['HS256'] });
+    if (t.purpose !== 'sofia-action') throw new Error('not an action token');
+    if (t.sub && String(t.sub).toLowerCase() !== String(req.user.email || '').toLowerCase()) throw new Error('not yours');
+    if (!consumeSofiaAction(t.jti)) return res.status(409).json({ error: 'action_already_confirmed' });
+    payload = t.p;
   } catch {
     return res.status(400).json({ error: 'expired_or_invalid_action' });
   }
@@ -11905,7 +11998,7 @@ app.get('/api/auth/crm-callback', async (req, res) => {
     // laquelle : `k`.
     let genre = null;
     try {
-      const p = jwt.verify(String(req.query.state || ''), process.env.JWT_SECRET);
+      const p = jwt.verify(String(req.query.state || ''), process.env.JWT_SECRET, { algorithms: ['HS256'] });
       if (p && (p.k === 'crm-oauth' || p.k === 'desk-oauth') && p.email) {
         adminEmail = String(p.email); genre = p.k;
       }
@@ -12720,8 +12813,12 @@ app.put('/api/crm/deals/:dealId/source', authenticateToken, async (req, res) => 
 app.get('/api/crm/points/annual', authenticateToken, async (req, res) => {
   try {
     const year    = parseInt(req.query.year)       || new Date().getFullYear();
-    const repName = (req.query.repName || '').trim();
-    if (!repName) return res.status(400).json({ error: 'repName required' });
+    const requestedRep = (req.query.repName || '').trim();
+    if (!requestedRep) return res.status(400).json({ error: 'repName required' });
+    // SECURITY (audit 2026-10-14): the rep came straight from the query — anyone signed in could
+    // read any rep's points and bonus amounts. Same rule as the commission report: yourself, the
+    // reps you manage (report:view_others), or anyone for an admin.
+    const repName = await resolveTargetRep(req, requestedRep, await resolveOwnRepName(req.user.email, req.user.name));
 
     // CRM sold deals grouped by month for this rep & year
     const crmResult = await pool.query(`
@@ -12933,8 +13030,10 @@ app.post('/api/zentact/webhook', async (req, res) => {
   const secret = process.env.ZENTACT_WEBHOOK_SECRET;
   const signature = req.headers['x-hmac-signature'];
 
-  // Signature verification (only enforced if secret is set)
-  if (secret) {
+  // Signature verification — REQUIRED (audit 2026-10-14: it used to be skipped when the secret
+  // was unset, so a forged « ACTIVE » could move points and bonuses). Fail closed.
+  if (!secret) return res.status(503).json({ error: 'Webhook not configured' });
+  {
     if (!signature || !req.rawBody) {
       webhookStats.missing_signature_count++;
       console.warn('⚠️ Zentact webhook: missing signature or raw body');
@@ -17288,6 +17387,7 @@ app.put('/api/user/push-pin', authenticateToken, async (req, res) => {
   try {
     const existing = (await pool.query('SELECT pin_hash FROM saas_push_pins WHERE email = $1', [req.user.email])).rows[0];
     if (existing) {
+      if (rateLimited(`saaspin:${String(req.user.email || '').toLowerCase()}`, 5)) return res.status(429).json({ error: 'Too many attempts — try again in 15 minutes' });
       if (!currentPin || !(await bcrypt.compare(String(currentPin), existing.pin_hash))) {
         return res.status(401).json({ error: 'Current PIN is incorrect' });
       }
@@ -21556,6 +21656,7 @@ app.post('/api/admin/saas-increase/scenarios/:id/push', authenticateToken, async
 
   const pinRow = (await pool.query('SELECT pin_hash FROM saas_push_pins WHERE email = $1', [req.user.email])).rows[0];
   if (!pinRow) return res.status(400).json({ error: 'no_pin_set' });
+  if (rateLimited(`saaspin:${String(req.user.email || '').toLowerCase()}`, 5)) return res.status(429).json({ error: 'too_many_pin_attempts' });
   if (!pin || !(await bcrypt.compare(pin, pinRow.pin_hash))) return res.status(401).json({ error: 'invalid_pin' });
 
   const actor = req.user.realAdminEmail || req.user.email || 'unknown';
@@ -23508,8 +23609,10 @@ app.get('/api/proposals/estimate/:estimateId/preview', async (req, res) => {
                          (SELECT demo_mode FROM local_users WHERE LOWER(email) = LOWER($1) LIMIT 1),
                          false) AS demo_mode`, [tokenEmail]);
       isDemo = d.rows[0]?.demo_mode === true;
-      allowed = d.rows[0]?.is_admin === true
-        || userHasPermission(await getUserPermissions(tokenEmail), 'proposals:send');
+      const tokType = jwt.decode(String(token))?.userType || null;
+      const adminTok = tokType !== 'local' && d.rows[0]?.is_admin === true;
+      allowed = (adminTok || userHasPermission(await getUserPermissions(tokenEmail), 'proposals:send'))
+        && await estimateAllowedFor(tokenEmail, null, adminTok, req.params.estimateId);
     } catch {
       return res.status(503).send(DOC_DENY_HTML('Vérification impossible — réessayez / Could not verify permissions — please retry'));
     }
@@ -23526,7 +23629,7 @@ app.get('/api/proposals/estimate/:estimateId/preview', async (req, res) => {
     return res.send(result.buffer);
   } catch (e) {
     console.error('Estimate preview error:', e.message);
-    return res.status(500).send(`<html><body style="font-family:sans-serif;padding:2rem"><p>Error loading preview: ${e.message}</p></body></html>`);
+    return res.status(500).send(`<html><body style="font-family:sans-serif;padding:2rem"><p>Error loading preview: ${escHtml(e.message)}</p></body></html>`);
   }
 });
 
@@ -23860,6 +23963,24 @@ async function buildProposalPdf({ estimateId, lang, clientName, repName, title, 
     }
   }
   return { bytes: await out.save(), presentationPageCount, estimatePageCount };
+}
+
+// SECURITY (audit 2026-10-14): a Zoho estimate may only be previewed / prepared / emailed by its
+// own salesperson (or an admin) — the same rule the estimates LIST already applied. Before, any
+// proposals:send holder could open or SEND another rep's estimate by id (marking it sent in Zoho).
+async function estimateAllowedFor(email, name, isAdmin, estimateId) {
+  if (!estimateId) return true;
+  if (isAdmin) return true;
+  const { accessToken, apiDomain } = await getAdminBooksAuth();
+  const r = await axios.get(`${apiDomain}/books/v3/estimates/${encodeURIComponent(estimateId)}`, {
+    params: { organization_id: process.env.ZOHO_ORG_ID },
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, validateStatus: () => true,
+  });
+  if (r.status !== 200) return false;
+  const sp = String(r.data?.estimate?.salesperson_name || '').trim().toLowerCase();
+  if (!sp) return false;
+  const mine = [await resolveOwnRepName(email, null), name].map((x) => String(x || '').trim().toLowerCase()).filter(Boolean);
+  return mine.includes(sp);
 }
 
 // Customer name + email for an estimate (used to prefill the email draft).
@@ -24548,6 +24669,11 @@ app.post('/api/proposals/prepare', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'proposals:send'))) return;
   const lang = String(req.body.lang || 'fr').toLowerCase() === 'en' ? 'en' : 'fr';
   const estimateId = String(req.body.estimateId || '').trim();
+  if (estimateId) {
+    let okEst = false;
+    try { okEst = await estimateAllowedFor(req.user.email, req.user.name, req.user.isAdmin === true, estimateId); } catch { okEst = false; }
+    if (!okEst) return res.status(403).json({ error: 'This estimate belongs to another salesperson.' });
+  }
   const title = String(req.body.title || '').trim();
   const bodyClientName = String(req.body.clientName || '').trim();
   try {
@@ -24588,6 +24714,11 @@ app.post('/api/proposals/preview-email', authenticateToken, async (req, res) => 
   if (!(await requirePerm(req, res, 'proposals:send'))) return;
   const lang = String(req.body.lang || 'fr').toLowerCase() === 'en' ? 'en' : 'fr';
   const estimateId = String(req.body.estimateId || '').trim();
+  if (estimateId) {
+    let okEst = false;
+    try { okEst = await estimateAllowedFor(req.user.email, req.user.name, req.user.isAdmin === true, estimateId); } catch { okEst = false; }
+    if (!okEst) return res.status(403).json({ error: 'This estimate belongs to another salesperson.' });
+  }
   const bodyText = String(req.body.body || '');
   try {
     let acceptUrl = null;
@@ -24598,7 +24729,7 @@ app.post('/api/proposals/preview-email', authenticateToken, async (req, res) => 
     }
     const repName = req.user.name || req.user.email || '';
     const signatureHtml = await resolveSignatureHtml(req.user, repName);
-    const apiBase = process.env.PUBLIC_API_URL || `https://${req.get('host')}`;
+    const apiBase = process.env.PUBLIC_API_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : `https://${req.get('host')}`);
     const acceptBtn = acceptUrl
       ? `<div style="margin:22px 0"><a href="#" style="display:inline-block;background:#fe6523;color:#fff;text-decoration:none;font-weight:700;font-family:Arial,Helvetica,sans-serif;font-size:14px;padding:13px 26px;border-radius:8px">${lang === 'en' ? 'Review & accept the quote online →' : 'Voir et accepter le devis en ligne →'}</a></div>`
       : '';
@@ -24615,6 +24746,11 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'proposals:send'))) return;
   const lang = String(req.body.lang || 'fr').toLowerCase() === 'en' ? 'en' : 'fr';
   const estimateId = String(req.body.estimateId || '').trim();
+  if (estimateId) {
+    let okEst = false;
+    try { okEst = await estimateAllowedFor(req.user.email, req.user.name, req.user.isAdmin === true, estimateId); } catch { okEst = false; }
+    if (!okEst) return res.status(403).json({ error: 'This estimate belongs to another salesperson.' });
+  }
   const title = String(req.body.title || '').trim();
   const to = String(req.body.to || '').trim();
   const subject = String(req.body.subject || '').trim();
@@ -24651,7 +24787,7 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
     const signatureHtml = await resolveSignatureHtml(req.user, repName);
     // A unique token per send drives both the open pixel and the accept-link click redirect.
     const trackToken = require('crypto').randomUUID().replace(/-/g, '');
-    const apiBase = process.env.PUBLIC_API_URL || `https://${req.get('host')}`;
+    const apiBase = process.env.PUBLIC_API_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : `https://${req.get('host')}`);
     // Route the accept button through our backend so every click is logged (reliable repeat
     // counting), then 302s to the Zoho accept URL stored against this send.
     const acceptBtn = acceptUrl
@@ -24789,7 +24925,7 @@ app.get('/api/invoices/:invoiceNumber/pdf', authenticateToken, async (req, res) 
     // logged-in user could enumerate invoice numbers and pull every customer's PDF.
     let gate;
     try {
-      gate = await canViewInvoiceDocs(req.user.email);
+      gate = await canViewInvoiceDocs(req.user.email, req.params.invoiceNumber, req.user.userType);
     } catch { return res.status(503).json({ error: 'Could not verify permissions — try again' }); }
     if (!gate.ok) {
       return res.status(403).json({ error: gate.reason === 'demo' ? 'Disabled in demo mode' : 'Permission required' });
@@ -24811,8 +24947,10 @@ app.get('/api/invoices/:invoiceNumber/preview', async (req, res) => {
   const token = req.query.token;
   if (!token) return res.status(401).send('Missing token');
   let tokenEmail = null;
+  let tokenType = null;
   try {
     tokenEmail = sessionEmailFromToken(token);
+    tokenType = jwt.decode(String(token))?.userType || null; // already verified just above
   } catch {
     return res.status(401).send('Invalid token');
   }
@@ -24823,7 +24961,7 @@ app.get('/api/invoices/:invoiceNumber/preview', async (req, res) => {
   {
     let gate;
     try {
-      gate = await canViewInvoiceDocs(tokenEmail);
+      gate = await canViewInvoiceDocs(tokenEmail, req.params.invoiceNumber, tokenType);
     } catch {
       return res.status(503).send(DOC_DENY_HTML('Vérification impossible — réessayez / Could not verify permissions — please retry'));
     }
@@ -24846,7 +24984,7 @@ app.get('/api/invoices/:invoiceNumber/preview', async (req, res) => {
     return res.send(result.buffer);
   } catch (e) {
     console.error('Invoice preview error:', e.message);
-    return res.status(500).send(`<html><body style="font-family:sans-serif;padding:2rem"><p>Error loading preview: ${e.message}</p></body></html>`);
+    return res.status(500).send(`<html><body style="font-family:sans-serif;padding:2rem"><p>Error loading preview: ${escHtml(e.message)}</p></body></html>`);
   }
 });
 
@@ -26348,7 +26486,7 @@ app.post('/api/resellers/:id/logo', authenticateToken, uploadResellerLogo.single
   if (!(await requirePerm(req, res, 'reseller:manage'))) return;
   const file = req.file;
   if (!file) return res.status(400).json({ error: 'file required (multipart field "file")' });
-  if (!/^image\//.test(file.mimetype)) return res.status(400).json({ error: 'logo must be an image' });
+  if (!/^image\//.test(file.mimetype) || /svg/i.test(file.mimetype)) return res.status(400).json({ error: 'logo must be a PNG, JPEG or WebP image' });
   try {
     const r = await pool.query(
       `UPDATE resellers SET logo_data = $2, logo_mime_type = $3, logo_file_name = $4,
@@ -26473,7 +26611,7 @@ app.post('/api/hardware/:id/image', authenticateToken, uploadHardwareImg.single(
   if (!(await requirePerm(req, res, 'hardware:manage'))) return;
   const file = req.file;
   if (!file) return res.status(400).json({ error: 'file required (multipart field "file")' });
-  if (!/^image\//.test(file.mimetype)) return res.status(400).json({ error: 'file must be an image' });
+  if (!/^image\//.test(file.mimetype) || /svg/i.test(file.mimetype)) return res.status(400).json({ error: 'file must be a PNG, JPEG or WebP image' });
   try {
     const r = await pool.query(
       `UPDATE hardware_products SET img_data = $2, img_mime_type = $3, img_file_name = $4, updated_at = CURRENT_TIMESTAMP
@@ -29713,6 +29851,12 @@ async function deltaSyncInvoices() {
 // address via Zoho Books' built-in invoice email endpoint.
 app.post('/api/invoices/:invoiceNumber/email', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'invoices:send_email'))) return;
+  // SECURITY (audit 2026-10-14): same owner rule as the invoice PDF — the caller's own sale, a
+  // rep they manage, or invoices:view_all / admin. Any invoice could be emailed anywhere before.
+  try {
+    const gate = await canViewInvoiceDocs(req.user.email, req.params.invoiceNumber, req.user.userType);
+    if (!gate.ok) return res.status(403).json({ error: 'Not allowed for this invoice' });
+  } catch { return res.status(503).json({ error: 'Could not verify permissions — try again' }); }
   const { recipientEmail, subject, body } = req.body;
   if (!recipientEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipientEmail)) {
     return res.status(400).json({ error: 'Valid recipientEmail required' });
@@ -30310,6 +30454,16 @@ async function ensureResourceRoom(res, addBytes, uploaderEmail) {
 // "My files" (owner_email = their email). Helpers below keep the scoping in one place.
 const resourceZone = (req) => (String(req.query.zone || req.body?.zone || 'shared').toLowerCase() === 'personal' ? 'personal' : 'shared');
 const resourceMe = (req) => (req.user.realAdminEmail || req.user.email || '').toLowerCase() || null;
+// SECURITY (audit 2026-10-14): types a browser EXECUTES (HTML, SVG, XML, JS). Uploaded as such,
+// opened by a colleague, they ran script in Sales Hub's origin (the page opens downloads as a
+// same-origin blob) and could read the session token. They are stored and served as opaque bytes.
+const ACTIVE_CONTENT_TYPES = /^(text\/html|application\/xhtml\+xml|image\/svg\+xml|text\/xml|application\/xml|text\/javascript|application\/(x-)?javascript|text\/ecmascript|application\/ecmascript)\b/i;
+const ACTIVE_CONTENT_EXT = /\.(html?|xhtml|svgz?|xml|xsl|js|mjs)$/i;
+function safeResourceMime(fileName, declared) {
+  const m = String(declared || '').trim();
+  if (ACTIVE_CONTENT_EXT.test(String(fileName || '')) || ACTIVE_CONTENT_TYPES.test(m)) return 'application/octet-stream';
+  return m || 'application/octet-stream';
+}
 
 // GET /api/resources?q=&zone= — metadata only (never the blob). Returns the distinct categories too.
 app.get('/api/resources', authenticateToken, async (req, res) => {
@@ -30479,10 +30633,15 @@ app.put('/api/resources/user-storage', authenticateToken, async (req, res) => {
 app.get('/api/resources/:id/download', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'resources:view'))) return;
   try {
-    const r = (await pool.query(`SELECT file_name, mime_type, file_data FROM resources WHERE id = $1`, [req.params.id])).rows[0];
+    const r = (await pool.query(`SELECT file_name, mime_type, file_data, owner_email FROM resources WHERE id = $1`, [req.params.id])).rows[0];
     if (!r) return res.status(404).json({ error: 'not found' });
-    res.setHeader('Content-Type', r.mime_type || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(r.file_name)}"`);
+    // SECURITY (audit 2026-10-14): a personal « My files » document is its owner's only — the list
+    // and the mutations already said so, the download did not (sequential ids).
+    const owner = String(r.owner_email || '').toLowerCase();
+    if (owner && owner !== resourceMe(req)) return res.status(404).json({ error: 'not found' });
+    const type = safeResourceMime(r.file_name, r.mime_type);
+    res.setHeader('Content-Type', type);
+    res.setHeader('Content-Disposition', `${type === 'application/octet-stream' ? 'attachment' : 'inline'}; filename="${encodeURIComponent(r.file_name)}"`);
     res.send(r.file_data);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -30502,7 +30661,7 @@ app.post('/api/resources', authenticateToken, uploadResource.single('file'), asy
       `INSERT INTO resources (title, description, category, tags, file_name, mime_type, file_size, file_data, uploaded_by, owner_email)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
       [title, String(req.body.description || '').trim(), category,
-       parseTags(req.body.tags), file.originalname, file.mimetype, file.size, file.buffer, actor, w.owner]
+       parseTags(req.body.tags), file.originalname, safeResourceMime(file.originalname, file.mimetype), file.size, file.buffer, actor, w.owner]
     );
     await logResourceAudit('add', { id: r.rows[0].id, title, file_name: file.originalname, category }, actor);
     res.json({ success: true, id: r.rows[0].id });
@@ -30525,7 +30684,7 @@ app.post('/api/resources/bulk', authenticateToken, uploadResource.array('files',
       const r = await pool.query(
         `INSERT INTO resources (title, description, category, tags, file_name, mime_type, file_size, file_data, uploaded_by, owner_email)
          VALUES ($1, '', $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-        [title, category, tags, f.originalname, f.mimetype, f.size, f.buffer, actor, w.owner]);
+        [title, category, tags, f.originalname, safeResourceMime(f.originalname, f.mimetype), f.size, f.buffer, actor, w.owner]);
       await logResourceAudit('add', { id: r.rows[0].id, title, file_name: f.originalname, category }, actor);
       added++;
     }
@@ -30543,7 +30702,7 @@ const EXT_MIME = {
   csv: 'text/csv', ppt: 'application/vnd.ms-powerpoint',
   pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
-  svg: 'image/svg+xml', txt: 'text/plain', mp4: 'video/mp4', zip: 'application/zip',
+  txt: 'text/plain', mp4: 'video/mp4', zip: 'application/zip',
 };
 // 60 MB archive cap. The whole zip sits in RAM and adm-zip decompresses into RAM too; on a ~512 MB
 // dyno a bigger archive can blow the memory quota (R14) and take the whole app down. Keep it small
@@ -30596,6 +30755,10 @@ app.post('/api/resources/import-zip', authenticateToken, zipUpload, async (req, 
         // Keep the FULL folder path (all segments except the file) as the category, so the zip's
         // nested structure is preserved (browsed as nested folders in the UI), not flattened to top-level.
         const category = parts.slice(0, -1).join('/');
+        // Zip-bomb guard (audit 2026-10-14): decide BEFORE inflating — declared size over 25 MB, or
+        // a compression ratio no real document has, is skipped without calling getData().
+        const declared = entry.header?.size || 0, packed = entry.header?.compressedSize || 0;
+        if (declared > 25 * 1024 * 1024 || (packed > 0 && declared / packed > 200)) continue;
         const data = entry.getData();
         if (!data || data.length === 0 || data.length > 25 * 1024 * 1024) continue; // skip empty / >25MB
         const ext = (base.split('.').pop() || '').toLowerCase();
@@ -30648,7 +30811,7 @@ app.put('/api/resources/:id', authenticateToken, uploadResource.single('file'), 
     const params = [req.params.id, String(req.body.title || '').trim(), String(req.body.description || '').trim(),
                     String(req.body.category || '').trim(), parseTags(req.body.tags)];
     if (req.file) {
-      params.push(req.file.originalname, req.file.mimetype, req.file.size, req.file.buffer);
+      params.push(req.file.originalname, safeResourceMime(req.file.originalname, req.file.mimetype), req.file.size, req.file.buffer);
       sets.push(`file_name = $${params.length - 3}`, `mime_type = $${params.length - 2}`, `file_size = $${params.length - 1}`, `file_data = $${params.length}`);
     }
     const r = await pool.query(`UPDATE resources SET ${sets.join(', ')} WHERE id = $1 RETURNING id`, params);
@@ -37447,6 +37610,7 @@ app.get('/api/releases/latest', async (req, res) => {
 // GET /api/releases/generate-notes — generates release notes from GitHub commits
 // since the last published tag. Categorizes by prefix (feat/fix/style/etc).
 app.get('/api/releases/generate-notes', authenticateToken, async (req, res) => {
+  if (!(req.user.isAdmin === true && !req.user.impersonating)) return res.status(403).json({ error: 'Admin required' });
   const token = process.env.GITHUB_TOKEN;
   const owner = process.env.GITHUB_OWNER || 'milthuz';
   // Pull notes from BOTH frontend + backend repos so a release covers all commits
@@ -38110,7 +38274,9 @@ function normalizeLeadInput(b, defaults = {}) {
   return {
     businessName: cut(businessName, 255),
     businessType: cut(pick('businessType', 'business_type', 'industry', 'secteur'), 120),
-    website:      cut(pick('website', 'site', 'url'), 255),
+    // http(s) only (audit 2026-10-14): public forms fill this, and it is rendered as a link —
+    // « javascript:… » would run in a reviewer's session. A bare domain gets https://.
+    website:      safeWebsite(cut(pick('website', 'site', 'url'), 255)),
     firstName:    cut(first, 255),
     lastName:     cut(last, 255),
     title:        cut(pick('contactTitle', 'contact_title', 'title', 'titre'), 120),
@@ -39760,6 +39926,13 @@ const LEAD_MERGE_FIELDS = [
 ];
 
 // Le nom de la source dans les notes (en français : les notes Zoho de Sales Hub le sont).
+function safeWebsite(v) {
+  const t = String(v || '').trim();
+  if (!t) return t;
+  if (/^https?:\/\//i.test(t)) return t;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(t)) return ''; // any other scheme (javascript:, data:, …) is dropped
+  return `https://${t.replace(/^\/+/, '')}`;
+}
 const LEAD_SOURCE_FR = { website: 'formulaire du site', phone: 'téléphone', walk_in: 'visite', referral: 'recommandation',
   event: 'salon', other: 'autre', opener: 'opener' };
 const leadSourceFr = (k) => LEAD_SOURCE_FR[k] || k;
