@@ -24460,6 +24460,21 @@ async function resolveChainProposal(req, res, lang) {
   return { scenario, appendix: (startPage) => chainProposal.renderChainPricingPdf(scenario.inputs, { lang, startPage }) };
 }
 
+// Proposition « depuis le guide de prix » (refonte UI, P2 — avant, rien ne reliait le guide aux
+// propositions) : req.body.pricingQuote = { items, billing }. Mêmes droits et mêmes prix relus en
+// base que la soumission PDF du guide ; la soumission devient les pages finales de la proposition.
+// Renvoie null (pas de soumission), false (réponse déjà envoyée) ou { appendix }.
+async function resolveQuoteProposal(req, res, lang, clientName) {
+  const q = req.body.pricingQuote;
+  if (!q || !Array.isArray(q.items) || !q.items.length) return null;
+  if (!(await requirePermAny(req, res, ['pricing:view', 'hardware:view']))) return false;
+  const billing = q.billing === 'yearly' ? 'yearly' : 'monthly';
+  const items = await buildPricingQuoteItems(req, q.items, billing, lang === 'fr');
+  if (!items.length) { res.status(400).json({ error: 'no valid items' }); return false; }
+  const repName = req.user.name || req.user.email || '';
+  return { appendix: () => buildQuotePdf({ items, clientName, repName, repEmail: req.user.email || '', lang, billing }) };
+}
+
 app.post('/api/proposals/prepare', authenticateToken, async (req, res) => {
   if (!(await requirePerm(req, res, 'proposals:send'))) return;
   const lang = String(req.body.lang || 'fr').toLowerCase() === 'en' ? 'en' : 'fr';
@@ -24475,17 +24490,19 @@ app.post('/api/proposals/prepare', authenticateToken, async (req, res) => {
     const chain = estimateId ? null : await resolveChainProposal(req, res, lang);
     if (chain === false) return;
     const clientName = bodyClientName || (det && det.customerName) || (chain && chain.scenario.inputs.merchantName) || (lang === 'en' ? 'your business' : 'votre entreprise');
+    const quote = (estimateId || chain) ? null : await resolveQuoteProposal(req, res, lang, clientName);
+    if (quote === false) return;
     const repName = req.user.name || req.user.email || '';
     const pageOrder = Array.isArray(req.body.pageOrder) ? req.body.pageOrder.map(Number).filter(Boolean) : null;
     const includeEstimate = req.body.includeEstimate !== false;
-    const built = await buildProposalPdf({ estimateId: estimateId || null, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64), logoDataUrl: req.body.logoBase64, pageOrder, includeEstimate, appendix: chain && chain.appendix });
+    const built = await buildProposalPdf({ estimateId: estimateId || null, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64), logoDataUrl: req.body.logoBase64, pageOrder, includeEstimate, appendix: (chain && chain.appendix) || (quote && quote.appendix) });
     const subject = lang === 'en' ? `Cluster POS proposal — ${clientName}` : `Proposition Cluster POS — ${clientName}`;
     // No name/company after the sign-off line — the signature block appended below (or the
     // "Cluster Systems" footer when no signature is set) already covers that; repeating it here
     // duplicated the rep's name right above their own signature.
     const body = lang === 'en'
-      ? `Hello,\n\nThank you for your interest in Cluster POS. Please find attached our proposal prepared for ${clientName}${estimateId ? ', including your quote' : (chain ? ', including your pricing' : '')}.\n\nI'd be glad to walk you through it — just reply to this email.\n\nBest regards,`
-      : `Bonjour,\n\nMerci de votre intérêt envers Cluster POS. Vous trouverez ci-joint notre proposition préparée pour ${clientName}${estimateId ? ', incluant votre soumission' : (chain ? ', incluant votre tarification' : '')}.\n\nJe me ferai un plaisir de vous la présenter — répondez simplement à ce courriel.\n\nCordialement,`;
+      ? `Hello,\n\nThank you for your interest in Cluster POS. Please find attached our proposal prepared for ${clientName}${estimateId ? ', including your quote' : (chain ? ', including your pricing' : (quote ? ', including your quote' : ''))}.\n\nI'd be glad to walk you through it — just reply to this email.\n\nBest regards,`
+      : `Bonjour,\n\nMerci de votre intérêt envers Cluster POS. Vous trouverez ci-joint notre proposition préparée pour ${clientName}${estimateId ? ', incluant votre soumission' : (chain ? ', incluant votre tarification' : (quote ? ', incluant votre soumission' : ''))}.\n\nJe me ferai un plaisir de vous la présenter — répondez simplement à ce courriel.\n\nCordialement,`;
     res.json({
       pdfBase64: Buffer.from(built.bytes).toString('base64'), fileName: proposalFileName(clientName),
       presentationPageCount: built.presentationPageCount, estimatePageCount: built.estimatePageCount,
@@ -24546,10 +24563,12 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
     const chain = estimateId ? null : await resolveChainProposal(req, res, lang);
     if (chain === false) return;
     const clientName = bodyClientName || (det && det.customerName) || (chain && chain.scenario.inputs.merchantName) || (lang === 'en' ? 'your business' : 'votre entreprise');
+    const quote = (estimateId || chain) ? null : await resolveQuoteProposal(req, res, lang, clientName);
+    if (quote === false) return;
     const repName = req.user.name || req.user.email || '';
     const pageOrder = Array.isArray(req.body.pageOrder) ? req.body.pageOrder.map(Number).filter(Boolean) : null;
     const includeEstimate = req.body.includeEstimate !== false;
-    const built = await buildProposalPdf({ estimateId: estimateId || null, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64), logoDataUrl: req.body.logoBase64, pageOrder, includeEstimate, appendix: chain && chain.appendix });
+    const built = await buildProposalPdf({ estimateId: estimateId || null, lang, clientName, repName, title, logoBytes: logoFromBody(req.body.logoBase64), logoDataUrl: req.body.logoBase64, pageOrder, includeEstimate, appendix: (chain && chain.appendix) || (quote && quote.appendix) });
     const pdf = built.bytes;
     // Mark the estimate "sent" in Zoho (enables client acceptance + viewed/accepted tracking),
     // then try to surface its accept link to add as a button in our email. Only applies when a
@@ -26805,15 +26824,12 @@ app.get('/api/pricing/:id/image', async (req, res) => {
 // items the rep staged in the Hardware & Service Guide's quote tray. Prices are re-fetched from
 // the DB by id (never trusted from the client) so a rep can't hand a merchant a PDF with edited
 // numbers. Items carry a `type` ('package' | 'hardware') so both catalogs can populate one quote.
-app.post('/api/pricing/quote/pdf', authenticateToken, async (req, res) => {
-  if (!(await requirePermAny(req, res, ['pricing:view', 'hardware:view']))) return;
-  const { items, clientName, billing, lang } = req.body || {};
-  if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items required' });
-  try {
+// Lignes d'une soumission du guide, prix RELUS en base (jamais ceux du navigateur). Partagé par le
+// PDF de soumission et par la proposition « depuis le guide de prix » (refonte UI, P2).
+async function buildPricingQuoteItems(req, items, billing, isFr) {
     const perms = req.user.isAdmin === true ? null : await getUserPermissions(req.user.email);
     const canPricing = req.user.isAdmin === true || userHasPermission(perms, 'pricing:view');
     const canHardware = req.user.isAdmin === true || userHasPermission(perms, 'hardware:view');
-    const isFr = lang === 'fr';
 
     const pkgItems = items.filter((it) => it.type !== 'hardware' && canPricing);
     const hwItems = items.filter((it) => it.type === 'hardware' && canHardware);
@@ -26850,7 +26866,16 @@ app.post('/api/pricing/quote/pdf', authenticateToken, async (req, res) => {
       return { name: (isFr && p.name_fr) ? p.name_fr : p.name_en, sku: p.sku, qty, unitAmt, recurring: false };
     }).filter(Boolean);
 
-    const built = builtPkg.concat(builtHw);
+    return builtPkg.concat(builtHw);
+}
+
+app.post('/api/pricing/quote/pdf', authenticateToken, async (req, res) => {
+  if (!(await requirePermAny(req, res, ['pricing:view', 'hardware:view']))) return;
+  const { items, clientName, billing, lang } = req.body || {};
+  if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items required' });
+  try {
+    const isFr = lang === 'fr';
+    const built = await buildPricingQuoteItems(req, items, billing, isFr);
     if (!built.length) return res.status(400).json({ error: 'no valid items' });
     const repName = req.user.name || req.user.email || '';
     const pdf = await buildQuotePdf({
