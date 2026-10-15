@@ -1086,10 +1086,14 @@ function registerOpenerFieldRoutes(app, deps) {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
-  // « Ce n'était pas une visite » : le check-in est retiré et l'arrêt prend son vrai sort —
-  // fermé (revient dans une prochaine route), plus tard (fin de la route du jour) ou n'existe pas
-  // (lieu exclu). Le contenu retiré est gardé dans le journal d'activité.
-  const VOID_REASONS = ['closed', 'later', 'not_found'];
+  // « Ce n'était pas une visite » : le check-in est retiré et l'arrêt prend son vrai sort.
+  // MÊME liste de raisons que « Pas de visite possible » et « Marquer non visité » (refonte UI,
+  // 2026-10-14 — avant, 3 raisons ici et 6 sur la fiche) :
+  //   later → fin de la route du jour · closed / no_time / refused / other → arrêt sauté avec
+  //   cette raison · not_found / not_restaurant → lieu exclu pour de bon.
+  // Le contenu retiré est gardé dans le journal d'activité.
+  const VOID_EXCLUDE = ['not_found', 'not_restaurant'];
+  const VOID_REASONS = ['later', ...SKIP_REASONS, ...VOID_EXCLUDE];
   app.post('/api/opener/checkins/:id/void', authenticateToken, async (req, res) => {
     if (!(await guard(req, res, PERM_FIELD))) return;
     const reason = String(req.body?.reason || '');
@@ -1105,14 +1109,15 @@ function registerOpenerFieldRoutes(app, deps) {
       if (stop && !other) {
         if (reason === 'later' && stop.route_status === 'published' && stop.route_date >= ymdMtl()) await moveToEnd(stop);
         else await pool.query(`UPDATE opener_route_stops SET outcome = 'skipped', skip_reason = $2, done_at = CURRENT_TIMESTAMP WHERE id = $1`,
-          [stop.id, reason === 'not_found' ? 'excluded' : 'closed']);
+          [stop.id, VOID_EXCLUDE.includes(reason) ? 'excluded' : reason === 'later' ? 'closed' : reason]);
       }
-      if (reason === 'not_found') {
+      if (VOID_EXCLUDE.includes(reason)) {
         await pool.query(
-          `INSERT INTO opener_places (place_id, excluded_at, excluded_by, excluded_reason, source) VALUES ($1, CURRENT_TIMESTAMP, $2, 'not_found', 'exclude')
-           ON CONFLICT (place_id) DO UPDATE SET excluded_at = CURRENT_TIMESTAMP, excluded_by = $2, excluded_reason = 'not_found'`, [c.place_id, actorOf(req)]);
+          `INSERT INTO opener_places (place_id, excluded_at, excluded_by, excluded_reason, source) VALUES ($1, CURRENT_TIMESTAMP, $2, $3, 'exclude')
+           ON CONFLICT (place_id) DO UPDATE SET excluded_at = CURRENT_TIMESTAMP, excluded_by = $2, excluded_reason = $3`, [c.place_id, actorOf(req), reason]);
       }
-      const what = { closed: 'fermé', later: 'revenir plus tard', not_found: "n'existe pas (exclu)" }[reason];
+      const what = { later: 'revenir plus tard', closed: 'fermé', no_time: 'pas le temps', refused: 'refusé', other: 'autre',
+        not_found: "n'existe pas (exclu)", not_restaurant: 'pas un restaurant (exclu)' }[reason];
       log('opener_checkin', c.id, 'voided', `Check-in annulé par l'opener : ${what} (${c.stop_label || c.place_id})`, actorOf(req),
         { metadata: { reason, checkin: { at: c.at, placeId: c.place_id, currentPos: c.current_pos, interest: c.interest_level, notes: c.notes } } });
       res.json({ ok: true, stopOutcome: stop && !other ? (reason === 'later' && stop.route_date >= ymdMtl() ? 'planned' : 'skipped') : null });

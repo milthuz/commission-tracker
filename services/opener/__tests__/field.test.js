@@ -528,6 +528,17 @@ const IN = (i) => [45.521 + i * 0.0003, -73.589 + i * 0.0004];   // points dans 
       const ex = (await pool.query(`SELECT excluded_reason FROM opener_places WHERE place_id = 'PLACE_H_00000001'`)).rows[0];
       assert.strictEqual(ex.excluded_reason, 'not_found');
       assert.strictEqual((await h()).find((x) => x.place_id === 'PLACE_H_00000001').skip_reason, 'excluded');
+      // Liste unique (refonte UI) : les raisons de « Marquer non visité » valent aussi ici.
+      st = await h();
+      const ck5 = { ...ck2, id: crypto.randomUUID(), placeId: 'PLACE_H_00000003' };
+      await call('POST', '/api/opener/checkins', { ...ck5, stopId: st.find((x) => x.place_id === 'PLACE_H_00000003').id }, 'jo@x.com');
+      assert.strictEqual((await call('POST', `/api/opener/checkins/${ck5.id}/void`, { reason: 'refused' }, 'jo@x.com')).status, 200);
+      assert.deepStrictEqual(((s) => [s.outcome, s.skip_reason])((await h()).find((x) => x.place_id === 'PLACE_H_00000003')), ['skipped', 'refused']);
+      const ck6 = { ...ck2, id: crypto.randomUUID(), placeId: 'PLACE_H_00000002' };
+      await call('POST', '/api/opener/checkins', { ...ck6, stopId: (await h()).find((x) => x.place_id === 'PLACE_H_00000002').id }, 'jo@x.com');
+      assert.strictEqual((await call('POST', `/api/opener/checkins/${ck6.id}/void`, { reason: 'not_restaurant' }, 'jo@x.com')).status, 200);
+      assert.strictEqual((await pool.query(`SELECT excluded_reason FROM opener_places WHERE place_id = 'PLACE_H_00000002'`)).rows[0].excluded_reason, 'not_restaurant');
+      assert.strictEqual((await h()).find((x) => x.place_id === 'PLACE_H_00000002').skip_reason, 'excluded');
       // Un check-in lié à une piste ne s'annule pas.
       assert.strictEqual((await call('POST', `/api/opener/checkins/${ck.id}/void`, { reason: 'closed' }, 'jo@x.com')).body.error, 'has_lead');
     });
