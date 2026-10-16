@@ -16584,7 +16584,16 @@ app.get('/api/support/overview', authenticateToken, async (req, res) => {
     const de = req.query.from ? new Date(req.query.from)
       : new Date(Date.UTC(fin.getUTCFullYear(), fin.getUTCMonth() - mois + 1, 1));
     const a = req.query.to ? new Date(req.query.to) : new Date(fin.getTime() + 86400000);
-    const dep = req.query.department && req.query.department !== 'all' ? String(req.query.department) : null;
+    let dep = req.query.department && req.query.department !== 'all' ? String(req.query.department) : null;
+    // « default » = le département ouvert par défaut à l'écran : le soutien technique de Cluster
+    // (demande de David, 2026-10-16). Résolu ici par son nom, pour que l'écran n'ait pas à faire un
+    // premier chargement « tous » juste pour découvrir l'identifiant. Introuvable → tous.
+    if (dep === 'default') {
+      const d = (await pool.query(
+        `SELECT id FROM desk_departments WHERE name ILIKE '%technical support%'
+          ORDER BY (name ILIKE '%cluster%') DESC, name LIMIT 1`)).rows[0];
+      dep = d ? String(d.id) : null;
+    }
 
     const rapport = await soutienRapport({ de: de.toISOString(), a: a.toISOString(), departement: dep });
     const meta = await pool.query(
