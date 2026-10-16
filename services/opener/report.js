@@ -34,6 +34,7 @@ const VERDICT = { onsite: ['Sur place', '#047857'], far: ['À distance', '#B91C1
 const SKIP = { closed: 'fermé à l\'arrivée', no_time: 'manque de temps', refused: 'refus d\'entrer', other: 'autre raison',
   postponed: 'reporté', excluded: 'pas un restaurant (exclu)' };
 const PAY = { cluster: 'Cluster', other: 'un autre', unknown: 'inconnu' };
+const PRIO = { price: 'prix', stability: 'stabilité', support: 'soutien', ease: 'facilité', features: 'fonctionnalités', payment_fees: 'frais de paiement', integrations: 'intégrations' };
 
 // Le courriel, à partir des sections déjà calculées. Exporté pour l'aperçu des gabarits.
 // sections = [{ name, email, route: { name } | null, visits: [...], notVisited: [...], leads: [...], totals }]
@@ -56,6 +57,8 @@ function dailyReportEmail(mailShell, date, sections, link) {
         v.interest ? `intérêt ${v.interest}/5` : null,
         v.satisfaction ? `<b>satisfaction ${v.satisfaction}/5</b>${v.paymentsBy ? ` · paiements : ${esc(PAY[v.paymentsBy] || v.paymentsBy)}` : ''}` : null,
         v.decisionMaker === 'yes' ? 'décideur rencontré' : null,
+        v.priorities?.length ? `ce qui compte : ${esc(v.priorities.map((p) => PRIO[p] || p).join(', '))}` : null,
+        v.contact ? `contact : ${esc(v.contact)}` : null,
         v.leadRef ? `<b>lead ${esc(v.leadRef)}</b>` : null,
       ].filter(Boolean).join(' · ');
       return `<tr><td style="${cell};white-space:nowrap">${hhmm(v.startedAt || v.at)}–${hhmm(v.at)}${v.durationMin != null ? `<br><span style="color:#64748b">${v.durationMin} min</span>` : ''}</td>`
@@ -126,6 +129,7 @@ function registerOpenerReport(app, deps) {
       free: !c.route_stop_id,
       verdict: verdict(c.v_dist, c.v_acc, c.v_lat), distanceM: c.v_dist,
       currentPos: c.current_pos, interest: c.interest_level, satisfaction: c.satisfaction, paymentsBy: c.payments_by,
+      priorities: c.priorities || [], contact: [c.contact_name, c.contact_email, c.contact_phone].filter(Boolean).join(' · ') || null,
       decisionMaker: c.decision_maker, notes: c.notes, leadRef: c.ref_code || null, isClient: c.is_client,
     }));
     const leads = (await pool.query(

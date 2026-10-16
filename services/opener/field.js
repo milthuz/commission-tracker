@@ -50,6 +50,9 @@ const SCAN_MONTHLY_BUDGET = 6000;    // appels Nearby Search par mois (balayages
 const MAX_STOPS = 60;
 const CACHE_MS = 60 * 60 * 1000;     // mémoire des réponses Google (jamais en base)
 const SERVICES = ['payments', 'pos', 'beverage_control'];
+// Ce qui compte pour le restaurant (2026-10-16, David : « ce qui est important : le prix ? la
+// stabilité ? »). Plusieurs choix possibles.
+const PRIORITIES = ['price', 'stability', 'support', 'ease', 'features', 'payment_fees', 'integrations'];
 const SKIP_REASONS = ['closed', 'no_time', 'refused', 'other'];
 
 const SCHEMA = [
@@ -140,6 +143,11 @@ const SCHEMA = [
   `ALTER TABLE opener_checkins ALTER COLUMN interest_level DROP NOT NULL`,
   // Check-in libre (hors route) : le nom du restaurant, comme le libellé d'un arrêt de route.
   `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS place_name VARCHAR(255)`,
+  // Ce qui compte pour eux, et une personne-ressource (facultatif) — 2026-10-16.
+  `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS priorities JSONB`,
+  `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS contact_name VARCHAR(160)`,
+  `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS contact_email VARCHAR(255)`,
+  `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS contact_phone VARCHAR(40)`,
 ];
 
 // AAAA-MM-JJ à Montréal. Jamais `new Date().toISOString()` : à 20 h à Montréal, c'est déjà demain en UTC.
@@ -601,12 +609,14 @@ function registerOpenerFieldRoutes(app, deps) {
                 c.id AS c_id, c.at AS c_at, c.lat AS c_lat, c.lng AS c_lng, c.distance_m AS c_dist, c.accuracy_m AS c_acc,
                 c.started_at AS c_start, c.duration_min AS c_dur, c.end_distance_m AS c_end_dist,
                 c.current_pos, c.service_type, c.interest_level, c.decision_maker, c.satisfaction, c.payments_by,
-                c.services, c.notes, c.terminals, c.online_delivery, c.lead_id, ld.ref_code AS lead_ref, ld.status AS lead_status
+                c.services, c.notes, c.terminals, c.online_delivery, c.lead_id, ld.ref_code AS lead_ref, ld.status AS lead_status,
+                c.priorities, c.contact_name, c.contact_email, c.contact_phone
            FROM opener_route_stops s
            LEFT JOIN LATERAL (SELECT c.id, c.at, ${V_LAT} AS lat, COALESCE(c.start_lng, c.lng) AS lng, ${V_DIST} AS distance_m,
                                      ${V_ACC} AS accuracy_m, c.started_at, ${DUR_MIN} AS duration_min, c.distance_m AS end_distance_m,
                                      c.current_pos, c.service_type, c.interest_level, c.decision_maker, c.satisfaction, c.payments_by,
-                                     c.services, c.notes, c.terminals, c.online_delivery, c.lead_id
+                                     c.services, c.notes, c.terminals, c.online_delivery, c.lead_id,
+                                     c.priorities, c.contact_name, c.contact_email, c.contact_phone
                                 FROM opener_checkins c
                                WHERE c.route_stop_id = s.id ORDER BY c.at DESC LIMIT 1) c ON true
            LEFT JOIN leads ld ON ld.id = c.lead_id
@@ -634,6 +644,7 @@ function registerOpenerFieldRoutes(app, deps) {
             result: s.c_at ? {
               checkinId: s.c_id, currentPos: s.current_pos, serviceType: s.service_type, interest: s.interest_level, decisionMaker: s.decision_maker,
               satisfaction: s.satisfaction, paymentsBy: s.payments_by, services: s.services || [], notes: s.notes, terminals: s.terminals,
+              priorities: s.priorities || [], contact: s.contact_name || s.contact_email || s.contact_phone ? { name: s.contact_name, email: s.contact_email, phone: s.contact_phone } : null,
               onlineDelivery: s.online_delivery, lead: s.lead_id ? { id: s.lead_id, refCode: s.lead_ref, status: s.lead_status } : null,
             } : null,
             // La visite : où était le téléphone au check-in, et le verdict qui en découle.
@@ -655,6 +666,7 @@ function registerOpenerFieldRoutes(app, deps) {
         `SELECT c.id, c.user_email, c.at, c.place_id, c.place_name, ${V_LAT} AS lat, ${V_DIST} AS distance_m, ${V_ACC} AS accuracy_m,
                 c.started_at, ${DUR_MIN} AS duration_min, c.current_pos, c.service_type, c.interest_level, c.decision_maker,
                 c.satisfaction, c.payments_by, c.services, c.notes, c.terminals, c.online_delivery, c.lead_id,
+                c.priorities, c.contact_name, c.contact_email, c.contact_phone,
                 ld.ref_code AS lead_ref, ld.status AS lead_status, ld.business_name AS lead_name, op.lat AS p_lat, op.lng AS p_lng
            FROM opener_checkins c LEFT JOIN leads ld ON ld.id = c.lead_id LEFT JOIN opener_places op ON op.place_id = c.place_id
           WHERE c.route_stop_id IS NULL AND (c.at AT TIME ZONE '${TZ}')::date BETWEEN $1::date AND $2::date
@@ -673,6 +685,7 @@ function registerOpenerFieldRoutes(app, deps) {
             durationMin: c.duration_min, endDistanceM: null, verdict: verdict(c.distance_m, c.accuracy_m, c.lat) },
           result: { checkinId: c.id, currentPos: c.current_pos, serviceType: c.service_type, interest: c.interest_level, decisionMaker: c.decision_maker,
             satisfaction: c.satisfaction, paymentsBy: c.payments_by, services: c.services || [], notes: c.notes, terminals: c.terminals,
+            priorities: c.priorities || [], contact: c.contact_name || c.contact_email || c.contact_phone ? { name: c.contact_name, email: c.contact_email, phone: c.contact_phone } : null,
             onlineDelivery: c.online_delivery, lead: c.lead_id ? { id: c.lead_id, refCode: c.lead_ref, status: c.lead_status } : null },
         });
       }
@@ -888,7 +901,7 @@ function registerOpenerFieldRoutes(app, deps) {
       const history = (await pool.query(
         `SELECT c.id, c.at, ${V_LAT} AS lat, ${V_DIST} AS distance_m, ${V_ACC} AS accuracy_m, ${DUR_MIN} AS duration_min,
                 COALESCE(c.user_name, c.user_email) AS by, c.current_pos, c.service_type, c.terminals,
-                c.decision_maker, c.interest_level, c.services, c.notes, c.satisfaction, c.payments_by, ld.ref_code,
+                c.decision_maker, c.interest_level, c.services, c.notes, c.satisfaction, c.payments_by, ld.ref_code, c.priorities, c.contact_name,
                 (LOWER(c.user_email) = $2 AND c.at > CURRENT_TIMESTAMP - INTERVAL '7 days') AS editable
            FROM opener_checkins c LEFT JOIN leads ld ON ld.id = c.lead_id
           WHERE c.place_id = $1 ORDER BY c.at DESC LIMIT 15`, [pid, me(req)])).rows;
@@ -914,6 +927,7 @@ function registerOpenerFieldRoutes(app, deps) {
           id: h.id, at: h.at, by: h.by, distanceM: h.distance_m, durationMin: h.duration_min, verdict: verdict(h.distance_m, h.accuracy_m, h.lat), currentPos: h.current_pos, serviceType: h.service_type, terminals: h.terminals,
           decisionMaker: h.decision_maker, interest: h.interest_level, services: h.services || [], notes: h.notes, leadRef: h.ref_code,
           satisfaction: h.satisfaction ?? null, paymentsBy: h.payments_by || null, editable: h.editable === true, hasLead: !!h.ref_code,
+          priorities: h.priorities || [], contactName: h.contact_name || null,
         })),
       });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -950,6 +964,9 @@ function registerOpenerFieldRoutes(app, deps) {
       notes: clean(b.notes, 2000),
       satisfaction: (() => { const v = parseInt(b.satisfaction, 10); return v >= 1 && v <= 5 ? v : null; })(),
       paymentsBy: ['cluster', 'other', 'unknown'].includes(b.paymentsBy) ? b.paymentsBy : null,
+      priorities: Array.isArray(b.priorities) ? [...new Set(b.priorities.filter((x) => PRIORITIES.includes(x)))] : [],
+      // Personne-ressource : facultative, et jamais un refus (un courriel mal tapé est gardé tel quel).
+      contactName: clean(b.contactName, 160), contactEmail: clean(b.contactEmail, 255)?.toLowerCase() || null, contactPhone: clean(b.contactPhone, 40),
       // Arrivée : retenue seulement si elle précède le départ de moins de 12 h.
       startedAt: (() => {
         const s = new Date(b.startedAt || '');
@@ -990,14 +1007,16 @@ function registerOpenerFieldRoutes(app, deps) {
       await pool.query(
         `INSERT INTO opener_checkins (id, place_id, route_stop_id, user_email, user_name, at, lat, lng, accuracy_m, distance_m,
                 current_pos, service_type, terminals, online_delivery, decision_maker, interest_level, services, notes,
-                started_at, start_lat, start_lng, start_accuracy_m, start_distance_m, satisfaction, payments_by, place_name)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+                started_at, start_lat, start_lng, start_accuracy_m, start_distance_m, satisfaction, payments_by, place_name,
+                priorities, contact_name, contact_email, contact_phone)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27::jsonb,$28,$29,$30)
          ON CONFLICT (id) DO NOTHING`,
         [c.id, c.placeId, stop?.id || null, me(req), (await userName(me(req))) || req.user?.name || null, c.at.toISOString(),
          c.lat, c.lng, c.accuracy, distance, c.currentPos, c.serviceType, c.terminals, c.onlineDelivery, c.decisionMaker,
          c.interest, JSON.stringify(c.services), c.notes,
          c.startedAt ? c.startedAt.toISOString() : null, hasStart ? c.startLat : null, hasStart ? c.startLng : null,
-         hasStart ? c.startAccuracy : null, startDistance, c.satisfaction, c.paymentsBy, stop?.label || clean(req.body?.placeName, 255)]);
+         hasStart ? c.startAccuracy : null, startDistance, c.satisfaction, c.paymentsBy, stop?.label || clean(req.body?.placeName, 255),
+         JSON.stringify(c.priorities), c.contactName, c.contactEmail, c.contactPhone]);
       if (!place || place.lat == null) await upsertPlaces([{ placeId: c.placeId, lat: stop?.lat ?? given?.[0], lng: stop?.lng ?? given?.[1] }], 'checkin');
       if (stop) {
         await pool.query(`UPDATE opener_route_stops SET outcome = 'done', skip_reason = NULL, done_at = $2 WHERE id = $1`,
@@ -1138,6 +1157,7 @@ function registerOpenerFieldRoutes(app, deps) {
         currentPos: c.current_pos, serviceType: c.service_type, terminals: c.terminals, onlineDelivery: c.online_delivery,
         decisionMaker: c.decision_maker, interest: c.interest_level, services: c.services || [], notes: c.notes || '',
         satisfaction: c.satisfaction, paymentsBy: c.payments_by, leadId: c.lead_id, editable: c.editable,
+        priorities: c.priorities || [], contactName: c.contact_name || '', contactEmail: c.contact_email || '', contactPhone: c.contact_phone || '',
         isClient: st.status === 'client', updatedAt: c.updated_at || null,
       } });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1156,10 +1176,12 @@ function registerOpenerFieldRoutes(app, deps) {
       const v = p.value;
       await pool.query(
         `UPDATE opener_checkins SET current_pos = $2, service_type = $3, terminals = $4, online_delivery = $5, decision_maker = $6,
-                interest_level = $7, services = $8::jsonb, notes = $9, satisfaction = $10, payments_by = $11, updated_at = CURRENT_TIMESTAMP
+                interest_level = $7, services = $8::jsonb, notes = $9, satisfaction = $10, payments_by = $11,
+                priorities = $12::jsonb, contact_name = $13, contact_email = $14, contact_phone = $15, updated_at = CURRENT_TIMESTAMP
           WHERE id = $1`,
         [c.id, v.currentPos, v.serviceType, v.terminals, v.onlineDelivery, v.decisionMaker, v.interest,
-         JSON.stringify(v.services), v.notes, v.satisfaction, v.paymentsBy]);
+         JSON.stringify(v.services), v.notes, v.satisfaction, v.paymentsBy,
+         JSON.stringify(v.priorities), v.contactName, v.contactEmail, v.contactPhone]);
       log('opener_checkin', c.id, 'edited', `Check-in corrigé par l'opener (${c.stop_label || c.place_id})`, actorOf(req),
         { metadata: { before: { currentPos: c.current_pos, serviceType: c.service_type, interest: c.interest_level, notes: c.notes, satisfaction: c.satisfaction, paymentsBy: c.payments_by } } });
       res.json({ ok: true });

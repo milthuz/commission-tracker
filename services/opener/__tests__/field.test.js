@@ -572,7 +572,8 @@ const IN = (i) => [45.521 + i * 0.0003, -73.589 + i * 0.0004];   // points dans 
     });
 
     const free = { id: crypto.randomUUID(), placeId: 'PLACE_TEXT_00001', placeName: 'Pizza du Coin', currentPos: 'Square', serviceType: 'quick', interest: 4,
-      at: new Date().toISOString(), lat: IN(5)[0], lng: IN(5)[1], placeLat: IN(5)[0], placeLng: IN(5)[1] };
+      at: new Date().toISOString(), lat: IN(5)[0], lng: IN(5)[1], placeLat: IN(5)[0], placeLng: IN(5)[1],
+      priorities: ['price', 'stability', 'bidon'], contactName: 'Marie Tremblay', contactEmail: 'Marie@Resto.CA', contactPhone: '' };
     await t('check-in libre : enregistré sans arrêt, nom gardé ; les écrans de route restent fermés', async () => {
       const r1 = await call('POST', '/api/opener/checkins', free, 'libre@x.com');
       assert.strictEqual(r1.status, 200, JSON.stringify(r1.body));
@@ -593,6 +594,9 @@ const IN = (i) => [45.521 + i * 0.0003, -73.589 + i * 0.0004];   // points dans 
       assert.ok(mine, JSON.stringify(ov.free));
       assert.strictEqual(mine.stops[0].name, 'Pizza du Coin');
       assert.deepStrictEqual([mine.stops[0].result.currentPos, mine.stops[0].result.interest], ['Square', 4]);
+      // Ce qui compte pour eux (valeur inconnue écartée) et la personne-ressource (facultative).
+      assert.deepStrictEqual(mine.stops[0].result.priorities, ['price', 'stability']);
+      assert.deepStrictEqual(mine.stops[0].result.contact, { name: 'Marie Tremblay', email: 'marie@resto.ca', phone: null });
     });
 
     console.log(`field : ${n} tests OK (${nearbyCalls.length} appels Nearby simulés dans le dernier lot)`);
