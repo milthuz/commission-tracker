@@ -29,6 +29,12 @@ const F = require('./franchise');
 const E = require('./emails');
 
 const PERM_FIELD = 'opener:field';
+// Check-in LIBRE (2026-10-16, David : « permettre les check-ins à n'importe quel moment, l'étendre
+// à tous mes employés ») : un check-in n'importe où, sans route. opener:field l'inclut.
+const PERM_CHECKIN = 'opener:checkin';
+const FIELD_ANY = [PERM_FIELD, PERM_CHECKIN];
+const NEAR_RADIUS = 250;        // m autour du téléphone
+const NEAR_FIELDS = ['places.id', 'places.displayName', 'places.location', 'places.shortFormattedAddress', 'places.formattedAddress', 'places.primaryType', 'places.businessStatus'];
 const PERM_ROUTES = 'opener:routes';
 const TZ = 'America/Toronto';
 const PLACE_RE = /^[A-Za-z0-9_-]{10,300}$/;
@@ -132,6 +138,8 @@ const SCHEMA = [
   `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP`,
   // Client qui a DÉJÀ les paiements Cluster (demande de Hao, 2026-10-14) : pas d'intérêt à noter.
   `ALTER TABLE opener_checkins ALTER COLUMN interest_level DROP NOT NULL`,
+  // Check-in libre (hors route) : le nom du restaurant, comme le libellé d'un arrêt de route.
+  `ALTER TABLE opener_checkins ADD COLUMN IF NOT EXISTS place_name VARCHAR(255)`,
 ];
 
 // AAAA-MM-JJ à Montréal. Jamais `new Date().toISOString()` : à 20 h à Montréal, c'est déjà demain en UTC.
@@ -642,7 +650,35 @@ function registerOpenerFieldRoutes(app, deps) {
           lastCheckin: l ? { at: l.at, lat: l.lat, lng: l.lng, stopName: l.label, distanceM: l.distance_m } : null,
         });
       }
-      res.json({ from, to, today, routes: out });
+      // Check-ins LIBRES (hors route) de la période, par employé — le gestionnaire les voit aussi.
+      const free = (await pool.query(
+        `SELECT c.id, c.user_email, c.at, c.place_id, c.place_name, ${V_LAT} AS lat, ${V_DIST} AS distance_m, ${V_ACC} AS accuracy_m,
+                c.started_at, ${DUR_MIN} AS duration_min, c.current_pos, c.service_type, c.interest_level, c.decision_maker,
+                c.satisfaction, c.payments_by, c.services, c.notes, c.terminals, c.online_delivery, c.lead_id,
+                ld.ref_code AS lead_ref, ld.status AS lead_status, ld.business_name AS lead_name, op.lat AS p_lat, op.lng AS p_lng
+           FROM opener_checkins c LEFT JOIN leads ld ON ld.id = c.lead_id LEFT JOIN opener_places op ON op.place_id = c.place_id
+          WHERE c.route_stop_id IS NULL AND (c.at AT TIME ZONE '${TZ}')::date BETWEEN $1::date AND $2::date
+          ORDER BY c.at`, [from, to])).rows;
+      const fst = await statusOf(free.map((c) => c.place_id));
+      const byUser = new Map();
+      for (const c of free) {
+        const k = c.user_email.toLowerCase();
+        if (!byUser.has(k)) byUser.set(k, []);
+        byUser.get(k).push({
+          id: `free-${c.id}`, placeId: c.place_id, name: c.place_name || c.lead_name || '—', address: null,
+          lat: c.p_lat ?? c.lat ?? null, lng: c.p_lng ?? null, outcome: 'done', skipReason: null, doneAt: c.at,
+          place: (({ status, version, competitorPos, franchise, brand, seasonal, lastSatisfaction, visits }) =>
+            ({ status, version, competitorPos, franchise, brand, seasonal, lastSatisfaction, visits }))(fst.get(c.place_id) || { status: 'new' }),
+          checkin: { at: c.at, lat: c.lat, lng: null, distanceM: c.distance_m, accuracyM: c.accuracy_m, startedAt: c.started_at,
+            durationMin: c.duration_min, endDistanceM: null, verdict: verdict(c.distance_m, c.accuracy_m, c.lat) },
+          result: { checkinId: c.id, currentPos: c.current_pos, serviceType: c.service_type, interest: c.interest_level, decisionMaker: c.decision_maker,
+            satisfaction: c.satisfaction, paymentsBy: c.payments_by, services: c.services || [], notes: c.notes, terminals: c.terminals,
+            onlineDelivery: c.online_delivery, lead: c.lead_id ? { id: c.lead_id, refCode: c.lead_ref, status: c.lead_status } : null },
+        });
+      }
+      const freeOut = [];
+      for (const [email, stops] of byUser) freeOut.push({ userEmail: email, userName: await displayName(email), stops });
+      res.json({ from, to, today, routes: out, free: freeOut });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
@@ -787,8 +823,49 @@ function registerOpenerFieldRoutes(app, deps) {
         WHERE s.id = $1 AND LOWER(r.opener_email) = $2`, [stopId, me(req)])).rows[0] || null;
   }
 
+  // Check-in libre : les restaurants autour du téléphone (ou cherchés par nom), avec ce que
+  // Cluster en sait. Une recherche Google par endroit et par heure (mémoire), comptée au budget.
+  app.get('/api/opener/nearby', authenticateToken, async (req, res) => {
+    if (!(await guardAny(req, res, FIELD_ANY))) return;
+    if (!google.configured()) return res.status(503).json({ error: 'GOOGLE_PLACES_API_KEY absente' });
+    const lat = num(req.query.lat), lng = num(req.query.lng);
+    const here = lat != null && lng != null && Math.abs(lat) <= 90 && Math.abs(lng) <= 180 ? [lat, lng] : null;
+    const q = clean(req.query.q, 120);
+    if (!here && !q) return res.status(400).json({ error: 'position_or_query_required' });
+    try {
+      const key = q ? `near-q:${q.toLowerCase()}:${here ? here.map((v) => v.toFixed(2)).join(',') : '-'}`
+        : `near:${here.map((v) => v.toFixed(4)).join(',')}`;
+      let fresh = false;
+      const places = await cached(key, async () => {
+        fresh = true;
+        const budget = await scanBudget(0);
+        if (budget.left <= 0) { const e = new Error('scan_budget_exhausted'); e.code = 429; throw e; }
+        return q
+          ? google.searchText(q, { max: 10, bias: here ? { center: here, radius: 5000 } : { center: [45.5236, -73.5865], radius: 50000 } })
+          : google.searchNearby(here, NEAR_RADIUS, SCAN_TYPES, { fields: NEAR_FIELDS });
+      });
+      if (fresh) await scanBudget(1);
+      const ok = places.filter((p) => p.id && p.location && p.businessStatus !== 'CLOSED_PERMANENTLY');
+      const excluded = new Set((await pool.query(
+        `SELECT place_id FROM opener_places WHERE excluded_at IS NOT NULL AND place_id = ANY($1::text[])`, [ok.map((p) => p.id)])).rows.map((x) => x.place_id));
+      const kept = ok.filter((p) => !excluded.has(p.id));
+      const st = await statusOf(kept.map((p) => p.id));
+      const out = kept.map((p) => {
+        const plat = p.location.latitude, plng = p.location.longitude;
+        return { placeId: p.id, name: p.displayName?.text || '', address: p.shortFormattedAddress || p.formattedAddress || '',
+          lat: plat, lng: plng, primaryType: p.primaryType || null,
+          distanceM: here ? Math.round(G.haversine(here, [plat, plng])) : null, ...(st.get(p.id) || { status: 'new', visits: 0 }) };
+      });
+      if (here) out.sort((a, b) => a.distanceM - b.distanceM);
+      res.json({ places: out.slice(0, 20) });
+    } catch (e) {
+      if (e.code === 429) return res.status(429).json({ error: 'scan_budget_exhausted' });
+      res.status(502).json({ error: e.message });
+    }
+  });
+
   app.get('/api/opener/today', authenticateToken, async (req, res) => {
-    if (!(await guard(req, res, PERM_FIELD))) return;
+    if (!(await guardAny(req, res, FIELD_ANY))) return;
     try {
       const date = DATE_RE.test(String(req.query.date || '')) ? req.query.date : ymdMtl();
       res.json({ date, route: await myRoute(req, date) });
@@ -797,7 +874,7 @@ function registerOpenerFieldRoutes(app, deps) {
 
   // Fiche d'un restaurant : Google (lu à la demande) + Cluster + historique des visites.
   app.get('/api/opener/place/:placeId', authenticateToken, async (req, res) => {
-    if (!(await guardAny(req, res, [PERM_FIELD, PERM_ROUTES]))) return;
+    if (!(await guardAny(req, res, [...FIELD_ANY, PERM_ROUTES]))) return;
     const pid = String(req.params.placeId || '');
     if (!PLACE_RE.test(pid)) return res.status(404).json({ error: 'not_found' });
     const lang = String(req.query.lang || 'fr') === 'en' ? 'en' : 'fr';
@@ -887,7 +964,7 @@ function registerOpenerFieldRoutes(app, deps) {
   // Check-in : idempotent par l'identifiant généré sur le téléphone (la file d'envoi hors ligne
   // peut le renvoyer plusieurs fois).
   app.post('/api/opener/checkins', authenticateToken, async (req, res) => {
-    if (!(await guard(req, res, PERM_FIELD))) return;
+    if (!(await guardAny(req, res, FIELD_ANY))) return;
     const p = parseCheckin(req.body || {});
     if (p.error) return res.status(400).json(p);
     const c = p.value;
@@ -903,22 +980,25 @@ function registerOpenerFieldRoutes(app, deps) {
         if (!stop || stop.place_id !== c.placeId) return res.status(400).json({ error: 'invalid_stop' });
       }
       const place = (await pool.query(`SELECT lat, lng FROM opener_places WHERE place_id = $1`, [c.placeId])).rows[0];
-      const ref = place?.lat != null ? [place.lat, place.lng] : stop?.lat != null ? [stop.lat, stop.lng] : null;
+      // Check-in libre sur un resto encore inconnu : sa position vient de la recherche Google du téléphone.
+      const pLat = num(req.body?.placeLat), pLng = num(req.body?.placeLng);
+      const given = pLat != null && pLng != null && Math.abs(pLat) <= 90 && Math.abs(pLng) <= 180 ? [pLat, pLng] : null;
+      const ref = place?.lat != null ? [place.lat, place.lng] : stop?.lat != null ? [stop.lat, stop.lng] : given;
       const distance = c.lat != null && c.lng != null && ref ? Math.round(G.haversine([c.lat, c.lng], ref)) : null;
       const hasStart = c.startedAt && c.startLat != null && c.startLng != null;
       const startDistance = hasStart && ref ? Math.round(G.haversine([c.startLat, c.startLng], ref)) : null;
       await pool.query(
         `INSERT INTO opener_checkins (id, place_id, route_stop_id, user_email, user_name, at, lat, lng, accuracy_m, distance_m,
                 current_pos, service_type, terminals, online_delivery, decision_maker, interest_level, services, notes,
-                started_at, start_lat, start_lng, start_accuracy_m, start_distance_m, satisfaction, payments_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18,$19,$20,$21,$22,$23,$24,$25)
+                started_at, start_lat, start_lng, start_accuracy_m, start_distance_m, satisfaction, payments_by, place_name)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18,$19,$20,$21,$22,$23,$24,$25,$26)
          ON CONFLICT (id) DO NOTHING`,
         [c.id, c.placeId, stop?.id || null, me(req), (await userName(me(req))) || req.user?.name || null, c.at.toISOString(),
          c.lat, c.lng, c.accuracy, distance, c.currentPos, c.serviceType, c.terminals, c.onlineDelivery, c.decisionMaker,
          c.interest, JSON.stringify(c.services), c.notes,
          c.startedAt ? c.startedAt.toISOString() : null, hasStart ? c.startLat : null, hasStart ? c.startLng : null,
-         hasStart ? c.startAccuracy : null, startDistance, c.satisfaction, c.paymentsBy]);
-      if (!place) await upsertPlaces([{ placeId: c.placeId, lat: stop?.lat, lng: stop?.lng }], 'checkin');
+         hasStart ? c.startAccuracy : null, startDistance, c.satisfaction, c.paymentsBy, stop?.label || clean(req.body?.placeName, 255)]);
+      if (!place || place.lat == null) await upsertPlaces([{ placeId: c.placeId, lat: stop?.lat ?? given?.[0], lng: stop?.lng ?? given?.[1] }], 'checkin');
       if (stop) {
         await pool.query(`UPDATE opener_route_stops SET outcome = 'done', skip_reason = NULL, done_at = $2 WHERE id = $1`,
           [stop.id, c.at.toISOString()]);
@@ -931,7 +1011,7 @@ function registerOpenerFieldRoutes(app, deps) {
   // Piste créée depuis le terrain : le même chemin que la saisie interne (file de révision,
   // doublons Zoho, attribution), source « opener ». Idempotente par `clientRef`.
   app.post('/api/opener/leads', authenticateToken, async (req, res) => {
-    if (!(await guard(req, res, PERM_FIELD))) return;
+    if (!(await guardAny(req, res, FIELD_ANY))) return;
     const b = req.body || {};
     const clientRef = String(b.clientRef || '').toLowerCase();
     if (!UUID_RE.test(clientRef)) return res.status(400).json({ error: 'invalid_client_ref' });
@@ -975,7 +1055,7 @@ function registerOpenerFieldRoutes(app, deps) {
   });
 
   app.get('/api/opener/my-leads', authenticateToken, async (req, res) => {
-    if (!(await guard(req, res, PERM_FIELD))) return;
+    if (!(await guardAny(req, res, FIELD_ANY))) return;
     try {
       const { rows } = await pool.query(
         `SELECT ld.id, ld.ref_code, ld.business_name, ld.status, ld.interest, ld.created_at, ld.raw->>'placeId' AS place_id,
@@ -1048,13 +1128,13 @@ function registerOpenerFieldRoutes(app, deps) {
   }
 
   app.get('/api/opener/checkins/:id', authenticateToken, async (req, res) => {
-    if (!(await guard(req, res, PERM_FIELD))) return;
+    if (!(await guardAny(req, res, FIELD_ANY))) return;
     try {
       const c = await myCheckin(req, req.params.id);
       if (!c) return res.status(404).json({ error: 'not_found' });
       const st = (await statusOf([c.place_id])).get(c.place_id) || { status: 'new' };
       res.json({ checkin: {
-        id: c.id, placeId: c.place_id, stopId: c.route_stop_id, name: c.stop_label || null, at: c.at, startedAt: c.started_at,
+        id: c.id, placeId: c.place_id, stopId: c.route_stop_id, name: c.stop_label || c.place_name || null, at: c.at, startedAt: c.started_at,
         currentPos: c.current_pos, serviceType: c.service_type, terminals: c.terminals, onlineDelivery: c.online_delivery,
         decisionMaker: c.decision_maker, interest: c.interest_level, services: c.services || [], notes: c.notes || '',
         satisfaction: c.satisfaction, paymentsBy: c.payments_by, leadId: c.lead_id, editable: c.editable,
@@ -1066,7 +1146,7 @@ function registerOpenerFieldRoutes(app, deps) {
   // Corriger un check-in envoyé : les RÉPONSES seulement. L'heure et la position (la preuve de
   // la visite) ne changent jamais.
   app.put('/api/opener/checkins/:id', authenticateToken, async (req, res) => {
-    if (!(await guard(req, res, PERM_FIELD))) return;
+    if (!(await guardAny(req, res, FIELD_ANY))) return;
     try {
       const c = await myCheckin(req, req.params.id);
       if (!c) return res.status(404).json({ error: 'not_found' });
@@ -1095,7 +1175,7 @@ function registerOpenerFieldRoutes(app, deps) {
   const VOID_EXCLUDE = ['not_found', 'not_restaurant'];
   const VOID_REASONS = ['later', ...SKIP_REASONS, ...VOID_EXCLUDE];
   app.post('/api/opener/checkins/:id/void', authenticateToken, async (req, res) => {
-    if (!(await guard(req, res, PERM_FIELD))) return;
+    if (!(await guardAny(req, res, FIELD_ANY))) return;
     const reason = String(req.body?.reason || '');
     if (!VOID_REASONS.includes(reason)) return res.status(400).json({ error: 'invalid_reason' });
     try {
@@ -1136,7 +1216,7 @@ function registerOpenerFieldRoutes(app, deps) {
     return m ? { address: m[1], notes: m[2] || '' } : { address: '', notes: n || '' };
   };
   app.get('/api/opener/leads/:id', authenticateToken, async (req, res) => {
-    if (!(await guard(req, res, PERM_FIELD))) return;
+    if (!(await guardAny(req, res, FIELD_ANY))) return;
     try {
       const l = await myLead(req, req.params.id);
       if (!l) return res.status(404).json({ error: 'not_found' });
@@ -1152,7 +1232,7 @@ function registerOpenerFieldRoutes(app, deps) {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
   app.put('/api/opener/leads/:id', authenticateToken, async (req, res) => {
-    if (!(await guard(req, res, PERM_FIELD))) return;
+    if (!(await guardAny(req, res, FIELD_ANY))) return;
     const L = late();
     if (!L.normalizeLeadInput) return res.status(503).json({ error: 'leads_unavailable' });
     try {
@@ -1190,7 +1270,7 @@ function registerOpenerFieldRoutes(app, deps) {
   // LOT 4 — Journée
   // ==========================================================================
   app.get('/api/opener/day', authenticateToken, async (req, res) => {
-    if (!(await guard(req, res, PERM_FIELD))) return;
+    if (!(await guardAny(req, res, FIELD_ANY))) return;
     try {
       const date = DATE_RE.test(String(req.query.date || '')) ? req.query.date : ymdMtl();
       const route = await myRoute(req, date);

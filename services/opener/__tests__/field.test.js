@@ -45,7 +45,7 @@ const IN = (i) => [45.521 + i * 0.0003, -73.589 + i * 0.0004];   // points dans 
   let full = false;   // true → le 1er cercle revient plein (20) et doit être découpé
   const google = {
     configured: () => true,
-    searchText: async () => [],
+    searchText: async (q) => (/pizza/i.test(q) ? [P('PLACE_TEXT_00001', 'Pizza du Coin', ...IN(5))] : []),
     details: async () => null,
     searchNearby: async (center, radius) => {
       nearbyCalls.push({ center, radius });
@@ -93,7 +93,7 @@ const IN = (i) => [45.521 + i * 0.0003, -73.589 + i * 0.0004];   // points dans 
 
   const app = express();
   app.use(express.json());
-  const perms = { 'jo@x.com': ['opener:field'], 'autre@x.com': ['opener:field'], 'mgr@x.com': ['opener:routes'], 'rien@x.com': [] };
+  const perms = { 'jo@x.com': ['opener:field'], 'autre@x.com': ['opener:field'], 'mgr@x.com': ['opener:routes'], 'rien@x.com': [], 'libre@x.com': ['opener:checkin'] };
   app.use((req, _res, next) => { req.user = { email: req.headers['x-user'] }; next(); });
   const authenticateToken = (req, res, next) => (req.user.email ? next() : res.status(401).end());
   const hasPerm = async (req, p) => (perms[req.user.email] || []).includes(p);
@@ -555,6 +555,44 @@ const IN = (i) => [45.521 + i * 0.0003, -73.589 + i * 0.0004];   // points dans 
       await pool.query(`UPDATE leads SET status = 'accepted' WHERE id = $1`, [lead.id]);
       assert.strictEqual((await call('PUT', `/api/opener/leads/${lead.id}`, body, 'jo@x.com')).body.error, 'lead_locked');
       assert.strictEqual((await call('GET', `/api/opener/leads/${lead.id}`, undefined, 'jo@x.com')).body.lead.editable, false);
+    });
+
+    // ------------------------------------------------ check-in libre (2026-10-16)
+    await t('check-in libre : les restos autour (ou par nom), sans route, avec opener:checkin seulement', async () => {
+      const near = await call('GET', `/api/opener/nearby?lat=${IN(3)[0]}&lng=${IN(3)[1]}`, undefined, 'libre@x.com');
+      assert.strictEqual(near.status, 200, JSON.stringify(near.body));
+      const ids = near.body.places.map((p) => p.placeId);
+      assert.ok(ids.includes('PLACE_NEW_000001') && !ids.includes('PLACE_CLOSED_0001'), 'les fermés pour de bon sont écartés');
+      assert.ok(near.body.places[0].distanceM <= near.body.places[near.body.places.length - 1].distanceM, 'du plus proche au plus loin');
+      assert.ok(near.body.places.find((p) => p.placeId === 'PLACE_CLIENT_0001').status, 'statut Cluster joint');
+      const byName = await call('GET', '/api/opener/nearby?q=pizza', undefined, 'libre@x.com');
+      assert.deepStrictEqual(byName.body.places.map((p) => p.placeId), ['PLACE_TEXT_00001']);
+      assert.strictEqual((await call('GET', '/api/opener/nearby', undefined, 'libre@x.com')).body.error, 'position_or_query_required');
+      assert.strictEqual((await call('GET', `/api/opener/nearby?lat=1&lng=1`, undefined, 'rien@x.com')).status, 403);
+    });
+
+    const free = { id: crypto.randomUUID(), placeId: 'PLACE_TEXT_00001', placeName: 'Pizza du Coin', currentPos: 'Square', serviceType: 'quick', interest: 4,
+      at: new Date().toISOString(), lat: IN(5)[0], lng: IN(5)[1], placeLat: IN(5)[0], placeLng: IN(5)[1] };
+    await t('check-in libre : enregistré sans arrêt, nom gardé ; les écrans de route restent fermés', async () => {
+      const r1 = await call('POST', '/api/opener/checkins', free, 'libre@x.com');
+      assert.strictEqual(r1.status, 200, JSON.stringify(r1.body));
+      const row = (await pool.query(`SELECT route_stop_id, place_name FROM opener_checkins WHERE id = $1`, [free.id])).rows[0];
+      assert.deepStrictEqual([row.route_stop_id, row.place_name], [null, 'Pizza du Coin']);
+      assert.strictEqual(r1.body.distanceM, 0, 'position du resto reçue de la recherche : la visite se vérifie');
+      assert.ok((await pool.query(`SELECT lat FROM opener_places WHERE place_id = 'PLACE_TEXT_00001'`)).rows[0].lat, 'lieu gardé avec sa position');
+      assert.strictEqual((await call('GET', `/api/opener/checkins/${free.id}`, undefined, 'libre@x.com')).body.checkin.name, 'Pizza du Coin');
+      assert.strictEqual((await call('GET', '/api/opener/day', undefined, 'libre@x.com')).status, 200);
+      assert.strictEqual((await call('GET', '/api/opener/today', undefined, 'libre@x.com')).body.route, null);
+      // Les routes ne sont pas à lui : sauter un arrêt reste réservé à opener:field.
+      assert.strictEqual((await call('POST', '/api/opener/stops/1/skip', { reason: 'closed' }, 'libre@x.com')).status, 403);
+    });
+
+    await t('check-in libre : visible du gestionnaire dans le suivi, par employé', async () => {
+      const ov = (await call('GET', `/api/opener/routes-overview?from=${today}&to=${today}`)).body;
+      const mine = ov.free.find((f) => f.userEmail === 'libre@x.com');
+      assert.ok(mine, JSON.stringify(ov.free));
+      assert.strictEqual(mine.stops[0].name, 'Pizza du Coin');
+      assert.deepStrictEqual([mine.stops[0].result.currentPos, mine.stops[0].result.interest], ['Square', 4]);
     });
 
     console.log(`field : ${n} tests OK (${nearbyCalls.length} appels Nearby simulés dans le dernier lot)`);

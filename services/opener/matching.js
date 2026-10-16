@@ -261,11 +261,14 @@ function createGooglePlaces({ http = axios, env = process.env } = {}) {
     return new Error(`Google Places : ${st ? `HTTP ${st} — ` : ''}${String(msg).slice(0, 200)}`);
   }
 
-  async function searchText(textQuery, { max = 5 } = {}) {
+  // `bias` : { center: [lat, lng], radius } — les résultats proches d'abord (check-in libre).
+  async function searchText(textQuery, { max = 5, bias = null } = {}) {
     if (!key()) throw new Error('GOOGLE_PLACES_API_KEY absente');
     try {
+      const body = { textQuery, regionCode: 'CA', languageCode: 'fr', maxResultCount: max };
+      if (bias) body.locationBias = { circle: { center: { latitude: bias.center[0], longitude: bias.center[1] }, radius: Math.min(50000, bias.radius || 3000) } };
       const r = await http.post('https://places.googleapis.com/v1/places:searchText',
-        { textQuery, regionCode: 'CA', languageCode: 'fr', maxResultCount: max },
+        body,
         { headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': key(), 'X-Goog-FieldMask': FIELDS.join(',') }, timeout: 15000 });
       return Array.isArray(r?.data?.places) ? r.data.places : [];
     } catch (e) { throw explain(e); }

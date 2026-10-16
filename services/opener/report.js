@@ -59,7 +59,7 @@ function dailyReportEmail(mailShell, date, sections, link) {
         v.leadRef ? `<b>lead ${esc(v.leadRef)}</b>` : null,
       ].filter(Boolean).join(' · ');
       return `<tr><td style="${cell};white-space:nowrap">${hhmm(v.startedAt || v.at)}–${hhmm(v.at)}${v.durationMin != null ? `<br><span style="color:#64748b">${v.durationMin} min</span>` : ''}</td>`
-        + `<td style="${cell}"><b>${esc(v.name || '—')}</b>${v.isClient ? ' <span style="color:#047857">(client)</span>' : ''}<br><span style="color:#475569">${details}</span>`
+        + `<td style="${cell}"><b>${esc(v.name || '—')}</b>${v.isClient ? ' <span style="color:#047857">(client)</span>' : ''}${v.free ? ' <span style="color:#7C3AED">(check-in libre)</span>' : ''}<br><span style="color:#475569">${details}</span>`
         + `${v.notes ? `<br><span style="color:#64748b;font-style:italic">« ${esc(String(v.notes).slice(0, 300))} »</span>` : ''}</td>`
         + `<td style="${cell};white-space:nowrap;color:${vc}">${vl}${v.distanceM != null && v.verdict === 'far' ? `<br>${Math.round(v.distanceM)} m` : ''}</td></tr>`;
     }).join('');
@@ -121,7 +121,9 @@ function registerOpenerReport(app, deps) {
         WHERE LOWER(c.user_email) = $1 AND (c.at AT TIME ZONE '${TZ}')::date = $2::date ORDER BY c.at`, [email, date])).rows;
     const visits = cks.map((c) => ({
       at: c.at, startedAt: c.started_at, durationMin: c.duration_min > 0 ? c.duration_min : null,
-      name: byStop.get(c.route_stop_id)?.label || c.lead_name || null,
+      name: byStop.get(c.route_stop_id)?.label || c.place_name || c.lead_name || null,
+      // Check-in libre : fait hors de la route du jour (ou sans route).
+      free: !c.route_stop_id,
       verdict: verdict(c.v_dist, c.v_acc, c.v_lat), distanceM: c.v_dist,
       currentPos: c.current_pos, interest: c.interest_level, satisfaction: c.satisfaction, paymentsBy: c.payments_by,
       decisionMaker: c.decision_maker, notes: c.notes, leadRef: c.ref_code || null, isClient: c.is_client,
