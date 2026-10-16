@@ -1195,6 +1195,17 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS click_count INT DEFAULT 0`);
     await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS first_click_at TIMESTAMPTZ`);
     await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS last_click_at TIMESTAMPTZ`);
+    // Ce qui est PARTI chez le client, pour que le représentant puisse le revoir (écran « Envoyées »).
+    // Avant le 2026-10-16 rien de tout cela n'était gardé : ces colonnes restent vides pour les
+    // anciens envois. email_view_html = le courriel SANS pixel de suivi ni lien d'acceptation actif
+    // (sinon relire son envoi compterait comme une ouverture ou un clic du client).
+    await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS subject TEXT`);
+    await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS body_text TEXT`);
+    await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS cc_email TEXT`);
+    await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS from_email TEXT`);
+    await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS email_view_html TEXT`);
+    await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS pdf_name TEXT`);
+    await pool.query(`ALTER TABLE proposals_sent ADD COLUMN IF NOT EXISTS pdf_bytes BYTEA`);
     // Admin-managed category structure for the resources library.
     await pool.query(`
       CREATE TABLE IF NOT EXISTS resource_categories (
@@ -24859,10 +24870,18 @@ app.post('/api/proposals/send', authenticateToken, async (req, res) => {
     // Record the send for the status board (best-effort).
     const proposalActor = req.user.realAdminEmail || req.user.email || 'unknown';
     let insertedId = null;
+    // Copie de consultation du courriel : même rendu, mais sans pixel et avec un bouton d'acceptation
+    // inerte — le représentant voit ce que le client a vu sans fausser le suivi.
+    const inertBtn = acceptUrl ? acceptBtn.replace(/<a href="[^"]*"([^>]*)>/, '<span$1>').replace('</a>', '</span>') : '';
+    const viewHtml = buildProposalEmailHtml({ bodyText, acceptBtn: inertBtn, signatureHtml, pixel: '', frontendBase });
+    const ccSent = req.body.cc ? String(req.body.cc).trim() : null;
     try {
       const ins = await pool.query(
-        `INSERT INTO proposals_sent (estimate_id, estimate_number, customer_name, rep_email, to_email, lang, track_token, accept_url) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
-        [estimateId || null, (det && det.number) || (chain ? chain.scenario.name : ''), clientName, proposalActor, to, lang, trackToken, acceptUrl || null]);
+        `INSERT INTO proposals_sent (estimate_id, estimate_number, customer_name, rep_email, to_email, lang, track_token, accept_url,
+                                     subject, body_text, cc_email, from_email, email_view_html, pdf_name, pdf_bytes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
+        [estimateId || null, (det && det.number) || (chain ? chain.scenario.name : ''), clientName, proposalActor, to, lang, trackToken, acceptUrl || null,
+         subject, bodyText, ccSent, fromAddr || null, viewHtml, proposalFileName(clientName), Buffer.from(pdf)]);
       insertedId = ins.rows[0]?.id || null;
     } catch (e) { console.warn('[proposal/send] record:', e.message); }
     // A presentation-only proposal has no Zoho estimate id to key the activity log on — fall back
@@ -24920,9 +24939,13 @@ app.get('/api/proposals/sent', authenticateToken, async (req, res) => {
       effAdmin = row ? !!row.is_admin : false;
     }
     const me = (req.user.realAdminEmail || req.user.email || '').toLowerCase();
+    // Colonnes nommées : jamais pdf_bytes ni email_view_html ici (des Mo par ligne) — ils se lisent
+    // un envoi à la fois via /sent/:id/content et /sent/:id/pdf.
+    const cols = `id, estimate_id, estimate_number, customer_name, rep_email, to_email, sent_at, opened_at, open_count,
+                  click_count, first_click_at, last_click_at, (email_view_html IS NOT NULL) AS has_content`;
     const rows = effAdmin
-      ? (await pool.query(`SELECT * FROM proposals_sent ORDER BY sent_at DESC LIMIT 100`)).rows
-      : (await pool.query(`SELECT * FROM proposals_sent WHERE LOWER(rep_email) = $1 ORDER BY sent_at DESC LIMIT 100`, [me])).rows;
+      ? (await pool.query(`SELECT ${cols} FROM proposals_sent ORDER BY sent_at DESC LIMIT 100`)).rows
+      : (await pool.query(`SELECT ${cols} FROM proposals_sent WHERE LOWER(rep_email) = $1 ORDER BY sent_at DESC LIMIT 100`, [me])).rows;
     const out = [];
     for (const r0 of rows.slice(0, 40)) {
       const st = r0.estimate_id ? await getEstimateStatus(r0.estimate_id) : null;
@@ -24933,9 +24956,54 @@ app.get('/api/proposals/sent', authenticateToken, async (req, res) => {
         acceptedDate: (st && st.acceptedDate) || '', declinedDate: (st && st.declinedDate) || '',
         emailOpened: !!r0.opened_at, emailOpenedAt: r0.opened_at || '', emailOpenCount: r0.open_count || 0,
         linkClickCount: r0.click_count || 0, linkFirstClickAt: r0.first_click_at || '', linkLastClickAt: r0.last_click_at || '',
+        hasContent: !!r0.has_content,
       });
     }
     res.json({ proposals: out });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Un envoi que l'utilisateur a le droit de revoir : le sien, ou n'importe lequel pour un admin
+// (même règle que la liste ci-dessus). Renvoie la ligne demandée ou null.
+async function sentProposalFor(req, id, columns) {
+  let effAdmin = false;
+  if (!req.user.impersonating && req.user.email) {
+    const row = (await pool.query('SELECT is_admin FROM user_tokens WHERE email = $1', [req.user.email])).rows[0];
+    effAdmin = row ? !!row.is_admin : false;
+  }
+  const me = (req.user.realAdminEmail || req.user.email || '').toLowerCase();
+  const r = (await pool.query(`SELECT rep_email, ${columns} FROM proposals_sent WHERE id = $1`, [parseInt(id, 10) || 0])).rows[0];
+  if (!r) return null;
+  if (!effAdmin && String(r.rep_email || '').toLowerCase() !== me) return null;
+  return r;
+}
+
+// GET /api/proposals/sent/:id/content — ce qui est parti chez le client (en-tête + courriel tel
+// qu'affiché, sans pixel ni lien actif). Les envois d'avant le 2026-10-16 n'ont rien de conservé.
+app.get('/api/proposals/sent/:id/content', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'proposals:send'))) return;
+  try {
+    const r = await sentProposalFor(req, req.params.id,
+      `customer_name, estimate_number, to_email, cc_email, from_email, subject, sent_at, email_view_html, pdf_name, (pdf_bytes IS NOT NULL) AS has_pdf`);
+    if (!r) return res.status(404).json({ error: 'not_found' });
+    res.json({
+      customerName: r.customer_name, number: r.estimate_number, to: r.to_email, cc: r.cc_email, from: r.from_email,
+      subject: r.subject, sentAt: r.sent_at, html: r.email_view_html, pdfName: r.pdf_name, hasPdf: !!r.has_pdf,
+      stored: r.email_view_html != null,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/proposals/sent/:id/pdf — la pièce jointe EXACTE envoyée au client.
+app.get('/api/proposals/sent/:id/pdf', authenticateToken, async (req, res) => {
+  if (!(await requirePerm(req, res, 'proposals:send'))) return;
+  try {
+    const r = await sentProposalFor(req, req.params.id, `pdf_name, pdf_bytes`);
+    if (!r || !r.pdf_bytes) return res.status(404).json({ error: 'not_found' });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(r.pdf_name || 'proposition.pdf')}"`);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.send(r.pdf_bytes);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
