@@ -2793,6 +2793,24 @@ async function initializeDatabase() {
       );
     `);
 
+    // Historique mensuel des métriques Zoho Billing (MRR, abonnements…). Zoho ne donne qu'une
+    // photo à l'instant T : sans cette table, le tableau de bord ne peut ni tracer le MRR sur
+    // 12 mois ni dire « +0,6 % vs le mois dernier ». Une ligne par mois, réécrite à chaque calcul
+    // (toutes les ~25 min) : la valeur d'un mois clos est celle de son dernier calcul.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS billing_metrics_monthly (
+        month        DATE PRIMARY KEY,
+        mrr          NUMERIC(14,2) NOT NULL,
+        arr          NUMERIC(14,2) NOT NULL,
+        active_subs  INTEGER NOT NULL,
+        arpu         NUMERIC(12,2) NOT NULL,
+        churned      INTEGER NOT NULL,
+        churn_rate   NUMERIC(8,2) NOT NULL,
+        ltv          NUMERIC(14,2) NOT NULL,
+        captured_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
     // Copie locale des billets Zoho Desk. Voir le bloc « SOUTIEN TECHNIQUE » plus bas pour
     // le pourquoi : ~156 000 billets et une API qui ne sait pas agreger.
     await pool.query(`
@@ -18131,11 +18149,34 @@ async function computeBillingMetrics() {
   const churnRate = activeSubs > 0 ? (churnedThisMonth / activeSubs) * 100 : 0;
   const ltv       = churnRate > 0 ? arpu / (churnRate / 100) : 0;
   const r2 = (n) => Math.round(n * 100) / 100;
-  return {
+  const out = {
     mrr: r2(mrr), arr: r2(mrr * 12), activeSubs,
     arpu: r2(arpu), churnedThisMonth, churnRate: r2(churnRate), ltv: r2(ltv),
     perOrg, orgCount: ZOHO_BILLING_ORG_IDS.length, generatedAt: new Date().toISOString(),
   };
+  // Photo du mois en cours (heure de Montréal) pour l'historique du tableau de bord. Un échec
+  // ici ne doit jamais faire tomber les métriques elles-mêmes.
+  try {
+    await pool.query(
+      `INSERT INTO billing_metrics_monthly (month, mrr, arr, active_subs, arpu, churned, churn_rate, ltv, captured_at)
+       VALUES (date_trunc('month', (NOW() AT TIME ZONE 'America/Toronto'))::date, $1, $2, $3, $4, $5, $6, $7, NOW())
+       ON CONFLICT (month) DO UPDATE SET mrr = EXCLUDED.mrr, arr = EXCLUDED.arr, active_subs = EXCLUDED.active_subs,
+         arpu = EXCLUDED.arpu, churned = EXCLUDED.churned, churn_rate = EXCLUDED.churn_rate, ltv = EXCLUDED.ltv,
+         captured_at = NOW()`,
+      [out.mrr, out.arr, out.activeSubs, out.arpu, out.churnedThisMonth, out.churnRate, out.ltv]
+    );
+  } catch (e) { console.warn('[billing] monthly snapshot failed:', e.message); }
+  return out;
+}
+
+// Les 13 derniers mois enregistrés (le mois en cours compris), du plus ancien au plus récent.
+async function billingMetricsHistory() {
+  const rows = (await pool.query(
+    `SELECT to_char(month, 'YYYY-MM') AS month, mrr::float, active_subs AS "activeSubs", arpu::float,
+            churn_rate::float AS "churnRate", ltv::float
+     FROM billing_metrics_monthly ORDER BY month DESC LIMIT 13`
+  )).rows;
+  return rows.reverse();
 }
 const billingMetricsCache = makeDurableCache('billing_metrics_durable_cache');
 const getBillingMetrics = (opts) => billingMetricsCache.get(computeBillingMetrics, opts);
@@ -18152,7 +18193,9 @@ app.get('/api/billing/metrics', authenticateToken, async (req, res) => {
   try {
     const fresh = req.query.fresh === '1';
     const data = await getBillingMetrics({ fresh });
-    res.json({ ...data, cached: !fresh });
+    // L'historique vient de NOTRE table (pas du cache) : il reste lisible même si Zoho tombe.
+    const history = await billingMetricsHistory().catch(() => []);
+    res.json({ ...data, history, cached: !fresh });
   } catch (e) {
     res.status(502).json({ error: 'billing_fetch_failed', detail: e.message });
   }
@@ -39513,8 +39556,10 @@ app.get('/api/leads/pending-count', authenticateToken, async (req, res) => {
   const acc = await leadAccess(req);
   if (!acc.review) return res.json({ count: 0 });
   try {
-    const r = await pool.query(`SELECT COUNT(*)::int AS n FROM leads WHERE status IN ('new', 'in_review')`);
-    res.json({ count: r.rows[0].n });
+    // oldestAt : depuis quand la plus vieille piste attend (tableau de bord « La plus vieille
+    // attend depuis 5 h »). Le compteur de la barre latérale ignore ce champ.
+    const r = await pool.query(`SELECT COUNT(*)::int AS n, MIN(created_at) AS oldest FROM leads WHERE status IN ('new', 'in_review')`);
+    res.json({ count: r.rows[0].n, oldestAt: r.rows[0].oldest });
   } catch (e) { res.status(500).json({ error: 'count_failed' }); }
 });
 
