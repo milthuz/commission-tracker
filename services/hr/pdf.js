@@ -743,4 +743,11 @@ async function pageCount(buf) {
   try { return (await LibDoc.load(buf, { ignoreEncryption: true })).getPageCount(); } catch { return null; }
 }
 
-module.exports = { renderAgreement, renderOffer, renderAddendumSignature, renderCertificate, mergePdfs, pageCount, money, longDate };
+// `kit` : les briques de mise en page, réutilisées par services/nda/pdf.js pour que les NDA aient
+// exactement le même habillage que les contrats RH.
+const kit = {
+  newDoc, collect, flow, footer, brandMark, sigBuffer, longDate, stamp, isoDay,
+  W, H, M, CW, BOTTOM, INK, TEXT, MUTED, ORANGE, PEACH,
+};
+
+module.exports = { renderAgreement, renderOffer, renderAddendumSignature, renderCertificate, mergePdfs, pageCount, money, longDate, kit };

@@ -281,6 +281,12 @@ const PERMISSION_CATALOG = [
   // Effacer un contrat SIGNÉ détruit la preuve : clé à part, absente du rôle RH semé (admins seuls
   // par défaut). Sert aux dossiers de test ou créés par erreur.
   { key: 'hr:delete_signed',           label: 'HR — permanently delete a SIGNED hiring file (test or created by mistake)', category: 'HR' },
+  // NDA : ententes de confidentialité envoyées pour signature. N'importe quelle équipe prépare et
+  // envoie ; Cluster est TOUJOURS contresigné par le signataire configuré (David) — la permission
+  // de contresigner ne suffit pas, il faut aussi être connecté avec SON courriel.
+  { key: 'nda:send',                   label: 'NDA — prepare and send non-disclosure agreements for signature (sees own NDAs)', category: 'NDA' },
+  { key: 'nda:view_all',               label: 'NDA — see every NDA, all teams', category: 'NDA' },
+  { key: 'nda:countersign',            label: 'NDA — countersign for Cluster (only the configured signatory can actually sign) and change the signatory', category: 'NDA' },
   // Crédits de compensation marchand (pénalité de résiliation du processeur précédent) : le rep
   // prépare et envoie, le client signe en ligne, l'approbateur crée la note de crédit Zoho Books.
   { key: 'credits:send',               label: 'Merchant processor credits: create (Zentact merchants), upload proof and send compensation-credit agreements for signature (own files)', category: 'Merchant Processor Credits' },
@@ -4009,6 +4015,13 @@ require('./services/hr/routes').registerHrRoutes(app, {
   engine: () => ({ monthlyQuota: MONTHLY_QUOTA, monthlyTiers: MONTHLY_BONUS_TIERS, annualTiers: ANNUAL_BONUS_TIERS }),
 });
 
+// NDA — ententes de confidentialité, signature électronique, contresignées par David pour
+// Cluster. Tout vit sous services/nda/.
+require('./services/nda/routes').registerNdaRoutes(app, {
+  authenticateToken, requirePerm, hasPerm, pool, logActivity,
+  sendMail: (...a) => sendMail(...a), mailShell: (...a) => mailShell(...a), rateLimited: (...a) => rateLimited(...a),
+});
+
 // Crédits de compensation marchand — formulaire signé en ligne, note de crédit Zoho Books.
 // Tout vit sous services/credits/.
 const creditsModule = require('./services/credits/routes').registerCreditRoutes(app, {
@@ -4912,7 +4925,7 @@ app.post('/api/admin/local-users/test-email', authenticateToken, async (req, res
 // sampleEmail(), dans TEMPLATE_TYPES de EmailPreview.tsx, et dans les libellés i18n.
 // Les quatre `pass_*` sont les courriels du programme La Passe ; ils sont les seuls de la
 // liste à partir d'une adresse et d'une enveloppe qui ne sont pas celles de Sales Hub.
-const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder', 'lead_review', 'lead_assigned', 'lead_welcome', 'lead_booking_client', 'lead_booking_cancelled', 'lead_booking_rep', 'lead_event_thanks', 'lead_import_rep', 'partner_lead_assigned', 'hr_sign_request', 'hr_countersign', 'hr_completed', 'hr_declined', 'opener_route_published', 'opener_week_published', 'role_request', 'opener_daily_report'];
+const EMAIL_TEMPLATE_TYPES = ['invitation', 'reset', 'paystub', 'payroll', 'feature_request', 'missing_commission', 'missing_points', 'report_resolved', 'probation', 'new_user', 'saas_increase', 'new_partner_opportunity', 'partner_invoice_uploaded', 'pass_received', 'pass_live', 'pass_tier_up', 'pass_credit', 'partner_invite', 'partner_reset', 'partner_invite_migration', 'partner_reminder', 'lead_review', 'lead_assigned', 'lead_welcome', 'lead_booking_client', 'lead_booking_cancelled', 'lead_booking_rep', 'lead_event_thanks', 'lead_import_rep', 'partner_lead_assigned', 'hr_sign_request', 'hr_countersign', 'hr_completed', 'hr_declined', 'nda_sign_request', 'nda_countersign', 'nda_completed', 'nda_declined', 'opener_route_published', 'opener_week_published', 'role_request', 'opener_daily_report'];
 function sampleEmail(type, lang) {
   const base = process.env.FRONTEND_URL || 'https://saleshub.clusterpos.com';
   const money = (n) => '$' + (Number(n) || 0).toLocaleString('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -4949,6 +4962,15 @@ function sampleEmail(type, lang) {
       publishedBy: 'Marie Manager', link: `${base}/opener`,
       stops: [{ name: 'Café Merlebleu', address: '4520 Rue Saint-Denis' }, { name: 'Bistro du Coin', address: '100 Av. Laurier O' }],
     });
+  }
+  if (type.startsWith('nda_')) {
+    const NE = require('./services/nda/emails');
+    const ndaLang = isFrLocale(lang) ? 'fr' : 'en';
+    const link = `${base}/nda`;
+    if (type === 'nda_sign_request') return NE.signRequestEmail(mailShell, { lang: ndaLang, firstName: 'Julie', company: 'Calibre Integration', senderName: 'Marie Produit', link: `${base}/nda-sign?token=exemple`, expiresDays: 14 });
+    if (type === 'nda_countersign') return NE.countersignEmail(mailShell, { company: 'Calibre Integration', signerName: 'Julie Tremblay', link });
+    if (type === 'nda_declined') return NE.declinedEmail(mailShell, { company: 'Calibre Integration', signerName: 'Julie Tremblay', reason: ndaLang === 'fr' ? 'Nous utilisons notre propre gabarit.' : 'We use our own template.', link });
+    return NE.completedPartyEmail(mailShell, { lang: ndaLang, firstName: 'Julie', company: 'Calibre Integration' });
   }
   if (type.startsWith('hr_')) {
     const HRE = require('./services/hr/emails');
@@ -11108,6 +11130,7 @@ THE APP'S SECTIONS (what each one does):
   ⚠️ RULE THAT OVERRIDES EVERYTHING ELSE ABOUT PRICES. Cluster is raising SaaS prices on existing subscriptions. Each increase takes effect at THAT subscription's own next renewal, never on a single shared date. When anyone asks what a specific merchant pays now or will pay, you MUST call the saas_price_lookup tool and report only what it returns. You must NEVER answer from the Services & Pricing Guide: that guide is a CATALOGUE of list prices, and a merchant's bill is not the catalogue. Quoting it to someone on the phone with a customer would commit Cluster to a price nobody agreed to. If the tool finds nothing, or you do not have access to it, say plainly that you cannot see that merchant's change and that the agent should check Référence hausse SaaS or escalate — never estimate, never interpolate, never reason from the plan name.
 - The Pass (La Passe): the merchant referral program. A merchant refers another merchant; the credit is floored when the referral is submitted, capped at the tier when the new merchant goes live, then the final amount is confirmed by hand (its own permission) before accounting is notified.
 - Hiring (Embauches / HR, /hr): HR prepares a new sales rep's hiring file (candidate, position, start date, salary, allowances, and the commission plan, pre-filled from the plan the commission engine actually pays). Sales Hub generates two documents from it: Cluster's offer of employment (English legal template) and the v7.7 Compensation Agreement (English or French), plus optional PDF attachments. "Send for signature" emails the candidate a personal 14-day link where they read and sign on screen; then someone with the countersign permission signs for Cluster, and the fully signed package (with a signature certificate) is emailed to both sides. A sent file is locked — to change it, cancel and duplicate. HR can also create an ADDENDUM ("New addendum"): they upload a PDF (salary change, new position…) for an employee already in place — either linked to a signed hiring file or for someone hired before Sales Hub — and it goes through the same signing flow; Sales Hub appends a signature page naming the document and its fingerprint. Once signed, HR can create the rep in Sales Hub (hire date → 90-day ramp, base salary, login email). Salary data is sensitive: only the HR permissions (hr:view / hr:manage / hr:countersign, bundled in the "RH" role) show this section.
+- NDA (/nda): any team (product, sales…) prepares a mutual non-disclosure agreement with another company and sends it for e-signature. Two modes: Cluster's own mutual NDA (generated in English or French from the company name, address, signatory and purpose), or the other party's own NDA uploaded as a PDF (Sales Hub appends a signature page naming it with its fingerprint). The other party gets a personal 14-day link, reads and signs on screen; then Cluster's configured signatory (David Lafleur) — and only him, logged in with his own account — countersigns, and the signed NDA with a signature certificate is emailed to both sides. A sent NDA is locked: cancel and duplicate to change it. Permissions: nda:send (prepare/send, sees own NDAs), nda:view_all, nda:countersign.
 - What each user sees depends on their permissions — some sections may not be visible to everyone.
 
 THE COMMISSION MODEL:
