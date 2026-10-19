@@ -42,7 +42,15 @@ const DELETABLE = ['draft', 'cancelled', 'declined'];
 const DEFAULT_SIGNER = { name: 'David Lafleur', titleEn: 'Vice-President', titleFr: 'Vice-président', email: 'david@clustersystems.com' };
 
 const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
-const refOf = (n) => `NDA-${String(n).padStart(4, '0')}`;
+// Référence : NDA-2026-0147 (demande de David, 2026-10-19 — « NDA-0001 » faisait premier NDA).
+// Année de création (heure de Montréal) + compteur décalé de REF_OFFSET, qui ne repart pas à
+// chaque année. Un NDA déjà ENVOYÉ garde la référence imprimée sur son PDF (instantané).
+const REF_OFFSET = 146;
+const refOf = (row) => {
+  if (row.snap_ref || (row.snapshot && row.snapshot.ref)) return row.snap_ref || row.snapshot.ref;
+  const year = new Date(row.created_at || Date.now()).toLocaleDateString('en-CA', { timeZone: 'America/Toronto' }).slice(0, 4);
+  return `NDA-${year}-${String(Number(row.ref_no) + REF_OFFSET).padStart(4, '0')}`;
+};
 const str = (v, max = 200) => String(v == null ? '' : v).trim().slice(0, max);
 
 async function ensureSchema(pool) {
@@ -197,9 +205,9 @@ function registerNdaRoutes(app, deps) {
   }
 
   const LIST_COLS = `id, ref_no, status, mode, company, email, data, created_by, created_at, updated_at, sent_at, viewed_at,
-    party_signed_at, completed_at, declined_at, cancelled_at, token_expires_at`;
+    party_signed_at, completed_at, declined_at, cancelled_at, token_expires_at, snapshot->>'ref' AS snap_ref`;
   const shapeListItem = (r) => ({
-    id: r.id, ref: refOf(r.ref_no), status: r.status, mode: r.mode, company: r.company, email: r.email,
+    id: r.id, ref: refOf(r), status: r.status, mode: r.mode, company: r.company, email: r.email,
     signerName: `${r.data.signer.firstName} ${r.data.signer.lastName}`.trim(), team: r.data.team || '',
     lang: r.data.lang, createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
     sentAt: r.sent_at, viewedAt: r.viewed_at, partySignedAt: r.party_signed_at, completedAt: r.completed_at,
@@ -238,7 +246,7 @@ function registerNdaRoutes(app, deps) {
   const signerFor = (signer, lang) => ({ name: signer.name, title: lang === 'fr' ? (signer.titleFr || signer.titleEn) : (signer.titleEn || signer.titleFr), email: signer.email });
   // Instantané d'un brouillon (aperçu) ou celui figé à l'envoi.
   const snapOf = async (row) => row.snapshot || {
-    ref: refOf(row.ref_no), nda: row.data, clusterSigner: signerFor(await readSigner(), row.data.lang),
+    ref: refOf(row), nda: row.data, clusterSigner: signerFor(await readSigner(), row.data.lang),
     attachments: row.mode === 'upload' ? await attachmentsWithPages(row.id) : [],
   };
   const render = (snap, sigs = {}) => (snap.nda.mode === 'upload' ? R.renderUploadSignature(snap, sigs) : R.renderNda(snap, sigs));
@@ -347,7 +355,7 @@ function registerNdaRoutes(app, deps) {
         `INSERT INTO nda_agreements (id, mode, company, email, data, created_by) SELECT $2, mode, company, email, data, $3 FROM nda_agreements WHERE id = $1`,
         [row.id, id, req.user.email],
       );
-      await event(id, 'created', req.user.email, null, { duplicatedFrom: refOf(row.ref_no) });
+      await event(id, 'created', req.user.email, null, { duplicatedFrom: refOf(row) });
       res.json(await shapeDetail(await loadNda(id)));
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
@@ -360,7 +368,7 @@ function registerNdaRoutes(app, deps) {
       // Jamais un NDA signé (c'est la preuve) ni en cours de signature (on l'annule d'abord).
       if (!DELETABLE.includes(row.status)) return res.status(409).json({ error: 'not_deletable', message: 'Only draft, cancelled or declined NDAs can be deleted.' });
       await pool.query('DELETE FROM nda_agreements WHERE id = $1', [row.id]);
-      await audit(row.id, 'deleted', `NDA ${refOf(row.ref_no)} deleted (${row.status}): ${row.company}`, req.user.email);
+      await audit(row.id, 'deleted', `NDA ${refOf(row)} deleted (${row.status}): ${row.company}`, req.user.email);
       res.json({ ok: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
@@ -494,7 +502,7 @@ function registerNdaRoutes(app, deps) {
       const att = row.mode === 'upload' ? await attachmentsWithPages(row.id) : [];
       if (row.mode === 'upload' && !att.length) return res.status(400).json({ error: 'no_document', message: 'Attach the other party’s NDA (PDF) before sending.' });
       const snap = {
-        ref: refOf(row.ref_no),
+        ref: refOf(row),
         sentOn: new Date().toLocaleDateString('en-CA', { timeZone: 'America/Toronto' }),
         nda: row.data,
         clusterSigner: signerFor(await readSigner(), row.data.lang),
@@ -552,7 +560,7 @@ function registerNdaRoutes(app, deps) {
   // Contresignature par le signataire de Cluster → NDA final + copies
   // -------------------------------------------------------------------------
   async function buildSignedPackage(id) {
-    const r = (await pool.query(`SELECT ref_no, company, email, created_by, snapshot, doc_hashes, party_sig, cluster_sig, sent_at, viewed_at
+    const r = (await pool.query(`SELECT ref_no, created_at, company, email, created_by, snapshot, doc_hashes, party_sig, cluster_sig, sent_at, viewed_at
       FROM nda_agreements WHERE id = $1`, [id])).rows[0];
     const snap = r.snapshot;
     const sigs = { partySig: r.party_sig, clusterSig: r.cluster_sig };
@@ -569,7 +577,7 @@ function registerNdaRoutes(app, deps) {
     }
     const s = snap.nda.signer;
     const cert = await R.renderCertificate({
-      ref: refOf(r.ref_no), company: r.company, documents, sentAt: r.sent_at, viewedAt: r.viewed_at, preparedBy: r.created_by,
+      ref: refOf(r), company: r.company, documents, sentAt: r.sent_at, viewedAt: r.viewed_at, preparedBy: r.created_by,
       party: { name: `${s.firstName} ${s.lastName}`, title: r.party_sig.title || s.title, email: r.email, at: r.party_sig.at, typedName: r.party_sig.name, ip: r.party_sig.ip, ua: r.party_sig.ua },
       cluster: { name: r.cluster_sig.name, title: snap.clusterSigner.title, email: r.cluster_sig.email, at: r.cluster_sig.at, ip: r.cluster_sig.ip },
     });
@@ -618,7 +626,7 @@ function registerNdaRoutes(app, deps) {
     if (rateLimited(`ndasign:${clientIp(req).ip}`, 60)) { res.status(429).json({ error: 'Too many requests' }); return null; }
     if (raw.length < 20 || raw.length > 100) { res.status(404).json({ error: 'invalid' }); return null; }
     await schema();
-    const r = await pool.query(`SELECT id, ref_no, status, company, email, created_by, snapshot, doc_hashes, token_expires_at, viewed_at,
+    const r = await pool.query(`SELECT id, ref_no, created_at, status, company, email, created_by, snapshot, doc_hashes, token_expires_at, viewed_at,
         party_signed_at, completed_at FROM nda_agreements WHERE token_hash = $1`, [sha256(raw)]);
     const row = r.rows[0];
     if (!row) { res.status(404).json({ error: 'invalid' }); return null; }
@@ -645,7 +653,7 @@ function registerNdaRoutes(app, deps) {
       }
       const s = row.snapshot;
       res.json({
-        ref: refOf(row.ref_no),
+        ref: refOf(row),
         status: row.status === 'sent' ? 'viewed' : row.status,
         firstName: s.nda.signer.firstName,
         name: `${s.nda.signer.firstName} ${s.nda.signer.lastName}`,
