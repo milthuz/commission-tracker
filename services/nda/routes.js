@@ -39,7 +39,7 @@ const MAX_SIG_BYTES = 400 * 1024;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 const DELETABLE = ['draft', 'cancelled', 'declined'];
-const DEFAULT_SIGNER = { name: 'David Lafleur', titleEn: 'Senior Vice-President', titleFr: 'Vice-président principal', email: 'david@clustersystems.com' };
+const DEFAULT_SIGNER = { name: 'David Lafleur', titleEn: 'Vice-President', titleFr: 'Vice-président', email: 'david@clustersystems.com' };
 
 const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 const refOf = (n) => `NDA-${String(n).padStart(4, '0')}`;
