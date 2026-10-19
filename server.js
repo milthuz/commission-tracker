@@ -295,6 +295,12 @@ const PERMISSION_CATALOG = [
   { key: 'credits:delete',             label: 'Merchant processor credits: delete any file, including sent, signed or approved ones (a reason is required; the Zoho Books credit note is NOT deleted)', category: 'Merchant Processor Credits' },
   { key: 'credits:report',             label: 'Merchant processor credits — accounting: monthly report of approved credits and clawbacks, CSV export, signed PDFs (read-only)', category: 'Merchant Processor Credits' },
   { key: 'revmodel:settings',          label: 'Edit the Revenue Modeler SaaS tiers (the three default prices, applied to everyone)', category: 'Revenue Modeler' },
+  // Section Finance (CFO) : budget consolidé, drivers, paie, OPEX — les vrais chiffres de l'entreprise.
+  // Les salaires individuels ont leur propre clé ; approuver VERROUILLE le budget pour tout le monde.
+  { key: 'finance:view',               label: 'Finance — view the budgets: Master Budget, revenue and COGS drivers, OPEX (company figures; payroll as department totals only)', category: 'Finance' },
+  { key: 'finance:edit',               label: 'Finance — edit drivers, OPEX lines and the travel budget (draft budgets only)', category: 'Finance' },
+  { key: 'finance:payroll',            label: 'Finance — see and edit individual salaries and contractors (names, amounts; add or remove people)', category: 'Finance' },
+  { key: 'finance:approve',            label: 'Finance — approve (lock) and unlock a budget', category: 'Finance' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -4034,6 +4040,17 @@ const creditsModule = require('./services/credits/routes').registerCreditRoutes(
 require('./services/revenueModel/routes').registerRevenueModelRoutes(app, {
   authenticateToken, requirePerm, hasPerm, pool, logActivity,
 });
+
+// Section Finance (CFO) : budget consolidé FY2027 — tout vit sous services/finance/. Chargement
+// protégé : si une autre session commite ce fichier sans le dossier, le serveur démarre quand même
+// (incident du modélisateur de revenus, 2026-09-22).
+try {
+  require('./services/finance/routes').registerFinanceRoutes(app, {
+    authenticateToken, requirePerm, hasPerm, pool, logActivity,
+  });
+} catch (e) {
+  console.error('finance module not loaded:', e.message);
+}
 
 // Rendez-vous des pistes (page publique /rdv, Google Agenda des reps) — services/leadBooking/.
 // `late` : ce que le module lit dans la section des pistes, définie plus bas dans ce fichier.
@@ -11081,6 +11098,7 @@ WHERE THINGS ARE (the menu, redesigned in October 2026 — use these names, the 
   • Compensation / Rémunération: Points tracker / Suivi des points, Commission Report / Rapport de commissions, Merchant credits / Crédits marchands.
   • Operations / Opérations: Opener (Campaign & routes, Field app, Cluster locations), SaaS increase / Hausse SaaS (Campaign, Reference), The Pass / La Passe, Partners and resellers / Partenaires et revendeurs (Opportunity queue, Manage partners, Partner users, Partner payouts, Reseller Activation).
   • Management / Direction: Processing Revenue / Revenus de paiements, Tech support / Soutien technique, Hiring / Embauches.
+  • Finance (CFO only — finance permissions): Master Budget / Budget maître, Revenue Drivers / Drivers de revenus, COGS Drivers / Drivers de COGS, Salary & Contractors / Salaires et contractuels (separate payroll permission), OPEX.
   • Administration: opens a hub of eight zones (People and access, Sales team and compensation, Commissions and payroll, Partners and channels, Catalogue and pricing, Leads and prospecting, Customers and revenue, Data and integrations), with a search box and a "Needs attention / À corriger" bar.
 - Ctrl K (⌘K on Mac) or the search field at the top of the menu jumps to any screen by name.
 - Each user only sees the entries their permissions allow; never tell someone to click an entry they may not have.
@@ -11092,6 +11110,7 @@ THE APP'S SECTIONS (what each one does):
 - Commission Tracker: monthly sales points per rep. Points come from CRM sold deals and Zentact merchant activations. Each rep has a monthly quota (default 15 points). Reps are grouped into Teams, each with a progress bar; you see your own team.
 - Commission Report: a rep's commissions month by month for a year. Months show EARNED commission grouped by "Unlock Month" (when the commission becomes payable). The "Pay stub / Bulletin de paie" button shows the pay stub for the selected month: invoices paid, bonuses, total. A "Total Compensation" banner shows base salary accrued by pay period (26 bi-weekly periods/year) + YTD commission + annual bonus + signup payments.
 - Reseller Activation: POS activations attributed to external resellers.
+- Finance (Budget maître etc.): the CFO's driver-based FY2027 consolidated budget, replacing her Excel workbooks. Master Budget = the budgeted income statement (no editable cells; each line expands into its accounts, each account opens the page that calculates it). Revenue Drivers and COGS Drivers = yellow editable assumptions per month (rooftop adds and churn, ARPU growth, Adyen target, hardware, service, licence, COGS percentages), "⇥" copies January across the year. Salary & Contractors = burden %, global raise and month, per-person salary/raise/burden, add or remove people with a start and end month (needs the payroll permission). OPEX = FY2027 editable lines with a compounded monthly increase, plus a travel budget; FY2026 and FY2028 are read-only. Edits save automatically. "Approve (CFO)" LOCKS the budget for everyone until it is unlocked. Never quote individual salaries to someone who does not have the payroll permission.
 - Processing Revenue (Revenus de paiements): monthly payment-processing revenue per rep/reseller (transaction profit + other revenue).
 - Resources: the shared sales-document library — search, browse and download guides and templates. Two featured tiles here open the Hardware Overview and Services & Pricing Guide (see below). The folder "Guides Sales Hub" holds the official bilingual procedure guides (PDF, FR then EN): "Crédits processeur marchand — Guide du représentant" and "Pistes et rendez-vous en ligne — Guide du représentant". When a user asks how one of these procedures works, answer from what you know below AND point them to that guide.
 - Hardware Overview: the full Cluster hardware catalog (POS terminals, printers, payment devices, displays, networking, peripherals) — searchable, filterable by Kaizen(V2)/V1 compatibility and lifecycle status, with a compare tool (up to 4 side by side) and one-click SKU copy.
@@ -37874,6 +37893,7 @@ app.get('/api/releases/generate-notes', authenticateToken, async (req, res) => {
       salespeople:          { path: '/admin/salespeople',   title: 'Salespeople' },
       roles:                { path: '/admin/roles',         title: 'Roles & Permissions' },
       'revenue-modeler':    { path: '/revenue-modeler',     title: 'Revenue Modeler' },
+      finance:              { path: '/finance',             title: 'Finance — Master Budget' },
     };
     const suggestedMap = new Map();
     for (const c of filtered) {
