@@ -36,6 +36,18 @@ function signRequestEmail(mailShell, d) {
   };
 }
 
+// Aux personnes EN COPIE : avis d'envoi, sans le lien de signature (il est personnel).
+// d = { lang, company, senderName, signerName, signerEmail }
+function ccNoticeEmail(mailShell, d) {
+  const subject = pair(d.lang, `Copie — NDA envoyé pour signature — Cluster × ${d.company}`, `Copy — NDA sent for signature — Cluster × ${d.company}`);
+  const intro = both(d.lang,
+    `<p style="margin:0 0 12px">${esc(d.senderName)}, de Cluster, a envoyé une entente de confidentialité mutuelle entre Cluster et <b>${esc(endName(d.company))}</b> à ${esc(d.signerName)} (${esc(d.signerEmail)}) pour signature.</p>
+     <p style="margin:0">Vous êtes en copie : vous recevrez l’exemplaire signé par les deux parties dès qu’il sera complété.</p>`,
+    `<p style="margin:0 0 12px">${esc(d.senderName)} from Cluster sent a mutual non-disclosure agreement between Cluster and <b>${esc(endName(d.company))}</b> to ${esc(d.signerName)} (${esc(d.signerEmail)}) for signature.</p>
+     <p style="margin:0">You are copied: you will receive the copy signed by both parties as soon as it is complete.</p>`);
+  return { subject, html: mailShell(pair(d.lang, 'Entente de confidentialité', 'Non-disclosure agreement'), intro, null, null, undefined, 'cluster-plain') };
+}
+
 // Interne, au signataire de Cluster. d = { company, signerName, link }
 function countersignEmail(mailShell, d) {
   const subject = `✍️ NDA ${d.company} — contresignature requise / countersignature needed`;
@@ -71,4 +83,4 @@ function declinedEmail(mailShell, d) {
   return { subject, html: mailShell('NDA refusé · NDA declined', intro, 'Ouvrir / Open', d.link) };
 }
 
-module.exports = { signRequestEmail, countersignEmail, completedPartyEmail, completedInternalEmail, declinedEmail, esc };
+module.exports = { signRequestEmail, ccNoticeEmail, countersignEmail, completedPartyEmail, completedInternalEmail, declinedEmail, esc };

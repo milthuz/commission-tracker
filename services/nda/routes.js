@@ -117,6 +117,10 @@ function normalize(body) {
     effectiveDate: /^\d{4}-\d{2}-\d{2}$/.test(String(b.effectiveDate || '')) ? b.effectiveDate : '',
     team: str(b.team, 80),
     notes: str(b.notes, 2000),
+    // En copie : avis d'envoi SANS le lien de signature (il est personnel — quiconque l'ouvre
+    // peut signer pour l'entreprise) + copie signée à la fin.
+    cc: [...new Set((Array.isArray(b.cc) ? b.cc : String(b.cc || '').split(/[\s,;]+/))
+      .map((e) => str(e, 200).toLowerCase()).filter(Boolean))].slice(0, 10),
   };
   if (!data.company.legalName) errors.push('company.legalName');
   if (data.mode === 'template' && !data.company.address) errors.push('company.address');
@@ -125,6 +129,9 @@ function normalize(body) {
   if (!data.signer.lastName) errors.push('signer.lastName');
   if (!data.signer.title) errors.push('signer.title');
   if (!EMAIL_RE.test(data.signer.email)) errors.push('signer.email');
+  // Le signataire reçoit déjà le vrai courriel : inutile (et trompeur) de le garder en copie.
+  data.cc = data.cc.filter((e) => e !== data.signer.email);
+  if (data.cc.some((e) => !EMAIL_RE.test(e))) errors.push('cc');
   return { ok: errors.length === 0, data, errors };
 }
 
@@ -445,15 +452,38 @@ function registerNdaRoutes(app, deps) {
     const addr = (/<([^>]+)>/.exec(baseFrom) || [null, baseFrom])[1].trim();
     return addr ? { from: `"${name} (Cluster)" <${addr}>`, replyTo: email } : { replyTo: email };
   }
+  // Courriel à l'autre partie — le MÊME constructeur sert à l'envoi et à l'aperçu de la fiche.
+  const requestMail = (snap, link) => E.signRequestEmail(mailShell, {
+    lang: snap.nda.lang, firstName: snap.nda.signer.firstName, company: snap.nda.company.legalName,
+    senderName: snap.sender.name, link, expiresDays: TOKEN_DAYS,
+  });
+  const ccList = (nda) => (nda.cc || []).filter((e) => e !== String(nda.signer.email).toLowerCase());
+  const ccMail = (snap) => E.ccNoticeEmail(mailShell, {
+    lang: snap.nda.lang, company: snap.nda.company.legalName, senderName: snap.sender.name,
+    signerName: `${snap.nda.signer.firstName} ${snap.nda.signer.lastName}`.trim(), signerEmail: snap.nda.signer.email,
+  });
   async function mailParty(row, snap, rawToken) {
     const link = `${base()}/nda-sign?token=${encodeURIComponent(rawToken)}`;
-    const m = E.signRequestEmail(mailShell, {
-      lang: snap.nda.lang, firstName: snap.nda.signer.firstName, company: snap.nda.company.legalName,
-      senderName: snap.sender.name, link, expiresDays: TOKEN_DAYS,
-    });
+    const m = requestMail(snap, link);
     const r = await sendMail(snap.nda.signer.email, m.subject, m.html, senderOpts(snap.sender));
     return { link, mail: r };
   }
+
+  // Aperçu du courriel tel qu'il partira (même constructeur que l'envoi). Le lien affiché est
+  // un exemple inerte : le vrai jeton n'existe qu'au moment de l'envoi.
+  app.get('/api/nda/agreements/:id/email-preview', authenticateToken, async (req, res) => {
+    try {
+      const row = await loadForReq(req, res);
+      if (!row) return;
+      const snap = row.snapshot || { ...(await snapOf(row)), sender: { email: req.user.email, name: req.user.name || req.user.email } };
+      const m = requestMail(snap, `${base()}/nda-sign?token=apercu`);
+      const cc = ccList(snap.nda);
+      res.json({
+        from: senderOpts(snap.sender).from || null, to: snap.nda.signer.email, subject: m.subject, html: m.html,
+        cc, ccNotice: cc.length ? ccMail(snap) : null,
+      });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
 
   app.post('/api/nda/agreements/:id/send', authenticateToken, async (req, res) => {
     if (!(await requirePerm(req, res, PERM_SEND))) return;
@@ -482,7 +512,9 @@ function registerNdaRoutes(app, deps) {
       );
       if (!upd.rows[0]) return res.status(409).json({ error: 'Already sent' });
       const out = await mailParty(row, snap, tok.raw);
-      await event(row.id, 'sent', req.user.email, null, { to: row.email, emailed: out.mail.sent, reason: out.mail.reason || null });
+      const cc = ccList(snap.nda);
+      if (cc.length) { const m = ccMail(snap); await sendMail(cc.join(','), m.subject, m.html, senderOpts(snap.sender)); }
+      await event(row.id, 'sent', req.user.email, null, { to: row.email, cc, emailed: out.mail.sent, reason: out.mail.reason || null });
       await audit(row.id, 'sent', `NDA sent for signature: ${row.company} (${row.email})`, req.user.email);
       // Le lien n'est rendu que si le courriel n'est pas parti, pour le transmettre à la main.
       res.json({ ...(await shapeDetail(await loadNda(row.id))), emailed: out.mail.sent, link: out.mail.sent ? null : out.link });
@@ -567,7 +599,7 @@ function registerNdaRoutes(app, deps) {
       const attachment = [{ filename: `Cluster_NDA_${fileBase(row)}_signed.pdf`, content: pdf, contentType: 'application/pdf' }];
       const mp = E.completedPartyEmail(mailShell, { lang: snap.nda.lang, firstName: snap.nda.signer.firstName, company: row.company });
       const toParty = await sendMail(row.email, mp.subject, mp.html, { attachments: attachment, ...senderOpts(snap.sender) });
-      const internal = [...new Set([row.created_by, signer.email].filter(Boolean).map((e) => String(e).toLowerCase()))].filter((e) => e !== String(row.email).toLowerCase());
+      const internal = [...new Set([row.created_by, signer.email, ...ccList(snap.nda)].filter(Boolean).map((e) => String(e).toLowerCase()))].filter((e) => e !== String(row.email).toLowerCase());
       if (internal.length) {
         const mi = E.completedInternalEmail(mailShell, { company: row.company, link: `${base()}/nda?id=${row.id}` });
         await sendMail(internal.join(','), mi.subject, mi.html, { attachments: attachment });
