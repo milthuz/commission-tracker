@@ -37,15 +37,30 @@ function header(doc, f, { title, subtitle, small, fields, values }) {
   f.st.y = M + bandH + 12;
   doc.rect(M - 2, f.st.y, CW + 38, 1.6).fill(ORANGE);
   f.st.y += 14;
+  // Bande d'identification. Une valeur = texte, ou { main, sub } : le nom sur une ligne et le
+  // titre dessous, plus petit et gris (demande de David, 2026-10-19 : « Nicolas Auclair,
+  // Gestionnaire du… » coupé à deux lignes n'était pas beau). La bande grandit pour tout montrer
+  // (titre sur deux lignes au plus) plutôt que de couper avec « … ».
   const colW = CW / 4;
-  doc.rect(M, f.st.y, CW, 50).fill('#f4f4f4');
+  const w = colW - 16;
+  const cells = values.map((v) => (v && typeof v === 'object' ? v : { main: v || '', sub: '' }));
+  const subH = (c) => {
+    if (!c.sub) return 0;
+    doc.font('Helvetica').fontSize(7.5);
+    return Math.min(doc.heightOfString(c.sub, { width: w, lineGap: 0 }), 19) + 2;
+  };
+  const contentH = Math.max(...cells.map((c) => 11 + subH(c)));
+  const stripH = Math.max(50, 18 + contentH + 13);
+  doc.rect(M, f.st.y, CW, stripH).fill('#f4f4f4');
   fields.forEach((label, i) => {
     const x = M + i * colW + 8;
-    doc.font('Helvetica-Bold').fontSize(6.5).fillColor(ORANGE).text(label, x, f.st.y + 7, { width: colW - 16, lineBreak: false });
-    doc.font('Helvetica').fontSize(8.5).fillColor(TEXT).text(values[i] || '', x, f.st.y + 18, { width: colW - 16, height: 22, ellipsis: true, lineGap: 0 });
-    doc.save().moveTo(x, f.st.y + 42).lineTo(x + colW - 16, f.st.y + 42).lineWidth(0.6).strokeColor('#bdbdbd').stroke().restore();
+    const c = cells[i];
+    doc.font('Helvetica-Bold').fontSize(6.5).fillColor(ORANGE).text(label, x, f.st.y + 7, { width: w, lineBreak: false });
+    doc.font('Helvetica').fontSize(8.5).fillColor(TEXT).text(c.main, x, f.st.y + 18, { width: w, height: 11, ellipsis: true, lineGap: 0 });
+    if (c.sub) doc.font('Helvetica').fontSize(7.5).fillColor(MUTED).text(c.sub, x, f.st.y + 30, { width: w, height: 19, ellipsis: true, lineGap: 0 });
+    doc.save().moveTo(x, f.st.y + stripH - 8).lineTo(x + w, f.st.y + stripH - 8).lineWidth(0.6).strokeColor('#bdbdbd').stroke().restore();
   });
-  f.st.y += 66;
+  f.st.y += stripH + 16;
 }
 
 // Deux cartes de signature côte à côte : l'autre partie, puis Cluster.
@@ -105,7 +120,7 @@ async function renderNda(snap, { partySig = null, clusterSig = null } = {}) {
 
   header(doc, f, {
     title: L.docTypeShort, subtitle: c.legalName, small: L.confidential, fields: L.fields,
-    values: [c.legalName, `${signerName(n.signer)}${n.signer.title ? `, ${n.signer.title}` : ''}`, date, snap.ref || '—'],
+    values: [c.legalName, { main: signerName(n.signer), sub: n.signer.title }, date, snap.ref || '—'],
   });
 
   doc.font('Helvetica-Bold').fontSize(14).fillColor(INK).text(L.docType.toUpperCase(), M, f.st.y, { width: CW, align: 'center' });
@@ -174,7 +189,7 @@ async function renderUploadSignature(snap, { partySig = null, clusterSig = null 
 
   header(doc, f, {
     title: A.kind, subtitle: c.legalName, small: A.confidential, fields: A.fields,
-    values: [c.legalName, `${signerName(n.signer)}${n.signer.title ? `, ${n.signer.title}` : ''}`, K.longDate(snap.sentOn || today(), lang), snap.ref || '—'],
+    values: [c.legalName, { main: signerName(n.signer), sub: n.signer.title }, K.longDate(snap.sentOn || today(), lang), snap.ref || '—'],
   });
   f.para(A.intro(T.CLUSTER.legalName, c.legalName), { gap: 12 });
   for (const a of snap.attachments || []) {
