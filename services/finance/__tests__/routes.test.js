@@ -196,6 +196,15 @@ function prototype() {
   await seedRole(pool);
   perms2 = (await db.query("SELECT permissions FROM roles WHERE name = 'Finance (CFO)'")).rows[0].permissions;
   ok(!perms2.includes('finance:post_je'), 'une clé retirée par un admin n\'est jamais remise');
+  // Lot suivant (aides à la décision) : ajouté UNE fois, sans toucher aux clés retirées du lot précédent.
+  await db.query("DELETE FROM app_settings WHERE key = 'finance_role_perms_v3'");
+  await seedRole(pool);
+  perms2 = (await db.query("SELECT permissions FROM roles WHERE name = 'Finance (CFO)'")).rows[0].permissions;
+  ok(['finance:suggestions', 'finance:ai_budget', 'finance:driver_approve', 'finance:progress', 'finance:guide'].every((p) => perms2.includes(p)) && perms2.length === 14, 'lot v3 : les 5 nouvelles clés ajoutées');
+  ok(!perms2.includes('finance:post_je'), 'lot v3 : la clé retirée du lot v2 reste retirée');
+  await db.query(`UPDATE roles SET permissions = permissions - 'finance:guide' WHERE name = 'Finance (CFO)'`);
+  await seedRole(pool);
+  ok(!(await db.query("SELECT permissions FROM roles WHERE name = 'Finance (CFO)'")).rows[0].permissions.includes('finance:guide'), 'lot v3 : appliqué une seule fois');
 
   server.close();
   console.log(`✅ finance routes : ${n} vérifications`);

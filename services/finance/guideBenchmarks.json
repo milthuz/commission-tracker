@@ -1,0 +1,153 @@
+{
+  "version": "2026-10-20",
+  "note": "Repères PUBLICS livrés avec l'application. Chaque valeur a un organisme, une URL et une année (relevés le 2026-10-20 en lisant les pages citées). Les lignes sans valeur sont « à valider par la CFO » : aucune source citable n'a été trouvée. La CFO peut tout modifier depuis l'écran ; ses modifications ne sont jamais écrasées par ce fichier.",
+  "benchmarks": [
+    {
+      "id": "rule_of_40.aleph2026_median", "metric": "rule_of_40",
+      "labelEn": "Rule of 40 score, median B2B SaaS (CY2025)", "labelFr": "Score de la règle des 40, SaaS B2B médian (2025)",
+      "value": 25, "unit": "pts", "direction": "higher_better", "kind": "public", "useForFlags": true,
+      "sourceOrg": "Aleph x Benchmarkit, 2026 SaaS & AI Performance Benchmarks", "sourceUrl": "https://www.getaleph.com/answers/rule-of-40-saas-2026", "sourceYear": 2026, "sourceDate": "2026-06-01",
+      "note": "342 companies, 110 reporting the metric; revenue growth plus profit margin, EBITDA margin most common."
+    },
+    {
+      "id": "rule_of_40.aleph2026_top_quartile", "metric": "rule_of_40",
+      "labelEn": "Rule of 40 score, top quartile B2B SaaS (CY2025)", "labelFr": "Score de la règle des 40, quartile supérieur SaaS B2B (2025)",
+      "value": 43, "unit": "pts", "direction": "higher_better", "kind": "public", "useForFlags": false,
+      "sourceOrg": "Aleph x Benchmarkit, 2026 SaaS & AI Performance Benchmarks", "sourceUrl": "https://www.getaleph.com/answers/rule-of-40-saas-2026", "sourceYear": 2026, "sourceDate": "2026-06-01",
+      "note": "Aspirational level, shown but not used to flag areas to improve."
+    },
+    {
+      "id": "gross_margin.aleph2026_blended", "metric": "gross_margin",
+      "labelEn": "Gross margin on total revenue, median B2B SaaS (CY2025)", "labelFr": "Marge brute sur le revenu total, SaaS B2B médian (2025)",
+      "value": 76, "unit": "pct", "direction": "higher_better", "kind": "public", "useForFlags": true,
+      "sourceOrg": "Aleph x Benchmarkit, 2026 SaaS & AI Performance Benchmarks", "sourceUrl": "https://www.getaleph.com/answers/saas-gross-margin-2026", "sourceYear": 2026, "sourceDate": "2026-06-01",
+      "note": "Blended margin including services and other revenue. A POS company selling hardware and payments is structurally lower: read as a distance to pure SaaS, not as a target."
+    },
+    {
+      "id": "gross_margin.aleph2026_software", "metric": "gross_margin",
+      "labelEn": "Software gross margin, median B2B SaaS (CY2025)", "labelFr": "Marge brute logicielle, SaaS B2B médian (2025)",
+      "value": 80, "unit": "pct", "direction": "higher_better", "kind": "public", "useForFlags": false,
+      "sourceOrg": "Aleph x Benchmarkit, 2026 SaaS & AI Performance Benchmarks", "sourceUrl": "https://www.getaleph.com/answers/saas-gross-margin-2026", "sourceYear": 2026, "sourceDate": "2026-06-01",
+      "note": "Software revenue only; our model margin covers all revenue, so this one is informational."
+    },
+    {
+      "id": "gross_margin.toast_fy2024", "metric": "gross_margin",
+      "labelEn": "Gross margin, Toast Inc. (restaurant POS and payments), FY2024", "labelFr": "Marge brute, Toast Inc. (caisse restaurant et paiements), exercice 2024",
+      "value": 24, "unit": "pct", "direction": "higher_better", "kind": "reference", "useForFlags": false,
+      "sourceOrg": "Toast, Inc., Form 10-K FY2024 (SEC)", "sourceUrl": "https://www.sec.gov/Archives/edgar/data/1650164/000165016425000072/tost-20241231.htm", "sourceYear": 2025, "sourceDate": null,
+      "note": "Derived by Sales Hub from the filing: revenue 4,960 M USD less total costs of revenue 3,770 M USD, rounded. Payments revenue is reported gross, so it is not comparable with a net-revenue presentation."
+    },
+    {
+      "id": "arr_per_location.toast_fy2024", "metric": "arr_per_location",
+      "labelEn": "ARR per location, Toast Inc., end of 2024", "labelFr": "ARR par emplacement, Toast Inc., fin 2024",
+      "value": 12134, "unit": "usd_year", "direction": "higher_better", "kind": "reference", "useForFlags": false,
+      "sourceOrg": "Toast, Inc., Form 10-K FY2024 (SEC)", "sourceUrl": "https://www.sec.gov/Archives/edgar/data/1650164/000165016425000072/tost-20241231.htm", "sourceYear": 2025, "sourceDate": null,
+      "note": "Derived by Sales Hub: ARR 1,626 M USD divided by about 134,000 locations. Toast ARR includes a payments component; our figure is in CAD."
+    },
+    {
+      "id": "nrr.aleph2026_median", "metric": "nrr",
+      "labelEn": "Net revenue retention, median B2B SaaS (CY2025)", "labelFr": "Rétention nette des revenus, SaaS B2B médian (2025)",
+      "value": 102, "unit": "pct", "direction": "higher_better", "kind": "public", "useForFlags": true,
+      "sourceOrg": "Aleph x Benchmarkit, 2026 SaaS & AI Performance Benchmarks", "sourceUrl": "https://www.getaleph.com/answers/net-revenue-retention-saas-2026", "sourceYear": 2026, "sourceDate": "2026-06-01",
+      "note": "230 companies reporting. The model has no net retention figure (no expansion data): shown for reference."
+    },
+    {
+      "id": "grr.aleph2026_median", "metric": "grr",
+      "labelEn": "Gross revenue retention, median B2B SaaS (CY2025)", "labelFr": "Rétention brute des revenus, SaaS B2B médian (2025)",
+      "value": 84, "unit": "pct", "direction": "higher_better", "kind": "public", "useForFlags": true,
+      "sourceOrg": "Aleph x Benchmarkit, 2026 SaaS & AI Performance Benchmarks", "sourceUrl": "https://www.getaleph.com/answers/gross-revenue-retention-saas-2026", "sourceYear": 2026, "sourceDate": "2026-06-01",
+      "note": "226 companies reporting; down from 88 in 2024. Our annual logo churn is the closest model figure (1 minus churn)."
+    },
+    {
+      "id": "cac_payback_months.aleph2026_median", "metric": "cac_payback_months",
+      "labelEn": "Gross-margin-adjusted CAC payback, median B2B SaaS (CY2025)", "labelFr": "Récupération du coût d'acquisition (ajustée à la marge brute), SaaS B2B médian (2025)",
+      "value": 16, "unit": "months", "direction": "lower_better", "kind": "public", "useForFlags": true,
+      "sourceOrg": "Aleph x Benchmarkit, 2026 SaaS & AI Performance Benchmarks", "sourceUrl": "https://www.getaleph.com/answers/cac-payback-period-saas-2026", "sourceYear": 2026, "sourceDate": "2026-06-01",
+      "note": "198 companies reporting. S&M expense divided by (new ARR times gross margin), times 12."
+    },
+    {
+      "id": "ltv_cac.aleph2026_median", "metric": "ltv_cac",
+      "labelEn": "CLTV to CAC ratio, median B2B SaaS (CY2025)", "labelFr": "Ratio valeur à vie / coût d'acquisition, SaaS B2B médian (2025)",
+      "value": 4.1, "unit": "ratio", "direction": "higher_better", "kind": "public", "useForFlags": true,
+      "sourceOrg": "Aleph x Benchmarkit, 2026 SaaS & AI Performance Benchmarks", "sourceUrl": "https://www.getaleph.com/answers/cltv-cac-ratio-saas-2026", "sourceYear": 2026, "sourceDate": "2026-06-01",
+      "note": "146 companies reporting. CLTV = annual revenue per customer times gross margin divided by annual churn; CAC = total S&M divided by new customers."
+    },
+    {
+      "id": "rd_pct.aleph2026_median", "metric": "rd_pct",
+      "labelEn": "R&D as % of revenue, median B2B SaaS (CY2025)", "labelFr": "R&D en % des revenus, SaaS B2B médian (2025)",
+      "value": 27, "unit": "pct", "direction": "lower_better", "kind": "public", "useForFlags": true,
+      "sourceOrg": "Aleph x Benchmarkit, 2026 SaaS & AI Performance Benchmarks", "sourceUrl": "https://www.getaleph.com/answers/median-rd-percent-revenue-saas-2026", "sourceYear": 2026, "sourceDate": "2026-07-01",
+      "note": "192 companies reporting; quartiles 10 % to 40 %. Spending above a benchmark is a question to ask, not necessarily a problem."
+    },
+    {
+      "id": "sm_pct.aleph2026_median", "metric": "sm_pct",
+      "labelEn": "Sales & marketing as % of revenue, B2B SaaS (CY2025)", "labelFr": "Ventes et marketing en % des revenus, SaaS B2B (2025)",
+      "value": 35, "unit": "pct", "direction": "lower_better", "kind": "public", "useForFlags": true,
+      "sourceOrg": "Aleph x Benchmarkit, 2026 SaaS & AI Performance Benchmarks", "sourceUrl": "https://www.getaleph.com/answers/median-rd-percent-revenue-saas-2026", "sourceYear": 2026, "sourceDate": "2026-07-01",
+      "note": "Quoted on the R&D page of the report; the page does not label it explicitly as a median."
+    },
+    {
+      "id": "ga_pct.aleph2026", "metric": "ga_pct",
+      "labelEn": "G&A as % of revenue, B2B SaaS (CY2025)", "labelFr": "G&A en % des revenus, SaaS B2B (2025)",
+      "value": 17, "unit": "pct", "direction": "lower_better", "kind": "public", "useForFlags": true,
+      "sourceOrg": "Aleph x Benchmarkit, 2026 SaaS & AI Performance Benchmarks", "sourceUrl": "https://www.getaleph.com/answers/median-rd-percent-revenue-saas-2026", "sourceYear": 2026, "sourceDate": "2026-07-01",
+      "note": "Quoted on the R&D page of the report; the page does not label it explicitly as a median."
+    },
+    {
+      "id": "rd_pct.saascap2026_median", "metric": "rd_pct",
+      "labelEn": "R&D as % of ARR, median private B2B SaaS (2026 survey)", "labelFr": "R&D en % de l'ARR, SaaS B2B privé médian (sondage 2026)",
+      "value": 22, "unit": "pct", "direction": "lower_better", "kind": "public", "useForFlags": false,
+      "sourceOrg": "SaaS Capital, 2026 Spending Benchmarks for Private B2B SaaS Companies", "sourceUrl": "https://www.saas-capital.com/blog-posts/spending-benchmarks/", "sourceYear": 2026, "sourceDate": "2026-06-10",
+      "note": "Percent of ARR, not of revenue; over 1,000 respondents. Informational."
+    },
+    {
+      "id": "sm_pct.saascap2026", "metric": "sm_pct",
+      "labelEn": "Sales + marketing as % of ARR, private B2B SaaS (2026 survey)", "labelFr": "Ventes + marketing en % de l'ARR, SaaS B2B privé (sondage 2026)",
+      "value": 23, "unit": "pct", "direction": "lower_better", "kind": "public", "useForFlags": false,
+      "sourceOrg": "SaaS Capital, 2026 Spending Benchmarks for Private B2B SaaS Companies", "sourceUrl": "https://www.saas-capital.com/blog-posts/spending-benchmarks/", "sourceYear": 2026, "sourceDate": "2026-06-10",
+      "note": "Sum of two separate medians (sales 15 %, marketing 8 %); medians do not strictly add. Percent of ARR. Informational."
+    },
+    {
+      "id": "ga_pct.saascap2026_median", "metric": "ga_pct",
+      "labelEn": "G&A as % of ARR, median private B2B SaaS (2026 survey)", "labelFr": "G&A en % de l'ARR, SaaS B2B privé médian (sondage 2026)",
+      "value": 15, "unit": "pct", "direction": "lower_better", "kind": "public", "useForFlags": false,
+      "sourceOrg": "SaaS Capital, 2026 Spending Benchmarks for Private B2B SaaS Companies", "sourceUrl": "https://www.saas-capital.com/blog-posts/spending-benchmarks/", "sourceYear": 2026, "sourceDate": "2026-06-10",
+      "note": "Percent of ARR, not of revenue. Informational."
+    },
+    {
+      "id": "revenue_growth.to_validate", "metric": "revenue_growth",
+      "labelEn": "Revenue growth, POS / payments peers", "labelFr": "Croissance des revenus, pairs caisse / paiements",
+      "value": null, "unit": "pct", "direction": "higher_better", "kind": "public", "useForFlags": true,
+      "sourceOrg": null, "sourceUrl": null, "sourceYear": null, "sourceDate": null,
+      "note": "No citable source found. To be validated by the CFO."
+    },
+    {
+      "id": "ebitda_margin.to_validate", "metric": "ebitda_margin",
+      "labelEn": "EBITDA margin, POS / payments peers", "labelFr": "Marge du BAIIA, pairs caisse / paiements",
+      "value": null, "unit": "pct", "direction": "higher_better", "kind": "public", "useForFlags": true,
+      "sourceOrg": null, "sourceUrl": null, "sourceYear": null, "sourceDate": null,
+      "note": "No citable source found. To be validated by the CFO."
+    },
+    {
+      "id": "recurring_share.to_validate", "metric": "recurring_share",
+      "labelEn": "Recurring revenue as % of total revenue, POS / payments", "labelFr": "Revenus récurrents en % du total, caisse / paiements",
+      "value": null, "unit": "pct", "direction": "higher_better", "kind": "public", "useForFlags": true,
+      "sourceOrg": null, "sourceUrl": null, "sourceYear": null, "sourceDate": null,
+      "note": "No citable source found. To be validated by the CFO."
+    },
+    {
+      "id": "churn_annual.to_validate", "metric": "churn_annual",
+      "labelEn": "Annual logo churn, restaurant POS", "labelFr": "Attrition annuelle des clients, caisse de restaurant",
+      "value": null, "unit": "pct", "direction": "lower_better", "kind": "public", "useForFlags": true,
+      "sourceOrg": null, "sourceUrl": null, "sourceYear": null, "sourceDate": null,
+      "note": "No citable source found for restaurant POS. To be validated by the CFO."
+    },
+    {
+      "id": "arpu_monthly.to_validate", "metric": "arpu_monthly",
+      "labelEn": "Monthly ARPU per location, restaurant POS", "labelFr": "ARPU mensuel par emplacement, caisse de restaurant",
+      "value": null, "unit": "cad", "direction": "higher_better", "kind": "public", "useForFlags": true,
+      "sourceOrg": null, "sourceUrl": null, "sourceYear": null, "sourceDate": null,
+      "note": "No citable source found. To be validated by the CFO."
+    }
+  ]
+}

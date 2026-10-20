@@ -119,23 +119,29 @@ async function seedRole(pool) {
      VALUES ('Finance (CFO)', 'Finance section: budgets, drivers, payroll and OPEX; approves and unlocks budgets',
              $1::jsonb, false)
      ON CONFLICT (name) DO NOTHING`,
-    [JSON.stringify([PERM_VIEW, PERM_EDIT, PERM_PAYROLL, PERM_APPROVE, ...LATER_PERMS])]);
-  // Rôle semé avant les phases suivantes : on lui ajoute UNE fois les nouvelles clés (repère dans
-  // app_settings), sans jamais remettre une clé qu'un admin aurait retirée ensuite.
-  const mark = await pool.query("SELECT 1 FROM app_settings WHERE key = 'finance_role_perms_v2'");
-  if (mark.rows[0]) return;
-  for (const p of LATER_PERMS) {
-    await pool.query(
-      `UPDATE roles SET permissions = permissions || $1::jsonb WHERE name = 'Finance (CFO)' AND NOT (permissions ? $2)`,
-      [JSON.stringify([p]), p]);
+    [JSON.stringify([PERM_VIEW, PERM_EDIT, PERM_PAYROLL, PERM_APPROVE, ...PERM_BATCHES.flatMap((b) => b.perms)])]);
+  // Rôle semé avant une phase : on lui ajoute UNE fois les clés de cette phase (repère dans
+  // app_settings, un par lot), sans jamais remettre une clé qu'un admin aurait retirée ensuite.
+  for (const b of PERM_BATCHES) {
+    const mark = await pool.query('SELECT 1 FROM app_settings WHERE key = $1', [b.marker]);
+    if (mark.rows[0]) continue;
+    for (const p of b.perms) {
+      await pool.query(
+        `UPDATE roles SET permissions = permissions || $1::jsonb WHERE name = 'Finance (CFO)' AND NOT (permissions ? $2)`,
+        [JSON.stringify([p]), p]);
+    }
+    await pool.query("INSERT INTO app_settings (key, value, updated_at) VALUES ($1, 'true'::jsonb, NOW()) ON CONFLICT (key) DO NOTHING", [b.marker]);
   }
-  await pool.query("INSERT INTO app_settings (key, value, updated_at) VALUES ('finance_role_perms_v2', 'true'::jsonb, NOW()) ON CONFLICT (key) DO NOTHING");
 }
 
-// Clés des phases suivantes (catalogue dans server.js), données au rôle « Finance (CFO) ».
-const LATER_PERMS = [
-  'finance:entity_budgets', 'finance:dept_budgets', 'finance:kpi', 'finance:forecasts', 'finance:cash',
-  'finance:investment', 'finance:deferred', 'finance:amortization', 'finance:post_je',
+// Clés des phases suivantes (catalogue dans server.js), données au rôle « Finance (CFO) ». Un lot
+// par phase : le repère `marker` garantit qu'un lot n'est appliqué qu'une fois par base.
+const PERM_BATCHES = [
+  { marker: 'finance_role_perms_v2', perms: [
+    'finance:entity_budgets', 'finance:dept_budgets', 'finance:kpi', 'finance:forecasts', 'finance:cash',
+    'finance:investment', 'finance:deferred', 'finance:amortization', 'finance:post_je'] },
+  { marker: 'finance_role_perms_v3', perms: [
+    'finance:suggestions', 'finance:ai_budget', 'finance:driver_approve', 'finance:progress', 'finance:guide'] },
 ];
 
 // ---------------------------------------------------------------------------- lecture des lignes
@@ -548,7 +554,7 @@ function registerFinanceRoutes(app, deps) {
 }
 
 // Ordre de chargement des sous-modules (fichiers services/finance/<nom>.js, export `register`).
-const SUBMODULES = ['entityBudgets', 'kpi', 'forecasts', 'managers', 'consolidatedImport'];
+const SUBMODULES = ['entityBudgets', 'kpi', 'forecasts', 'managers', 'consolidatedImport', 'suggestions', 'aiBudget', 'driverApprovals', 'guide'];
 
 // Trousse partagée par les sous-modules. Tout ce qu'un écran de la section Finance doit faire de
 // la même façon que la phase 1 passe par ici.

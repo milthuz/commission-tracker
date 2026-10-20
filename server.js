@@ -312,6 +312,12 @@ const PERMISSION_CATALOG = [
   { key: 'finance:amortization',       label: 'Finance — terminal amortization (lots, net book value)', category: 'Finance' },
   // Écrire dans la comptabilité de l'entreprise : clé distincte de la préparation.
   { key: 'finance:post_je',            label: 'Finance — post journal entries to Zoho Books (deferred revenue, amortization)', category: 'Finance' },
+  // Aides à la décision du budget (2026-10-20, demandes de la CFO). Chacune sa clé.
+  { key: 'finance:suggestions',        label: 'Finance — driver forecast suggestions based on history (view, apply or keep your own value)', category: 'Finance' },
+  { key: 'finance:ai_budget',          label: 'Finance — generate an AI budget draft (sends aggregated figures — never names or salaries — to the AI provider; review before applying)', category: 'Finance' },
+  { key: 'finance:driver_approve',     label: 'Finance — approve individual drivers and OPEX lines (the budget progress bar counts them)', category: 'Finance' },
+  { key: 'finance:progress',           label: 'Finance — budget progress bar and checklist (what is still to feed in, which drivers still need approval)', category: 'Finance' },
+  { key: 'finance:guide',              label: 'Finance — question guide for managers, cost-saving prompts, Rule of 40 and SaaS benchmarks', category: 'Finance' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -4064,6 +4070,8 @@ try {
       getAdminBooksAuth, fetchBillingSubs, subMonthlyAmount, MRR_STATUSES, ACTIVE_STATUSES,
       ZOHO_BILLING_ORG_IDS, ZOHO_BILLING_ORG_NAMES,
       acquireSaasScanLock, saasScanShouldStop, releaseSaasScanLock,
+      // Brouillon de budget par IA : même client et même modèle que Sofia (modifiable par l'environnement).
+      getAnthropic, anthropicModel: process.env.FINANCE_AI_MODEL || 'claude-opus-4-8',
     }),
   });
 } catch (e) {
