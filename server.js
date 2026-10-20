@@ -232,7 +232,7 @@ const PERMISSION_CATALOG = [
   { key: 'opener:routes',              label: 'Design opener routes: scan a zone for restaurants (Google), build, order and publish a route to an opener', category: 'Opener' },
   { key: 'opener:franchises',          label: 'Opener franchises: mark a brand as a franchise (kept off routes) or "visit anyway"', category: 'Opener' },
   { key: 'opener:reports',             label: 'Opener daily report: choose recipients, send time and openers; preview and send now', category: 'Opener' },
-  { key: 'opener:checkin',             label: 'Free check-in: check in at any restaurant, any time, without a route (all employees); create leads from it', category: 'Opener' },
+  { key: 'opener:checkin',             label: 'Free check-in: check in at any restaurant, any time, without a route; create leads from it — GIVEN AUTOMATICALLY to everyone who has a role', category: 'Opener' },
   { key: 'opener:field',               label: 'Opener in the field: see my route of the day, restaurant cards, check-ins, create leads, day summary', category: 'Opener' },
 
   // Sofia (in-app assistant) — CRM tools. Split read/write on purpose: the write key is the
@@ -323,6 +323,11 @@ const PERMISSION_CATALOG = [
   { key: 'finance:guide',              label: 'Finance — question guide for managers, cost-saving prompts, Rule of 40 and SaaS benchmarks', category: 'Finance' },
 ];
 
+// Permissions de BASE : données à toute personne qui a au moins un rôle, c.-à-d. à tous ceux qui
+// ont accès à Sales Hub, rôles présents ET futurs (David, 2026-10-20 : « tous les gens de Sales Hub
+// devraient avoir le check-in libre »). Pas aux comptes sans rôle (écran d'accueil NoRoleNotice).
+const BASE_PERMISSIONS = ['opener:checkin'];
+
 // Returns the effective permission set for a user (union of all their roles)
 async function getUserPermissions(email) {
   if (!email) return new Set();
@@ -338,6 +343,7 @@ async function getUserPermissions(email) {
       const perms = Array.isArray(row.permissions) ? row.permissions : [];
       for (const p of perms) set.add(p);
     }
+    if (result.rows.length) for (const p of BASE_PERMISSIONS) set.add(p);
     return set;
   } catch {
     return new Set();
