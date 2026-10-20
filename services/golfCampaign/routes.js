@@ -94,7 +94,7 @@ const date = (v) => {
   return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
 };
 
-function registerGolfCampaignRoutes(app, { authenticateToken, requirePerm, pool }) {
+function registerGolfCampaignRoutes(app, { authenticateToken, requirePerm, hasPerm, pool }) {
   let ready = null;
   const schema = () => (ready = ready || (async () => {
     await ensureSchema(pool);
@@ -112,6 +112,56 @@ function registerGolfCampaignRoutes(app, { authenticateToken, requirePerm, pool 
   };
   const use = [authenticateToken, guard(PERM_USE)];
   const manage = [authenticateToken, guard(PERM_MANAGE)];
+
+  // Personnes à qui on peut confier des appels : détenteurs de la permission (via un rôle, ou
+  // jokers « * ») + administrateurs. Chaque requête est isolée : une table absente n'invalide pas l'autre.
+  const listAssignees = async () => {
+    const people = new Map();
+    const add = (email, name) => {
+      const e = String(email || '').trim().toLowerCase();
+      if (!e) return;
+      if (!people.has(e) || (name && !people.get(e))) people.set(e, name || null);
+    };
+    try {
+      const r = await pool.query(
+        `SELECT DISTINCT LOWER(ur.user_email) AS email FROM user_roles ur JOIN roles r ON r.id = ur.role_id
+          WHERE r.permissions @> $1::jsonb OR r.permissions @> '["*"]'::jsonb`, [JSON.stringify([PERM_USE])]);
+      r.rows.forEach((x) => add(x.email));
+    } catch { /* pas de rôles : on continue */ }
+    try { (await pool.query('SELECT email FROM user_tokens WHERE is_admin = TRUE')).rows.forEach((x) => add(x.email)); } catch { /* idem */ }
+    const names = new Map();
+    for (const tbl of ['user_tokens', 'local_users']) {
+      try {
+        (await pool.query(`SELECT LOWER(email) AS email, display_name FROM ${tbl} WHERE display_name IS NOT NULL`)).rows
+          .forEach((x) => { if (x.display_name) names.set(x.email, x.display_name); });
+      } catch { /* idem */ }
+    }
+    return [...people.keys()].sort().map((email) => ({ email, name: names.get(email) || null }));
+  };
+  // Confier un club à quelqu'un d'autre exige « manage » ; se l'attribuer ou se le retirer, « use » suffit.
+  const mayAssign = async (req, to) => {
+    const me = String(req.user.email || '').toLowerCase();
+    if (to === null || to === me) return true;
+    return req.user.isAdmin === true || (hasPerm ? await hasPerm(req, PERM_MANAGE) : false);
+  };
+
+  app.get('/api/golf-campaign/assignees', ...use, async (req, res) => {
+    try { res.json({ people: await listAssignees() }); } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Attribution en lot : { ids: [...], assigned_to: courriel | null }.
+  app.post('/api/golf-campaign/assign', ...use, async (req, res) => {
+    try {
+      const ids = Array.isArray(req.body.ids) ? req.body.ids.filter((x) => typeof x === 'string' && /^[0-9a-f-]{36}$/i.test(x)).slice(0, 500) : [];
+      const to = req.body.assigned_to ? String(req.body.assigned_to).trim().toLowerCase() : null;
+      if (!ids.length) return res.status(400).json({ error: 'invalid', fields: ['ids'] });
+      if (to && !(await listAssignees()).some((p) => p.email === to)) return res.status(400).json({ error: 'unknown_assignee' });
+      if (!(await mayAssign(req, to))) return res.status(403).json({ error: 'Permission required: ' + PERM_MANAGE });
+      const r = await pool.query(
+        'UPDATE golf_clubs SET assigned_to = $1, updated_at = NOW() WHERE id = ANY($2::uuid[]) RETURNING *', [to, ids]);
+      res.json({ clubs: r.rows });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
 
   app.get('/api/golf-campaign/clubs', ...use, async (req, res) => {
     try {
@@ -150,8 +200,14 @@ function registerGolfCampaignRoutes(app, { authenticateToken, requirePerm, pool 
           add(k, d);
         }
       }
-      for (const [k, max] of [['contact_name', 200], ['email', 200], ['phone', 60], ['address', 300], ['notes', 5000], ['assigned_to', 200]]) {
+      for (const [k, max] of [['contact_name', 200], ['email', 200], ['phone', 60], ['address', 300], ['notes', 5000]]) {
         if (b[k] !== undefined) add(k, text(b[k], max));
+      }
+      if (b.assigned_to !== undefined) {
+        const to = b.assigned_to ? String(b.assigned_to).trim().toLowerCase() : null;
+        if (to && !(await listAssignees()).some((p) => p.email === to)) return res.status(400).json({ error: 'unknown_assignee' });
+        if (!(await mayAssign(req, to))) return res.status(403).json({ error: 'Permission required: ' + PERM_MANAGE });
+        add('assigned_to', to);
       }
       if (b.answers !== undefined) {
         if (typeof b.answers !== 'object' || b.answers === null || Array.isArray(b.answers)) {
