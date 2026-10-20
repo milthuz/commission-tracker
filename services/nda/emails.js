@@ -14,7 +14,7 @@ const SECOND = (html) => `<div style="color:#64748b">${html}</div>`;
 // Deux blocs, celui de la langue de l'entente en premier.
 const both = (lang, fr, en) => (lang === 'en' ? `<div lang="en">${en}</div>${SEP}${SECOND(`<div lang="fr">${fr}</div>`)}` : `<div lang="fr">${fr}</div>${SEP}${SECOND(`<div lang="en">${en}</div>`)}`);
 // « Inc. » en fin de phrase : la phrase fournit le point.
-const endName = (s) => String(s || '').replace(/.$/, '');
+const endName = (s) => String(s || '').replace(/\.$/, '');
 const pair = (lang, fr, en) => (lang === 'en' ? `${en} / ${fr}` : `${fr} / ${en}`);
 
 // À l'autre partie. d = { lang, firstName, company, senderName, purpose, link, expiresDays }
