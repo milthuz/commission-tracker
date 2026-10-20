@@ -548,7 +548,7 @@ function registerFinanceRoutes(app, deps) {
 }
 
 // Ordre de chargement des sous-modules (fichiers services/finance/<nom>.js, export `register`).
-const SUBMODULES = ['entityBudgets', 'kpi', 'forecasts', 'managers'];
+const SUBMODULES = ['entityBudgets', 'kpi', 'forecasts', 'managers', 'consolidatedImport'];
 
 // Trousse partagée par les sous-modules. Tout ce qu'un écran de la section Finance doit faire de
 // la même façon que la phase 1 passe par ici.
