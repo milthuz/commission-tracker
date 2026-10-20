@@ -301,6 +301,17 @@ const PERMISSION_CATALOG = [
   { key: 'finance:edit',               label: 'Finance — edit drivers, OPEX lines and the travel budget (draft budgets only)', category: 'Finance' },
   { key: 'finance:payroll',            label: 'Finance — see and edit individual salaries and contractors (names, amounts; add or remove people)', category: 'Finance' },
   { key: 'finance:approve',            label: 'Finance — approve (lock) and unlock a budget', category: 'Finance' },
+  // Phases suivantes : une clé par écran (lecture ; l'écriture demande aussi finance:edit).
+  { key: 'finance:entity_budgets',     label: 'Finance — Cluster and Xperio budgets (standalone P&L Sep-26 → Dec-27, GL drivers)', category: 'Finance' },
+  { key: 'finance:dept_budgets',       label: 'Finance — departmental budgets (Sales, R&D, Delivery & Ops, Accounting)', category: 'Finance' },
+  { key: 'finance:kpi',                label: 'Finance — KPI tab: month-over-month budget vs actual, trailing 12 months (Zoho Billing and Books actuals)', category: 'Finance' },
+  { key: 'finance:forecasts',          label: 'Finance — sales forecast (BvA) and payments forecast', category: 'Finance' },
+  { key: 'finance:cash',               label: 'Finance — Holdco 13-week cash forecast (bank balances)', category: 'Finance' },
+  { key: 'finance:investment',         label: 'Finance — V2 and Payments resource investment (named people also need finance:payroll)', category: 'Finance' },
+  { key: 'finance:deferred',           label: 'Finance — deferred revenue manager (contracts, recognition schedule)', category: 'Finance' },
+  { key: 'finance:amortization',       label: 'Finance — terminal amortization (lots, net book value)', category: 'Finance' },
+  // Écrire dans la comptabilité de l'entreprise : clé distincte de la préparation.
+  { key: 'finance:post_je',            label: 'Finance — post journal entries to Zoho Books (deferred revenue, amortization)', category: 'Finance' },
 ];
 
 // Returns the effective permission set for a user (union of all their roles)
@@ -4047,6 +4058,13 @@ require('./services/revenueModel/routes').registerRevenueModelRoutes(app, {
 try {
   require('./services/finance/routes').registerFinanceRoutes(app, {
     authenticateToken, requirePerm, hasPerm, pool, logActivity,
+    // Lus au moment de l'appel (définis plus bas dans ce fichier) : Zoho Books/Billing et le
+    // verrou partagé du jeton Zoho, pour les données réelles des KPI et les écritures de journal.
+    late: () => ({
+      getAdminBooksAuth, fetchBillingSubs, subMonthlyAmount, MRR_STATUSES, ACTIVE_STATUSES,
+      ZOHO_BILLING_ORG_IDS, ZOHO_BILLING_ORG_NAMES,
+      acquireSaasScanLock, saasScanShouldStop, releaseSaasScanLock,
+    }),
   });
 } catch (e) {
   console.error('finance module not loaded:', e.message);
@@ -4162,6 +4180,13 @@ app.get('/api/auth/zoho', (req, res) => {
   // silently redirect returning users who already granted access. First-time users (and
   // an explicit reconnect to repair a broken refresh_token) still get the consent screen.
   const forceConsent = req.query.reconsent === '1' || req.query.prompt === 'consent';
+  // Section Finance (2026-10-19) : rapports P&L, plan comptable et écritures de journal, comptes
+  // bancaires. Demandés SEULEMENT sur une reconnexion forcée (le geste de l'admin qui relie le
+  // compte de service) : une connexion ordinaire ne redemande rien, sinon chaque rep reverrait
+  // l'écran de consentement. Toujours inclus dans une reconnexion, pour qu'elle ne les retire pas.
+  const financeScopes = forceConsent
+    ? ',ZohoBooks.reports.READ,ZohoBooks.accountants.READ,ZohoBooks.accountants.CREATE,ZohoBooks.banking.READ,ZohoBooks.settings.READ'
+    : '';
 
   const authUrl = `${ZOHO_CONFIG.accounts_url}/oauth/v2/auth?` +
     // ⚠️ Zoho ne sait PAS ajouter une portee a une subvention existante : toute portee nouvelle
@@ -4170,7 +4195,7 @@ app.get('/api/auth/zoho', (req, res) => {
     // faudrait refaire consentir plus tard. READ accompagne CREATE : creer une note de credit
     // sans pouvoir la relire empecherait de verifier ce qu'on vient d'ecrire.
     // Les subventions DEJA accordees ne changent pas ; seul un nouveau consentement la porte.
-    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE,ZohoBooks.estimates.READ,ZohoBooks.contacts.READ,ZohoBooks.creditnotes.CREATE,ZohoBooks.creditnotes.READ,ZohoBooks.creditnotes.UPDATE,ZohoSubscriptions.plans.READ,ZohoSubscriptions.products.READ,ZohoSubscriptions.subscriptions.READ,ZohoSubscriptions.subscriptions.UPDATE,ZohoSubscriptions.subscriptions.DELETE,AaaServer.profile.READ` +
+    `scope=ZohoBooks.invoices.READ,ZohoBooks.invoices.CREATE,ZohoBooks.invoices.UPDATE,ZohoBooks.estimates.READ,ZohoBooks.contacts.READ,ZohoBooks.creditnotes.CREATE,ZohoBooks.creditnotes.READ,ZohoBooks.creditnotes.UPDATE,ZohoSubscriptions.plans.READ,ZohoSubscriptions.products.READ,ZohoSubscriptions.subscriptions.READ,ZohoSubscriptions.subscriptions.UPDATE,ZohoSubscriptions.subscriptions.DELETE,AaaServer.profile.READ${financeScopes}` +
     `&client_id=${ZOHO_CONFIG.client_id}` +
     `&response_type=code` +
     `&redirect_uri=${ZOHO_CONFIG.redirect_uri}` +
@@ -11098,7 +11123,7 @@ WHERE THINGS ARE (the menu, redesigned in October 2026 — use these names, the 
   • Compensation / Rémunération: Points tracker / Suivi des points, Commission Report / Rapport de commissions, Merchant credits / Crédits marchands.
   • Operations / Opérations: Opener (Campaign & routes, Field app, Cluster locations), SaaS increase / Hausse SaaS (Campaign, Reference), The Pass / La Passe, Partners and resellers / Partenaires et revendeurs (Opportunity queue, Manage partners, Partner users, Partner payouts, Reseller Activation).
   • Management / Direction: Processing Revenue / Revenus de paiements, Tech support / Soutien technique, Hiring / Embauches.
-  • Finance (CFO only — finance permissions): Master Budget / Budget maître, Revenue Drivers / Drivers de revenus, COGS Drivers / Drivers de COGS, Salary & Contractors / Salaires et contractuels (separate payroll permission), OPEX.
+  • Finance (CFO only — finance permissions, one permission per screen): Budgets / Budgets (Master Budget / Budget maître, Revenue Drivers / Drivers de revenus, COGS Drivers / Drivers de COGS, Salary & Contractors / Salaires et contractuels — separate payroll permission, OPEX, Cluster Budget, Xperio Budget, Departmental Budgets / Budgets départementaux), KPI, Forecasts / Prévisions (Sales Forecast · BvA, Payments Forecast, Holdco Cash Forecast / Trésorerie Holdco), Resource Investment / Investissement en ressources (V2, Payments), Managers / Gestionnaires (Deferred Revenue / Revenus reportés, Terminal Amortization / Amortissement des terminaux, Zoho Books accounts).
   • Administration: opens a hub of eight zones (People and access, Sales team and compensation, Commissions and payroll, Partners and channels, Catalogue and pricing, Leads and prospecting, Customers and revenue, Data and integrations), with a search box and a "Needs attention / À corriger" bar.
 - Ctrl K (⌘K on Mac) or the search field at the top of the menu jumps to any screen by name.
 - Each user only sees the entries their permissions allow; never tell someone to click an entry they may not have.
@@ -11110,7 +11135,7 @@ THE APP'S SECTIONS (what each one does):
 - Commission Tracker: monthly sales points per rep. Points come from CRM sold deals and Zentact merchant activations. Each rep has a monthly quota (default 15 points). Reps are grouped into Teams, each with a progress bar; you see your own team.
 - Commission Report: a rep's commissions month by month for a year. Months show EARNED commission grouped by "Unlock Month" (when the commission becomes payable). The "Pay stub / Bulletin de paie" button shows the pay stub for the selected month: invoices paid, bonuses, total. A "Total Compensation" banner shows base salary accrued by pay period (26 bi-weekly periods/year) + YTD commission + annual bonus + signup payments.
 - Reseller Activation: POS activations attributed to external resellers.
-- Finance (Budget maître etc.): the CFO's driver-based FY2027 consolidated budget, replacing her Excel workbooks. Master Budget = the budgeted income statement (no editable cells; each line expands into its accounts, each account opens the page that calculates it). Revenue Drivers and COGS Drivers = yellow editable assumptions per month (rooftop adds and churn, ARPU growth, Adyen target, hardware, service, licence, COGS percentages), "⇥" copies January across the year. Salary & Contractors = burden %, global raise and month, per-person salary/raise/burden, add or remove people with a start and end month (needs the payroll permission). OPEX = FY2027 editable lines with a compounded monthly increase, plus a travel budget; FY2026 and FY2028 are read-only. Edits save automatically. "Approve (CFO)" LOCKS the budget for everyone until it is unlocked. Never quote individual salaries to someone who does not have the payroll permission.
+- Finance (Budget maître etc.): the CFO's driver-based FY2027 consolidated budget, replacing her Excel workbooks. Master Budget = the budgeted income statement (no editable cells; each line expands into its accounts, each account opens the page that calculates it). Revenue Drivers and COGS Drivers = yellow editable assumptions per month (rooftop adds and churn, ARPU growth, Adyen target, hardware, service, licence, COGS percentages), "⇥" copies January across the year. Salary & Contractors = burden %, global raise and month, per-person salary/raise/burden, add or remove people with a start and end month (needs the payroll permission). OPEX = FY2027 editable lines with a compounded monthly increase, plus a travel budget; FY2026 and FY2028 are read-only. Edits save automatically. "Approve (CFO)" LOCKS the budget for everyone until it is unlocked. Never quote individual salaries to someone who does not have the payroll permission. Other screens: Cluster/Xperio budgets (standalone P&L Sep-26→Dec-27 with editable GL drivers, Excel import with a preview before anything is saved); KPI = month-over-month budget vs actual for the trailing 12 months (rooftops, churn, MRR, ARPU, cost of acquisition) built from Zoho Billing and Zoho Books, with manual overrides; Sales and Payments forecasts, Holdco 13-week cash forecast and Resource Investment are filled by Excel import or manual entry; Deferred Revenue and Terminal Amortization compute the monthly journal entry and can post it to Zoho Books (separate "post journal entries" permission, once per month, preview first). Zoho-based screens need the admin to reconnect Zoho Books once; until then they say so and accept manual entry.
 - Processing Revenue (Revenus de paiements): monthly payment-processing revenue per rep/reseller (transaction profit + other revenue).
 - Resources: the shared sales-document library — search, browse and download guides and templates. Two featured tiles here open the Hardware Overview and Services & Pricing Guide (see below). The folder "Guides Sales Hub" holds the official bilingual procedure guides (PDF, FR then EN): "Crédits processeur marchand — Guide du représentant" and "Pistes et rendez-vous en ligne — Guide du représentant". When a user asks how one of these procedures works, answer from what you know below AND point them to that guide.
 - Hardware Overview: the full Cluster hardware catalog (POS terminals, printers, payment devices, displays, networking, peripherals) — searchable, filterable by Kaizen(V2)/V1 compatibility and lifecycle status, with a compare tool (up to 4 side by side) and one-click SKU copy.

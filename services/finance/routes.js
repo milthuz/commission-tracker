@@ -119,8 +119,24 @@ async function seedRole(pool) {
      VALUES ('Finance (CFO)', 'Finance section: budgets, drivers, payroll and OPEX; approves and unlocks budgets',
              $1::jsonb, false)
      ON CONFLICT (name) DO NOTHING`,
-    [JSON.stringify([PERM_VIEW, PERM_EDIT, PERM_PAYROLL, PERM_APPROVE])]);
+    [JSON.stringify([PERM_VIEW, PERM_EDIT, PERM_PAYROLL, PERM_APPROVE, ...LATER_PERMS])]);
+  // Rôle semé avant les phases suivantes : on lui ajoute UNE fois les nouvelles clés (repère dans
+  // app_settings), sans jamais remettre une clé qu'un admin aurait retirée ensuite.
+  const mark = await pool.query("SELECT 1 FROM app_settings WHERE key = 'finance_role_perms_v2'");
+  if (mark.rows[0]) return;
+  for (const p of LATER_PERMS) {
+    await pool.query(
+      `UPDATE roles SET permissions = permissions || $1::jsonb WHERE name = 'Finance (CFO)' AND NOT (permissions ? $2)`,
+      [JSON.stringify([p]), p]);
+  }
+  await pool.query("INSERT INTO app_settings (key, value, updated_at) VALUES ('finance_role_perms_v2', 'true'::jsonb, NOW()) ON CONFLICT (key) DO NOTHING");
 }
+
+// Clés des phases suivantes (catalogue dans server.js), données au rôle « Finance (CFO) ».
+const LATER_PERMS = [
+  'finance:entity_budgets', 'finance:dept_budgets', 'finance:kpi', 'finance:forecasts', 'finance:cash',
+  'finance:investment', 'finance:deferred', 'finance:amortization', 'finance:post_je',
+];
 
 // ---------------------------------------------------------------------------- lecture des lignes
 const n = (v) => (v == null ? null : Number(v));
@@ -264,8 +280,8 @@ function registerFinanceRoutes(app, deps) {
   }
 
   // Budget modifiable ? Sinon la réponse est déjà envoyée.
-  async function writable(req, res, extraPerm) {
-    if (!(await guard(req, res, PERM_EDIT))) return null;
+  async function writable(req, res, extraPerm, basePerm = PERM_EDIT) {
+    if (!(await guard(req, res, basePerm))) return null;
     if (extraPerm && !(await requirePerm(req, res, extraPerm))) return null;
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) { res.status(400).json({ error: 'bad_id' }); return null; }
@@ -514,7 +530,73 @@ function registerFinanceRoutes(app, deps) {
     });
   }
 
-  return { ensureReady: schema };
+  // ------------------------------------------------------------------------ sous-modules
+  // Phases suivantes : chaque écran a son fichier, qui reçoit la même trousse (garde d'accès,
+  // verrou d'approbation, journal, Zoho, lecture d'Excel). Un sous-module absent ou cassé ne fait
+  // pas tomber les autres ni le serveur.
+  const kit = makeKit({ app, deps, schema, guard, writable, loadBudget, touch, can, PERMS: { PERM_VIEW, PERM_EDIT, PERM_PAYROLL, PERM_APPROVE } });
+  for (const name of SUBMODULES) {
+    try {
+      require(`./${name}`).register(app, kit);
+    } catch (e) {
+      if (e && e.code === 'MODULE_NOT_FOUND' && String(e.message).includes(`${name}'`)) continue;
+      console.error(`finance submodule ${name} not loaded:`, e.message);
+    }
+  }
+
+  return { ensureReady: schema, kit };
+}
+
+// Ordre de chargement des sous-modules (fichiers services/finance/<nom>.js, export `register`).
+const SUBMODULES = ['entityBudgets', 'kpi', 'forecasts', 'managers'];
+
+// Trousse partagée par les sous-modules. Tout ce qu'un écran de la section Finance doit faire de
+// la même façon que la phase 1 passe par ici.
+function makeKit({ app, deps, schema, guard, writable, loadBudget, touch, can, PERMS }) {
+  const { authenticateToken, requirePerm, hasPerm, pool, logActivity } = deps;
+  let multer = null, xlsx = null;
+  try { multer = require('multer'); } catch { /* bancs d'essai sans multer */ }
+  try { xlsx = require('xlsx'); } catch { /* idem */ }
+  // Fichier Excel en mémoire, 10 Mo au plus, un seul fichier « file ».
+  const upload = multer ? multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 1 } }).single('file') : null;
+  const role = process.env.ROLE || 'all';
+  return {
+    app, pool, authenticateToken, requirePerm, hasPerm, logActivity,
+    /** Zoho Books/Billing et le verrou du jeton partagé (server.js) ; {} dans les bancs d'essai. */
+    late: () => (deps.late ? deps.late() : {}),
+    schema,
+    /** Authentifié, hors mode démo, avec `perm` (finance:view par défaut). */
+    guard,
+    /** Toutes ces permissions (la première passe par guard). */
+    async guardAll(req, res, perms) {
+      if (!(await guard(req, res, perms[0]))) return false;
+      for (const p of perms.slice(1)) if (!(await requirePerm(req, res, p))) return false;
+      return true;
+    },
+    /** Budget :id modifiable (finance:edit + extraPerm, pas approuvé) ; sinon réponse envoyée, null. */
+    writable,
+    loadBudget,
+    touch,
+    can,
+    PERMS,
+    /** Middleware multer (champ « file ») ou null. */
+    upload,
+    /** Classeur Excel → { sheetNames, rows(sheet) : tableau de tableaux de valeurs } ; null si illisible. */
+    readWorkbook(buffer) {
+      if (!xlsx || !buffer) return null;
+      try {
+        const wb = xlsx.read(buffer, { type: 'buffer', cellDates: true });
+        return {
+          sheetNames: wb.SheetNames,
+          rows: (name) => (wb.Sheets[name] ? xlsx.utils.sheet_to_json(wb.Sheets[name], { header: 1, raw: true, defval: null }) : []),
+        };
+      } catch { return null; }
+    },
+    /** Le processus exécute-t-il les tâches de fond (worker ou « all ») ? */
+    runsJobs: role === 'worker' || role === 'all',
+    /** Le processus sert-il les requêtes HTTP ? */
+    servesHttp: role !== 'worker',
+  };
 }
 
 module.exports = {

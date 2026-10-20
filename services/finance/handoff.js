@@ -104,4 +104,12 @@ function extractHandoff(dir) {
   return { reference, roster };
 }
 
-module.exports = { extractHandoff, PROTO };
+// Phase 2 (lot A) : les budgets d'entité Cluster / Xperio et les budgets départementaux, tirés du
+// même budget_data.js — références construites par entityBudgets.js (identifiants stables des
+// drivers, voir l'en-tête de ce fichier).
+function extractEntityBudgets(dir) {
+  const { fromHandoffBudget } = require('./entityBudgets');
+  return fromHandoffBudget(readDataFiles(dir).BUDGET);
+}
+
+module.exports = { extractHandoff, extractEntityBudgets, PROTO };

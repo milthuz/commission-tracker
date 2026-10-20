@@ -43,6 +43,7 @@ function prototype() {
   await db.exec(`
     CREATE TABLE activity_log (id SERIAL, entity_type TEXT, entity_id TEXT, event_type TEXT, description TEXT, actor TEXT, amount NUMERIC, metadata JSONB, created_at TIMESTAMPTZ DEFAULT NOW());
     CREATE TABLE roles (id SERIAL PRIMARY KEY, name TEXT UNIQUE, description TEXT, permissions JSONB, is_system BOOLEAN);
+    CREATE TABLE app_settings (key TEXT PRIMARY KEY, value JSONB, updated_at TIMESTAMPTZ);
   `);
   const perms = {
     'cfo@x.com': ['finance:view', 'finance:edit', 'finance:payroll', 'finance:approve'],
@@ -186,6 +187,15 @@ function prototype() {
   await seedRole(pool);
   const role = (await db.query("SELECT permissions FROM roles WHERE name = 'Finance (CFO)'")).rows;
   ok(role.length === 1 && role[0].permissions.length === 1, 'rôle Finance (CFO) semé une fois, jamais écrasé ensuite');
+  // Rôle existant AVANT les nouvelles clés : elles sont ajoutées une seule fois.
+  await db.query("DELETE FROM app_settings WHERE key = 'finance_role_perms_v2'");
+  await seedRole(pool);
+  let perms2 = (await db.query("SELECT permissions FROM roles WHERE name = 'Finance (CFO)'")).rows[0].permissions;
+  ok(perms2.includes('finance:kpi') && perms2.includes('finance:post_je') && perms2.length === 10, 'rôle existant : les 9 nouvelles clés ajoutées');
+  await db.query(`UPDATE roles SET permissions = permissions - 'finance:post_je' WHERE name = 'Finance (CFO)'`);
+  await seedRole(pool);
+  perms2 = (await db.query("SELECT permissions FROM roles WHERE name = 'Finance (CFO)'")).rows[0].permissions;
+  ok(!perms2.includes('finance:post_je'), 'une clé retirée par un admin n\'est jamais remise');
 
   server.close();
   console.log(`✅ finance routes : ${n} vérifications`);

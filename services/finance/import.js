@@ -11,17 +11,28 @@
 //   … --apply --reference-only   remplace la RÉFÉRENCE d'un budget existant ; garde les
 //                                ajustements et l'effectif saisis dans l'app
 //
+// Phase 2 (lot A) : le même import crée aussi, dans la même transaction, les budgets d'entité
+// FY2027 « cluster » et « xperio » (P&L autonome + drivers GL, voir entityBudgets.js) et la ligne
+// « departments » (budgets départementaux). À la création, une de ces lignes qui existe déjà (la
+// CFO a pu importer son classeur depuis l'app) n'est PAS touchée. --reference-only remplace aussi
+// leurs trois références (ou les crée si elles manquent) ; les ajustements de drivers sont gardés
+// quand le driver existe encore, les autres sont retirés et listés dans le résumé.
+//
 // Sans --apply : rien n'est écrit, le script affiche ce qu'il ferait. Refuse d'écraser un
 // budget existant (sauf --reference-only) : l'effectif saisi par la CFO ne se perd pas par
 // mégarde.
 // ============================================================================
 
 const path = require('path');
-const { extractHandoff } = require('./handoff');
+const { extractHandoff, extractEntityBudgets } = require('./handoff');
 const { ensureSchema } = require('./routes');
+const { upsertReference, DEPT_ROW, FY: ENTITY_FY } = require('./entityBudgets');
+
+const ENTITY_ROWS = ['cluster', 'xperio', DEPT_ROW];
 
 async function importHandoff(pool, dir, { apply = false, referenceOnly = false, actor = 'import' } = {}) {
   const { reference, roster } = extractHandoff(dir);
+  const entityRefs = extractEntityBudgets(dir);
   const fy = reference.fiscalYear;
   const summary = {
     fiscalYear: fy,
@@ -44,6 +55,16 @@ async function importHandoff(pool, dir, { apply = false, referenceOnly = false, 
     return summary;
   }
   summary.action = existing ? 'replace_reference' : 'create';
+  // Budgets d'entité / départementaux : action prévue par ligne (simulation comprise).
+  summary.entityBudgets = {};
+  for (const e of ENTITY_ROWS) {
+    const r = await pool.query('SELECT id FROM finance_budgets WHERE fiscal_year = $1 AND entity = $2', [ENTITY_FY, e]);
+    const ref = entityRefs[e];
+    summary.entityBudgets[e] = {
+      action: r.rows[0] ? (referenceOnly ? 'replace' : 'kept_existing') : 'create',
+      ...(ref.kind === 'entity' ? { drivers: ref.drivers.length } : { depts: ref.depts.length }),
+    };
+  }
   if (!apply) { summary.dryRun = true; return summary; }
 
   // Une transaction = UNE connexion : avec un vrai Pool, chaque pool.query peut partir sur une
@@ -51,14 +72,14 @@ async function importHandoff(pool, dir, { apply = false, referenceOnly = false, 
   const client = pool.connect ? await pool.connect() : null;
   const db = client || pool;
   try {
-    await importIn(db, existing, reference, roster, actor, summary);
+    await importIn(db, existing, reference, roster, actor, summary, entityRefs, referenceOnly);
   } finally {
     if (client) client.release();
   }
   return summary;
 }
 
-async function importIn(pool, existing, reference, roster, actor, summary) {
+async function importIn(pool, existing, reference, roster, actor, summary, entityRefs, referenceOnly) {
   const fy = reference.fiscalYear;
   await pool.query('BEGIN');
   try {
@@ -86,6 +107,10 @@ async function importIn(pool, existing, reference, roster, actor, summary) {
            VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, $11)`,
           [id, c.co || '', c.name || '', c.svc || '', c.rate || null, c.hours || null, c.amt || 0, c.map, c.dept || '', ++sort, actor]);
       }
+    }
+    for (const e of ENTITY_ROWS) {
+      const r = await upsertReference(pool, e, entityRefs[e], actor, { keepExisting: !referenceOnly });
+      Object.assign(summary.entityBudgets[e], { action: r.action, budgetId: r.budgetId, ...(r.dropped.length ? { droppedOverrides: r.dropped } : {}) });
     }
     await pool.query('COMMIT');
   } catch (e) {
