@@ -31,15 +31,27 @@ const COGS_INPUTS = [
   'xperioHwPct', 'halukPct', 'onsites', 'jobCost', 'buffer', 'travel', 'svcSw', 'licPct',
 ];
 
-// Responsables par défaut (SUGGESTIONS, jamais enregistrées tant que la CFO ne les confirme pas) :
-// ventes → David ; soutien / livraison / TI / ops → Eric ; comptabilité et OPEX général → Amanda ;
-// R&D → Fred. Dans les COGS, les lignes de coûts de traitement et de marge matériel / licence
-// vont à la comptabilité.
+// Responsables par défaut (SUGGESTIONS, jamais enregistrées tant que la CFO ne les confirme pas),
+// selon la répartition donnée par la CFO le 2026-10-21 :
+//   - les ventes (tous les drivers de revenus et l'OPEX S&M) → David ;
+//   - TOUS les COGS → Eric, SAUF : hébergement et outils → Fred ; versements récurrents aux
+//     revendeurs → David ; frais marchands et frais de plateforme de paiement → Amanda ;
+//   - comptabilité et OPEX général (G&A) → Amanda ; R&D → Fred.
+// Jerome possède les salaires Admin en G&A : c'est une ligne de PAIE (non saisissable, donc non
+// suivie ici) — voir ecarts/progress.md.
 const OWNER_SALES = 'David';
 const OWNER_DELIVERY = 'Eric';
 const OWNER_FINANCE = 'Amanda';
 const OWNER_RD = 'Fred';
-const COGS_FINANCE_KEYS = ['merchantFees', 'platformFees', 'revShare', 'clusterHwPct', 'xperioHwPct', 'licPct'];
+// Exceptions de la CFO dans les COGS. `hostingG` = hébergement et outils ; `resellerSaasG` et
+// `revShare` calculent le versement récurrent (SaaS des revendeurs × partage des revenus).
+const COGS_OWNER_EXCEPTIONS = {
+  hostingG: 'Fred',
+  resellerSaasG: OWNER_SALES,
+  revShare: OWNER_SALES,
+  merchantFees: OWNER_FINANCE,
+  platformFees: OWNER_FINANCE,
+};
 const OPEX_OWNER = { 'S&M': OWNER_SALES, 'R&D': OWNER_RD, 'G&A': OWNER_FINANCE };
 const DEFAULT_DIRECTORY = [OWNER_SALES, 'Jerome', OWNER_DELIVERY, OWNER_FINANCE, OWNER_RD];
 
@@ -69,7 +81,7 @@ function buildLines(ref) {
   for (const [group, ids] of [['revenue', REVENUE_INPUTS], ['cogs', COGS_INPUTS]]) {
     for (const id of ids) {
       if (!Object.prototype.hasOwnProperty.call(defs, id)) continue;
-      const owner = group === 'revenue' ? OWNER_SALES : COGS_FINANCE_KEYS.includes(id) ? OWNER_FINANCE : OWNER_DELIVERY;
+      const owner = group === 'revenue' ? OWNER_SALES : (COGS_OWNER_EXCEPTIONS[id] || OWNER_DELIVERY);
       lines.push({ key: `drv:${id}`, kind: 'driver', id, group, dept: null, name: null, suggestedOwner: owner });
     }
   }

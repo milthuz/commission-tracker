@@ -112,4 +112,19 @@ function extractEntityBudgets(dir) {
   return fromHandoffBudget(readDataFiles(dir).BUDGET);
 }
 
-module.exports = { extractHandoff, extractEntityBudgets, PROTO };
+// Corrections demandées par la CFO (2026-10-21) PAR-DESSUS le prototype, qui reste lu tel quel
+// (les bancs de parité comparent encore au prototype). Appliquées à l'import seulement.
+//   · G&A : le prototype omet la ligne « Contractors » alors que le classeur de paie contient un
+//     contractuel G&A (Sachin, 2 875 $/mois = 34 500 $/an). La ligne est liée à la paie (« con:G&A »)
+//     et se place avant le sous-total « Wages & Salaries ».
+function applyCfoAdjustments(reference) {
+  const opex = reference.opex.slice();
+  if (!opex.some((it) => it.key === 'gaContr')) {
+    const at = opex.findIndex((it) => it.key === 'gaSal');
+    if (at < 0) throw new Error('applyCfoAdjustments : sous-total gaSal introuvable');
+    opex.splice(at, 0, { t: 'line', name: 'Contractors', key: 'gaContr', pay: 'con:G&A', v: Array(36).fill(0) });
+  }
+  return { ...reference, opex };
+}
+
+module.exports = { extractHandoff, extractEntityBudgets, applyCfoAdjustments, PROTO };

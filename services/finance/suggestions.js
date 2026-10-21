@@ -127,7 +127,7 @@ function register(app, kit) {
       const method = req.query.method;
       if (method !== undefined && !METHODS.includes(method)) return res.status(400).json({ error: 'bad_method' });
       const r = await computeSuggestions(kit, ensureKpi, { fy: req.query.fy, window, method });
-      const caps = { canApply: await kit.can(req, PERM_EDIT), canAiBudget: await kit.can(req, PERM_AI) };
+      const caps = { canApply: await kit.can(req, PERM_EDIT), canAiBudget: aiEnabled() && await kit.can(req, PERM_AI) };
       if (r.empty) return res.json({ empty: true, fiscalYear: r.fiscalYear, suggestions: [], unavailable: [], caps });
       res.json({ empty: false, budget: r.budget, meta: r.meta, suggestions: r.suggestions, unavailable: r.unavailable, caps });
     } catch (e) {
@@ -137,4 +137,7 @@ function register(app, kit) {
   });
 }
 
-module.exports = { register, computeSuggestions, PERM_SUGGESTIONS, PERM_AI };
+// Brouillon IA : ÉTEINT par défaut (décision de la CFO, 2026-10-21) ; s'allume avec FINANCE_AI_ENABLED=true.
+const aiEnabled = () => process.env.FINANCE_AI_ENABLED === 'true';
+
+module.exports = { register, computeSuggestions, aiEnabled, PERM_SUGGESTIONS, PERM_AI };

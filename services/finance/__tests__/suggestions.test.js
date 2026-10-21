@@ -375,7 +375,9 @@ const at = (key, m) => H[key][MONTHS.indexOf(m)];
   ok(S.intAdds.basis.method && S.intAdds.basis.why && Array.isArray(S.intAdds.basis.sample) && S.intAdds.basis.unit === 'count', 'base de calcul dite : méthode, pourquoi, échantillon, unité');
   ok(S.intAdds.alternatives.length >= 3 && S.intAdds.alternatives.every((a) => a.suggested.length === 12), 'alternatives (3/6/12 mois, tendance, saisonnier)');
   ok(S.intAdds.history.values.length === 24 && S.intAdds.history.months[23] === lastClosed, 'historique de 24 mois');
-  ok(r.body.caps.canApply === true && r.body.caps.canAiBudget === true, 'caps du CFO');
+  ok(r.body.caps.canApply === true && r.body.caps.canAiBudget === false, 'caps du CFO : brouillon IA éteint par défaut');
+  process.env.FINANCE_AI_ENABLED = 'true';
+  ok((await api('GET', GET, 'cfo@x.com')).body.caps.canAiBudget === true, 'caps du CFO : brouillon IA allumé par FINANCE_AI_ENABLED');
   // Le Canada ne mélange pas les organisations malgré les numéros d'abonnement réutilisés.
   const canActs = subs.filter((s) => s.org === CANID && s.act.startsWith(lastClosed)).length;
   const canResv = subs.filter((s) => s.org === CANID && s.act.startsWith(lastClosed) && /^SC - /.test(s.name)).length;

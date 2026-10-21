@@ -24,7 +24,7 @@
 // ============================================================================
 
 const SC = require('./suggestionsCore');
-const { computeSuggestions } = require('./suggestions');
+const { computeSuggestions, aiEnabled } = require('./suggestions');
 
 const PERM_VIEW = 'finance:view';
 const PERM_EDIT = 'finance:edit';
@@ -196,8 +196,8 @@ function register(app, kit) {
       if (!(await read(req, res))) return;
       const L = limits();
       const u = await usage(req.user.email);
-      const client = (late().getAnthropic || (() => null))();
-      res.json({ available: !!client, limits: { perHour: L.perHour, perDay: L.perDay }, used: u, remaining: Math.max(0, Math.min(L.perHour - u.hour, L.perDay - u.day)), model: late().anthropicModel || null });
+      const client = aiEnabled() ? (late().getAnthropic || (() => null))() : null;
+      res.json({ available: !!client, enabled: aiEnabled(), limits: { perHour: L.perHour, perDay: L.perDay }, used: u, remaining: Math.max(0, Math.min(L.perHour - u.hour, L.perDay - u.day)), model: late().anthropicModel || null });
     } catch (e) {
       console.error('finance ai-budget status:', e.message);
       res.status(500).json({ error: 'load_failed' });
@@ -224,7 +224,7 @@ function register(app, kit) {
       const email = req.user.email;
       const lang = req.body && req.body.lang === 'fr' ? 'fr' : 'en';
       const L = late();
-      const client = (L.getAnthropic || (() => null))();
+      const client = aiEnabled() ? (L.getAnthropic || (() => null))() : null;
       if (!client) return res.status(503).json({ error: 'ai_unavailable', message: 'The AI service is not configured on this server (no API key).' });
       const model = L.anthropicModel || 'claude-opus-4-8';
 

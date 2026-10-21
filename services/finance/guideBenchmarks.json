@@ -113,41 +113,6 @@
       "value": 15, "unit": "pct", "direction": "lower_better", "kind": "public", "useForFlags": false,
       "sourceOrg": "SaaS Capital, 2026 Spending Benchmarks for Private B2B SaaS Companies", "sourceUrl": "https://www.saas-capital.com/blog-posts/spending-benchmarks/", "sourceYear": 2026, "sourceDate": "2026-06-10",
       "note": "Percent of ARR, not of revenue. Informational."
-    },
-    {
-      "id": "revenue_growth.to_validate", "metric": "revenue_growth",
-      "labelEn": "Revenue growth, POS / payments peers", "labelFr": "Croissance des revenus, pairs caisse / paiements",
-      "value": null, "unit": "pct", "direction": "higher_better", "kind": "public", "useForFlags": true,
-      "sourceOrg": null, "sourceUrl": null, "sourceYear": null, "sourceDate": null,
-      "note": "No citable source found. To be validated by the CFO."
-    },
-    {
-      "id": "ebitda_margin.to_validate", "metric": "ebitda_margin",
-      "labelEn": "EBITDA margin, POS / payments peers", "labelFr": "Marge du BAIIA, pairs caisse / paiements",
-      "value": null, "unit": "pct", "direction": "higher_better", "kind": "public", "useForFlags": true,
-      "sourceOrg": null, "sourceUrl": null, "sourceYear": null, "sourceDate": null,
-      "note": "No citable source found. To be validated by the CFO."
-    },
-    {
-      "id": "recurring_share.to_validate", "metric": "recurring_share",
-      "labelEn": "Recurring revenue as % of total revenue, POS / payments", "labelFr": "Revenus récurrents en % du total, caisse / paiements",
-      "value": null, "unit": "pct", "direction": "higher_better", "kind": "public", "useForFlags": true,
-      "sourceOrg": null, "sourceUrl": null, "sourceYear": null, "sourceDate": null,
-      "note": "No citable source found. To be validated by the CFO."
-    },
-    {
-      "id": "churn_annual.to_validate", "metric": "churn_annual",
-      "labelEn": "Annual logo churn, restaurant POS", "labelFr": "Attrition annuelle des clients, caisse de restaurant",
-      "value": null, "unit": "pct", "direction": "lower_better", "kind": "public", "useForFlags": true,
-      "sourceOrg": null, "sourceUrl": null, "sourceYear": null, "sourceDate": null,
-      "note": "No citable source found for restaurant POS. To be validated by the CFO."
-    },
-    {
-      "id": "arpu_monthly.to_validate", "metric": "arpu_monthly",
-      "labelEn": "Monthly ARPU per location, restaurant POS", "labelFr": "ARPU mensuel par emplacement, caisse de restaurant",
-      "value": null, "unit": "cad", "direction": "higher_better", "kind": "public", "useForFlags": true,
-      "sourceOrg": null, "sourceUrl": null, "sourceYear": null, "sourceDate": null,
-      "note": "No citable source found. To be validated by the CFO."
     }
   ]
 }

@@ -93,6 +93,11 @@ async function ensureSchema(pool) {
        ON CONFLICT (id) DO NOTHING`,
       [r.id, r.metric, r.label_en, r.label_fr, r.value, r.unit, r.direction, r.kind, r.use_for_flags, r.source_org, r.source_url, r.source_year, r.source_date, r.note]);
   }
+  // Ménage : un repère livré, jamais modifié, qui a quitté le fichier livré (ex. les repères vides
+  // « à valider ») disparaît de la base. Une ligne modifiée ou ajoutée par la CFO n'est jamais touchée.
+  await pool.query(
+    `DELETE FROM finance_benchmarks WHERE origin = 'shipped' AND edited = FALSE AND NOT (id = ANY($1::text[]))`,
+    [shipped.rows.map((r) => r.id)]);
 }
 
 const bOut = (r) => ({

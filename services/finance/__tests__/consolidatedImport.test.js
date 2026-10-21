@@ -372,7 +372,7 @@ const clearRow = (ws, row, cols = 'ABCDEFGHIJKLMN') => { for (const c of cols) d
   // ---------------------------------------------------------------- 9. OPEX : vrai classeur = 0 écart
   r = await opexPrev(OPX); pv = r.body.preview;
   ok(r.status === 200 && pv.canConfirm && pv.errors.length === 0 && pv.warnings.length === 0, 'OPEX : aperçu du vrai classeur confirmable, sans avertissement');
-  ok(pv.changed.length === 0 && pv.unmatched.length === 0 && pv.notInFile.length === 0 && pv.unchanged === 42, 'OPEX : 0 modifiée / 0 sans clé / 0 absente / 42 inchangées');
+  ok(pv.changed.length === 0 && pv.unmatched.length === 0 && pv.unchanged === 42 && pv.notInFile.length === 1, `OPEX : 0 modifiée / 0 sans clé / 42 inchangées / seule la ligne ajoutée par la CFO absente du classeur (${JSON.stringify(pv.notInFile)})`);
   ok(JSON.stringify(pv.totals.before) === JSON.stringify(pv.totals.after), 'OPEX : totaux avant = après');
   near(pv.totals.before[1], sum(refBefore.opex.filter((i) => i.t === 'line').map((i) => sum(i.v.slice(12, 24)))), 'OPEX : total FY27 stocké = Σ des lignes', 0.01);
   r = await confirm('opex', 'cfo@x.com', pv);
@@ -413,7 +413,7 @@ const clearRow = (ws, row, cols = 'ABCDEFGHIJKLMN') => { for (const c of cols) d
   near(chg('Rent').fy[0].after - chg('Rent').fy[0].before, 1 - 25716.666666666668, 'OPEX : FY26 Rent écart');
   ok(chg('Rent').months === 1 && chg('Travel').months === 1, 'OPEX : nombre de mois modifiés');
   ok(pv.unmatched.length === 1 && pv.unmatched[0].name === 'Brand New Line' && pv.unmatched[0].fy[0] === 120, 'OPEX : ligne neuve listée comme non importée (sans clé)');
-  ok(pv.notInFile.length === 1 && pv.notInFile[0].name === 'Water', 'OPEX : ligne de l\'app absente du fichier listée');
+  ok(pv.notInFile.length === 2 && pv.notInFile.map((x) => x.name).sort().join('|') === 'Contractors|Water', 'OPEX : lignes de l\'app absentes du fichier listées (Water vidée + Contractors ajoutée par la CFO)');
   ok(pv.warnings.some((w) => w.code === 'fy27_adjustments_win' && w.value === 'Sales & Marketing Software Expenses'), 'OPEX : avertissement — les ajustements FY27 priment');
   ok(pv.warnings.some((w) => w.code === 'computed_lines' && w.value.includes('Sales Wages & Salaries') && w.value.includes('Travel')), 'OPEX : avertissement — lignes de paie / voyage calculées par l\'app');
   const dB = pv.totals.before, dA = pv.totals.after;
@@ -457,7 +457,7 @@ const clearRow = (ws, row, cols = 'ABCDEFGHIJKLMN') => { for (const c of cols) d
   const tparse = X.parseOpex(r.body);
   ok(tparse.errors.length === 0 && tparse.warnings.length === 0 && tparse.rows.length > 42, 'modèle OPEX relu : aucune anomalie');
   pv = (await opexPrev(r.body)).body.preview;
-  ok(pv.changed.length === 0 && pv.unmatched.length === 0 && pv.notInFile.length === 0 && pv.unchanged === 42 && JSON.stringify(pv.totals.before) === JSON.stringify(pv.totals.after), 'modèle OPEX : réimporté = 0 écart, 0 ligne sans clé');
+  ok(pv.changed.length === 0 && pv.unmatched.length === 0 && pv.notInFile.length === 0 && pv.unchanged === 43 && JSON.stringify(pv.totals.before) === JSON.stringify(pv.totals.after), 'modèle OPEX : réimporté = 0 écart, 0 ligne sans clé');
   // Les sous-totaux du modèle sont ignorés (ils ne deviennent pas des lignes).
   ok(tparse.rows.some((x) => x.norm === 'total opex'), 'modèle OPEX : contient les sous-totaux (ignorés à l\'import)');
 

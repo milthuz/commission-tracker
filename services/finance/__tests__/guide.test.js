@@ -101,7 +101,7 @@ const near = (a, b, m, eps = 1e-6) => { assert(a != null && b != null && Math.ab
       ok(!b.source_org && !b.source_url, `repère ${b.id} sans valeur : aucune source inventée`);
     }
   }
-  ok(shipped.rows.some((b) => b.value == null), 'des repères restent « à valider par la CFO »');
+  ok(shipped.rows.every((b) => b.value != null), 'aucun repère livré sans valeur');
 
   // ================================================================ analyse des réels (synthétique)
   const NOW = new Date(Date.UTC(2026, 9, 15)); // octobre 2026 : le mois en cours est exclu
@@ -221,12 +221,13 @@ const near = (a, b, m, eps = 1e-6) => { assert(a != null && b != null && Math.ab
   ok(e1.status === 200 && e1.body.benchmark.value === 30 && e1.body.benchmark.edited === true && e1.body.benchmark.version === bRule.version + 1, 'repères : modification enregistrée, version + 1');
   ok((await api('PUT', `/api/finance/guide/benchmarks/${bRule.id}`, 'cfo@x.com', { ...bRule, value: 31 })).status === 409, 'repères : version périmée = 409');
   ok((await api('PUT', '/api/finance/guide/benchmarks/inexistant.xx', 'cfo@x.com', { ...bRule, id: 'inexistant.xx', version: 1 })).status === 404, 'repères : inconnu = 404');
-  const blank = r2.body.benchmarks.find((b) => b.id === 'ebitda_margin.to_validate');
-  ok(blank.value === null && blank.sourceOrg === null, 'repère sans source : vide, « à valider »');
-  e1 = await api('PUT', `/api/finance/guide/benchmarks/${blank.id}`, 'cfo@x.com', { ...blank, value: 12 });
+  ok(r2.body.benchmarks.every((b) => b.value != null), 'plus aucun repère vide livré');
+  ok(!r2.body.benchmarks.some((b) => /\.to_validate$/.test(b.id)), 'les cinq repères vides ont disparu');
+  e1 = await api('POST', '/api/finance/guide/benchmarks', 'cfo@x.com', { metric: 'ebitda_margin', labelEn: 'Peer EBITDA', labelFr: 'BAIIA pairs', unit: 'pct', direction: 'higher_better', kind: 'public', value: 12 });
   ok(e1.status === 400 && e1.body.error === 'source_org_required', 'on ne peut pas remplir un repère sans le sourcer');
-  e1 = await api('PUT', `/api/finance/guide/benchmarks/${blank.id}`, 'cfo@x.com', { ...blank, value: 12, sourceOrg: 'Org Test', sourceUrl: 'https://example.org/x', sourceYear: 2026 });
+  e1 = await api('POST', '/api/finance/guide/benchmarks', 'cfo@x.com', { metric: 'ebitda_margin', labelEn: 'Peer EBITDA', labelFr: 'BAIIA pairs', unit: 'pct', direction: 'higher_better', kind: 'public', value: 12, sourceOrg: 'Org Test', sourceUrl: 'https://example.org/x', sourceYear: 2026 });
   ok(e1.status === 200 && e1.body.benchmark.value === 12, 'repère rempli avec une source complète');
+  const keepId = e1.body.benchmark.id;
   let cr = await api('POST', '/api/finance/guide/benchmarks', 'cfo@x.com', { metric: 'sm_pct', labelEn: 'Own target', labelFr: 'Cible interne', unit: 'pct', direction: 'lower_better', kind: 'internal', value: 30, sourceOrg: 'CFO target', sourceYear: 2026 });
   ok(cr.status === 200 && cr.body.benchmark.origin === 'cfo' && cr.body.benchmark.kind === 'internal', 'cible interne de la CFO créée');
   ok((await api('POST', '/api/finance/guide/benchmarks', 'lecteur@x.com', { metric: 'sm_pct' })).status === 403, 'création refusée sans finance:edit');
@@ -237,7 +238,13 @@ const near = (a, b, m, eps = 1e-6) => { assert(a != null && b != null && Math.ab
   ok((await api('POST', '/api/finance/guide/benchmarks/cfo.xx/reset', 'cfo@x.com')).body.error === 'not_shipped', 'rétablir : seulement les repères livrés');
   // la ré-initialisation du schéma (redémarrage) n'écrase pas la modification de la CFO
   await guideMod.ensureSchema(pool);
-  ok(Number((await db.query("SELECT value FROM finance_benchmarks WHERE id = 'ebitda_margin.to_validate'")).rows[0].value) === 12, 'le semis ne réécrit jamais une ligne modifiée');
+  ok(Number((await db.query(`SELECT value FROM finance_benchmarks WHERE id = '${keepId}'`)).rows[0].value) === 12, 'le semis ne touche jamais une ligne de la CFO');
+  // ménage : un repère livré jamais modifié qui a quitté le fichier disparaît ; un repère modifié reste
+  await db.query("INSERT INTO finance_benchmarks (id, metric, label_en, label_fr, unit, direction, origin) VALUES ('old.stale','ebitda_margin','x','x','pct','higher_better','shipped')");
+  await db.query("INSERT INTO finance_benchmarks (id, metric, label_en, label_fr, unit, direction, origin, edited, value) VALUES ('old.edited','ebitda_margin','x','x','pct','higher_better','shipped',TRUE,9)");
+  await guideMod.ensureSchema(pool);
+  ok((await db.query("SELECT 1 FROM finance_benchmarks WHERE id = 'old.stale'")).rows.length === 0, 'ménage : repère livré périmé retiré');
+  ok((await db.query("SELECT 1 FROM finance_benchmarks WHERE id = 'old.edited'")).rows.length === 1, 'ménage : repère périmé mais modifié conservé');
 
   // --- notes
   let nt = await api('PUT', '/api/finance/guide/notes/opexChange:gaRent', 'cfo@x.com', { note: 'Réponse du gestionnaire', state: 'asked', version: 0 });

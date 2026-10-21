@@ -109,7 +109,7 @@ function prototype() {
   near(s12(lec.payroll.payEX), s12(P.payEX), 'payEX');
   near(s12(lec.payroll.payNN) + s12(lec.payroll.payEX) + s12(lec.payroll.payByMap['Recurring COGS']) + s12(lec.payroll.payByMap['S&M']) + s12(lec.payroll.payByMap['R&D']) + s12(lec.payroll.payByMap['G&A']), s12(P.payTot), 'paie 2027 totale');
   ok(Math.round(s12(P.payTot)) === 6001863, 'paie 2027 = 6 001 863 $ (chiffre de la spec)');
-  ok(Object.keys(lec.payroll.lines).length === 9, '9 lignes de paie dans l\'OPEX');
+  ok(Object.keys(lec.payroll.lines).length === 10, '10 lignes de paie dans l\'OPEX');
 
   // ---------------------------------------------------------------- sections
   const put = (user, section, data, version) => api('PUT', `/api/finance/budgets/${id}/state/${section}`, user, { data, version });

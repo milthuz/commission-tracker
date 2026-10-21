@@ -164,7 +164,17 @@ const sha = (values, g = 0) => crypto.createHash('sha256').update(JSON.stringify
   ok(g.body.summary.total === L.length && g.body.summary.ownersMissing === L.length && g.body.summary.default === L.length, 'compteurs de départ');
   ok(g.body.directory.length === 5 && g.body.directory.includes('Amanda'), 'annuaire de départ : 5 responsables');
   ok(L.every((l) => g.body.directory.includes(l.suggestedOwner)), 'chaque ligne a un responsable SUGGÉRÉ qui est dans l\'annuaire');
-  ok(by('drv:intAdds').suggestedOwner === 'David' && by('drv:svcSw').suggestedOwner === 'Eric' && by('drv:revShare').suggestedOwner === 'Amanda', 'suggestions : ventes, livraison, comptabilité');
+  ok(by('drv:intAdds').suggestedOwner === 'David' && by('drv:svcSw').suggestedOwner === 'Eric', 'suggestions : ventes → David, livraison → Eric');
+  // Répartition de la CFO (2026-10-21) : tous les COGS à Eric SAUF hébergement et outils (Fred),
+  // versements récurrents (David), frais marchands et de plateforme de paiement (Amanda).
+  const cogsOwner = Object.fromEntries(cogs.map((l) => [l.id, l.suggestedOwner]));
+  ok(cogsOwner.hostingG === 'Fred', 'COGS : hébergement et outils → Fred');
+  ok(cogsOwner.revShare === 'David' && cogsOwner.resellerSaasG === 'David', 'COGS : versement récurrent (SaaS des revendeurs × partage) → David');
+  ok(cogsOwner.merchantFees === 'Amanda' && cogsOwner.platformFees === 'Amanda', 'COGS : frais marchands et de plateforme de paiement → Amanda');
+  const eric = cogs.filter((l) => l.suggestedOwner === 'Eric').map((l) => l.id).sort();
+  ok(eric.length === cogs.length - 5, `tous les autres COGS (${eric.length}) → Eric`);
+  ok(['clusterHwPct', 'xperioHwPct', 'licPct', 'supportSw', 'halukPct', 'travel'].every((k) => cogsOwner[k] === 'Eric'), 'COGS matériel, licences, soutien, livraison → Eric (plus à la comptabilité)');
+  ok(rev.every((l) => l.suggestedOwner === 'David'), 'tous les drivers de revenus → David');
   const gaRent = by('opx:gaRent'), smLine = opx.find((l) => l.dept === 'S&M'), rdLine = opx.find((l) => l.dept === 'R&D');
   ok(gaRent.suggestedOwner === 'Amanda' && smLine.suggestedOwner === 'David' && rdLine.suggestedOwner === 'Fred', 'suggestions OPEX : S&M → David, R&D → Fred, G&A → Amanda');
   ok(by('drv:intAdds').hash === sha(Array(12).fill(ref.drvDefaults.intAdds)), 'hachage d\'un driver par défaut = SHA-256 des 12 valeurs par défaut');

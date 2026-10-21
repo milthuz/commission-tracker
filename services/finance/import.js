@@ -24,14 +24,15 @@
 // ============================================================================
 
 const path = require('path');
-const { extractHandoff, extractEntityBudgets } = require('./handoff');
+const { extractHandoff, extractEntityBudgets, applyCfoAdjustments } = require('./handoff');
 const { ensureSchema } = require('./routes');
 const { upsertReference, DEPT_ROW, FY: ENTITY_FY } = require('./entityBudgets');
 
 const ENTITY_ROWS = ['cluster', 'xperio', DEPT_ROW];
 
 async function importHandoff(pool, dir, { apply = false, referenceOnly = false, actor = 'import' } = {}) {
-  const { reference, roster } = extractHandoff(dir);
+  const { reference: proto, roster } = extractHandoff(dir);
+  const reference = applyCfoAdjustments(proto);
   const entityRefs = extractEntityBudgets(dir);
   const fy = reference.fiscalYear;
   const summary = {

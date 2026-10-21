@@ -98,6 +98,16 @@ eq(AI.cleanText(42, 10), '', 'non-texte → vide');
   process.env.FINANCE_AI_DRAFTS_PER_HOUR = '50';
   process.env.FINANCE_AI_DRAFTS_PER_DAY = '100';
 
+  // ---- éteint par défaut : même avec une clé, aucun appel et aucune trace
+  delete process.env.FINANCE_AI_ENABLED;
+  client = fake;
+  const off = await POST('cfo@x.com');
+  ok(off.status === 503 && off.body.error === 'ai_unavailable', 'IA éteinte par défaut : 503 ai_unavailable');
+  const offSt = (await api('GET', '/api/finance/ai-budget/status', 'cfo@x.com')).body;
+  ok(offSt.available === false && offSt.enabled === false, 'état : éteinte par défaut');
+  ok(calls === 0 && Number((await db.query('SELECT COUNT(*)::int AS n FROM finance_ai_drafts')).rows[0].n) === 0, 'éteinte : aucun appel, aucune trace');
+  process.env.FINANCE_AI_ENABLED = 'true';
+
   // ---- permissions, mode démo, absence de budget, absence de clé
   ok((await POST(null)).status === 401, 'sans jeton : 401');
   ok((await POST('nobody@x.com')).status === 403, 'sans permission : 403');
