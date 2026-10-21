@@ -128,7 +128,8 @@ const PERMISSION_CATALOG = [
   { key: 'admin:releases',             label: 'Push new app releases',                       category: 'Admin Panel' },
   { key: 'admin:impersonate',          label: 'Use impersonation mode',                      category: 'Admin Panel' },
   { key: 'admin:data_health',          label: 'View the "Needs attention" data-health page', category: 'Admin Panel' },
-  { key: 'reports:investigate',        label: 'Re-run the automatic diagnosis on a rep report', category: 'Admin Panel' },
+  { key: 'feature_requests:review',    label: 'Approve or decline feature requests (approval creates the JIRA ticket)', category: 'Admin Panel' },
+  { key: 'reports:investigate',       label: 'Re-run the automatic diagnosis on a rep report', category: 'Admin Panel' },
   { key: 'admin:notifications',        label: 'Configure notification recipients & email templates', category: 'Admin Panel' },
   { key: 'users:role_requests',        label: 'See and handle role requests from new users who have no role yet', category: 'Admin Panel' },
   { key: 'admin:demo_mode',            label: 'Toggle demo mode on user accounts',            category: 'Admin Panel' },
@@ -1830,6 +1831,12 @@ async function initializeDatabase() {
         resolved_at    TIMESTAMPTZ,
         resolved_by    VARCHAR(255)
       );
+    `);
+    // Feature requests: an admin approves (→ JIRA ticket created then, not at submission) or
+    // declines. 'approving' is a transient claim so a double-click cannot create two tickets.
+    await pool.query(`
+      ALTER TABLE user_reports ADD COLUMN IF NOT EXISTS jira_key      VARCHAR(30);
+      ALTER TABLE user_reports ADD COLUMN IF NOT EXISTS decision_note TEXT;
     `);
     // Seed preset roles (only inserted once if name not already present)
     await pool.query(`
@@ -34513,7 +34520,10 @@ async function createJiraIssue({ summary, descriptionText, labels = [] }) {
       labels: (labels || []).map(l => String(l).replace(/\s+/g, '-')),
       description: {
         type: 'doc', version: 1,
-        content: [{ type: 'paragraph', content: [{ type: 'text', text: String(descriptionText || '').slice(0, 30000) }] }],
+        // One ADF paragraph per non-empty line — a single text node renders a multi-line
+        // description as one run-on block.
+        content: String(descriptionText || '').slice(0, 30000).split('\n').filter(l => l.trim())
+          .map(l => ({ type: 'paragraph', content: [{ type: 'text', text: l }] })),
       },
     },
   };
@@ -34531,9 +34541,9 @@ async function createJiraIssue({ summary, descriptionText, labels = [] }) {
   }
 }
 
-// POST /api/feedback/feature-request — any authenticated user suggests a feature. Persists it
-// to the "À corriger" dashboard (user_reports), auto-creates a Jira ticket in the backlog,
-// and emails admins.
+// POST /api/feedback/feature-request — any authenticated user suggests a feature. It is saved
+// as a PENDING request: it raises the "À corriger" badge and emails admins, but NO JIRA ticket
+// exists until an admin approves it (POST /api/admin/feature-requests/:id/approve).
 app.post('/api/feedback/feature-request', authenticateToken, async (req, res) => {
   const { email, name: jwtName } = req.user;
   const message = (req.body.message || '').toString().trim().slice(0, 4000);
@@ -34542,33 +34552,130 @@ app.post('/api/feedback/feature-request', authenticateToken, async (req, res) =>
     const tok = await pool.query('SELECT display_name FROM user_tokens WHERE email = $1', [email]);
     const who = tok.rows[0]?.display_name || jwtName || email || 'Unknown user';
     const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    // 1) Persist → shows in the admin "À corriger" dashboard (report_type 'feature_request').
     await pool.query(
       `INSERT INTO user_reports (report_type, reporter_email, reporter_name, message)
        VALUES ('feature_request', $1, $2, $3)`,
       [email || null, who, message]
     );
     _dataHealthCache = { at: 0, data: null }; // bust the 60s cache so the badge updates now
-    // 2) Auto-create a Jira ticket in the backlog (best-effort — needs JIRA_* env vars).
-    const firstLine = message.split('\n')[0].slice(0, 120);
-    const jira = await createJiraIssue({
-      summary: `Feature request: ${firstLine}`,
-      descriptionText: `Submitted by ${who} (${email || '—'}) via Sales Hub.\n\n${message}`,
-      labels: ['feature-request', 'sales-hub-intake'],
-    });
-    // 3) Email admins (existing behaviour), noting the Jira ticket if one was created.
     const admins = (await pool.query('SELECT email FROM user_tokens WHERE is_admin = true AND email IS NOT NULL')).rows.map(r => r.email);
     const recipients = [...new Set([...admins, process.env.SMTP_FROM || process.env.SMTP_USER].filter(Boolean))];
-    const jiraLine = jira.created
-      ? `<br><br><strong>JIRA:</strong> ${esc(jira.key)}${process.env.JIRA_BASE_URL ? ` — <a href="${process.env.JIRA_BASE_URL.replace(/\/+$/, '')}/browse/${esc(jira.key)}">${esc(jira.key)}</a>` : ''}`
-      : '';
     const html = mailShell(
-      'Demande de fonctionnalité / Feature request',
-      `<strong>${esc(who)}</strong> (${esc(email || '—')}) propose / suggests:<br><br>${esc(message).replace(/\n/g, '<br>')}${jiraLine}`,
-      null, null
+      'Demande de fonctionnalité à examiner / Feature request to review',
+      `<strong>${esc(who)}</strong> (${esc(email || '—')}) propose / suggests:<br><br>${esc(message).replace(/\n/g, '<br>')}<br><br>`
+      + `À approuver ou décliner dans « À corriger ». / Approve or decline it in "Needs attention".`,
+      'Ouvrir / Open', `${process.env.FRONTEND_URL || ''}/admin/data-health`
     );
     const r = await sendMail(recipients.join(','), `Demande de fonctionnalité — ${who}`, html);
-    res.json({ sent: r.sent, reason: r.reason, saved: true, jira });
+    res.json({ sent: r.sent, reason: r.reason, saved: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Courriel au demandeur une fois la décision prise (même logique que reportResolvedEmail :
+// sans retour, il resoumet ou croit avoir été ignoré).
+function featureDecisionEmail(r, approved, jiraKey, note) {
+  const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const body = (approved
+      ? `Bonne nouvelle — votre demande a été retenue et ajoutée à notre liste de développement (${esc(jiraKey)}).<br>`
+        + `Good news — your request was accepted and added to our development backlog (${esc(jiraKey)}).<br><br>`
+      : `Merci pour votre suggestion. Nous ne la retenons pas pour l'instant.<br>`
+        + `Thanks for your suggestion. We are not taking it forward for now.<br><br>`)
+    + `<strong>Votre demande · Your request :</strong><br>${esc(r.message).replace(/\n/g, '<br>')}`
+    + (note ? `<br><br><strong>Réponse · Response :</strong><br>${esc(note).replace(/\n/g, '<br>')}` : '');
+  return {
+    subject: approved ? 'Demande de fonctionnalité retenue / accepted' : 'Demande de fonctionnalité — réponse / response',
+    html: mailShell(approved ? 'Demande retenue / Request accepted' : 'Demande de fonctionnalité / Feature request', body, null, null),
+  };
+}
+
+// Claim a pending feature request atomically ('open' → 'approving'): two admins, or one
+// double-click, can never both create a JIRA ticket.
+async function claimFeatureRequest(id, to) {
+  return (await pool.query(
+    `UPDATE user_reports SET status = $2 WHERE id = $1 AND report_type = 'feature_request' AND status = 'open'
+      RETURNING id, reporter_email, reporter_name, message, created_at`, [id, to])).rows[0];
+}
+
+// POST /api/admin/feature-requests/:id/approve — body { title?, note?, jiraKey? }.
+// Creates the JIRA ticket NOW (or, with jiraKey, just links an existing one — for requests
+// filed before approval existed, which already got a ticket automatically).
+app.post('/api/admin/feature-requests/:id/approve', authenticateToken, async (req, res) => {
+  if (!(await requirePermAny(req, res, ['feature_requests:review', 'admin:data_health']))) return;
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ error: 'invalid id' });
+  const note = (req.body?.note || '').toString().trim().slice(0, 1000);
+  const existing = (req.body?.jiraKey || '').toString().trim().toUpperCase();
+  if (existing && !/^[A-Z][A-Z0-9]+-[0-9]+$/.test(existing)) return res.status(400).json({ error: 'invalid jiraKey' });
+  const row = await claimFeatureRequest(id, 'approving');
+  if (!row) return res.status(409).json({ error: 'already_decided' });
+  const decider = req.user.email || req.user.name || 'admin';
+  try {
+    let key = existing;
+    if (!key) {
+      const title = ((req.body?.title || '').toString().trim() || row.message.split('\n')[0]).slice(0, 200);
+      const jira = await createJiraIssue({
+        summary: title,
+        descriptionText: [
+          `Submitted by ${row.reporter_name || '—'} (${row.reporter_email || '—'}) via Sales Hub on ${new Date(row.created_at).toISOString().slice(0, 10)}.`,
+          `Approved by ${decider}.`,
+          '',
+          row.message,
+        ].join('\n'),
+        labels: ['feature-request', 'sales-hub-intake'],
+      });
+      if (!jira.created) {
+        await pool.query(`UPDATE user_reports SET status = 'open' WHERE id = $1`, [id]); // release the claim
+        return res.status(502).json({ error: jira.reason || 'jira_failed' });
+      }
+      key = jira.key;
+    }
+    await pool.query(
+      `UPDATE user_reports SET status = 'approved', jira_key = $2, decision_note = $3, resolved_at = NOW(), resolved_by = $4 WHERE id = $1`,
+      [id, key, note || null, decider]);
+    _dataHealthCache = { at: 0, data: null };
+    let notified = false, reason = null;
+    if (row.reporter_email) {
+      try {
+        const { subject, html } = featureDecisionEmail(row, true, key, note);
+        const sent = await sendMail(row.reporter_email, subject, html);
+        notified = !!sent.sent; reason = sent.reason || null;
+      } catch (e) { reason = e.message; }
+    } else reason = 'no_reporter_email';
+    await logActivity('user_report', id, 'feature_approved', `Demande de fonctionnalité approuvée — ${key}`,
+      decider, { metadata: { jiraKey: key, linkedExisting: !!existing, notified } });
+    res.json({ approved: true, jiraKey: key, notified, reason });
+  } catch (e) {
+    await pool.query(`UPDATE user_reports SET status = 'open' WHERE id = $1 AND status = 'approving'`, [id]).catch(() => {});
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/feature-requests/:id/decline — body { note? }. No JIRA ticket is ever made.
+app.post('/api/admin/feature-requests/:id/decline', authenticateToken, async (req, res) => {
+  if (!(await requirePermAny(req, res, ['feature_requests:review', 'admin:data_health']))) return;
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ error: 'invalid id' });
+  const note = (req.body?.note || '').toString().trim().slice(0, 1000);
+  const decider = req.user.email || req.user.name || 'admin';
+  try {
+    const row = (await pool.query(
+      `UPDATE user_reports SET status = 'declined', decision_note = $2, resolved_at = NOW(), resolved_by = $3
+        WHERE id = $1 AND report_type = 'feature_request' AND status = 'open'
+        RETURNING id, reporter_email, reporter_name, message`, [id, note || null, decider])).rows[0];
+    _dataHealthCache = { at: 0, data: null };
+    if (!row) return res.status(409).json({ error: 'already_decided' });
+    let notified = false, reason = null;
+    if (row.reporter_email) {
+      try {
+        const { subject, html } = featureDecisionEmail(row, false, null, note);
+        const sent = await sendMail(row.reporter_email, subject, html);
+        notified = !!sent.sent; reason = sent.reason || null;
+      } catch (e) { reason = e.message; }
+    } else reason = 'no_reporter_email';
+    await logActivity('user_report', id, 'feature_declined', 'Demande de fonctionnalité déclinée', decider, { metadata: { notified } });
+    res.json({ declined: true, notified, reason });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
