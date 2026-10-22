@@ -218,7 +218,21 @@ function validateSection(section, data, ref) {
     if (!finite(burden) || burden < 0 || burden > 100) return 'bad_burden';
     if (!finite(raise) || raise < -100 || raise > 100) return 'bad_raise';
     if (!month(raiseMo)) return 'bad_raise_month';
-    return { burden, raise, raiseMo };
+    // SH-48 : hausse par département (code → %), facultative ; un département absent suit la
+    // hausse globale.
+    const out = { burden, raise, raiseMo };
+    if (data.deptRaise != null) {
+      if (typeof data.deptRaise !== 'object' || Array.isArray(data.deptRaise)) return 'bad_dept_raise';
+      const entries = Object.entries(data.deptRaise);
+      if (entries.length > 60) return 'bad_dept_raise';
+      const deptRaise = {};
+      for (const [dept, pct] of entries) {
+        if (!dept || dept.length > 60 || !finite(pct) || pct < -100 || pct > 100) return 'bad_dept_raise';
+        deptRaise[dept] = pct;
+      }
+      out.deptRaise = deptRaise;
+    }
+    return out;
   }
   return 'unknown_section';
 }

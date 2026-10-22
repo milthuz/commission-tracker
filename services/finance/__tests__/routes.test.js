@@ -138,6 +138,26 @@ function prototype() {
   ok(after.payrollGlobals.burden === 20, 'les réglages de paie sont relus par tous');
   ok(s12(after.payroll.payByMap['G&A']) > s12(lec.payroll.payByMap['G&A']), 'les totaux de paie suivent les nouveaux réglages');
 
+  // SH-48 : hausse par département — seule la ligne du département bouge, le reste suit le global.
+  ok((await put('cfo@x.com', 'payroll', { burden: 20, raise: 3, raiseMo: 6, deptRaise: { SALES: 'x' } }, 1)).body.error === 'bad_dept_raise', 'hausse par département : % non numérique refusé');
+  ok((await put('cfo@x.com', 'payroll', { burden: 20, raise: 3, raiseMo: 6, deptRaise: [5] }, 1)).body.error === 'bad_dept_raise', 'hausse par département : liste refusée');
+  ok((await put('cfo@x.com', 'payroll', { burden: 20, raise: 3, raiseMo: 6, deptRaise: { SALES: 10 } }, 1)).status === 200, 'hausse par département enregistrée');
+  const dr = (await api('GET', '/api/finance/budget', 'lecteur@x.com')).body;
+  ok(dr.payrollGlobals.deptRaise && dr.payrollGlobals.deptRaise.SALES === 10, 'hausse par département relue par tous');
+  ok(s12(dr.payroll.lines.SALES) > s12(after.payroll.lines.SALES), 'la ligne SALES suit la hausse du département');
+  near(s12(dr.payroll.lines.ADMIN), s12(after.payroll.lines.ADMIN), 'les autres départements gardent la hausse globale');
+  {
+    const P = require('../payroll');
+    const e = [{ dept: 'SALES', salary: 120000, alloc: 1, raisePct: null, raiseMo: null, burdenPct: 0, startMo: 0, endMo: null, map: 'S&M' },
+      { dept: 'SALES', salary: 120000, alloc: 1, raisePct: 2, raiseMo: null, burdenPct: 0, startMo: 0, endMo: null, map: 'S&M' },
+      { dept: 'ADMIN', salary: 120000, alloc: 1, raisePct: null, raiseMo: null, burdenPct: 0, startMo: 0, endMo: null, map: 'G&A' }];
+    const c = P.computePayroll(e, [], { burden: 0, raise: 3, raiseMo: 6, deptRaise: { SALES: 10 } });
+    near(c.emp[0].m[6], 11000, 'priorité : département (10 %) sur le global (3 %)');
+    near(c.emp[1].m[6], 10200, 'priorité : employé (2 %) sur le département');
+    near(c.emp[2].m[6], 10300, 'priorité : global (3 %) hors du département réglé');
+    near(c.emp[0].m[5], 10000, 'la hausse part du mois choisi, pas avant');
+  }
+
   // ---------------------------------------------------------------- effectif
   const addE = (user, b) => api('POST', `/api/finance/budgets/${id}/employees`, user, b);
   const hire = { ent: 'Cluster', dept: 'sales', name: 'Embauche prévue', salary: 80000, alloc: 1, map: 'S&M', startMo: 6 };
