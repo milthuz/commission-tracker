@@ -12,6 +12,8 @@
 // La hausse est UNE marche, pas composée. Un champ par personne laissé vide (null) suit le
 // réglage global. Ajout de la phase 1 : mois d'arrivée / de départ (embauches et départs prévus) ;
 // hors de cette plage, la personne coûte 0.
+// SH-48 : hausse par DÉPARTEMENT (`globals.deptRaise`, code de département → %). Priorité :
+// hausse de l'employé > hausse de son département > hausse globale.
 // ============================================================================
 
 const MAPS = ['Recurring COGS', 'Service COGS', 'S&M', 'R&D', 'G&A'];
@@ -24,9 +26,11 @@ function computePayroll(employees, contractors, globals = {}) {
   const gBurden = num(globals.burden, 17.5);
   const gRaise = num(globals.raise, 0);
   const gRaiseMo = num(globals.raiseMo, 0);
+  const deptRaise = globals.deptRaise && typeof globals.deptRaise === 'object' ? globals.deptRaise : {};
   const emp = employees.map((e) => {
     const salary = num(e.salary);
-    const raise = e.raisePct == null ? gRaise : num(e.raisePct);
+    const dRaise = deptRaise[e.dept] == null ? gRaise : num(deptRaise[e.dept], gRaise);
+    const raise = e.raisePct == null ? dRaise : num(e.raisePct);
     const raiseMo = e.raiseMo == null ? gRaiseMo : num(e.raiseMo);
     const burden = e.burdenPct == null ? gBurden : num(e.burdenPct);
     const incl = salary * num(e.alloc);
@@ -47,7 +51,7 @@ function computePayroll(employees, contractors, globals = {}) {
   // rangé dans OPERATIONS — comme le prototype.
   const deptPay = (d) => sumM(emp.filter((e) => (d === 'R&D' ? e.map === 'R&D' : (e.dept === d || (d === 'OPERATIONS' && e.dept === 'CONTROL PLUS')))));
   const payLine = (code) => (String(code).startsWith('con:') ? (conByMap[code.slice(4)] || z12()) : deptPay(code));
-  return { emp, con, payByMap, conByMap, payNN, payEX, payLine, globals: { burden: gBurden, raise: gRaise, raiseMo: gRaiseMo } };
+  return { emp, con, payByMap, conByMap, payNN, payEX, payLine, globals: { burden: gBurden, raise: gRaise, raiseMo: gRaiseMo, deptRaise } };
 }
 
 // Ce que reçoit un usager SANS `finance:payroll` : aucun nom, aucun salaire, seulement des
