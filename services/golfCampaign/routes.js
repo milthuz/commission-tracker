@@ -3,6 +3,7 @@
 // Tables créées à la demande (même patron que services/nda). Données de départ : seed.json.
 const crypto = require('crypto');
 const SEED = require('./seed.json');
+const { registerVisitRoutes } = require('./visits');
 
 const PERM_USE = 'golfcampaign:use';
 const PERM_MANAGE = 'golfcampaign:manage';
@@ -59,6 +60,7 @@ async function ensureSchema(pool) {
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
+  await pool.query(`ALTER TABLE golf_clubs ADD COLUMN IF NOT EXISTS meeting_with TEXT, ADD COLUMN IF NOT EXISTS gcal_event_id TEXT, ADD COLUMN IF NOT EXISTS gcal_calendar TEXT`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS golf_clubs_name_uq ON golf_clubs (LOWER(name))`);
   await pool.query(`CREATE TABLE IF NOT EXISTS golf_call_log (
     id UUID PRIMARY KEY,
@@ -94,7 +96,7 @@ const date = (v) => {
   return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
 };
 
-function registerGolfCampaignRoutes(app, { authenticateToken, requirePerm, hasPerm, pool }) {
+function registerGolfCampaignRoutes(app, { authenticateToken, requirePerm, hasPerm, pool, sendMail, mailShell }) {
   let ready = null;
   const schema = () => (ready = ready || (async () => {
     await ensureSchema(pool);
@@ -112,6 +114,8 @@ function registerGolfCampaignRoutes(app, { authenticateToken, requirePerm, hasPe
   };
   const use = [authenticateToken, guard(PERM_USE)];
   const manage = [authenticateToken, guard(PERM_MANAGE)];
+  // Rendez-vous en personne (Google Agenda du visiteur + courriels) : voir ./visits.js
+  registerVisitRoutes(app, { use, manage, pool, sendMail, mailShell });
 
   // Personnes à qui on peut confier des appels : détenteurs de la permission (via un rôle, ou
   // jokers « * ») + administrateurs. Chaque requête est isolée : une table absente n'invalide pas l'autre.

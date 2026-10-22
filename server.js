@@ -4062,7 +4062,10 @@ require('./services/nda/routes').registerNdaRoutes(app, {
 });
 
 // Campagne golf — liste de clubs à appeler + questionnaire + journal d'appels. Tout vit sous services/golfCampaign/.
-require('./services/golfCampaign/routes').registerGolfCampaignRoutes(app, { authenticateToken, requirePerm, hasPerm, pool });
+require('./services/golfCampaign/routes').registerGolfCampaignRoutes(app, {
+  authenticateToken, requirePerm, hasPerm, pool,
+  sendMail: (...a) => sendMail(...a), mailShell: (...a) => mailShell(...a),
+});
 
 // Crédits de compensation marchand — formulaire signé en ligne, note de crédit Zoho Books.
 // Tout vit sous services/credits/.
