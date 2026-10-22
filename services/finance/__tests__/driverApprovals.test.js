@@ -147,7 +147,8 @@ const sha = (values, g = 0) => crypto.createHash('sha256').update(JSON.stringify
   let L = g.body.lines;
   const by = (k) => L.find((l) => l.key === k);
   const rev = L.filter((l) => l.group === 'revenue'), cogs = L.filter((l) => l.group === 'cogs'), opx = L.filter((l) => l.group === 'opex');
-  ok(rev.length === 30 && cogs.length === 15, `30 drivers de revenus et 15 de COGS saisissables (${rev.length}/${cogs.length})`);
+  // 15 COGS + 7 de SH-49 (COGS de service en deux blocs).
+  ok(rev.length === 30 && cogs.length === 22, `30 drivers de revenus et 22 de COGS saisissables (${rev.length}/${cogs.length})`);
   ok(opx.length > 20 && new Set(L.map((l) => l.key)).size === L.length, `${opx.length} lignes OPEX modifiables, clés uniques`);
   ok(['supportWages', 'supportContr', 'nnWages', 'exWages'].every((k) => !by(`drv:${k}`)), 'les lignes alimentées par la paie ne sont pas suivies');
   ok(Object.keys(ref.drvDefaults).every((k) => by(`drv:${k}`) || ['supportWages', 'supportContr', 'nnWages', 'exWages'].includes(k)), 'tout driver de la référence est suivi, sauf les 4 lignes de paie');
@@ -308,7 +309,7 @@ const sha = (values, g = 0) => crypto.createHash('sha256').update(JSON.stringify
   // Approuver un lot de drivers par défaut (la CFO approuve « tous les drivers de la page »).
   const batch = (await reload()).filter((l) => l.group === 'cogs').map((l) => l.key);
   r = await post('approve', 'cfo@x.com', { keys: batch });
-  ok(r.status === 200 && r.body.changed.length === 15 && r.body.summary.groups.cogs.approved === 15, 'approbation en lot : les 15 drivers de COGS');
+  ok(r.status === 200 && r.body.changed.length === 22 && r.body.summary.groups.cogs.approved === 22, 'approbation en lot : les 22 drivers de COGS');
   ok(r.body.lines.every((l) => l.state === 'approved'), 'valeurs par défaut approuvées telles quelles');
 
   // ---------------------------------------------------------------- verrou du budget entier
@@ -394,7 +395,7 @@ const sha = (values, g = 0) => crypto.createHash('sha256').update(JSON.stringify
   ok(item('payroll_settings').state === 'todo' && item('kpi_budget').state === 'todo' && item('kpi_budget').total === 12 && item('kpi_budget').detail.missing === 12, 'paie non confirmée ; budget KPI : 12 mois sans budget');
   ok(item('billing_sync').state === 'todo' && item('books_connected').state === 'todo' && item('gl_actuals').state === 'todo', 'rien synchronisé : à faire');
   ok(item('budget_cluster').state === 'todo' && item('budget_cluster').detail.code === 'draft' && item('budget_departments').detail.code === 'draft', 'budgets Cluster / Xperio / départements : brouillons');
-  ok(item('drivers_cogs').state === 'done' && item('drivers_cogs').done === 15, 'drivers de COGS approuvés : 15/15');
+  ok(item('drivers_cogs').state === 'done' && item('drivers_cogs').done === 22, 'drivers de COGS approuvés : 22/22');
   ok(item('drivers_revenue').state === 'todo' && item('drivers_revenue').total === 30, 'drivers de revenus : à faire');
   ok(item('owners').state === 'done' && item('owners').detail.missing === 0, 'responsables : tous confirmés');
   ok(item('drivers_stale').state === 'warn' && item('drivers_stale').detail.stale >= 1, 'périmés signalés (intAdds, gaRent)');

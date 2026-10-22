@@ -117,6 +117,13 @@ function extractEntityBudgets(dir) {
 //   · G&A : le prototype omet la ligne « Contractors » alors que le classeur de paie contient un
 //     contractuel G&A (Sachin, 2 875 $/mois = 34 500 $/an). La ligne est liée à la paie (« con:G&A »)
 //     et se place avant le sous-total « Wages & Salaries ».
+//   · COGS de service en deux blocs, Net New Delivery / Existing Service (SH-49, réponses de la CFO
+//     du 2026-10-22) : IMPLEMENTATION scindée (% vers Net New), logiciels 50/50, automobile =
+//     nouvelle dépense (0 $ par défaut), un coussin dans chaque bloc. Les valeurs par défaut
+//     laissent le total des COGS de service IDENTIQUE au prototype, au cent près.
+const SERVICE_COGS_DRIVERS = Object.freeze({
+  implNnPct: 50, svcSwNnPct: 50, bufferNnPct: 50, nnImplSw: 0, exImplSw: 0, nnAuto: 0, exAuto: 0,
+});
 function applyCfoAdjustments(reference) {
   const opex = reference.opex.slice();
   if (!opex.some((it) => it.key === 'gaContr')) {
@@ -124,7 +131,9 @@ function applyCfoAdjustments(reference) {
     if (at < 0) throw new Error('applyCfoAdjustments : sous-total gaSal introuvable');
     opex.splice(at, 0, { t: 'line', name: 'Contractors', key: 'gaContr', pay: 'con:G&A', v: Array(36).fill(0) });
   }
-  return { ...reference, opex };
+  // Une valeur déjà présente gagne toujours (jamais écrasée par un nouvel import).
+  const drvDefaults = { ...SERVICE_COGS_DRIVERS, ...(reference.drvDefaults || {}) };
+  return { ...reference, opex, drvDefaults };
 }
 
-module.exports = { extractHandoff, extractEntityBudgets, applyCfoAdjustments, PROTO };
+module.exports = { extractHandoff, extractEntityBudgets, applyCfoAdjustments, SERVICE_COGS_DRIVERS, PROTO };
