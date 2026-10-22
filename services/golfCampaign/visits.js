@@ -125,6 +125,23 @@ function registerVisitRoutes(app, { use, manage, pool, sendMail, mailShell, base
     };
   }
 
+  // Tout ce qui partira, composé UNE fois : l'aperçu montre exactement ce que l'envoi enverra.
+  function composeMails(club, visitor, at, lang, note, bookerEmail, notify) {
+    const when = E.whenLabel(at, 'fr');
+    const toClub = notify && club.email ? club.email.split(/[\/;,]/)[0].trim() : null;
+    const cm = toClub ? clubMail(club, visitor, at, lang, false) : null;
+    const sender = senderFor(visitor);
+    const client = cm ? { to: toClub, from: sender.from || null, replyTo: sender.replyTo || null, subject: cm.subject, html: cm.html, attachment: lang === 'en' ? 'meeting.ics' : 'rendez-vous.ics' } : null;
+    const visitorMail = {
+      to: visitor.email, subject: `Visite planifiée — ${club.name} · ${when}`,
+      html: mailShell(`Visite planifiée — ${club.name}`,
+        `<strong>${when}</strong>${club.address ? `<br>${clean(club.address, 300)}` : ''}${club.contact_name ? `<br>Contact : ${clean(club.contact_name, 200)}` : ''}${club.phone ? `<br>Tél. : ${clean(club.phone, 60)}` : ''}${club.email ? `<br>Courriel : ${clean(club.email, 200)}` : ''}<br>Réservé par : ${clean(bookerEmail, 200)}${note ? `<br>Note : ${note}` : ''}`,
+        'Ouvrir la campagne golf', `${baseUrl()}/golf-campaign`, 'fr'),
+    };
+    const ev = eventBody(club, visitor, at, note, bookerEmail);
+    return { client, visitor: visitorMail, event: { summary: ev.summary, when, location: ev.location || null, description: ev.description, calendar: visitor.email, minutes: visitor.slotMinutes } };
+  }
+
   const icsFor = (club, visitor, at, lang, cancelled, seq) => E.ics({
     uid: `golf-${club.id}@saleshub.clusterpos.com`, at, minutes: visitor.slotMinutes, sequence: seq, cancelled,
     title: lang === 'en' ? `Meeting with ${visitor.name} — Cluster` : `Rendez-vous avec ${visitor.name} — Cluster`,
@@ -159,6 +176,26 @@ function registerVisitRoutes(app, { use, manage, pool, sendMail, mailShell, base
       const visitor = await getVisitor();
       const r = await slotsFor(visitor, club.id, club.meeting_at);
       res.json({ visitor, slotMinutes: visitor.slotMinutes, days: r.days, source: r.source, googleError: r.googleError });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Aperçu : valide le créneau comme la réservation, ne modifie rien, n'envoie rien.
+  app.post('/api/golf-campaign/clubs/:id/meeting/preview', ...use, async (req, res) => {
+    try {
+      const at = new Date(req.body && req.body.at);
+      if (!Number.isFinite(at.getTime()) || at.getTime() < Date.now()) return res.status(400).json({ error: 'invalid_time' });
+      const lang = req.body.lang === 'en' ? 'en' : 'fr';
+      const note = clean(req.body.note, MAX_NOTE);
+      const club = (await pool.query('SELECT * FROM golf_clubs WHERE id = $1', [req.params.id])).rows[0];
+      if (!club) return res.status(404).json({ error: 'not_found' });
+      const visitor = await getVisitor();
+      const cur = club.meeting_at ? new Date(club.meeting_at) : null;
+      if (!(cur && cur.getTime() === at.getTime())) {
+        const r = await slotsFor(visitor, club.id, cur);
+        if (!r.days.some((d) => d.slots.includes(at.toISOString()))) return res.status(409).json({ error: 'slot_taken' });
+      }
+      const mails = composeMails(club, visitor, at, lang, note, String(req.user.email || '').toLowerCase(), req.body.notify !== false);
+      res.json({ ...mails, moving: !!cur, calendarConnected: G.configured(), noClubEmail: !club.email });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
@@ -203,22 +240,16 @@ function registerVisitRoutes(app, { use, manage, pool, sendMail, mailShell, base
 
       const fresh = (await pool.query('SELECT * FROM golf_clubs WHERE id = $1', [club.id])).rows[0];
       let clientMail = { sent: false, reason: 'not_requested' };
-      if (req.body.notify !== false && club.email && sendMail) {
-        const m = clubMail(club, visitor, at, lang, false);
+      const composed = composeMails(club, visitor, at, lang, note, email, req.body.notify !== false);
+      if (composed.client && sendMail) {
         const seq = Math.floor(Date.now() / 1000);
-        clientMail = await sendMail(club.email.split(/[\/;,]/)[0].trim(), m.subject, m.html, {
+        clientMail = await sendMail(composed.client.to, composed.client.subject, composed.client.html, {
           ...senderFor(visitor),
-          attachments: [{ filename: lang === 'en' ? 'meeting.ics' : 'rendez-vous.ics', content: Buffer.from(icsFor(club, visitor, at, lang, false, seq)), contentType: 'text/calendar; charset=utf-8' }],
+          attachments: [{ filename: composed.client.attachment, content: Buffer.from(icsFor(club, visitor, at, lang, false, seq)), contentType: 'text/calendar; charset=utf-8' }],
         });
       } else if (!club.email) clientMail = { sent: false, reason: 'no_club_email' };
       let visitorMail = { sent: false, reason: 'no_mailer' };
-      if (sendMail && !same) {
-        const when = E.whenLabel(at, 'fr');
-        visitorMail = await sendMail(visitor.email, `Visite planifiée — ${club.name} · ${when}`,
-          mailShell(`Visite planifiée — ${club.name}`,
-            `<strong>${when}</strong>${club.address ? `<br>${clean(club.address, 300)}` : ''}${club.contact_name ? `<br>Contact : ${clean(club.contact_name, 200)}` : ''}${club.phone ? `<br>Tél. : ${clean(club.phone, 60)}` : ''}${club.email ? `<br>Courriel : ${clean(club.email, 200)}` : ''}<br>Réservé par : ${clean(email, 200)}${note ? `<br>Note : ${note}` : ''}`,
-            'Ouvrir la campagne golf', `${baseUrl()}/golf-campaign`, 'fr'));
-      }
+      if (sendMail && !same) visitorMail = await sendMail(composed.visitor.to, composed.visitor.subject, composed.visitor.html);
       res.json({ club: fresh, calendar, clientMail, visitorMail, visitor });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
