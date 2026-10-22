@@ -109,29 +109,49 @@ function registerVisitRoutes(app, { use, manage, pool, sendMail, mailShell, base
     return { replyTo: visitor.email };
   }
 
-  function clubMail(club, visitor, at, lang, cancelled) {
+  const escHtml = (v) => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+  // Le texte PAR DÉFAUT du courriel au club, en texte brut : c'est lui que le représentant peut corriger
+  // dans la fenêtre d'aperçu avant l'envoi.
+  function clubText(club, visitor, at, lang, cancelled) {
     const en = lang === 'en';
     const when = E.whenLabel(at, en ? 'en' : 'fr');
-    const hello = en ? `Hello ${club.contact_name ? club.contact_name.split(' ')[0] : ''},` : `Bonjour ${club.contact_name ? club.contact_name.split(' ')[0] : ''},`;
-    const where = club.address ? (en ? `<br>Location: ${clean(club.address, 300)}` : `<br>Lieu : ${clean(club.address, 300)}`) : '';
-    const intro = cancelled
-      ? (en ? `${hello}<br><br>Your meeting with ${visitor.name} (Cluster) planned for <strong>${when}</strong> is cancelled. We'll be in touch to find another time.`
-        : `${hello}<br><br>Votre rendez-vous avec ${visitor.name} (Cluster) prévu le <strong>${when}</strong> est annulé. Nous vous recontactons pour trouver un autre moment.`)
-      : (en ? `${hello}<br><br>Thanks for your time on the phone. Your in-person meeting with <strong>${visitor.name}</strong> (Cluster) is confirmed for <strong>${when}</strong>.${where}<br><br>We'll show you how Cluster can replace what GGGolf does for you, while you keep everything else as it is today. To change the time, just reply to this email.`
-        : `${hello}<br><br>Merci du temps accordé au téléphone. Votre rendez-vous en personne avec <strong>${visitor.name}</strong> (Cluster) est confirmé le <strong>${when}</strong>.${where}<br><br>Nous vous montrerons comment Cluster peut remplacer ce que GGGolf fait pour vous, tout en gardant le reste comme aujourd'hui. Pour changer l'heure, répondez simplement à ce courriel.`);
+    const first = club.contact_name ? club.contact_name.split(' ')[0] : '';
+    const hello = en ? `Hello ${first},` : `Bonjour ${first},`;
+    const where = club.address ? (en ? `\nLocation: ${clean(club.address, 300)}` : `\nLieu : ${clean(club.address, 300)}`) : '';
+    const text = cancelled
+      ? (en ? `${hello}\n\nYour meeting with ${visitor.name} (Cluster) planned for ${when} is cancelled. We'll be in touch to find another time.`
+        : `${hello}\n\nVotre rendez-vous avec ${visitor.name} (Cluster) prévu le ${when} est annulé. Nous vous recontactons pour trouver un autre moment.`)
+      : (en ? `${hello}\n\nThanks for your time on the phone. Your in-person meeting with ${visitor.name} (Cluster) is confirmed for ${when}.${where}\n\nWe'll show you how Cluster can replace what GGGolf does for you, while you keep everything else as it is today. To change the time, just reply to this email.`
+        : `${hello}\n\nMerci du temps accordé au téléphone. Votre rendez-vous en personne avec ${visitor.name} (Cluster) est confirmé le ${when}.${where}\n\nNous vous montrerons comment Cluster peut remplacer ce que GGGolf fait pour vous, tout en gardant le reste comme aujourd'hui. Pour changer l'heure, répondez simplement à ce courriel.`);
     return {
+      when, text,
+      title: cancelled ? (en ? 'Meeting cancelled' : 'Rendez-vous annulé') : (en ? 'Meeting confirmed' : 'Rendez-vous confirmé'),
       subject: cancelled ? (en ? `Meeting cancelled — Cluster` : `Rendez-vous annulé — Cluster`) : (en ? `Meeting confirmed — Cluster, ${when}` : `Rendez-vous confirmé — Cluster, ${when}`),
-      html: mailShell(cancelled ? (en ? 'Meeting cancelled' : 'Rendez-vous annulé') : (en ? 'Meeting confirmed' : 'Rendez-vous confirmé'), intro, undefined, undefined, en ? 'en' : 'fr'),
     };
   }
 
+  // `ov` = { subject, message } corrigés par le représentant. Le texte est TOUJOURS échappé : le HTML du
+  // courriel est fabriqué ici, jamais reçu du navigateur.
+  function clubMail(club, visitor, at, lang, cancelled, ov = {}) {
+    const d = clubText(club, visitor, at, lang, cancelled);
+    const subject = ov.subject || d.subject;
+    const text = ov.message || d.text;
+    const body = escHtml(text).split(escHtml(d.when)).join(`<strong>${escHtml(d.when)}</strong>`).replace(/\r?\n/g, '<br>');
+    return { subject, text, defaultSubject: d.subject, defaultText: d.text, html: mailShell(d.title, body, undefined, undefined, lang === 'en' ? 'en' : 'fr') };
+  }
+  const overridesOf = (b) => ({
+    subject: clean(b && b.subject, 200) || undefined,
+    message: String((b && b.message) || '').replace(/\r\n/g, '\n').trim().slice(0, 2000) || undefined,
+  });
+
   // Tout ce qui partira, composé UNE fois : l'aperçu montre exactement ce que l'envoi enverra.
-  function composeMails(club, visitor, at, lang, note, bookerEmail, notify) {
+  function composeMails(club, visitor, at, lang, note, bookerEmail, notify, ov = {}) {
     const when = E.whenLabel(at, 'fr');
     const toClub = notify && club.email ? club.email.split(/[\/;,]/)[0].trim() : null;
-    const cm = toClub ? clubMail(club, visitor, at, lang, false) : null;
+    const cm = toClub ? clubMail(club, visitor, at, lang, false, ov) : null;
     const sender = senderFor(visitor);
-    const client = cm ? { to: toClub, from: sender.from || null, replyTo: sender.replyTo || null, subject: cm.subject, html: cm.html, attachment: lang === 'en' ? 'meeting.ics' : 'rendez-vous.ics' } : null;
+    const client = cm ? { to: toClub, from: sender.from || null, replyTo: sender.replyTo || null, subject: cm.subject, text: cm.text, defaultSubject: cm.defaultSubject, defaultText: cm.defaultText, html: cm.html, attachment: lang === 'en' ? 'meeting.ics' : 'rendez-vous.ics' } : null;
     const visitorMail = {
       to: visitor.email, subject: `Visite planifiée — ${club.name} · ${when}`,
       html: mailShell(`Visite planifiée — ${club.name}`,
@@ -194,7 +214,7 @@ function registerVisitRoutes(app, { use, manage, pool, sendMail, mailShell, base
         const r = await slotsFor(visitor, club.id, cur);
         if (!r.days.some((d) => d.slots.includes(at.toISOString()))) return res.status(409).json({ error: 'slot_taken' });
       }
-      const mails = composeMails(club, visitor, at, lang, note, String(req.user.email || '').toLowerCase(), req.body.notify !== false);
+      const mails = composeMails(club, visitor, at, lang, note, String(req.user.email || '').toLowerCase(), req.body.notify !== false, overridesOf(req.body));
       res.json({ ...mails, moving: !!cur, calendarConnected: G.configured(), noClubEmail: !club.email });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
@@ -240,7 +260,7 @@ function registerVisitRoutes(app, { use, manage, pool, sendMail, mailShell, base
 
       const fresh = (await pool.query('SELECT * FROM golf_clubs WHERE id = $1', [club.id])).rows[0];
       let clientMail = { sent: false, reason: 'not_requested' };
-      const composed = composeMails(club, visitor, at, lang, note, email, req.body.notify !== false);
+      const composed = composeMails(club, visitor, at, lang, note, email, req.body.notify !== false, overridesOf(req.body));
       if (composed.client && sendMail) {
         const seq = Math.floor(Date.now() / 1000);
         clientMail = await sendMail(composed.client.to, composed.client.subject, composed.client.html, {
@@ -254,34 +274,69 @@ function registerVisitRoutes(app, { use, manage, pool, sendMail, mailShell, base
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
+  async function loadCancelContext(req, res) {
+    const club = (await pool.query('SELECT * FROM golf_clubs WHERE id = $1', [req.params.id])).rows[0];
+    if (!club) { res.status(404).json({ error: 'not_found' }); return null; }
+    if (!club.meeting_at) { res.status(409).json({ error: 'no_meeting' }); return null; }
+    const current = await getVisitor();
+    const visitor = { ...current, email: String(club.meeting_with || current.email).toLowerCase() };
+    return { club, visitor, at: new Date(club.meeting_at) };
+  }
+
+  // Aperçu de l'annulation : ne retire rien, n'envoie rien.
+  app.post('/api/golf-campaign/clubs/:id/meeting/cancel/preview', ...use, async (req, res) => {
+    try {
+      const ctx = await loadCancelContext(req, res);
+      if (!ctx) return;
+      const { club, visitor, at } = ctx;
+      const lang = req.body && req.body.lang === 'en' ? 'en' : 'fr';
+      const toClub = club.email ? club.email.split(/[\/;,]/)[0].trim() : null;
+      const sender = senderFor(visitor);
+      let client = null;
+      if (toClub) {
+        const m = clubMail(club, visitor, at, lang, true, overridesOf(req.body));
+        client = { to: toClub, from: sender.from || null, replyTo: sender.replyTo || null, subject: m.subject, text: m.text, defaultSubject: m.defaultSubject, defaultText: m.defaultText, html: m.html, attachment: 'cancel.ics' };
+      }
+      res.json({ client, noClubEmail: !club.email, when: E.whenLabel(at, 'fr'), calendarConnected: G.configured(), event: { summary: `Visite — ${club.name}`, calendar: visitor.email } });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  async function cancelMeeting(req, res, { notify, lang, ov }) {
+    const ctx = await loadCancelContext(req, res);
+    if (!ctx) return;
+    const { club, visitor, at } = ctx;
+    let calendar = { ok: true, skipped: 'none' };
+    if (club.gcal_event_id && G.configured()) {
+      try { calendar = await G.deleteEvent(String(club.gcal_calendar || visitor.email), club.gcal_event_id); } catch (e) { calendar = { ok: false, error: e.message.slice(0, 300) }; }
+    }
+    const email = String(req.user.email || '').toLowerCase();
+    const up = await pool.query(
+      `UPDATE golf_clubs SET meeting_at = NULL, meeting_with = NULL, gcal_event_id = NULL, gcal_calendar = NULL,
+              status = 'interested', updated_at = NOW() WHERE id = $1 RETURNING *`, [club.id]);
+    await pool.query('INSERT INTO golf_call_log (id, club_id, by_email, outcome, note) VALUES ($1,$2,$3,$4,$5)',
+      [crypto.randomUUID(), club.id, email, 'interested', `Visite annulée (était le ${E.whenLabel(at, 'fr')})`]);
+    let clientMail = { sent: false, reason: 'not_requested' };
+    if (notify && club.email && sendMail) {
+      const m = clubMail(club, visitor, at, lang, true, ov);
+      clientMail = await sendMail(club.email.split(/[\/;,]/)[0].trim(), m.subject, m.html, {
+        ...senderFor(visitor),
+        attachments: [{ filename: 'cancel.ics', content: Buffer.from(icsFor(club, visitor, at, lang, true, Math.floor(Date.now() / 1000))), contentType: 'text/calendar; charset=utf-8' }],
+      });
+    }
+    res.json({ club: up.rows[0], calendar, clientMail });
+  }
+
+  app.post('/api/golf-campaign/clubs/:id/meeting/cancel', ...use, async (req, res) => {
+    try {
+      await cancelMeeting(req, res, { notify: req.body.notify !== false, lang: req.body.lang === 'en' ? 'en' : 'fr', ov: overridesOf(req.body) });
+    } catch (e) { if (!res.headersSent) res.status(500).json({ error: e.message }); }
+  });
+
+  // Ancienne forme, gardée : mêmes effets, texte par défaut.
   app.delete('/api/golf-campaign/clubs/:id/meeting', ...use, async (req, res) => {
     try {
-      const club = (await pool.query('SELECT * FROM golf_clubs WHERE id = $1', [req.params.id])).rows[0];
-      if (!club) return res.status(404).json({ error: 'not_found' });
-      if (!club.meeting_at) return res.status(409).json({ error: 'no_meeting' });
-      const visitor = { ...(await getVisitor()), email: String(club.meeting_with || (await getVisitor()).email).toLowerCase() };
-      const at = new Date(club.meeting_at);
-      let calendar = { ok: true, skipped: 'none' };
-      if (club.gcal_event_id && G.configured()) {
-        try { calendar = await G.deleteEvent(String(club.gcal_calendar || visitor.email), club.gcal_event_id); } catch (e) { calendar = { ok: false, error: e.message.slice(0, 300) }; }
-      }
-      const email = String(req.user.email || '').toLowerCase();
-      const up = await pool.query(
-        `UPDATE golf_clubs SET meeting_at = NULL, meeting_with = NULL, gcal_event_id = NULL, gcal_calendar = NULL,
-                status = 'interested', updated_at = NOW() WHERE id = $1 RETURNING *`, [club.id]);
-      await pool.query('INSERT INTO golf_call_log (id, club_id, by_email, outcome, note) VALUES ($1,$2,$3,$4,$5)',
-        [crypto.randomUUID(), club.id, email, 'interested', `Visite annulée (était le ${E.whenLabel(at, 'fr')})`]);
-      let clientMail = { sent: false, reason: 'not_requested' };
-      if (req.query.notify !== '0' && club.email && sendMail) {
-        const lang = req.query.lang === 'en' ? 'en' : 'fr';
-        const m = clubMail(club, visitor, at, lang, true);
-        clientMail = await sendMail(club.email.split(/[\/;,]/)[0].trim(), m.subject, m.html, {
-          ...senderFor(visitor),
-          attachments: [{ filename: 'cancel.ics', content: Buffer.from(icsFor(club, visitor, at, lang, true, Math.floor(Date.now() / 1000))), contentType: 'text/calendar; charset=utf-8' }],
-        });
-      }
-      res.json({ club: up.rows[0], calendar, clientMail });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+      await cancelMeeting(req, res, { notify: req.query.notify !== '0', lang: req.query.lang === 'en' ? 'en' : 'fr', ov: {} });
+    } catch (e) { if (!res.headersSent) res.status(500).json({ error: e.message }); }
   });
 }
 
