@@ -13,8 +13,8 @@ const SCRIPT_KEY = 'golf_campaign_script';
 
 // Accroche d'ouverture (≈30 s). {{club}} et {{contact}} sont remplacés à l'affichage. Modifiable (manage).
 const DEFAULT_SCRIPT = {
-  fr: 'Bonjour {{contact}}, ici [votre nom] de Cluster. Je vous appelle parce que plusieurs clubs de golf du Québec qui utilisent GGGolf se font imposer une migration vers Lightspeed. Nous avons développé une plateforme de gestion de golf 100 % web, moderne et dotée d’intelligence artificielle, pour {{club}} et ses membres. Avez-vous 2 minutes pour que je vous pose quelques questions sur votre situation, et peut-être planifier une courte démo ?',
-  en: 'Hi {{contact}}, this is [your name] from Cluster. I’m calling because many Quebec golf clubs on GGGolf are being moved to Lightspeed. We built a modern, 100% web-based golf management platform with built-in AI for {{club}} and its members. Do you have 2 minutes for a few questions about your situation, and maybe a short demo?',
+  fr: 'Bonjour {{contact}}, ici [votre nom] de Cluster. Nous tenons à vous informer que Cluster offre une alternative à Lightspeed pour la gestion de votre terrain de golf, sans que vous ayez à changer toutes vos opérations. Elle remplace simplement ce que GGGolf fait pour vous et vous laisse tout le reste tel que vous l’avez aujourd’hui. Je vous prends 2 minutes, et nous planifierons un rendez-vous en personne. Avez-vous un moment pour quelques questions rapides ?',
+  en: 'Hi {{contact}}, this is [your name] from Cluster. We want you to know that Cluster has an alternative to Lightspeed for your golf course management, so you don’t have to change all your operations. It simply replaces what GGGolf does for you and lets you keep everything else as you have it now. I’ll take 2 minutes of your time, and we’ll book you an in-person appointment. Do you have a moment for a few quick questions?',
 };
 
 // Questionnaire par défaut ; modifiable depuis la page (perm golfcampaign:manage).
