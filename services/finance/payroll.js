@@ -46,12 +46,15 @@ function computePayroll(employees, contractors, globals = {}) {
   const conByMap = Object.fromEntries(MAPS.map((mp) => [mp, sumM(con.filter((c) => c.map === mp))]));
   const payNN = sumM(emp.filter((e) => e.map === 'Service COGS' && NET_NEW_RE.test(e.dept)));
   const payEX = sumM(emp.filter((e) => e.map === 'Service COGS' && !NET_NEW_RE.test(e.dept)));
+  // SH-49 : la part IMPLEMENTATION de payNN, scindée ensuite entre Net New et Existing par le driver
+  // implNnPct (payNN garde son sens d'avant).
+  const payImpl = sumM(emp.filter((e) => e.map === 'Service COGS' && /IMPLEMENTATION/.test(e.dept) && !/NET NEW/.test(e.dept)));
   // Lignes de paie de l'OPEX : par code de département (« SALES », « R&D »…) ou « con:<poste> ».
   // Le département ignore l'entité (le personnel de Xperio est inclus) et CONTROL PLUS est
   // rangé dans OPERATIONS — comme le prototype.
   const deptPay = (d) => sumM(emp.filter((e) => (d === 'R&D' ? e.map === 'R&D' : (e.dept === d || (d === 'OPERATIONS' && e.dept === 'CONTROL PLUS')))));
   const payLine = (code) => (String(code).startsWith('con:') ? (conByMap[code.slice(4)] || z12()) : deptPay(code));
-  return { emp, con, payByMap, conByMap, payNN, payEX, payLine, globals: { burden: gBurden, raise: gRaise, raiseMo: gRaiseMo, deptRaise } };
+  return { emp, con, payByMap, conByMap, payNN, payEX, payImpl, payLine, globals: { burden: gBurden, raise: gRaise, raiseMo: gRaiseMo, deptRaise } };
 }
 
 // Ce que reçoit un usager SANS `finance:payroll` : aucun nom, aucun salaire, seulement des
@@ -61,7 +64,7 @@ function payrollAggregate(employees, contractors, globals, payCodes) {
   const lines = {};
   for (const code of payCodes) lines[code] = p.payLine(code);
   return {
-    payByMap: p.payByMap, conByMap: p.conByMap, payNN: p.payNN, payEX: p.payEX, lines,
+    payByMap: p.payByMap, conByMap: p.conByMap, payNN: p.payNN, payEX: p.payEX, payImpl: p.payImpl, lines,
     headcount: employees.length, contractorCount: contractors.length,
   };
 }

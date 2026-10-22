@@ -109,6 +109,14 @@ async function ensureSchema(pool) {
     )`);
   await pool.query('CREATE INDEX IF NOT EXISTS finance_employees_budget ON finance_employees (budget_id, sort, id)');
   await pool.query('CREATE INDEX IF NOT EXISTS finance_contractors_budget ON finance_contractors (budget_id, sort, id)');
+  // SH-49 : drivers des COGS de service ajoutés aux budgets consolidés déjà importés. Seules les
+  // clés ABSENTES sont ajoutées (une valeur existante gagne) ; les défauts ne changent aucun total.
+  const { SERVICE_COGS_DRIVERS } = require('./handoff');
+  await pool.query(
+    `UPDATE finance_budgets
+        SET reference = jsonb_set(reference, '{drvDefaults}', $1::jsonb || COALESCE(reference->'drvDefaults', '{}'::jsonb))
+      WHERE entity = 'consolidated' AND NOT (COALESCE(reference->'drvDefaults', '{}'::jsonb) ?& $2::text[])`,
+    [JSON.stringify(SERVICE_COGS_DRIVERS), Object.keys(SERVICE_COGS_DRIVERS)]);
 }
 
 // Rôle livré avec la section, à attribuer à la CFO. ON CONFLICT : jamais écrasé s'il a été
@@ -174,7 +182,8 @@ function editableOpexKeys(ref) {
 function validateSection(section, data, ref) {
   if (!data || typeof data !== 'object' || Array.isArray(data)) return 'bad_data';
   if (section === 'drivers') {
-    const keys = new Set(Object.keys(ref.drvDefaults || {}));
+    // Les drivers SH-49 sont acceptés même sur une référence antérieure à leur ajout.
+    const keys = new Set([...Object.keys(ref.drvDefaults || {}), ...Object.keys(require('./handoff').SERVICE_COGS_DRIVERS)]);
     const drv = data.drv || {};
     if (typeof drv !== 'object' || Array.isArray(drv)) return 'bad_drv';
     for (const [k, a] of Object.entries(drv)) {

@@ -29,6 +29,8 @@ const REVENUE_INPUTS = [
 const COGS_INPUTS = [
   'supportSw', 'merchantFees', 'platformFees', 'hostingG', 'resellerSaasG', 'revShare', 'clusterHwPct',
   'xperioHwPct', 'halukPct', 'onsites', 'jobCost', 'buffer', 'travel', 'svcSw', 'licPct',
+  // SH-49 : COGS de service en deux blocs (Net New Delivery / Existing Service).
+  'implNnPct', 'svcSwNnPct', 'bufferNnPct', 'nnImplSw', 'exImplSw', 'nnAuto', 'exAuto',
 ];
 
 // Responsables par défaut (SUGGESTIONS, jamais enregistrées tant que la CFO ne les confirme pas),

@@ -70,6 +70,14 @@ const CATALOG = {
   travel: ['money', 'Service travel, meals and auto cost per month, in dollars'],
   svcSw: ['money', 'Service software, phone, hardware and other cost per month, in dollars'],
   licPct: ['share', 'Licence cost as a percent of licence revenue'],
+  // SH-49 : COGS de service en deux blocs (Net New Delivery / Existing Service).
+  implNnPct: ['share', 'Share (percent) of Implementation payroll charged to Net New Delivery; the rest goes to Existing Service'],
+  svcSwNnPct: ['share', 'Share (percent) of service software costs charged to Net New Delivery; the rest goes to Existing Service'],
+  bufferNnPct: ['share', 'Share (percent) of the service contractor buffer kept for Net New Delivery; the rest goes to Existing Service'],
+  nnImplSw: ['money', 'Net New implementation software cost per month, in dollars'],
+  exImplSw: ['money', 'Existing implementation software cost per month, in dollars'],
+  nnAuto: ['money', 'Net New Delivery automobile cost per month, in dollars'],
+  exAuto: ['money', 'Existing Service automobile cost per month, in dollars'],
 };
 // Inputs « morts » : la paie les remplace dans le modèle (model.ts) — ni suggestion ni brouillon.
 const DEAD_DRIVERS = ['supportWages', 'supportContr', 'nnWages', 'exWages'];
@@ -409,7 +417,8 @@ const FIXED_UNAVAILABLE = {
 };
 const LEDGER_KEYS = new Set(['hwPerNew', 'existClients', 'hwPerExist', 'xpHw', 'cpHw', 'installPrice', 'discount', 'onsite', 'xpService', 'licG',
   'supportSw', 'merchantFees', 'platformFees', 'hostingG', 'resellerSaasG', 'revShare', 'clusterHwPct', 'xperioHwPct', 'halukPct', 'onsites',
-  'jobCost', 'buffer', 'travel', 'svcSw', 'licPct']);
+  'jobCost', 'buffer', 'travel', 'svcSw', 'licPct',
+  'implNnPct', 'svcSwNnPct', 'bufferNnPct', 'nnImplSw', 'exImplSw', 'nnAuto', 'exAuto']);
 const BILLING_ORG = { intAdds: 'can', resAdds: 'can', canChurn: 'can', newClientPct: 'can', canArpuG: 'can', usaChurn: 'usa', usaArpuG: 'usa', xpAdds: 'xp', xpChurn: 'xp', xpArpuG: 'xp' };
 const ARPU_KEYS = new Set(['canArpuG', 'usaArpuG', 'xpArpuG', 'adyenArpuG']);
 

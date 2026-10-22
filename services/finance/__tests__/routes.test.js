@@ -14,7 +14,7 @@ const vm = require('vm');
 const express = require('express');
 let PGlite;
 try { ({ PGlite } = require('@electric-sql/pglite')); } catch { console.error('ÉCHEC : @electric-sql/pglite manquant (npm install --no-save @electric-sql/pglite)'); process.exit(1); }
-const { registerFinanceRoutes, seedRole } = require('../routes');
+const { registerFinanceRoutes, seedRole, ensureSchema } = require('../routes');
 const { importHandoff } = require('../import');
 const { PROTO } = require('../handoff');
 
@@ -89,6 +89,25 @@ function prototype() {
   ok(imp.action === 'create' && imp.budgetId, 'import appliqué');
   ok((await importHandoff(pool, DIR, { apply: true })).action === 'refused_exists', 'un 2e import est refusé (l\'effectif saisi ne se perd pas)');
   ok((await importHandoff(pool, DIR, { apply: true, referenceOnly: true })).action === 'replace_reference', '--reference-only remplace la référence');
+
+  // SH-49 : un budget importé AVANT les drivers des COGS de service les reçoit au démarrage, sans
+  // qu'une valeur déjà présente soit écrasée ; un second passage ne change rien.
+  {
+    const { SERVICE_COGS_DRIVERS } = require('../handoff');
+    const keys = Object.keys(SERVICE_COGS_DRIVERS);
+    await db.query(`UPDATE finance_budgets SET reference = jsonb_set(reference, '{drvDefaults}', (reference->'drvDefaults') - $1::text[] || '{"implNnPct": 70}'::jsonb) WHERE entity = 'consolidated'`, [keys]);
+    const before = (await db.query("SELECT reference->'drvDefaults' d FROM finance_budgets WHERE entity = 'consolidated'")).rows[0].d;
+    ok(before.implNnPct === 70 && before.nnAuto === undefined, 'référence ancienne simulée (clés retirées, une valeur saisie)');
+    await ensureSchema(pool);
+    const after1 = (await db.query("SELECT reference->'drvDefaults' d FROM finance_budgets WHERE entity = 'consolidated'")).rows[0].d;
+    ok(keys.every((k) => k in after1), 'démarrage : les 7 drivers SH-49 sont ajoutés');
+    ok(after1.implNnPct === 70 && after1.nnAuto === 0 && after1.svcSwNnPct === 50, 'démarrage : la valeur saisie est gardée, les autres prennent leur défaut');
+    ok(Object.keys(after1).length === Object.keys(before).length + keys.length - 1, 'démarrage : aucune autre clé touchée');
+    await ensureSchema(pool);
+    const after2 = (await db.query("SELECT reference->'drvDefaults' d FROM finance_budgets WHERE entity = 'consolidated'")).rows[0].d;
+    ok(JSON.stringify(after2) === JSON.stringify(after1), 'démarrage : un second passage ne change rien');
+    await db.query(`UPDATE finance_budgets SET reference = jsonb_set(reference, '{drvDefaults}', (reference->'drvDefaults') || '{"implNnPct": 50}'::jsonb) WHERE entity = 'consolidated'`);
+  }
 
   // ---------------------------------------------------------------- lecture et salaires cachés
   const cfo = (await api('GET', '/api/finance/budget', 'cfo@x.com')).body;
