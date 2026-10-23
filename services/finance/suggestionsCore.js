@@ -67,7 +67,8 @@ const CATALOG = {
   onsites: ['count', 'On-site jobs per month'],
   jobCost: ['money', 'Cost per external job, in dollars'],
   buffer: ['money', 'Service contractor buffer per month, in dollars'],
-  travel: ['money', 'Service travel, meals and auto cost per month, in dollars'],
+  // SH-49 : l'automobile a ses propres lignes (nnAuto / exAuto) ; cette ligne ne la couvre plus.
+  travel: ['money', 'Service travel and meals cost per month, in dollars (automobile has its own lines)'],
   svcSw: ['money', 'Service software, phone, hardware and other cost per month, in dollars'],
   licPct: ['share', 'Licence cost as a percent of licence revenue'],
   // SH-49 : COGS de service en deux blocs (Net New Delivery / Existing Service).
